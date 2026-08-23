@@ -11,6 +11,7 @@ class Harness(StrEnum):
     PI = "pi"
     CLAUDE = "claude"
     HERMES = "hermes"
+    GROK = "grok"
 
 
 class JobState(StrEnum):
@@ -53,6 +54,7 @@ class WorkerConfig:
     name: str
     harness: Harness
     capabilities: tuple[str, ...]
+    replicas: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +98,7 @@ class ClaimedJob:
     dedupe_key: str
     attempt: int
     max_attempts: int
+    agent_name: str
 
 
 @dataclass(frozen=True, slots=True)
