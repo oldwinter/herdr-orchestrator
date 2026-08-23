@@ -14,7 +14,7 @@ CLI enqueue ────┘                               │
                                       Herdr transport adapter
                                                │
                          ┌─────────┬─────────┬──┴────┬────────┐
-                         Droid    Codex      pi    Claude   Hermes
+                         Droid    Codex      pi    Claude   Hermes   Grok
 ```
 
 ### Workflow loader
@@ -37,6 +37,7 @@ claim 在 `BEGIN IMMEDIATE` 事务内完成。`running` 任务持有 `lease_unti
 ### Coordinator
 
 - 一次最多 claim `max_parallel` 个任务；
+- 每个 harness 最多同时占用 `replicas` 个 slot；默认 1，因此同 harness 任务默认串行；
 - provisioning pane 与启动 agent 串行，避免布局竞争；
 - agent prompt 可并发等待；
 - `idle` / `done` 才成功；

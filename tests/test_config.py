@@ -19,10 +19,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.state_db, REPO_ROOT / ".orchestrator/state.db")
         self.assertEqual(
             {worker.harness for worker in config.workers},
-            set(Harness),
+            {Harness.DROID, Harness.CODEX, Harness.PI, Harness.CLAUDE, Harness.HERMES},
         )
         self.assertFalse(config.planner.enabled)
         self.assertEqual(len(config.seed_jobs), 5)
+
+    def test_loads_grok_only_research_workflow(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/grok-research.toml")
+
+        self.assertEqual(config.name, "grok-research")
+        self.assertTrue(config.planner.enabled)
+        self.assertEqual(config.planner.harness, Harness.GROK)
+        self.assertEqual([worker.harness for worker in config.workers], [Harness.GROK])
+        self.assertEqual({job.harness for job in config.seed_jobs}, {Harness.GROK})
+        self.assertEqual(config.coordinator.max_parallel, 10)
+        self.assertEqual(config.workers[0].replicas, 10)
 
     def test_rejects_unknown_harness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

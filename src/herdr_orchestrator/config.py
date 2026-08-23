@@ -97,7 +97,8 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         if harness in harnesses:
             raise ConfigError(f"worker_harness_duplicate: {harness.value}")
         capabilities = _string_list(row, "capabilities", maximum_items=32)
-        workers.append(WorkerConfig(worker_name, harness, capabilities))
+        replicas = _optional_integer(row, "replicas", minimum=1, maximum=16, default=1)
+        workers.append(WorkerConfig(worker_name, harness, capabilities, replicas))
         worker_names.add(worker_name)
         harnesses.add(harness)
 
@@ -175,6 +176,19 @@ def _string_list(
     ):
         raise ConfigError(f"{key}_must_be_string_array")
     return tuple(item.strip() for item in value)
+
+
+def _optional_integer(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    minimum: int,
+    maximum: int,
+    default: int,
+) -> int:
+    if key not in data:
+        return default
+    return _integer(data, key, minimum=minimum, maximum=maximum)
 
 
 def _integer(

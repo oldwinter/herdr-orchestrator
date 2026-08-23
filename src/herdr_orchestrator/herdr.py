@@ -349,6 +349,23 @@ def stable_agent_name(workflow_name: str, workspace: Path, harness: Harness) -> 
     return f"ho-{harness.value}-{digest}"
 
 
+def replica_slot_names(
+    workflow_name: str,
+    workspace: Path,
+    harness: Harness,
+    replicas: int,
+) -> tuple[str, ...]:
+    if replicas < 1:
+        raise ValueError("replicas_must_be_positive")
+    if replicas == 1:
+        return (stable_agent_name(workflow_name, workspace, harness),)
+    seed = f"{workflow_name}\0{workspace.resolve()}\0{harness.value}"
+    digest = hashlib.sha256(seed.encode()).hexdigest()[:6]
+    return tuple(
+        f"ho-{harness.value}-{index:02d}-{digest}" for index in range(1, replicas + 1)
+    )
+
+
 def smoke_agent_name(workflow_name: str, harness: Harness) -> str:
     digest = hashlib.sha256(f"{workflow_name}\0smoke\0{harness.value}".encode()).hexdigest()[:6]
     return f"smoke-{harness.value}-{digest}"

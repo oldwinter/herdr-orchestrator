@@ -23,9 +23,9 @@
 
 ## `[[workers]]`
 
-每个 worker 需要唯一 `name`、受支持的 `harness` 和可选 `capabilities`。v1 支持：
+每个 worker 需要唯一 `name`、受支持的 `harness` 和可选 `capabilities`。同一 harness 只能声明一个 worker；并行靠可选 `replicas`（1–16，默认 1）开多个同 kind pane。v1 支持：
 
-`droid`、`codex`、`pi`、`claude`、`hermes`
+`droid`、`codex`、`pi`、`claude`、`hermes`、`grok`
 
 Herdr 0.8.2 还支持更多 kind，但必须先加入代码白名单和测试，才能进入此仓库的稳定面。
 

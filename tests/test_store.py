@@ -44,6 +44,25 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(len(claimed), 2)
         self.assertEqual({job.harness for job in claimed}, {Harness.CODEX, Harness.DROID})
+        self.assertEqual({job.agent_name for job in claimed}, {"ho-codex", "ho-droid"})
+
+    def test_claims_up_to_harness_replica_slots(self) -> None:
+        self.store.enqueue(_job("one", Harness.GROK))
+        self.store.enqueue(_job("two", Harness.GROK))
+        self.store.enqueue(_job("three", Harness.GROK))
+
+        claimed = self.store.claim(
+            "example",
+            limit=5,
+            lease_seconds=60,
+            slot_names={"grok": ("ho-grok-01-slot", "ho-grok-02-slot")},
+        )
+
+        self.assertEqual(len(claimed), 2)
+        self.assertEqual(
+            [job.agent_name for job in claimed],
+            ["ho-grok-01-slot", "ho-grok-02-slot"],
+        )
 
     def test_success_records_receipt_and_terminal_state(self) -> None:
         self.store.enqueue(_job("one"))

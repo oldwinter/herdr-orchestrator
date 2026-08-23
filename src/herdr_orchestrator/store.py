@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -114,7 +115,14 @@ class Store:
                 raise StoreError("dedupe_lookup_failed")
             return int(row["id"]), False
 
-    def claim(self, workflow: str, *, limit: int, lease_seconds: int) -> list[ClaimedJob]:
+    def claim(
+        self,
+        workflow: str,
+        *,
+        limit: int,
+        lease_seconds: int,
+        slot_names: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[ClaimedJob]:
         now = time.time()
         lease_until = now + lease_seconds
         claimed: list[ClaimedJob] = []
@@ -135,12 +143,19 @@ class Store:
             )
             active_rows = connection.execute(
                 """
-                SELECT DISTINCT harness FROM jobs
+                SELECT harness, agent_name FROM jobs
                 WHERE workflow = ? AND state = ? AND lease_until > ?
                 """,
                 (workflow, JobState.RUNNING.value, now),
             ).fetchall()
-            busy_harnesses = {str(row["harness"]) for row in active_rows}
+            busy_counts: Counter[str] = Counter()
+            busy_names: dict[str, set[str]] = {}
+            for row in active_rows:
+                harness_value = str(row["harness"])
+                busy_counts[harness_value] += 1
+                name = row["agent_name"]
+                if isinstance(name, str) and name:
+                    busy_names.setdefault(harness_value, set()).add(name)
             candidates = connection.execute(
                 """
                 SELECT * FROM jobs
@@ -162,19 +177,30 @@ class Store:
             ).fetchall()
             for row in candidates:
                 harness_value = str(row["harness"])
-                if harness_value in busy_harnesses:
+                names = tuple(slot_names.get(harness_value, ()) if slot_names else ())
+                if not names:
+                    names = (f"ho-{harness_value}",)
+                if busy_counts[harness_value] >= len(names):
+                    continue
+                agent_name = next(
+                    (name for name in names if name not in busy_names.get(harness_value, set())),
+                    None,
+                )
+                if agent_name is None:
                     continue
                 attempt = int(row["attempts"]) + 1
                 connection.execute(
                     """
                     UPDATE jobs
-                    SET state = ?, attempts = ?, lease_until = ?, error_code = NULL, updated_at = ?
+                    SET state = ?, attempts = ?, lease_until = ?, agent_name = ?,
+                        error_code = NULL, updated_at = ?
                     WHERE id = ?
                     """,
                     (
                         JobState.RUNNING.value,
                         attempt,
                         lease_until,
+                        agent_name,
                         now,
                         row["id"],
                     ),
@@ -189,9 +215,11 @@ class Store:
                         dedupe_key=str(row["dedupe_key"]),
                         attempt=attempt,
                         max_attempts=int(row["max_attempts"]),
+                        agent_name=agent_name,
                     )
                 )
-                busy_harnesses.add(harness_value)
+                busy_counts[harness_value] += 1
+                busy_names.setdefault(harness_value, set()).add(agent_name)
                 if len(claimed) >= limit:
                     break
         return claimed

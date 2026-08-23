@@ -20,7 +20,9 @@ def planner_prompt(base_prompt: str, output_file: Path, max_tasks: int) -> str:
         "唯一允许写入的文件：\n"
         f"{output_file}\n\n"
         f"最多 {max_tasks} 项。文件必须是 UTF-8 JSON，且严格符合：\n"
-        '{"tasks":[{"title":"...","harness":"droid|codex|pi|claude|hermes",'
+        '{"tasks":[{"title":"...","harness":"'
+        + "|".join(item.value for item in Harness)
+        + '",'
         '"prompt":"...","dedupe_key":"..."}]}\n'
         "不要输出 shell command 字段。写完文件后只回复任务数量。"
     )

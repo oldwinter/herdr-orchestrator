@@ -1,0 +1,49 @@
+schema_version = 1
+name = "grok-research"
+workspace = ".."
+state_db = "../.orchestrator/grok-research.db"
+
+[coordinator]
+poll_seconds = 8
+max_parallel = 10
+lease_seconds = 3690
+max_attempts = 2
+agent_timeout_seconds = 3600
+
+[planner]
+enabled = true
+harness = "grok"
+interval_seconds = 900
+prompt_file = "prompts/planner-grok-research.md"
+output_file = "../.orchestrator/plans/grok-research.json"
+max_tasks = 12
+
+[[workers]]
+name = "research"
+harness = "grok"
+replicas = 10
+capabilities = ["research", "synthesis", "decision-support"]
+
+[[seed_jobs]]
+title = "Harness taxonomy and market map"
+harness = "grok"
+prompt_file = "prompts/harness-taxonomy.md"
+dedupe_key = "harness-taxonomy-v1"
+
+[[seed_jobs]]
+title = "Frontier lab CLI harness deep dive"
+harness = "grok"
+prompt_file = "prompts/frontier-lab-clis.md"
+dedupe_key = "frontier-lab-clis-v1"
+
+[[seed_jobs]]
+title = "IDE-native cloud and independent harness deep dive"
+harness = "grok"
+prompt_file = "prompts/ide-oss-enterprise.md"
+dedupe_key = "ide-oss-enterprise-v1"
+
+[[seed_jobs]]
+title = "Scenario and model pairing decision matrix"
+harness = "grok"
+prompt_file = "prompts/scenario-model-matrix.md"
+dedupe_key = "scenario-model-matrix-v1"

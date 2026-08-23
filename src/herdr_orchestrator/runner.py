@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Protocol
 
-from herdr_orchestrator.herdr import HerdrTransport
+from herdr_orchestrator.herdr import HerdrTransport, replica_slot_names
 from herdr_orchestrator.model import (
     AgentState,
     ClaimedJob,
@@ -98,6 +98,15 @@ class Coordinator:
             self.config.name,
             limit=self.config.coordinator.max_parallel,
             lease_seconds=self.config.coordinator.lease_seconds,
+            slot_names={
+                worker.harness.value: replica_slot_names(
+                    self.config.name,
+                    self.config.workspace,
+                    worker.harness,
+                    worker.replicas,
+                )
+                for worker in self.config.workers
+            },
         )
         results = {state.value: 0 for state in JobState}
         if not jobs:
@@ -131,6 +140,7 @@ class Coordinator:
             job.harness,
             job.prompt,
             timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+            agent_name=job.agent_name,
         )
 
     def _run_planner_if_due(self) -> None:
