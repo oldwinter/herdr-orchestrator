@@ -1,0 +1,74 @@
+schema_version = 1
+name = "multi-harness"
+workspace = ".."
+state_db = "../.orchestrator/state.db"
+
+[coordinator]
+poll_seconds = 5
+max_parallel = 5
+lease_seconds = 900
+max_attempts = 2
+agent_timeout_seconds = 300
+
+[planner]
+enabled = false
+harness = "droid"
+interval_seconds = 1800
+prompt_file = "prompts/planner.md"
+output_file = "../.orchestrator/plans/multi-harness.json"
+max_tasks = 20
+
+[[workers]]
+name = "operations"
+harness = "droid"
+capabilities = ["operations", "repository-maintenance"]
+
+[[workers]]
+name = "implementation"
+harness = "codex"
+capabilities = ["coding", "testing"]
+
+[[workers]]
+name = "quick-analysis"
+harness = "pi"
+capabilities = ["analysis", "small-tasks"]
+
+[[workers]]
+name = "deep-review"
+harness = "claude"
+capabilities = ["review", "design"]
+
+[[workers]]
+name = "research"
+harness = "hermes"
+capabilities = ["research", "synthesis"]
+
+[[seed_jobs]]
+title = "Droid workflow inventory"
+harness = "droid"
+prompt_file = "prompts/droid-inventory.md"
+dedupe_key = "droid-inventory-v1"
+
+[[seed_jobs]]
+title = "Codex architecture review"
+harness = "codex"
+prompt_file = "prompts/codex-architecture.md"
+dedupe_key = "codex-architecture-v1"
+
+[[seed_jobs]]
+title = "pi configuration check"
+harness = "pi"
+prompt_file = "prompts/pi-config-check.md"
+dedupe_key = "pi-config-check-v1"
+
+[[seed_jobs]]
+title = "Claude safety review"
+harness = "claude"
+prompt_file = "prompts/claude-safety.md"
+dedupe_key = "claude-safety-v1"
+
+[[seed_jobs]]
+title = "Hermes documentation synthesis"
+harness = "hermes"
+prompt_file = "prompts/hermes-docs.md"
+dedupe_key = "hermes-docs-v1"

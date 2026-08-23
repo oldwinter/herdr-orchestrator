@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import re
+import tomllib
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from herdr_orchestrator.model import (
+    CoordinatorConfig,
+    Harness,
+    PlannerConfig,
+    SeedJobConfig,
+    WorkerConfig,
+    WorkflowConfig,
+)
+
+WORKFLOW_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+WORKER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+DEDUPE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def load_workflow(path: str | Path) -> WorkflowConfig:
+    workflow_path = Path(path).expanduser().resolve()
+    if not workflow_path.is_file():
+        raise ConfigError(f"workflow_not_found: {workflow_path}")
+    try:
+        raw = tomllib.loads(workflow_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"workflow_invalid_toml: {exc}") from exc
+
+    schema_version = _integer(raw, "schema_version", minimum=1, maximum=1)
+    name = _string(raw, "name", maximum=64)
+    if not WORKFLOW_NAME.fullmatch(name):
+        raise ConfigError("workflow_name_invalid")
+
+    base = workflow_path.parent
+    workspace = _resolve_path(base, _string(raw, "workspace", maximum=4096))
+    if not workspace.is_dir():
+        raise ConfigError(f"workspace_not_found: {workspace}")
+    state_db = _resolve_path(base, _string(raw, "state_db", maximum=4096))
+
+    coordinator_raw = _table(raw, "coordinator")
+    coordinator = CoordinatorConfig(
+        poll_seconds=_integer(coordinator_raw, "poll_seconds", minimum=1, maximum=3600),
+        max_parallel=_integer(coordinator_raw, "max_parallel", minimum=1, maximum=16),
+        lease_seconds=_integer(coordinator_raw, "lease_seconds", minimum=30, maximum=86400),
+        max_attempts=_integer(coordinator_raw, "max_attempts", minimum=1, maximum=10),
+        agent_timeout_seconds=_integer(
+            coordinator_raw,
+            "agent_timeout_seconds",
+            minimum=10,
+            maximum=3600,
+        ),
+    )
+    if coordinator.lease_seconds < coordinator.agent_timeout_seconds + 90:
+        raise ConfigError("lease_seconds_must_cover_agent_timeout")
+
+    planner_raw = _table(raw, "planner")
+    planner_output = _resolve_path(
+        base,
+        _string(planner_raw, "output_file", maximum=4096),
+    )
+    if not planner_output.is_relative_to(workspace) or ".orchestrator" not in planner_output.parts:
+        raise ConfigError("planner_output_must_be_in_workspace_runtime")
+    planner = PlannerConfig(
+        enabled=_boolean(planner_raw, "enabled"),
+        harness=_harness(planner_raw, "harness"),
+        interval_seconds=_integer(
+            planner_raw,
+            "interval_seconds",
+            minimum=60,
+            maximum=86400,
+        ),
+        prompt_file=_existing_file(base, planner_raw, "prompt_file"),
+        output_file=planner_output,
+        max_tasks=_integer(planner_raw, "max_tasks", minimum=1, maximum=100),
+    )
+
+    worker_rows = _table_list(raw, "workers")
+    if not worker_rows:
+        raise ConfigError("workers_empty")
+    workers: list[WorkerConfig] = []
+    worker_names: set[str] = set()
+    harnesses: set[Harness] = set()
+    for row in worker_rows:
+        worker_name = _string(row, "name", maximum=32)
+        if not WORKER_NAME.fullmatch(worker_name):
+            raise ConfigError(f"worker_name_invalid: {worker_name}")
+        harness = _harness(row, "harness")
+        if worker_name in worker_names:
+            raise ConfigError(f"worker_name_duplicate: {worker_name}")
+        if harness in harnesses:
+            raise ConfigError(f"worker_harness_duplicate: {harness.value}")
+        capabilities = _string_list(row, "capabilities", maximum_items=32)
+        workers.append(WorkerConfig(worker_name, harness, capabilities))
+        worker_names.add(worker_name)
+        harnesses.add(harness)
+
+    seed_jobs: list[SeedJobConfig] = []
+    seed_keys: set[str] = set()
+    for row in _table_list(raw, "seed_jobs"):
+        harness = _harness(row, "harness")
+        if harness not in harnesses:
+            raise ConfigError(f"seed_harness_has_no_worker: {harness.value}")
+        dedupe_key = _string(row, "dedupe_key", maximum=128)
+        if not DEDUPE_KEY.fullmatch(dedupe_key):
+            raise ConfigError(f"dedupe_key_invalid: {dedupe_key}")
+        if dedupe_key in seed_keys:
+            raise ConfigError(f"seed_dedupe_key_duplicate: {dedupe_key}")
+        seed_jobs.append(
+            SeedJobConfig(
+                title=_string(row, "title", maximum=200),
+                harness=harness,
+                prompt_file=_existing_file(base, row, "prompt_file"),
+                dedupe_key=dedupe_key,
+            )
+        )
+        seed_keys.add(dedupe_key)
+
+    return WorkflowConfig(
+        schema_version=schema_version,
+        name=name,
+        path=workflow_path,
+        workspace=workspace,
+        state_db=state_db,
+        coordinator=coordinator,
+        planner=planner,
+        workers=tuple(workers),
+        seed_jobs=tuple(seed_jobs),
+    )
+
+
+def _resolve_path(base: Path, value: str) -> Path:
+    candidate = Path(value).expanduser()
+    return (base / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
+
+def _table(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key}_must_be_table")
+    return value
+
+
+def _table_list(data: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
+    value = data.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ConfigError(f"{key}_must_be_table_array")
+    return value
+
+
+def _string(data: Mapping[str, Any], key: str, *, maximum: int) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise ConfigError(f"{key}_must_be_non_empty_string")
+    return value.strip()
+
+
+def _string_list(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    maximum_items: int,
+) -> tuple[str, ...]:
+    value = data.get(key, [])
+    if (
+        not isinstance(value, list)
+        or len(value) > maximum_items
+        or not all(isinstance(item, str) and item.strip() for item in value)
+    ):
+        raise ConfigError(f"{key}_must_be_string_array")
+    return tuple(item.strip() for item in value)
+
+
+def _integer(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = data.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise ConfigError(f"{key}_must_be_integer_{minimum}_{maximum}")
+    return value
+
+
+def _boolean(data: Mapping[str, Any], key: str) -> bool:
+    value = data.get(key)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key}_must_be_boolean")
+    return value
+
+
+def _harness(data: Mapping[str, Any], key: str) -> Harness:
+    value = _string(data, key, maximum=32)
+    try:
+        return Harness(value)
+    except ValueError as exc:
+        raise ConfigError(f"unsupported_harness: {value}") from exc
+
+
+def _existing_file(base: Path, data: Mapping[str, Any], key: str) -> Path:
+    path = _resolve_path(base, _string(data, key, maximum=4096))
+    if not path.is_file():
+        raise ConfigError(f"{key}_not_found: {path}")
+    return path
