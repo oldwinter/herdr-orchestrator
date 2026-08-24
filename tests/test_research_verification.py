@@ -103,6 +103,61 @@ class ResearchCriticalityTests(unittest.TestCase):
 
 
 class ResearchVerificationTests(unittest.TestCase):
+    def test_verification_fixture_requires_role_capabilities(self) -> None:
+        with TemporaryDirectory() as temporary:
+            workflow = _workflow(Path(temporary))
+            workflow.write_text(
+                workflow.read_text(encoding="utf-8").replace(
+                    'capabilities = ["research.collect"]',
+                    'capabilities = ["research.verify"]',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            exit_code, payload = _invoke(
+                "research",
+                "verification-fixture",
+                "--workflow",
+                str(workflow),
+                "--case",
+                "critical-independent",
+            )
+
+        self.assertEqual(exit_code, 64)
+        self.assertFalse(payload["success"])
+        self.assertEqual(
+            payload["code"],
+            "research_verification_collector_capability_required",
+        )
+
+    def test_export_rejects_parent_components_before_normalization(self) -> None:
+        with TemporaryDirectory() as temporary:
+            workflow = _workflow(Path(temporary))
+            fixture_exit, fixture = _invoke(
+                "research",
+                "verification-fixture",
+                "--workflow",
+                str(workflow),
+                "--case",
+                "critical-independent",
+            )
+            export_exit, exported = _invoke(
+                "research",
+                "export",
+                "--workflow",
+                str(workflow),
+                "--run-id",
+                fixture["run_id"],
+                "--output",
+                "nested/../report.md",
+            )
+
+        self.assertEqual(fixture_exit, 0)
+        self.assertTrue(fixture["success"])
+        self.assertEqual(export_exit, 64)
+        self.assertFalse(exported["success"])
+        self.assertEqual(exported["code"], "research_export_path_parent")
+
     def test_public_contested_fixture_preserves_both_relations_and_status(self) -> None:
         with TemporaryDirectory() as temporary:
             workflow = _workflow(Path(temporary))
@@ -500,13 +555,16 @@ class ResearchVerificationTests(unittest.TestCase):
             VerificationAssignment(
                 assignment_id="assignment-downgrade",
                 claim_id=claim.claim_id,
-                verification_work_id="verify-downgrade",
+                verification_work_id="collect-scope",
                 verifier_logical_agent_id="agent-verifier",
                 verifier_harness="claude",
                 collector_logical_agent_ids=("agent-collector",),
                 collector_harnesses=("grok",),
                 source_ids=("source-verifier",),
                 excerpt_ids=(verification_excerpt.excerpt_id,),
+                run_id="run-1",
+                verification_attempt_id="attempt-2",
+                verification_fencing_token="fence-2",
             )
         )
         register.admit_verification_disposition(
@@ -593,7 +651,10 @@ class ResearchVerificationTests(unittest.TestCase):
             )
         )
 
-        restored = ResearchEvidenceRegister.from_mapping(register.to_dict())
+        restored = ResearchEvidenceRegister.from_mapping(
+            register.to_dict(),
+            verification_authorizer=lambda _assignment: None,
+        )
 
         self.assertEqual(restored.to_dict(), register.to_dict())
         self.assertEqual(
@@ -758,6 +819,9 @@ class ResearchVerificationTests(unittest.TestCase):
                 verifier_harness="grok",
                 collector_logical_agent_ids=("agent-collector",),
                 collector_harnesses=("grok",),
+                run_id="run-1",
+                verification_attempt_id="attempt-1",
+                verification_fencing_token="fence-1",
             )
         )
         self.assertTrue(first.current)
@@ -774,6 +838,9 @@ class ResearchVerificationTests(unittest.TestCase):
                 verifier_harness="grok",
                 collector_logical_agent_ids=("agent-collector",),
                 collector_harnesses=("grok",),
+                run_id="run-1",
+                verification_attempt_id="attempt-2",
+                verification_fencing_token="fence-2",
             )
         )
         self.assertTrue(replacement.current)
@@ -821,7 +888,9 @@ def _register_with_opposing_evidence() -> tuple[
     EvidenceRelation,
     EvidenceRelation,
 ]:
-    register = ResearchEvidenceRegister()
+    register = ResearchEvidenceRegister(
+        verification_authorizer=lambda _assignment: None,
+    )
     sources = []
     excerpts = []
     for source_id, agent, harness, text, order in (

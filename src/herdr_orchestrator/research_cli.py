@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,7 +16,11 @@ from herdr_orchestrator.executor_artifacts import (
     digest_file,
 )
 from herdr_orchestrator.executor_kernel import ExecutionKernel
-from herdr_orchestrator.executor_protocol import MANIFEST_DIGEST_FIELDS
+from herdr_orchestrator.executor_protocol import (
+    EMPTY_DIGEST,
+    MANIFEST_DIGEST_FIELDS,
+    definition_digest,
+)
 from herdr_orchestrator.executor_store import ExecutorStore, ExecutorStoreError
 from herdr_orchestrator.model import WorkflowConfig
 from herdr_orchestrator.research_executor import (
@@ -288,6 +293,67 @@ def _require_verification_fixture_roles(config: WorkflowConfig) -> None:
         raise ConfigError("research_verification_collector_role_required")
     if verifier_name not in workers:
         raise ConfigError("research_verification_verifier_role_required")
+    if "research.collect" not in workers[collector_name].capabilities:
+        raise ConfigError("research_verification_collector_capability_required")
+    if "research.verify" not in workers[verifier_name].capabilities:
+        raise ConfigError("research_verification_verifier_capability_required")
+
+
+def _verification_fixture_manifest_definitions(
+    config: WorkflowConfig,
+    *,
+    requested_case_id: str,
+    case_id: str,
+    research_config: ResearchConfig,
+) -> dict[str, object]:
+    workers = [
+        {
+            "name": item.name,
+            "harness": item.harness.value,
+            "capabilities": list(item.capabilities),
+            "replicas": item.replicas,
+        }
+        for item in config.workers
+    ]
+    return {
+        "workflow": {
+            "name": config.name,
+            "schema_version": 2,
+            "fixture_case_id": requested_case_id,
+            "workflow_source": config.path.read_text(encoding="utf-8"),
+        },
+        "config": {
+            "fixture_case_id": requested_case_id,
+            "research": dict(config.executor.settings)
+            if config.executor is not None
+            else {},
+            "coordinator": {
+                "poll_seconds": config.coordinator.poll_seconds,
+                "max_parallel": config.coordinator.max_parallel,
+                "lease_seconds": config.coordinator.lease_seconds,
+                "max_attempts": config.coordinator.max_attempts,
+                "agent_timeout_seconds": config.coordinator.agent_timeout_seconds,
+            },
+            "workspace": str(config.workspace),
+            "state_db": str(config.state_db),
+            "runtime_dir": str(config.runtime_dir),
+            "verification_policy": research_config.verification.to_dict()
+            if case_id in _RESEARCH_VERIFICATION_FIXTURE_CASES
+            else None,
+            "roles": dict(research_config.roles),
+            "workers": workers,
+        },
+        "route": {
+            "roles": dict(research_config.roles),
+            "workers": workers,
+        },
+        "contract": {"version": "research-evidence-v1"},
+        "executor": {"kind": "research-synthesis", "version": 1},
+        "artifact_contract": {
+            "version": ARTIFACT_CONTRACT_VERSION,
+            "schema_version": 1,
+        },
+    }
 
 
 def _research_evidence_fixture_in_state(
@@ -302,6 +368,12 @@ def _research_evidence_fixture_in_state(
     research_config = ResearchConfig.from_mapping(config.executor.settings)
     store = ExecutorStore(config.state_db)
     kernel = _research_kernel(config, store)
+    definitions = _verification_fixture_manifest_definitions(
+        config,
+        requested_case_id=requested_case_id,
+        case_id=case_id,
+        research_config=research_config,
+    )
     worker = config.workers[0]
     dedupe_case_id = (
         case_id
@@ -313,38 +385,13 @@ def _research_evidence_fixture_in_state(
         "research-synthesis",
         f"research-evidence-fixture-{dedupe_case_id}",
         state="pending",
-        workflow_definition={
-            "name": config.name,
-            "schema_version": 2,
-            "fixture_case_id": requested_case_id,
-        },
-        config_definition={
-            "fixture_case_id": requested_case_id,
-            "research": dict(config.executor.settings),
-            "verification_policy": research_config.verification.to_dict()
-            if case_id in _RESEARCH_VERIFICATION_FIXTURE_CASES
-            else None,
-            "roles": dict(research_config.roles),
-            "workers": [
-                {
-                    "name": item.name,
-                    "harness": item.harness.value,
-                    "replicas": item.replicas,
-                }
-                for item in config.workers
-            ],
-        },
+        workflow_definition=definitions["workflow"],
+        config_definition=definitions["config"],
         input_value={"question": "evidence fixture"},
-        route_definition={
-            "worker": worker.name,
-            "harness": worker.harness.value,
-        },
-        contract_definition={"version": "research-evidence-v1"},
-        executor_definition={"kind": "research-synthesis", "version": 1},
-        artifact_contract_definition={
-            "version": ARTIFACT_CONTRACT_VERSION,
-            "schema_version": 1,
-        },
+        route_definition=definitions["route"],
+        contract_definition=definitions["contract"],
+        executor_definition=definitions["executor"],
+        artifact_contract_definition=definitions["artifact_contract"],
     )
     if case_id in _RESEARCH_VERIFICATION_FIXTURE_CASES:
         if not created:
@@ -354,6 +401,7 @@ def _research_evidence_fixture_in_state(
                 kernel=kernel,
                 run_id=run_id,
                 requested_case_id=requested_case_id,
+                case_id=case_id,
                 route=route,
             )
         return _research_verification_fixture_in_state(
@@ -519,8 +567,15 @@ def _replay_verification_fixture(
     kernel: ExecutionKernel,
     run_id: str,
     requested_case_id: str,
+    case_id: str,
     route: str,
 ) -> int:
+    _validate_verification_fixture_manifest(
+        config,
+        store.require_run(run_id),
+        requested_case_id=requested_case_id,
+        case_id=case_id,
+    )
     persisted_evidence = _persisted_verification_evidence(kernel, run_id)
     event = next(
         (
@@ -530,6 +585,45 @@ def _replay_verification_fixture(
         ),
         None,
     )
+    checkpoint = next(
+        (
+            item
+            for item in reversed(kernel.list_events(run_id))
+            if item.event_type == "research_verification_checkpoint"
+        ),
+        None,
+    )
+    if persisted_evidence is None and checkpoint is not None:
+        if not isinstance(checkpoint.payload, dict):
+            raise ExecutorStoreError("verification_fixture_checkpoint_invalid")
+        checkpoint_evidence = checkpoint.payload.get("evidence")
+        if not isinstance(checkpoint_evidence, dict):
+            raise ExecutorStoreError("verification_fixture_checkpoint_missing")
+        # A fixture replay is a coordinator-owned recovery boundary.  Reclaim
+        # any abandoned register attempt, then admit the checkpoint through a
+        # fresh fenced attempt before reporting a terminal domain result.
+        kernel.reclaim_expired(
+            run_id,
+            now=time.time() + config.coordinator.lease_seconds + 1,
+        )
+        register_work = [
+            item
+            for item in kernel.inspect_run(run_id)["work_items"]
+            if item.get("work_id") == "persist-verification-register"
+        ]
+        if len(register_work) != 1:
+            raise ExecutorStoreError("verification_fixture_register_work_missing")
+        if register_work[0].get("state") != "succeeded":
+            claims = kernel.claim_ready(run_id, limit=1)
+            if len(claims) != 1 or claims[0].work_id != "persist-verification-register":
+                raise ExecutorStoreError("verification_fixture_register_recovery_not_ready")
+            _settle_verification_fixture_work(
+                kernel,
+                claims[0],
+                artifact_type="research-verification-register",
+                payload={"evidence": checkpoint_evidence},
+            )
+        persisted_evidence = _persisted_verification_evidence(kernel, run_id)
     if event is not None and not isinstance(event.payload, dict):
         raise ExecutorStoreError("verification_fixture_event_invalid")
     raw_evidence = (
@@ -541,10 +635,10 @@ def _replay_verification_fixture(
         raise ExecutorStoreError("verification_fixture_evidence_missing")
     if persisted_evidence != raw_evidence:
         raise ExecutorStoreError("verification_fixture_evidence_integrity_mismatch")
-    register = _register_from_persisted_evidence(raw_evidence)
-    for assignment in register.verification_assignments:
-        if assignment.current:
-            _validate_kernel_verification_assignment(kernel, assignment)
+    register = _register_from_persisted_evidence(
+        raw_evidence,
+        kernel=kernel,
+    )
     if (
         event is not None
         and isinstance(event.payload, dict)
@@ -557,6 +651,41 @@ def _replay_verification_fixture(
         if event is not None and isinstance(event.payload, dict)
         else _verification_outcome(register)
     )
+    run = store.require_run(run_id)
+    if event is None and run.state not in {"succeeded", "failed"}:
+        kernel.transition_run(
+            run_id,
+            "succeeded"
+            if outcome_code in {"claim_contested", "critical_claim_verified"}
+            else "failed",
+        )
+        kernel.append_event(
+            run_id,
+            event_key=f"research-verification-fixture:{requested_case_id}",
+            event_type="research_verification_fixture",
+            payload={
+                "fixture_case_id": requested_case_id,
+                "outcome_code": outcome_code,
+                "reason": outcome_code,
+                "verification_policy": register.verification_policy.to_dict(),
+                "verification": register.claim_status(register.claims[0].claim_id),
+                "verification_assignment": (
+                    register.verification_assignments[0].to_dict()
+                    if register.verification_assignments
+                    else None
+                ),
+                "verification_disposition": None,
+                "evidence": register.to_dict(),
+            },
+            error_code=None
+            if outcome_code in {"claim_contested", "critical_claim_verified"}
+            else outcome_code,
+        )
+        event = next(
+            item
+            for item in reversed(kernel.list_events(run_id))
+            if item.event_type == "research_verification_fixture"
+        )
     verification = register.claim_status(register.claims[0].claim_id)
     current_disposition = next(
         (
@@ -623,12 +752,62 @@ def _replay_verification_fixture(
 
 def _register_from_persisted_evidence(
     value: dict[str, object],
+    *,
+    kernel: ExecutionKernel | None = None,
 ) -> ResearchEvidenceRegister:
     policy = CriticalityPolicy.from_mapping(value.get("verification_policy"))
+
+    def authorize(assignment: VerificationAssignment) -> None:
+        if kernel is None:
+            raise ExecutorStoreError("verification_assignment_kernel_authority_required")
+        _validate_kernel_verification_assignment(
+            kernel,
+            assignment,
+        )
+
     return ResearchEvidenceRegister.from_mapping(
         value,
         verification_policy=policy,
+        verification_authorizer=authorize if kernel is not None else None,
     )
+
+
+def _validate_verification_fixture_manifest(
+    config: WorkflowConfig,
+    run: object,
+    *,
+    requested_case_id: str,
+    case_id: str,
+) -> None:
+    if not hasattr(run, "manifest"):
+        raise ExecutorStoreError("verification_fixture_manifest_missing")
+    research_config = ResearchConfig.from_mapping(
+        config.executor.settings if config.executor is not None else {}
+    )
+    definitions = _verification_fixture_manifest_definitions(
+        config,
+        requested_case_id=requested_case_id,
+        case_id=case_id,
+        research_config=research_config,
+    )
+    expected = {
+        "workflow_digest": definition_digest(definitions["workflow"]),
+        "config_digest": definition_digest(definitions["config"]),
+        "input_digest": definition_digest({"question": "evidence fixture"}),
+        "source_digest": EMPTY_DIGEST,
+        "route_digest": definition_digest(definitions["route"]),
+        "profile_digest": EMPTY_DIGEST,
+        "prompt_digest": EMPTY_DIGEST,
+        "static_check_digest": EMPTY_DIGEST,
+        "contract_digest": definition_digest(definitions["contract"]),
+        "executor_digest": definition_digest(definitions["executor"]),
+        "artifact_contract_digest": definition_digest(
+            definitions["artifact_contract"]
+        ),
+    }
+    manifest = run.manifest
+    if any(getattr(manifest, field) != digest for field, digest in expected.items()):
+        raise ExecutorStoreError("verification_fixture_pinned_manifest_mismatch")
 
 
 def _persisted_verification_evidence(
@@ -712,6 +891,7 @@ def _persisted_verification_evidence(
         sources = payload.get("sources")
         if not isinstance(sources, list):
             raise ExecutorStoreError("verification_register_sources_missing")
+        source_artifacts: dict[str, dict[str, object]] = {}
         for source in sources:
             if not isinstance(source, dict):
                 raise ExecutorStoreError("verification_register_source_invalid")
@@ -719,11 +899,36 @@ def _persisted_verification_evidence(
             matches = [
                 item
                 for item in admitted_payloads
-                if item["payload"].get("source_id") == source_id
+                if isinstance(item["payload"].get("source_receipt"), dict)
+                and item["payload"]["source_receipt"].get("source_id")
+                == source_id
             ]
             if len(matches) != 1:
                 raise ExecutorStoreError("verification_register_source_artifact_mismatch")
             artifact = matches[0]["artifact"]
+            artifact_payload = matches[0]["payload"]
+            source_receipt = artifact_payload.get("source_receipt")
+            content = artifact_payload.get("content")
+            if (
+                not isinstance(source_receipt, dict)
+                or source_receipt != source
+                or not isinstance(content, str)
+            ):
+                raise ExecutorStoreError(
+                    "verification_register_source_evidence_mismatch"
+                )
+            try:
+                content_digest = digest_bytes(
+                    content.encode(str(source.get("encoding", "utf-8")))
+                )
+            except (LookupError, UnicodeEncodeError) as exc:
+                raise ExecutorStoreError(
+                    "verification_register_source_content_invalid"
+                ) from exc
+            if content_digest != source.get("payload_digest"):
+                raise ExecutorStoreError(
+                    "verification_register_source_content_digest_mismatch"
+                )
             for source_field, artifact_field in (
                 ("run_id", "run_id"),
                 ("work_id", "work_id"),
@@ -737,6 +942,28 @@ def _persisted_verification_evidence(
                     raise ExecutorStoreError(
                         "verification_register_source_lineage_mismatch"
                     )
+            source_artifacts[str(source_id)] = artifact_payload
+        excerpts = payload.get("excerpts")
+        if not isinstance(excerpts, list):
+            raise ExecutorStoreError("verification_register_excerpts_missing")
+        for excerpt in excerpts:
+            if not isinstance(excerpt, dict):
+                raise ExecutorStoreError("verification_register_excerpt_invalid")
+            source_id = excerpt.get("source_id")
+            artifact_payload = source_artifacts.get(str(source_id))
+            if artifact_payload is None:
+                raise ExecutorStoreError(
+                    "verification_register_excerpt_source_artifact_mismatch"
+                )
+            if artifact_payload.get("excerpt_receipt") != excerpt:
+                raise ExecutorStoreError(
+                    "verification_register_excerpt_evidence_mismatch"
+                )
+            content = artifact_payload.get("content")
+            if not isinstance(content, str) or excerpt.get("text") not in content:
+                raise ExecutorStoreError(
+                    "verification_register_excerpt_content_mismatch"
+                )
         return payload
     return None
 
@@ -813,14 +1040,143 @@ def _validate_kernel_verification_assignment(
     ]
     if not artifacts:
         raise ExecutorStoreError("verification_assignment_artifact_missing")
-    artifact_source_ids = {
-        artifact.get("envelope", {}).get("payload", {}).get("source_id")
+    verification_payloads = [
+        artifact["envelope"]["payload"]
         for artifact in artifacts
         if isinstance(artifact.get("envelope"), dict)
         and isinstance(artifact["envelope"].get("payload"), dict)
-    }
-    if not set(assignment.source_ids).issubset(artifact_source_ids):
-        raise ExecutorStoreError("verification_assignment_source_artifact_missing")
+    ]
+    if len(verification_payloads) != len(artifacts):
+        raise ExecutorStoreError("verification_assignment_artifact_payload_missing")
+
+    def artifact_payload_for(
+        *,
+        work_id: str,
+        kind: str,
+    ) -> list[dict[str, object]]:
+        matches: list[dict[str, object]] = []
+        for artifact in inspected["artifacts"]:
+            if (
+                artifact.get("state") != "admitted"
+                or artifact.get("work_id") != work_id
+                or not isinstance(artifact.get("envelope"), dict)
+                or not isinstance(artifact["envelope"].get("payload"), dict)
+            ):
+                continue
+            payload = artifact["envelope"]["payload"]
+            if payload.get("research_kind") == kind:
+                matches.append(payload)
+        return matches
+
+    for payload in verification_payloads:
+        source_payload = payload.get("source_receipt")
+        excerpt_payload = payload.get("excerpt_receipt")
+        content = payload.get("content")
+        if (
+            not isinstance(source_payload, dict)
+            or not isinstance(excerpt_payload, dict)
+            or not isinstance(content, str)
+        ):
+            raise ExecutorStoreError("verification_assignment_evidence_payload_missing")
+        if source_payload.get("source_id") not in assignment.source_ids:
+            raise ExecutorStoreError("verification_assignment_source_artifact_missing")
+        if excerpt_payload.get("excerpt_id") not in assignment.excerpt_ids:
+            raise ExecutorStoreError("verification_assignment_excerpt_artifact_missing")
+        if (
+            source_payload.get("work_id") != assignment.verification_work_id
+            or source_payload.get("run_id") != assignment.run_id
+            or source_payload.get("attempt_id") != assignment.verification_attempt_id
+            or source_payload.get("fencing_token")
+            != assignment.verification_fencing_token
+            or source_payload.get("harness") != assignment.verifier_harness
+            or source_payload.get("agent") != assignment.verifier_logical_agent_id
+            or source_payload.get("role")
+            not in {"verifier", "verification", "independent-verifier"}
+        ):
+            raise ExecutorStoreError("verification_assignment_evidence_lineage_mismatch")
+        try:
+            content_digest = digest_bytes(
+                content.encode(str(source_payload.get("encoding", "utf-8")))
+            )
+        except (LookupError, UnicodeEncodeError) as exc:
+            raise ExecutorStoreError(
+                "verification_assignment_evidence_content_invalid"
+            ) from exc
+        if (
+            excerpt_payload.get("source_id") != source_payload.get("source_id")
+            or excerpt_payload.get("source_digest")
+            != source_payload.get("payload_digest")
+            or excerpt_payload.get("text") not in content
+            or content_digest != source_payload.get("payload_digest")
+        ):
+            raise ExecutorStoreError("verification_assignment_evidence_content_mismatch")
+
+    if not assignment.collector_work_ids:
+        raise ExecutorStoreError("verification_assignment_collector_work_lineage_required")
+    observed_collector_agents: set[str] = set()
+    observed_collector_harnesses: set[str] = set()
+    for collector_work_id in assignment.collector_work_ids:
+        collector_items = [
+            item
+            for item in inspected["work_items"]
+            if item.get("work_id") == collector_work_id
+        ]
+        if len(collector_items) != 1:
+            raise ExecutorStoreError("verification_assignment_collector_work_not_found")
+        collector_item = collector_items[0]
+        if (
+            collector_item.get("state") != "succeeded"
+            or not isinstance(collector_item.get("payload"), dict)
+            or collector_item["payload"].get("research_kind") != "collection"
+        ):
+            raise ExecutorStoreError("verification_assignment_collector_work_not_settled")
+        collector_payloads = artifact_payload_for(
+            work_id=collector_work_id,
+            kind="collection",
+        )
+        if len(collector_payloads) != 1:
+            raise ExecutorStoreError("verification_assignment_collector_artifact_missing")
+        collector_payload = collector_payloads[0]
+        source_payload = collector_payload.get("source_receipt")
+        excerpt_payload = collector_payload.get("excerpt_receipt")
+        if (
+            not isinstance(source_payload, dict)
+            or not isinstance(excerpt_payload, dict)
+            or not isinstance(collector_payload.get("content"), str)
+            or source_payload.get("role") != "collector"
+            or source_payload.get("work_id") != collector_work_id
+            or source_payload.get("run_id") != assignment.run_id
+            or source_payload.get("attempt_id") != collector_item.get("attempt_id")
+            or source_payload.get("fencing_token")
+            != collector_item.get("fencing_token")
+            or source_payload.get("harness") != collector_item.get("harness")
+            or source_payload.get("worker") != collector_item.get("worker")
+            or excerpt_payload.get("source_id") != source_payload.get("source_id")
+        ):
+            raise ExecutorStoreError("verification_assignment_collector_lineage_mismatch")
+        try:
+            collector_content_digest = digest_bytes(
+                str(collector_payload["content"]).encode(
+                    str(source_payload.get("encoding", "utf-8"))
+                )
+            )
+        except (LookupError, UnicodeEncodeError) as exc:
+            raise ExecutorStoreError(
+                "verification_assignment_collector_content_invalid"
+            ) from exc
+        if (
+            collector_content_digest != source_payload.get("payload_digest")
+            or excerpt_payload.get("text") not in collector_payload["content"]
+        ):
+            raise ExecutorStoreError(
+                "verification_assignment_collector_content_mismatch"
+            )
+        observed_collector_agents.add(str(source_payload.get("agent")))
+        observed_collector_harnesses.add(str(source_payload.get("harness")))
+    if observed_collector_agents != set(assignment.collector_logical_agent_ids):
+        raise ExecutorStoreError("verification_assignment_collector_agent_mismatch")
+    if observed_collector_harnesses != set(assignment.collector_harnesses):
+        raise ExecutorStoreError("verification_assignment_collector_harness_mismatch")
 
 
 def _verification_outcome(register: ResearchEvidenceRegister) -> str:
@@ -859,6 +1215,10 @@ def _research_verification_fixture_in_state(
 
     register = ResearchEvidenceRegister(
         verification_policy=research_config.verification,
+        verification_authorizer=lambda assignment: _validate_kernel_verification_assignment(
+            kernel,
+            assignment,
+        ),
     )
     kernel.add_work_items(
         run_id,
@@ -988,6 +1348,9 @@ def _research_verification_fixture_in_state(
                 "source_id": source.source_id,
                 "excerpt_id": excerpt.excerpt_id,
                 "logical_agent_id": source.agent,
+                "source_receipt": source.to_dict(),
+                "excerpt_receipt": excerpt.to_dict(),
+                "content": text,
             },
         )
     support = register.admit_relation(
@@ -1058,6 +1421,9 @@ def _research_verification_fixture_in_state(
             "source_id": verification_source.source_id,
             "excerpt_id": verification_excerpt.excerpt_id,
             "logical_agent_id": verification_source.agent,
+            "source_receipt": verification_source.to_dict(),
+            "excerpt_receipt": verification_excerpt.to_dict(),
+            "content": verification_text,
         },
     )
 
@@ -1255,6 +1621,17 @@ def _research_verification_fixture_in_state(
             rejection_code = str(exc).split(":", 1)[0]
 
     verification = register.claim_status(claim.claim_id)
+    checkpoint_evidence = register.to_dict()
+    kernel.append_event(
+        run_id,
+        event_key=f"research-verification-checkpoint:{requested_case_id}",
+        event_type="research_verification_checkpoint",
+        payload={
+            "fixture_case_id": requested_case_id,
+            "verification_policy": research_config.verification.to_dict(),
+            "evidence": checkpoint_evidence,
+        },
+    )
     register_claims = kernel.claim_ready(run_id, limit=1)
     if len(register_claims) != 1:
         raise ExecutorStoreError("verification_fixture_register_not_ready")
@@ -1362,7 +1739,11 @@ def _settle_verification_fixture_work(
     lineage = claim.payload.get("lineage")
     if not isinstance(assigned_path, str) or not isinstance(lineage, list):
         raise ExecutorStoreError("verification_fixture_assignment_invalid")
-    content = json.dumps(payload, sort_keys=True).encode("utf-8")
+    artifact_payload = {
+        "research_kind": claim.payload.get("research_kind"),
+        **payload,
+    }
+    content = json.dumps(artifact_payload, sort_keys=True).encode("utf-8")
     kernel.stage_artifact(claim, assigned_path, content)
     manifest = kernel.store.require_run(claim.run_id).manifest
     envelope = {
@@ -1385,14 +1766,14 @@ def _settle_verification_fixture_work(
         "worker": claim.worker,
         "agent": claim.agent_name,
         "pane": f"pane:{claim.agent_name}",
-        "payload": payload,
+        "payload": artifact_payload,
     }
     kernel.complete_work_item(
         claim,
         artifact=envelope,
         receipt_payload={
             "research_kind": claim.payload.get("research_kind"),
-            "payload": payload,
+            "payload": artifact_payload,
         },
         expected_lineage=lineage,
         expected_path=assigned_path,
@@ -1774,6 +2155,26 @@ def _research_export(
         and isinstance(verification_event.payload, dict)
         else None
     )
+    requested_case_id = (
+        event_payload.get("fixture_case_id")
+        if event_payload is not None
+        else run.dedupe_key.removeprefix("research-evidence-fixture-")
+    )
+    if not isinstance(requested_case_id, str):
+        raise ResearchEvidenceError("research_export_fixture_case_missing")
+    case_id = _RESEARCH_EVIDENCE_FIXTURE_ALIASES.get(
+        requested_case_id,
+        requested_case_id,
+    )
+    try:
+        _validate_verification_fixture_manifest(
+            config,
+            run,
+            requested_case_id=requested_case_id,
+            case_id=case_id,
+        )
+    except ExecutorStoreError as exc:
+        raise ResearchEvidenceError(str(exc)) from exc
     raw_evidence = event_payload.get("evidence") if event_payload else None
     try:
         persisted_evidence = _persisted_verification_evidence(kernel, run_id)
@@ -1786,7 +2187,10 @@ def _research_export(
     if persisted_evidence != raw_evidence:
         raise ResearchEvidenceError("research_export_evidence_integrity_mismatch")
     try:
-        register = _register_from_persisted_evidence(raw_evidence)
+        register = _register_from_persisted_evidence(
+            raw_evidence,
+            kernel=kernel,
+        )
     except ResearchEvidenceError:
         raise
     except (TypeError, ValueError) as exc:
@@ -1915,6 +2319,10 @@ def _resolve_export_path(workspace: Path, value: str) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ResearchEvidenceError("research_export_output_required")
     candidate = Path(value).expanduser()
+    if candidate.is_absolute():
+        raise ResearchEvidenceError("research_export_path_absolute")
+    if ".." in candidate.parts:
+        raise ResearchEvidenceError("research_export_path_parent")
     if not candidate.is_absolute():
         candidate = workspace / ".orchestrator" / "exports" / candidate
     return Path(os.path.abspath(candidate))

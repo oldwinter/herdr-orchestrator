@@ -5,8 +5,8 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from herdr_orchestrator.executor_protocol import canonical_json
@@ -321,6 +321,11 @@ class SourceReceipt:
     agent: str
     pane: str | None
     schema_version: int = RESEARCH_EVIDENCE_SCHEMA_VERSION
+    payload_bytes: bytes | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     EXACT_KEYS = frozenset(
         {
@@ -481,6 +486,7 @@ class SourceReceipt:
             worker=worker,
             agent=agent,
             pane=pane,
+            payload_bytes=retrieved_content,
         )
 
     @classmethod
@@ -520,6 +526,7 @@ class SourceReceipt:
             agent=value["agent"],
             pane=value["pane"],
             schema_version=schema_version,
+            payload_bytes=None,
         )
         supplied_digest = value.get("receipt_digest")
         if supplied_digest is not None:
@@ -1504,6 +1511,9 @@ class ResearchEvidenceRegister:
         self,
         *,
         verification_policy: CriticalityPolicy | Mapping[str, Any] | None = None,
+        verification_authorizer: Callable[
+            [VerificationAssignment], None
+        ] | None = None,
     ) -> None:
         self._sources: dict[str, SourceReceipt] = {}
         self._excerpts: dict[str, ExcerptReceipt] = {}
@@ -1514,6 +1524,7 @@ class ResearchEvidenceRegister:
             if isinstance(verification_policy, CriticalityPolicy)
             else CriticalityPolicy.from_mapping(verification_policy)
         )
+        self._verification_authorizer = verification_authorizer
         self._verification_assignments: dict[str, VerificationAssignment] = {}
         self._verification_dispositions: dict[str, VerificationDisposition] = {}
         self._verification_disposition_order: list[str] = []
@@ -1619,6 +1630,16 @@ class ResearchEvidenceRegister:
             raise _error("excerpt_source_not_retrieved")
         if source.payload_digest != excerpt.source_digest:
             raise _error("excerpt_source_digest_mismatch")
+        if source.payload_bytes is not None:
+            try:
+                normalized_content = unicodedata.normalize(
+                    "NFC",
+                    source.payload_bytes.decode(source.encoding),
+                )
+            except (LookupError, UnicodeDecodeError) as exc:
+                raise _error("excerpt_source_decode_failed") from exc
+            if excerpt.text not in normalized_content:
+                raise _error("excerpt_text_not_in_source")
         existing = self._excerpts.get(excerpt.excerpt_id)
         if existing is not None:
             if existing != excerpt:
@@ -1695,6 +1716,7 @@ class ResearchEvidenceRegister:
             raise _error(
                 f"verification_assignment_claim_not_admitted:{assignment.claim_id}"
             )
+        claim = self._claims[assignment.claim_id]
         if (
             self._verification_policy.require_independent_logical_agent
             and assignment.verifier_logical_agent_id
@@ -1706,6 +1728,15 @@ class ResearchEvidenceRegister:
             and assignment.verifier_harness in assignment.collector_harnesses
         ):
             raise _error("verification_assignment_harness_not_independent")
+        if (
+            derive_criticality(claim, self._verification_policy)
+            and (
+                assignment.run_id is None
+                or assignment.verification_attempt_id is None
+                or assignment.verification_fencing_token is None
+            )
+        ):
+            raise _error("verification_assignment_kernel_authority_required")
         if any(source_id not in self._sources for source_id in assignment.source_ids):
             raise _error("verification_assignment_source_not_admitted")
         if any(
@@ -1849,6 +1880,16 @@ class ResearchEvidenceRegister:
                 )
             ):
                 raise _error("verification_disposition_kernel_authority_required")
+            if (
+                derive_criticality(claim, self._verification_policy)
+                and self._verification_authorizer is None
+            ):
+                raise _error("verification_disposition_kernel_authority_unbound")
+            if (
+                derive_criticality(claim, self._verification_policy)
+                and self._verification_authorizer is not None
+            ):
+                self._verification_authorizer(assignment)
         elif disposition.disposition == "contested":
             if supplied_contradictions != contradiction_ids:
                 raise _error("verification_disposition_contradictions_unaccounted")
@@ -2044,6 +2085,7 @@ class ResearchEvidenceRegister:
         candidate = type(self).from_mapping(
             value,
             verification_policy=self._verification_policy,
+            verification_authorizer=self._verification_authorizer,
         )
         snapshot = (
             dict(self._sources),
@@ -2128,6 +2170,9 @@ class ResearchEvidenceRegister:
         verification_policy: CriticalityPolicy
         | Mapping[str, Any]
         | object = _POLICY_UNSET,
+        verification_authorizer: Callable[
+            [VerificationAssignment], None
+        ] | None = None,
     ) -> ResearchEvidenceRegister:
         if not isinstance(value, Mapping):
             raise _error("research_evidence_register_object_required")
@@ -2165,7 +2210,14 @@ class ResearchEvidenceRegister:
             raise _error(f"research_evidence_register_missing_field:{sorted(missing)[0]}")
         if value["schema_version"] != RESEARCH_EVIDENCE_SCHEMA_VERSION:
             raise _error("research_evidence_schema_version_unsupported")
-        register = cls()
+        register = cls(
+            verification_policy=(
+                verification_policy
+                if isinstance(verification_policy, CriticalityPolicy)
+                else None
+            ),
+            verification_authorizer=verification_authorizer,
+        )
         sources = value["sources"]
         excerpts = value["excerpts"]
         claims = value["claims"]
