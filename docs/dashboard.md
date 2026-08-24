@@ -34,11 +34,13 @@ Dashboard 只允许绑定 `127.0.0.1` 或 `localhost`。默认每 2 秒生成一
 
 ### Work in flight
 
-任务按 `pending`、`running`、`blocked/failed`、`succeeded` 分列。任务卡显示 harness、
-placement、attempt、agent、pane/workspace location 与最后 durable state change。
+任务按 `pending`、`running`、`blocked/failed`、`succeeded` 分列。任务卡数据包含 harness、
+placement、attempt、agent、pane/workspace location、`agent_settled`、`task_verified`、receipt
+kind 与最后的截断错误摘要。
 
-Dashboard 不推测任务完成百分比。`working` 只表示 Herdr 当前观察，任务成功仍以 SQLite
-receipt 为准。
+Dashboard 不推测任务完成百分比。`working` 只表示 Herdr 当前观察；`agent_settled` 也不
+代表内容正确。声明 task receipt 的任务只有 `task_verified=true` 才会成功，未声明时该值
+为 null。
 
 ### Attention
 

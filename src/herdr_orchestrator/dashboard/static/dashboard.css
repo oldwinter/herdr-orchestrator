@@ -405,6 +405,13 @@ h2 {
   font: 600 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+.error-summary {
+  margin: var(--space-2) 0 0;
+  color: var(--muted-strong);
+  font: 500 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
 .attention-list {
   display: grid;
   gap: var(--space-2);

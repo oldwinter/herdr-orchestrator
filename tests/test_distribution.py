@@ -10,11 +10,31 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from herdr_orchestrator import __version__
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI = REPO_ROOT / "bin/herdr-orchestrator.mjs"
 
 
 class DistributionCliTests(unittest.TestCase):
+    def test_install_help_has_no_filesystem_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            before = sorted(path.relative_to(project) for path in project.rglob("*"))
+
+            result = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--help",
+            )
+            after = sorted(path.relative_to(project) for path in project.rglob("*"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Usage: herdr-orchestrator install", result.stdout)
+        self.assertEqual(after, before)
+
     def test_version_matches_the_python_distribution(self) -> None:
         version = self._run("--version")
 
@@ -23,6 +43,7 @@ class DistributionCliTests(unittest.TestCase):
             (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )["project"]["version"]
         self.assertEqual(version.stdout.strip(), python_version)
+        self.assertEqual(__version__, python_version)
 
     def test_missing_option_value_returns_a_stable_cli_error(self) -> None:
         result = self._run("install", "--project")
@@ -56,6 +77,272 @@ class DistributionCliTests(unittest.TestCase):
                 [item["harness"] for item in catalog_payload["harnesses"]],
                 ["droid"],
             )
+
+    def test_wrapper_forwards_doctor_probe_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                "--probe-timeout-seconds",
+                "1",
+            )
+
+        self.assertEqual(doctor.returncode, 1, doctor.stderr)
+        payload = json.loads(doctor.stdout)
+        self.assertEqual(
+            payload["runtime"]["error"],
+            "doctor_probe_timeout_out_of_range",
+        )
+
+    def test_install_keeps_a_real_git_worktree_status_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            (project / "README.md").write_text("# Existing project\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(project), "add", "README.md"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            before = self._git_status(project)
+
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(install.returncode, 0, install.stderr)
+            self.assertEqual(self._git_status(project), before)
+            exclude = subprocess.run(
+                ["git", "-C", str(project), "rev-parse", "--git-path", "info/exclude"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            exclude_path = Path(exclude.stdout.strip())
+            if not exclude_path.is_absolute():
+                exclude_path = project / exclude_path
+            exclude_text = exclude_path.read_text(encoding="utf-8")
+            self.assertIn("/.herdr-orchestrator/", exclude_text)
+            self.assertIn("/.orchestrator/", exclude_text)
+            self.assertIn("/.agents/skills/herdr-orchestrator/", exclude_text)
+
+    def test_install_allows_a_linked_worktree_common_git_exclude(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            checkout = root / "linked-checkout"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(repository)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            (repository / "README.md").write_text("# Existing project\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "README.md"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "linked",
+                    str(checkout),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            before = self._git_status(checkout)
+
+            install = self._run(
+                "install",
+                "--project",
+                str(checkout),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(install.returncode, 0, install.stderr)
+            self.assertEqual(self._git_status(checkout), before)
+            exclude = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "--git-path", "info/exclude"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            exclude_path = Path(exclude.stdout.strip())
+            self.assertTrue(exclude_path.is_absolute())
+            exclude_text = exclude_path.read_text(encoding="utf-8")
+            self.assertIn("/.herdr-orchestrator/", exclude_text)
+
+    def test_existing_skill_router_requires_explicit_project_skill_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            existing = project / ".agents/skills/existing/SKILL.md"
+            existing.parent.mkdir(parents=True)
+            existing.write_text("---\nname: existing\n---\n", encoding="utf-8")
+
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(install.returncode, 0, install.stderr)
+            payload = json.loads(install.stdout)
+            self.assertEqual(payload["skill"], "skipped_existing_router")
+            skill = project / ".agents/skills/herdr-orchestrator/SKILL.md"
+            self.assertFalse(skill.exists())
+
+            explicit = self._run(
+                "upgrade",
+                "--project",
+                str(project),
+                "--install-skill",
+            )
+
+            self.assertEqual(explicit.returncode, 0, explicit.stderr)
+            self.assertEqual(json.loads(explicit.stdout)["skill"], "managed")
+            self.assertTrue(skill.is_file())
+
+    def test_install_rejects_a_symlinked_git_exclude_without_following_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            sentinel = root / "outside-exclude"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            exclude = project / ".git/info/exclude"
+            exclude.unlink()
+            sentinel.write_text("outside\n", encoding="utf-8")
+            os.symlink(sentinel, exclude)
+
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(install.returncode, 2)
+            self.assertIn("git_exclude_symlink", install.stderr)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "outside\n")
+            self.assertFalse((project / ".herdr-orchestrator").exists())
+
+    def test_install_rejects_a_non_regular_git_exclude(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            exclude = project / ".git/info/exclude"
+            exclude.unlink()
+            exclude.mkdir()
+
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(install.returncode, 2)
+            self.assertIn("git_exclude_not_regular", install.stderr)
+            self.assertFalse((project / ".herdr-orchestrator").exists())
+
+    def test_install_rejects_a_symlinked_git_directory_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            project = root / "project"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(outside)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            project.mkdir()
+            os.symlink(outside / ".git", project / ".git", target_is_directory=True)
+            exclude = outside / ".git/info/exclude"
+            before = exclude.read_text(encoding="utf-8")
+
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(install.returncode, 2)
+            self.assertIn("git_exclude_symlink", install.stderr)
+            self.assertEqual(exclude.read_text(encoding="utf-8"), before)
+            self.assertFalse((project / ".herdr-orchestrator").exists())
 
     def test_reinstall_preserves_user_modified_managed_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -290,7 +577,13 @@ class DistributionCliTests(unittest.TestCase):
     def test_install_does_not_take_ownership_of_an_existing_skill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
-            (project / ".git").mkdir()
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
             skill = project / ".agents/skills/herdr-orchestrator/SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text(
@@ -322,11 +615,21 @@ class DistributionCliTests(unittest.TestCase):
                 ".agents/skills/herdr-orchestrator/SKILL.md",
                 manifest["files"],
             )
+            exclude = project / ".git/info/exclude"
+            if exclude.exists():
+                self.assertNotIn(
+                    "/.agents/skills/herdr-orchestrator/",
+                    exclude.read_text(encoding="utf-8"),
+                )
 
             uninstall = self._run("uninstall", "--project", str(project))
 
             self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
             self.assertTrue(skill.is_file())
+            self.assertNotIn(
+                "# BEGIN herdr-orchestrator managed paths",
+                exclude.read_text(encoding="utf-8"),
+            )
 
     def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -337,6 +640,16 @@ class DistributionCliTests(unittest.TestCase):
             check=False,
             timeout=30,
         )
+
+    def _git_status(self, project: Path) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(project), "status", "--short"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
 
 
 if __name__ == "__main__":

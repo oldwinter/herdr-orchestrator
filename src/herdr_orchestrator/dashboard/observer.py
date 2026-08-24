@@ -55,7 +55,8 @@ class SqliteObserver:
                 """
                 SELECT id, title, harness, dedupe_key, placement, state, attempts,
                        max_attempts, available_at, lease_until, agent_name, error_code,
-                       execution_path, herdr_workspace_id, created_at, updated_at
+                       execution_path, herdr_workspace_id, receipt_kind, receipt_value,
+                       agent_settled, task_verified, error_summary, created_at, updated_at
                 FROM jobs
                 WHERE workflow = ?
                 ORDER BY created_at, id
@@ -68,7 +69,8 @@ class SqliteObserver:
                        receipts.agent_name, receipts.agent_state, receipts.member_reused,
                        receipts.pane_id, receipts.error_code, receipts.placement,
                        receipts.execution_path, receipts.herdr_workspace_id,
-                       receipts.observed_at
+                       receipts.agent_settled, receipts.task_verified,
+                       receipts.error_summary, receipts.observed_at
                 FROM receipts
                 JOIN jobs ON jobs.id = receipts.job_id
                 WHERE jobs.workflow = ?

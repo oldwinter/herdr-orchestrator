@@ -15,13 +15,28 @@ from herdr_orchestrator.model import (
     JobState,
     NewJob,
     PlacementTarget,
+    ReceiptKind,
+    TaskReceipt,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class StoreError(RuntimeError):
     pass
+
+
+def _nullable_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _bounded_error_summary(value: str | None) -> str | None:
+    if value is None:
+        return None
+    summary = " ".join(value.split())[:300]
+    return summary or None
 
 
 class Store:
@@ -53,6 +68,11 @@ class Store:
                     error_code TEXT,
                     execution_path TEXT,
                     herdr_workspace_id TEXT,
+                    receipt_kind TEXT,
+                    receipt_value TEXT,
+                    agent_settled INTEGER,
+                    task_verified INTEGER,
+                    error_summary TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(workflow, dedupe_key)
@@ -72,6 +92,9 @@ class Store:
                     placement TEXT,
                     execution_path TEXT,
                     herdr_workspace_id TEXT,
+                    agent_settled INTEGER,
+                    task_verified INTEGER,
+                    error_summary TEXT,
                     observed_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -84,10 +107,16 @@ class Store:
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
-            elif row["version"] == 1:
-                self._migrate_v1_to_v2(connection)
-            elif row["version"] != SCHEMA_VERSION:
-                raise StoreError(f"unsupported_schema_version: {row['version']}")
+            else:
+                version = int(row["version"])
+                if version == 1:
+                    self._migrate_v1_to_v2(connection)
+                    version = 2
+                if version == 2:
+                    self._migrate_v2_to_v3(connection)
+                    version = 3
+                if version != SCHEMA_VERSION:
+                    raise StoreError(f"unsupported_schema_version: {version}")
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE jobs ADD COLUMN placement TEXT")
@@ -103,6 +132,17 @@ class Store:
         connection.execute("ALTER TABLE receipts ADD COLUMN herdr_workspace_id TEXT")
         connection.execute("UPDATE schema_meta SET version = 2")
 
+    def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
+        connection.execute("ALTER TABLE jobs ADD COLUMN receipt_kind TEXT")
+        connection.execute("ALTER TABLE jobs ADD COLUMN receipt_value TEXT")
+        connection.execute("ALTER TABLE jobs ADD COLUMN agent_settled INTEGER")
+        connection.execute("ALTER TABLE jobs ADD COLUMN task_verified INTEGER")
+        connection.execute("ALTER TABLE jobs ADD COLUMN error_summary TEXT")
+        connection.execute("ALTER TABLE receipts ADD COLUMN agent_settled INTEGER")
+        connection.execute("ALTER TABLE receipts ADD COLUMN task_verified INTEGER")
+        connection.execute("ALTER TABLE receipts ADD COLUMN error_summary TEXT")
+        connection.execute("UPDATE schema_meta SET version = 3")
+
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
         with self._connect() as connection:
@@ -110,9 +150,10 @@ class Store:
                 """
                 INSERT INTO jobs(
                     workflow, title, harness, prompt, dedupe_key, placement, state,
-                    attempts, max_attempts, available_at, created_at, updated_at
+                    attempts, max_attempts, available_at, receipt_kind, receipt_value,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workflow, dedupe_key) DO NOTHING
                 """,
                 (
@@ -125,6 +166,8 @@ class Store:
                     JobState.PENDING.value,
                     job.max_attempts,
                     now,
+                    job.receipt.kind.value if job.receipt is not None else None,
+                    job.receipt.value if job.receipt is not None else None,
                     now,
                     now,
                 ),
@@ -284,6 +327,15 @@ class Store:
                         max_attempts=int(row["max_attempts"]),
                         agent_name=agent_name,
                         placement=PlacementTarget(placement_value),
+                        receipt=(
+                            TaskReceipt(
+                                ReceiptKind(str(row["receipt_kind"])),
+                                str(row["receipt_value"]),
+                            )
+                            if row["receipt_kind"] is not None
+                            and row["receipt_value"] is not None
+                            else None
+                        ),
                     )
                 )
                 busy_counts[harness_value] += 1
@@ -294,7 +346,12 @@ class Store:
 
     def record_outcome(self, job: ClaimedJob, outcome: DispatchOutcome) -> JobState:
         now = time.time()
-        if outcome.error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
+        error_code = outcome.error_code
+        if job.receipt is not None and outcome.task_verified is not True and error_code is None:
+            error_code = "task_receipt_missing"
+        elif outcome.task_verified is False and error_code is None:
+            error_code = "task_receipt_invalid"
+        if error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
             state = JobState.SUCCEEDED
             available_at = now
         elif outcome.state is AgentState.BLOCKED:
@@ -307,9 +364,14 @@ class Store:
             state = JobState.FAILED
             available_at = now
 
-        error_code = outcome.error_code
         if error_code is None and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
             error_code = "agent_not_settled"
+        agent_settled = (
+            outcome.agent_settled
+            if outcome.agent_settled is not None
+            else outcome.state in {AgentState.IDLE, AgentState.DONE}
+        )
+        error_summary = _bounded_error_summary(outcome.error_summary)
 
         with self._transaction() as connection:
             row = connection.execute(
@@ -325,7 +387,7 @@ class Store:
                 UPDATE jobs
                 SET state = ?, available_at = ?, lease_until = NULL, agent_name = ?,
                     error_code = ?, execution_path = ?, herdr_workspace_id = ?,
-                    updated_at = ?
+                    agent_settled = ?, task_verified = ?, error_summary = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -335,6 +397,13 @@ class Store:
                     error_code,
                     outcome.execution_path,
                     outcome.herdr_workspace_id,
+                    int(agent_settled),
+                    (
+                        int(outcome.task_verified)
+                        if outcome.task_verified is not None
+                        else None
+                    ),
+                    error_summary,
                     now,
                     job.job_id,
                 ),
@@ -344,9 +413,10 @@ class Store:
                 INSERT INTO receipts(
                     job_id, attempt, state, agent_name, agent_state,
                     member_reused, pane_id, error_code, placement,
-                    execution_path, herdr_workspace_id, observed_at
+                    execution_path, herdr_workspace_id, agent_settled,
+                    task_verified, error_summary, observed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -364,33 +434,140 @@ class Store:
                     ),
                     outcome.execution_path,
                     outcome.herdr_workspace_id,
+                    int(agent_settled),
+                    (
+                        int(outcome.task_verified)
+                        if outcome.task_verified is not None
+                        else None
+                    ),
+                    error_summary,
                     now,
                 ),
             )
         return state
 
-    def status_counts(self, workflow: str) -> dict[str, int]:
+    def status_counts(
+        self,
+        workflow: str,
+        *,
+        allowed_harnesses: Iterable[Harness] | None = None,
+    ) -> dict[str, int]:
         counts = {state.value: 0 for state in JobState}
+        allowed_values = (
+            None
+            if allowed_harnesses is None
+            else tuple(harness.value for harness in allowed_harnesses)
+        )
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT state, COUNT(*) AS total FROM jobs WHERE workflow = ? GROUP BY state",
-                (workflow,),
-            ).fetchall()
+            if allowed_values is None:
+                rows = connection.execute(
+                    "SELECT state, COUNT(*) AS total FROM jobs WHERE workflow = ? GROUP BY state",
+                    (workflow,),
+                ).fetchall()
+            elif not allowed_values:
+                rows = []
+            else:
+                placeholders = ", ".join("?" for _ in allowed_values)
+                rows = connection.execute(
+                    f"""
+                    SELECT state, COUNT(*) AS total FROM jobs
+                    WHERE workflow = ? AND harness IN ({placeholders})
+                    GROUP BY state
+                    """,
+                    (workflow, *allowed_values),
+                ).fetchall()
         for row in rows:
             counts[str(row["state"])] = int(row["total"])
         return counts
+
+    def retry_failed(
+        self,
+        workflow: str,
+        job_id: int,
+        *,
+        extra_attempts: int = 1,
+    ) -> dict[str, object]:
+        if not 1 <= extra_attempts <= 10:
+            raise StoreError("extra_attempts_out_of_range")
+        now = time.time()
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT id, state, attempts, max_attempts
+                FROM jobs WHERE workflow = ? AND id = ?
+                """,
+                (workflow, job_id),
+            ).fetchone()
+            if row is None:
+                raise StoreError("job_not_found")
+            if row["state"] != JobState.FAILED.value:
+                raise StoreError("job_not_retryable")
+            max_attempts = int(row["max_attempts"]) + extra_attempts
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = ?, max_attempts = ?, available_at = ?, lease_until = NULL,
+                    error_code = NULL, error_summary = NULL, agent_settled = NULL,
+                    task_verified = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    JobState.PENDING.value,
+                    max_attempts,
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+        return {
+            "job_id": job_id,
+            "state": JobState.PENDING.value,
+            "attempts": int(row["attempts"]),
+            "max_attempts": max_attempts,
+        }
 
     def jobs(self, workflow: str) -> list[dict[str, object]]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT id, title, harness, placement, state, attempts, max_attempts,
-                       agent_name, error_code, execution_path, herdr_workspace_id
+                       agent_name, error_code, execution_path, herdr_workspace_id,
+                       receipt_kind, receipt_value, agent_settled, task_verified
+                       , error_summary
                 FROM jobs WHERE workflow = ? ORDER BY id
                 """,
                 (workflow,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        jobs = [dict(row) for row in rows]
+        for job in jobs:
+            job["agent_settled"] = _nullable_bool(job["agent_settled"])
+            job["task_verified"] = _nullable_bool(job["task_verified"])
+        return jobs
+
+    def created_agent_panes(self, workflow: str) -> dict[str, str]:
+        """Return the latest pane recorded when this workflow created an agent."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT receipts.agent_name, receipts.pane_id
+                FROM receipts
+                JOIN jobs ON jobs.id = receipts.job_id
+                WHERE jobs.workflow = ?
+                  AND receipts.member_reused = 0
+                  AND receipts.pane_id IS NOT NULL
+                  AND receipts.placement IN (?, ?)
+                ORDER BY receipts.observed_at, receipts.id
+                """,
+                (
+                    workflow,
+                    PlacementTarget.TAB.value,
+                    PlacementTarget.PANE.value,
+                ),
+            ).fetchall()
+        return {
+            str(row["agent_name"]): str(row["pane_id"])
+            for row in rows
+        }
 
     def unplaced_jobs(
         self,

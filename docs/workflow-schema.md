@@ -18,7 +18,7 @@
 | `max_parallel` | 1–16 | 单轮最大并发 |
 | `lease_seconds` | 30–86400 | running lease |
 | `max_attempts` | 1–10 | 总 claim 次数 |
-| `agent_timeout_seconds` | 10–3600 | 单个 agent prompt wait |
+| `agent_timeout_seconds` | 10–3600 | 单次完整派发 deadline，包含 topology provisioning、agent 启动、prompt、settlement 与 receipt 验证 |
 
 `lease_seconds` 必须至少比 `agent_timeout_seconds` 长 90 秒，为 agent 启动、Herdr 控制请求和收据提交留出窗口，防止同一任务在旧 turn 尚未结束时被重复 claim。
 
@@ -96,6 +96,10 @@ planner 的 `output_file` 必须位于 workflow workspace 内或其 `.orchestrat
 `harness = "auto"` 时，coordinator 按 `droid → grok → codex → claude → hermes → pi` 的固定优先级，从候选 worker 中选择本机 executable 存在的 harness。显式主控可以不在 worker 候选池中，但必须有 catalog profile 和可用 CLI。
 
 `run` 与 `enqueue` 可用 `--controller-harness` 和可重复的 `--worker-harness` 临时覆盖这些默认值。`enqueue --harness auto` 或省略 `--harness` 时，主控读取候选池 compact catalog 并输出严格的单 harness JSON；显式 `--harness` 则跳过这次路由 turn。
+
+Task receipt 是 CLI enqueue 契约，不是 TOML workflow 字段。`--receipt-prefix` 要求 agent
+detection output 中有一行以指定值开头；`--receipt-file` 要求 execution root 下相对路径为
+非空文件。二者互斥，缺失时任务不能成功。`[[seed_jobs]]` 暂不声明 task receipt。
 
 ## `[standardized_delivery]`
 

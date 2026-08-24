@@ -7,7 +7,14 @@ import unittest
 from pathlib import Path
 
 from herdr_orchestrator.herdr import HerdrTransport, replica_slot_names, stable_agent_name
-from herdr_orchestrator.model import AgentState, Harness
+from herdr_orchestrator.model import (
+    AgentState,
+    DispatchContext,
+    Harness,
+    PlacementTarget,
+    ReceiptKind,
+    TaskReceipt,
+)
 from herdr_orchestrator.protocol import TransportError
 
 
@@ -15,21 +22,153 @@ class FakeRunner:
     def __init__(self, responses: list[subprocess.CompletedProcess[str]]) -> None:
         self.responses = responses
         self.calls: list[list[str]] = []
+        self.timeouts: list[float | None] = []
 
     def __call__(
         self,
         argv: list[str],
         *,
         cwd: str,
-        timeout: int | None,
+        timeout: float | None,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(argv)
+        self.timeouts.append(timeout)
         if not self.responses:
             raise AssertionError(f"unexpected call: {argv}")
         return self.responses.pop(0)
 
 
 class HerdrTransportTests(unittest.TestCase):
+    def test_closes_only_the_owned_pane_for_a_tab_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "name": "ho-codex-owned",
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "workspace_id": "w1",
+                                "tab_id": "w1:t2",
+                                "pane_id": "w1:p3",
+                            }
+                        }
+                    ),
+                    _result({"type": "ok"}),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+            )
+
+            action = transport.close_agent_terminal(
+                "ho-codex-owned",
+                PlacementTarget.TAB,
+                expected_pane_id="w1:p3",
+                dry_run=False,
+            )
+
+        self.assertEqual(action["action"], "closed")
+        self.assertEqual(
+            runner.calls[1],
+            ["herdr", "pane", "close", "w1:p3"],
+        )
+
+    def test_tab_agent_moved_to_a_user_tab_still_closes_only_its_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "name": "ho-codex-owned",
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "workspace_id": "w1",
+                                "tab_id": "w1:user-tab",
+                                "pane_id": "w1:p3",
+                            }
+                        }
+                    ),
+                    _result({"type": "ok"}),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+            )
+
+            transport.close_agent_terminal(
+                "ho-codex-owned",
+                PlacementTarget.TAB,
+                expected_pane_id="w1:p3",
+                dry_run=False,
+            )
+
+        self.assertEqual(runner.calls[1], ["herdr", "pane", "close", "w1:p3"])
+
+    def test_refuses_cleanup_when_the_owned_agent_moved_to_another_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "name": "ho-codex-owned",
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "workspace_id": "w1",
+                                "tab_id": "w1:t2",
+                                "pane_id": "w1:p8",
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+            )
+
+            with self.assertRaisesRegex(TransportError, "agent_pane_mismatch"):
+                transport.close_agent_terminal(
+                    "ho-codex-owned",
+                    PlacementTarget.TAB,
+                    expected_pane_id="w1:p3",
+                    dry_run=False,
+                )
+
+        self.assertEqual(len(runner.calls), 1)
+
     def test_starts_and_prompts_new_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -116,8 +255,13 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(outcome.pane_id, "w1:p2")
         self.assertIn("--no-focus", runner.calls[1])
         self.assertEqual(runner.calls[3][0:4], ["herdr", "agent", "start", outcome.agent_name])
+        start_timeout = runner.calls[3][runner.calls[3].index("--timeout") + 1]
+        self.assertLessEqual(int(start_timeout), 30_000)
         self.assertEqual(runner.calls[6][0:4], ["herdr", "agent", "prompt", outcome.agent_name])
         self.assertIn("--wait", runner.calls[6])
+        self.assertTrue(
+            all(timeout is None or timeout <= 30 for timeout in runner.timeouts)
+        )
         self.assertIn(3, sleeps)
 
     def test_reuses_matching_settled_agent(self) -> None:
@@ -522,10 +666,12 @@ class HerdrTransportTests(unittest.TestCase):
             outcome = transport.dispatch(Harness.HERMES, "inspect", timeout_seconds=30)
 
         self.assertEqual(outcome.state, AgentState.DONE)
-        self.assertIn(
-            ["herdr", "agent", "wait", outcome.agent_name, "--timeout", "120000"],
-            runner.calls,
+        wait_call = next(
+            call
+            for call in runner.calls
+            if call[0:4] == ["herdr", "agent", "wait", outcome.agent_name]
         )
+        self.assertLessEqual(int(wait_call[-1]), 30_000)
 
     def test_waits_when_successful_agent_start_is_still_working(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -618,10 +764,12 @@ class HerdrTransportTests(unittest.TestCase):
             outcome = transport.dispatch(Harness.CODEX, "inspect", timeout_seconds=30)
 
         self.assertEqual(outcome.state, AgentState.DONE)
-        self.assertIn(
-            ["herdr", "agent", "wait", outcome.agent_name, "--timeout", "120000"],
-            runner.calls,
+        wait_call = next(
+            call
+            for call in runner.calls
+            if call[0:4] == ["herdr", "agent", "wait", outcome.agent_name]
         )
+        self.assertLessEqual(int(wait_call[-1]), 30_000)
 
     def test_preserves_new_agent_tab_when_startup_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1137,6 +1285,500 @@ class HerdrTransportTests(unittest.TestCase):
             )
 
             outcome = transport.dispatch(Harness.CLAUDE, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.error_code, "agent_auth_failed")
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+
+    def test_verifies_declared_output_prefix_after_settlement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        "Task complete\nMOCK-OK harness=pi",
+                        "",
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(
+                Harness.PI,
+                "inspect",
+                timeout_seconds=30,
+                context=DispatchContext(
+                    placement=PlacementTarget.PANE,
+                    title="inspect",
+                    task_key="inspect-v1",
+                    receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, "MOCK-OK harness=pi"),
+                ),
+            )
+
+        self.assertTrue(outcome.task_verified)
+        self.assertEqual(outcome.state, AgentState.DONE)
+
+    def test_does_not_verify_receipt_prefix_mentioned_only_in_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        "Reply with exactly this line: MOCK-OK harness=pi",
+                        "",
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(
+                Harness.PI,
+                "inspect",
+                timeout_seconds=30,
+                context=DispatchContext(
+                    placement=PlacementTarget.PANE,
+                    title="inspect",
+                    task_key="inspect-v1",
+                    receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, "MOCK-OK harness=pi"),
+                ),
+            )
+
+        self.assertFalse(outcome.task_verified)
+        self.assertIs(outcome.agent_settled, True)
+        self.assertEqual(outcome.error_code, "task_receipt_missing")
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+
+    def test_verifies_declared_receipt_file_in_execution_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            (workspace / "MOCK-HERDR-RECEIPT.txt").write_text(
+                "MOCK-WORKTREE-OK\n",
+                encoding="utf-8",
+            )
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(
+                Harness.GROK,
+                "write receipt",
+                timeout_seconds=30,
+                context=DispatchContext(
+                    placement=PlacementTarget.PANE,
+                    title="write receipt",
+                    task_key="receipt-v1",
+                    receipt=TaskReceipt(ReceiptKind.FILE, "MOCK-HERDR-RECEIPT.txt"),
+                ),
+            )
+
+        self.assertTrue(outcome.task_verified)
+        self.assertEqual(outcome.state, AgentState.DONE)
+
+    def test_reports_invalid_provider_model_in_settled_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "hermes",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "hermes",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "hermes",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        (
+                            "API failed after 5 retries\n"
+                            "ValidationException: The provided model identifier is invalid"
+                        ),
+                        "",
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+            )
+
+            outcome = transport.dispatch(Harness.HERMES, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.error_code, "agent_model_invalid")
+        self.assertIs(outcome.agent_settled, True)
+        self.assertEqual(
+            outcome.error_summary,
+            "ValidationException: The provided model identifier is invalid",
+        )
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+
+    def test_reports_provider_retry_exhaustion_in_settled_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "hermes",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "hermes",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "hermes",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        "API failed after 5 retries: provider unavailable",
+                        "",
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+            )
+
+            outcome = transport.dispatch(Harness.HERMES, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.error_code, "agent_provider_failed")
+        self.assertIs(outcome.agent_settled, True)
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+
+    def test_reports_device_login_wait_in_settled_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "droid",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "droid",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "droid",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        (
+                            "Factory device login\n"
+                            "Visit https://example.invalid/device and enter code ABCD\n"
+                            "Waiting for authentication"
+                        ),
+                        "",
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+            )
+
+            outcome = transport.dispatch(Harness.DROID, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.error_code, "agent_auth_required")
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+
+    def test_reports_cross_harness_auth_failure_in_settled_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        "API Error: 401 Unauthorized - invalid API key",
+                        "",
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+            )
+
+            outcome = transport.dispatch(Harness.GROK, "inspect", timeout_seconds=30)
 
         self.assertEqual(outcome.error_code, "agent_auth_failed")
         self.assertEqual(outcome.state, AgentState.UNKNOWN)

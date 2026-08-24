@@ -22,7 +22,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 
 | 模式 | 入口 | 何时用 |
 | --- | --- | --- |
-| Durable queue | `just seed` / `enqueue` / `enqueue-auto` / `run` / `run-once` / `status` | 普通派发、重试、收据、无人值守 queue |
+| Durable queue | `just seed` / `enqueue` / `enqueue-auto` / `run` / `run-once` / `run-until-idle` / `retry` / `gc` / `status` | 普通派发、重试、收据、无人值守 queue |
 | Read-only dashboard | `just dashboard` | 实时查看 queue、attention、Herdr topology 与 receipt timeline |
 | Standardized delivery | 仅 `just deliver` 或显式 Skill | 用户明确触发标准交付；普通实现/修复/review/orchestrate 不走这条路 |
 
@@ -42,7 +42,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - **Opt-in 标准交付**：Wayfinder（仅在有 decision fog 时）→ spec + ticket DAG → 独立 worktree 实现 → Standards ∥ Spec review → 至多 2 轮 repair。成功停在隔离 integration branch，不自动 push / merge / deploy。
 - **Tracker**：默认 local Markdown；`github` 只授权该次交付的 issue 创建、更新与关闭。
 
-稳定命令入口是 `justfile`。常用：`doctor`、`test`、`check`、`catalog`、`profile`、`seed`、`enqueue`、`enqueue-auto`、`status`、`dashboard`、`run`、`run-once`、`deliver`、`smoke`。
+稳定命令入口是 `justfile`。常用：`doctor`、`test`、`check`、`catalog`、`profile`、`seed`、`enqueue`、`enqueue-auto`、`status`、`dashboard`、`run`、`run-once`、`run-until-idle`、`retry`、`gc`、`deliver`、`smoke`。
 
 ## Canonical Surface
 
@@ -78,6 +78,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
   merge、release 或 deploy。
 - worktree 只是 checkout 隔离，不是安全沙箱。
 - `blocked`、`unknown` 和 timeout 都不是成功。
+- `idle` / `done` 只表示 agent settled；声明 task receipt 时必须 `task_verified=true`。
 - 所有 Herdr wait 必须有 timeout。
 - 不关闭非本运行创建的 pane 或 agent。
 - 普通 queue 的 `blocked` 是 terminal；只有 opt-in 标准交付执行有界 controller response loop。

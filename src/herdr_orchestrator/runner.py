@@ -27,6 +27,7 @@ from herdr_orchestrator.model import (
     JobState,
     NewJob,
     PlacementTarget,
+    TaskReceipt,
     WorkflowConfig,
 )
 from herdr_orchestrator.planner import (
@@ -55,10 +56,14 @@ class Dispatcher(Protocol):
         harness: Harness,
         prompt: str,
         *,
-        timeout_seconds: int,
+        timeout_seconds: float,
         agent_name: str | None = None,
         context: DispatchContext | None = None,
     ) -> DispatchOutcome: ...
+
+
+class _DispatchDeadlineExceeded(RuntimeError):
+    pass
 
 
 class Coordinator:
@@ -116,6 +121,7 @@ class Coordinator:
         prompt_file: Path,
         dedupe_key: str,
         placement: PlacementTarget | None = None,
+        receipt: TaskReceipt | None = None,
     ) -> tuple[int, bool, Harness]:
         self.initialize()
         if not prompt_file.is_file():
@@ -144,6 +150,7 @@ class Coordinator:
                     selected,
                     placement,
                 ),
+                receipt=receipt,
             )
         )
         if not created:
@@ -153,10 +160,14 @@ class Coordinator:
             job_id, selected = existing
         return job_id, created, selected
 
-    def run_once(self) -> dict[str, int]:
+    def run_once(
+        self,
+        *,
+        dispatch_deadline: float | None = None,
+    ) -> dict[str, object]:
         self.initialize()
-        self._run_planner_if_due()
-        self._assign_pending_placements()
+        self._run_planner_if_due(dispatch_deadline)
+        self._assign_pending_placements(dispatch_deadline)
         batch_key = f"run-{time.time_ns()}"
         slot_names = self._slot_names()
         jobs = self.store.claim(
@@ -172,10 +183,15 @@ class Coordinator:
         )
         results = {state.value: 0 for state in JobState}
         if not jobs:
-            return results
+            return self._run_report(results, claimed=0)
         with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="harness") as executor:
             futures = {
-                executor.submit(self._dispatch_job, job, batch_key): job
+                executor.submit(
+                    self._dispatch_job,
+                    job,
+                    batch_key,
+                    dispatch_deadline,
+                ): job
                 for job in jobs
             }
             for future in as_completed(futures):
@@ -192,7 +208,209 @@ class Coordinator:
                     )
                 state = self.store.record_outcome(job, outcome)
                 results[state.value] += 1
-        return results
+        return self._run_report(results, claimed=len(jobs))
+
+    def _run_report(
+        self,
+        batch: dict[str, int],
+        *,
+        claimed: int,
+    ) -> dict[str, object]:
+        return {
+            **batch,
+            "claimed": claimed,
+            "batch": dict(batch),
+            "queue": self.store.status_counts(self.config.name),
+        }
+
+    def run_until_idle(self, *, timeout_seconds: int) -> dict[str, object]:
+        if timeout_seconds < 1:
+            raise ValueError("drain_timeout_must_be_positive")
+        self.initialize()
+        deadline = time.monotonic() + timeout_seconds
+        aggregate = {state.value: 0 for state in JobState}
+        total_claimed = 0
+        waves = 0
+        last_queue = self.store.status_counts(self.config.name)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._drain_report(
+                    aggregate,
+                    idle=False,
+                    reason="drain_timeout",
+                    waves=waves,
+                    claimed=total_claimed,
+                    queue=last_queue,
+                )
+            try:
+                report = self.run_once(dispatch_deadline=deadline)
+            except _DispatchDeadlineExceeded:
+                last_queue = self.store.status_counts(self.config.name)
+                active = self.store.status_counts(
+                    self.config.name,
+                    allowed_harnesses=self.worker_harnesses,
+                )
+                return self._drain_report(
+                    aggregate,
+                    idle=False,
+                    reason="drain_timeout",
+                    waves=waves,
+                    claimed=total_claimed,
+                    queue=last_queue,
+                    worker_pool_idle=(
+                        active[JobState.PENDING.value] == 0
+                        and active[JobState.RUNNING.value] == 0
+                    ),
+                    queue_idle=(
+                        last_queue[JobState.PENDING.value] == 0
+                        and last_queue[JobState.RUNNING.value] == 0
+                    ),
+                )
+            waves += 1
+            claimed = int(report["claimed"])
+            total_claimed += claimed
+            batch = report["batch"]
+            assert isinstance(batch, dict)
+            for state in JobState:
+                aggregate[state.value] += int(batch[state.value])
+            queue = report["queue"]
+            assert isinstance(queue, dict)
+            last_queue = {str(key): int(value) for key, value in queue.items()}
+            active = self.store.status_counts(
+                self.config.name,
+                allowed_harnesses=self.worker_harnesses,
+            )
+            worker_pool_idle = (
+                active[JobState.PENDING.value] == 0
+                and active[JobState.RUNNING.value] == 0
+            )
+            queue_idle = (
+                last_queue[JobState.PENDING.value] == 0
+                and last_queue[JobState.RUNNING.value] == 0
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._drain_report(
+                    aggregate,
+                    idle=False,
+                    reason="drain_timeout",
+                    waves=waves,
+                    claimed=total_claimed,
+                    queue=last_queue,
+                    worker_pool_idle=worker_pool_idle,
+                    queue_idle=queue_idle,
+                )
+            if worker_pool_idle:
+                return self._drain_report(
+                    aggregate,
+                    idle=True,
+                    reason="queue_idle" if queue_idle else "worker_pool_idle",
+                    waves=waves,
+                    claimed=total_claimed,
+                    queue=last_queue,
+                    worker_pool_idle=True,
+                    queue_idle=queue_idle,
+                )
+            if claimed == 0:
+                time.sleep(min(self.config.coordinator.poll_seconds, remaining))
+
+    def _drain_report(
+        self,
+        aggregate: dict[str, int],
+        *,
+        idle: bool,
+        reason: str,
+        waves: int,
+        claimed: int,
+        queue: dict[str, int],
+        worker_pool_idle: bool = False,
+        queue_idle: bool = False,
+    ) -> dict[str, object]:
+        return {
+            **aggregate,
+            "mode": "until_idle",
+            "scope": "worker_pool",
+            "idle": idle,
+            "worker_pool_idle": worker_pool_idle,
+            "queue_idle": queue_idle,
+            "reason": reason,
+            "waves": waves,
+            "claimed": claimed,
+            "batch": dict(aggregate),
+            "queue": queue,
+        }
+
+    def gc_succeeded_agents(self, *, dry_run: bool = True) -> dict[str, object]:
+        self.initialize()
+        rows = self.store.jobs(self.config.name)
+        created_panes = self.store.created_agent_panes(self.config.name)
+        owned_names = {
+            name
+            for worker in self.config.workers
+            for placement in (PlacementTarget.TAB, PlacementTarget.PANE)
+            for name in replica_slot_names(
+                self.config.name,
+                self.config.workspace,
+                worker.harness,
+                worker.replicas,
+                placement,
+            )
+        }
+        active_names = {
+            str(row["agent_name"])
+            for row in rows
+            if row["state"] != JobState.SUCCEEDED.value and row["agent_name"]
+        }
+        candidates_by_name: dict[str, dict[str, object]] = {}
+        skipped_worktrees = 0
+        skipped_unowned = 0
+        skipped_active = 0
+        for row in rows:
+            if row["state"] != JobState.SUCCEEDED.value:
+                continue
+            if row["placement"] == PlacementTarget.WORKTREE.value:
+                skipped_worktrees += 1
+                continue
+            name = row["agent_name"]
+            if (
+                not isinstance(name, str)
+                or name not in owned_names
+                or name not in created_panes
+            ):
+                skipped_unowned += 1
+                continue
+            if name in active_names:
+                skipped_active += 1
+                continue
+            candidates_by_name[name] = {
+                "job_id": int(row["id"]),
+                "agent_name": name,
+                "placement": str(row["placement"]),
+                "pane_id": created_panes[name],
+            }
+        closer = getattr(self.dispatcher, "close_agent_terminal", None)
+        if not callable(closer):
+            raise ValueError("dispatcher_cleanup_unsupported")
+        candidates = list(candidates_by_name.values())
+        actions = [
+            closer(
+                str(candidate["agent_name"]),
+                PlacementTarget(str(candidate["placement"])),
+                expected_pane_id=str(candidate["pane_id"]),
+                dry_run=dry_run,
+            )
+            for candidate in candidates
+        ]
+        return {
+            "dry_run": dry_run,
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "actions": actions,
+            "skipped_worktrees": skipped_worktrees,
+            "skipped_unowned": skipped_unowned,
+            "skipped_active": skipped_active,
+        }
 
     def run_forever(self) -> None:
         self.initialize()
@@ -200,12 +418,28 @@ class Coordinator:
             self.run_once()
             time.sleep(self.config.coordinator.poll_seconds)
 
-    def _dispatch_job(self, job: ClaimedJob, batch_key: str) -> DispatchOutcome:
+    def _dispatch_job(
+        self,
+        job: ClaimedJob,
+        batch_key: str,
+        dispatch_deadline: float | None = None,
+    ) -> DispatchOutcome:
         profile = profile_for_harness(self.config.profiles, job.harness)
+        try:
+            timeout_seconds = self._dispatch_timeout(dispatch_deadline)
+        except _DispatchDeadlineExceeded:
+            return DispatchOutcome(
+                agent_name=job.agent_name,
+                state=AgentState.UNKNOWN,
+                member_reused=False,
+                pane_id=None,
+                error_code="herdr_timeout",
+                placement=job.placement,
+            )
         return self.dispatcher.dispatch(
             job.harness,
             execution_prompt(profile, job.prompt),
-            timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+            timeout_seconds=timeout_seconds,
             agent_name=job.agent_name,
             context=DispatchContext(
                 placement=job.placement,
@@ -213,6 +447,7 @@ class Coordinator:
                 task_key=job.dedupe_key,
                 batch_key=batch_key,
                 worktree_root=self.config.placement.worktree_root,
+                receipt=job.receipt,
             ),
         )
 
@@ -237,11 +472,12 @@ class Coordinator:
             )
         return names
 
-    def _assign_pending_placements(self) -> None:
+    def _assign_pending_placements(self, dispatch_deadline: float | None) -> None:
         for row in self.store.unplaced_jobs(
             self.config.name,
             allowed_harnesses=self.worker_harnesses,
         ):
+            self._dispatch_timeout(dispatch_deadline)
             harness = Harness(str(row["harness"]))
             placement = self._static_placement(
                 str(row["title"]),
@@ -255,6 +491,7 @@ class Coordinator:
                     str(row["title"]),
                     str(row["prompt"]),
                     str(row["dedupe_key"]),
+                    dispatch_deadline,
                 )
             self.store.set_placement(int(row["id"]), placement)
 
@@ -283,6 +520,7 @@ class Coordinator:
         title: str,
         prompt: str,
         dedupe_key: str,
+        dispatch_deadline: float | None = None,
     ) -> PlacementTarget:
         controller = self._controller_harness()
         digest = hashlib.sha256(
@@ -300,7 +538,7 @@ class Coordinator:
                     output_file,
                     supports_worktree=self._supports_worktree(),
                 ),
-                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                timeout_seconds=self._dispatch_timeout(dispatch_deadline),
                 agent_name=_controller_agent_name(
                     self.config.name,
                     self.config.workspace,
@@ -312,6 +550,7 @@ class Coordinator:
                     f"topology:{job_id}",
                 ),
             )
+            self._dispatch_timeout(dispatch_deadline)
             if outcome.error_code is not None or outcome.state not in {
                 AgentState.IDLE,
                 AgentState.DONE,
@@ -396,7 +635,7 @@ class Coordinator:
             for harness in self.worker_harnesses
         )
 
-    def _run_planner_if_due(self) -> None:
+    def _run_planner_if_due(self, dispatch_deadline: float | None = None) -> None:
         planner = self.config.planner
         if not planner.enabled:
             return
@@ -419,7 +658,7 @@ class Coordinator:
                 render_compact_catalog(profiles),
                 self.worker_harnesses,
             ),
-            timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+            timeout_seconds=self._dispatch_timeout(dispatch_deadline),
             agent_name=_controller_agent_name(
                 self.config.name,
                 self.config.workspace,
@@ -431,6 +670,7 @@ class Coordinator:
                 f"planner:{self.config.name}",
             ),
         )
+        self._dispatch_timeout(dispatch_deadline)
         if outcome.error_code is not None or outcome.state not in {
             AgentState.IDLE,
             AgentState.DONE,
@@ -460,6 +700,15 @@ class Coordinator:
                     ),
                 )
             )
+
+    def _dispatch_timeout(self, dispatch_deadline: float | None) -> float:
+        timeout_seconds = float(self.config.coordinator.agent_timeout_seconds)
+        if dispatch_deadline is None:
+            return timeout_seconds
+        remaining = dispatch_deadline - time.monotonic()
+        if remaining <= 0:
+            raise _DispatchDeadlineExceeded
+        return min(timeout_seconds, remaining)
 
 
 def _controller_agent_name(

@@ -161,6 +161,8 @@ class DashboardTests(unittest.TestCase):
             snapshot["jobs"][1]["drift"],
         )
         self.assertEqual(snapshot["jobs"][1]["runtime"]["pane_id"], "w1:p2")
+        self.assertIs(snapshot["jobs"][1]["agent_settled"], True)
+        self.assertIs(snapshot["jobs"][1]["task_verified"], True)
         self.assertEqual(
             snapshot["topology"]["workspaces"][0]["tabs"][0]["panes"][0]["agent"][
                 "name"
@@ -340,6 +342,8 @@ class DashboardTests(unittest.TestCase):
                 with urlopen(f"{base_url}/assets/cytoscape.min.js", timeout=2) as response:
                     cytoscape_content_type = response.headers["Content-Type"]
                     cytoscape_data = response.read()
+                with urlopen(f"{base_url}/assets/dashboard.js", timeout=2) as response:
+                    dashboard_script = response.read().decode()
                 connection = HTTPConnection(host, port, timeout=2)
                 connection.request(
                     "GET",
@@ -361,6 +365,9 @@ class DashboardTests(unittest.TestCase):
         self.assertGreater(len(cytoscape_data), 400_000)
         self.assertIn("The Cytoscape Consortium", cytoscape_data[:180].decode())
         self.assertIn("/assets/cytoscape.min.js", index)
+        self.assertIn("agent settled", dashboard_script)
+        self.assertIn("task verified", dashboard_script)
+        self.assertIn("error_summary", dashboard_script)
         self.assertEqual(rejected_host, 421)
         self.assertFalse(thread.is_alive())
 
@@ -393,6 +400,8 @@ def _job_row(
         "lease_until": updated_at + 60 if state == "running" else None,
         "agent_name": agent_name,
         "error_code": None,
+        "agent_settled": state == "succeeded",
+        "task_verified": True if state == "succeeded" else None,
         "execution_path": "/repo",
         "herdr_workspace_id": "w1",
         "created_at": updated_at - 100,

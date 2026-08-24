@@ -82,6 +82,12 @@ npx --yes herdr-orchestrator install --project . \
   --harness droid --harness codex
 ```
 
+目标仓已存在 `.agents/skills/` 路由时，runtime installer 默认不注入项目 Skill；需要时显式
+加 `--install-skill`，或用上面的 `npx skills` 独立安装。installer 托管的生成目录通过
+仓库本地 `.git/info/exclude` 隐藏，不修改项目的已跟踪 `.gitignore`，也不隐藏独立安装的
+Skill。项目内 symlinked `.git` / exclude 会在写入前被拒绝；Git 原生 linked worktree 的
+外部 common Git dir 仍受支持。
+
 它只管理 `.herdr-orchestrator/`、`.agents/skills/herdr-orchestrator/` 和
 `.orchestrator/.gitignore` 中 manifest 记录的文件。重复安装或升级不会覆盖用户修改；
 卸载也只删除 hash 未变化的托管文件。若 Skill 已由 `npx skills` 安装，npm installer
@@ -103,8 +109,11 @@ just test
 # 把示例任务幂等写入 durable queue
 just seed
 
-# 处理当前可运行任务后退出
+# 处理一个 replica-limited wave 后退出
 just run-once
+
+# 多波处理，直到当前 worker pool 无 pending/running
+just run-until-idle
 
 # 持续运行，detach Herdr 后 coordinator 与 agents 继续工作
 just run
@@ -129,7 +138,8 @@ workspace/tab/pane/agent 拓扑、原生 worktree 和 receipt 时间线。Dashbo
 
 ## 六 harness 真实只读 smoke
 
-下面的命令会依次启动或复用六种 harness，要求它们只读检查两个本地配置文件，并验证六个 agent 都经历真实 turn 后回到 settled state：
+下面的命令会依次启动或复用六种 harness，要求它们只读检查目标仓实际存在的 README 与
+workflow，并验证六个 agent 都经历真实 turn、回到 settled state 且输出机器收据：
 
 ```bash
 just smoke
@@ -139,7 +149,10 @@ just smoke --harness pi --harness claude
 just smoke --harness grok
 ```
 
-smoke 不把终端文本当完整 transcript，因为 full-screen agent 的历史可能不进入 Herdr scrollback。验证依据是 agent 成功启动、prompt 被接受并经过 lifecycle change 后返回 `idle` 或 `done`。临时 tab 会在成功或失败后关闭；已存在并被安全复用的 agent 不会被关闭。
+smoke 不把终端文本当完整 transcript，因为 full-screen agent 的历史可能不进入 Herdr
+scrollback。验证依据是 agent 成功启动、prompt 被接受、经过 lifecycle change 后返回
+`idle` 或 `done`，并且 detection output 含指定行前缀。临时 tab 会在成功或失败后关闭；
+已存在并被安全复用的 agent 不会被关闭。
 
 若任务长时间停在 `running`、首次启动 timeout、或 agent 看似启动却没有真实执行，按
 [`docs/runtime-troubleshooting.md`](docs/runtime-troubleshooting.md) 区分 provisioning、
@@ -156,11 +169,39 @@ just enqueue grok build workflows/prompts/grok-build-check.md build-v1
 just enqueue codex build workflows/prompts/build.md build-v2 --placement worktree
 just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v2 --placement pane
 
+# 需要内容级机器验收时声明 output 或 file receipt（二选一）
+just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v3 \
+  --placement pane --receipt-prefix "TASK-OK inspect"
+
 # 不指定 worker，由主控读取 compact catalog 后选择
 just enqueue-auto review workflows/prompts/codex-architecture.md review-auto-v1
 ```
 
 参数依次为 `harness`、`title`、`prompt_file`、`dedupe_key`。相同 workflow 下重复的 `dedupe_key` 不会重复入队。
+
+`status` 同时展示 `agent_settled` 与 `task_verified`。未声明 receipt 的兼容任务会得到
+`task_verified = null`；声明了 `--receipt-prefix` 或 `--receipt-file` 的任务只有验证成功才
+能进入 `succeeded`。
+
+## 排空、重试与回收
+
+`run-once` 的 `batch` 是本波结果，`queue` 是结束时全局计数；replica=1 时同 harness 的
+多条任务需要多波。普通运行优先使用：
+
+```bash
+just run-until-idle --drain-timeout-seconds 3600
+
+# failed job 原 id / dedupe_key 保持不变，只追加一次 attempt budget
+just retry 42 --extra-attempts 1
+
+# 默认只预览；--apply 只关闭本 workflow 已成功且 settled 的 agent pane
+just gc
+just gc --apply
+```
+
+GC 永不关闭或删除 worktree workspace、checkout 与 branch，也不碰 foreign/active agent。
+回收还必须同时有 `member_reused=false` 的创建收据，且当前 pane ID 与收据一致；tab placement
+也只关闭该 pane，不关闭承载它的整个 tab。
 
 ### Tab、pane 与原生 worktree
 

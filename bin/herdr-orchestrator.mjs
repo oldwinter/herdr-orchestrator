@@ -11,11 +11,13 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HARNESSES = ["droid", "grok", "codex", "pi", "claude", "hermes"];
+const GIT_EXCLUDE_BEGIN = "# BEGIN herdr-orchestrator managed paths";
+const GIT_EXCLUDE_END = "# END herdr-orchestrator managed paths";
 const WORKER_NAMES = {
   droid: "operations",
   grok: "grok-build",
@@ -27,7 +29,13 @@ const WORKER_NAMES = {
 
 function parseArguments(argv) {
   const command = argv[0] ?? "help";
-  const options = { command, harnesses: [], project: process.cwd(), rest: [] };
+  const options = {
+    command,
+    harnesses: [],
+    installSkill: null,
+    project: process.cwd(),
+    rest: [],
+  };
   for (let index = 1; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--project") {
@@ -43,6 +51,15 @@ function parseArguments(argv) {
         throw new Error("option_value_required: --harness");
       }
       options.harnesses.push(argv[++index]);
+    } else if (
+      ["install", "update", "upgrade"].includes(command)
+      && ["--install-skill", "--skip-skill"].includes(value)
+    ) {
+      const requested = value === "--install-skill";
+      if (options.installSkill !== null && options.installSkill !== requested) {
+        throw new Error("skill_install_options_conflict");
+      }
+      options.installSkill = requested;
     } else {
       options.rest.push(value);
     }
@@ -81,6 +98,10 @@ function loadManifest(project) {
     || manifest.harnesses.length === 0
     || new Set(manifest.harnesses).size !== manifest.harnesses.length
     || manifest.harnesses.some((harness) => !HARNESSES.includes(harness))
+    || (
+      manifest.install_skill !== undefined
+      && typeof manifest.install_skill !== "boolean"
+    )
   ) {
     throw new Error("manifest_invalid");
   }
@@ -124,6 +145,141 @@ function assertNoSymlink(project, relativePath) {
   }
 }
 
+function previousSkillPreference(manifest) {
+  if (typeof manifest?.install_skill === "boolean") {
+    return manifest.install_skill;
+  }
+  return Object.keys(manifest?.files ?? {}).some((relativePath) =>
+    relativePath.startsWith(".agents/skills/herdr-orchestrator/")
+  );
+}
+
+function gitExcludePath(project) {
+  const result = spawnSync(
+    "git",
+    ["-C", project, "rev-parse", "--git-path", "info/exclude"],
+    { encoding: "utf8", timeout: 5_000 },
+  );
+  if (result.status !== 0) {
+    return null;
+  }
+  const rendered = result.stdout.trim();
+  return rendered.length > 0 ? resolve(project, rendered) : null;
+}
+
+function removeManagedExcludeBlock(content) {
+  const start = content.indexOf(GIT_EXCLUDE_BEGIN);
+  if (start < 0) {
+    return content;
+  }
+  const endMarker = content.indexOf(GIT_EXCLUDE_END, start);
+  if (endMarker < 0) {
+    throw new Error("git_exclude_marker_invalid");
+  }
+  let end = endMarker + GIT_EXCLUDE_END.length;
+  if (content[end] === "\n") {
+    end += 1;
+  }
+  return `${content.slice(0, start)}${content.slice(end)}`;
+}
+
+function assertGitExcludeSafe(project, path) {
+  const relativePath = relative(project, path);
+  if (
+    relativePath !== ".."
+    && !relativePath.startsWith(`..${sep}`)
+    && !isAbsolute(relativePath)
+  ) {
+    let current = project;
+    for (const component of relativePath.split(sep)) {
+      if (component.length === 0) {
+        continue;
+      }
+      current = join(current, component);
+      try {
+        if (lstatSync(current).isSymbolicLink()) {
+          throw new Error(`git_exclude_symlink: ${path}`);
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") {
+          throw error;
+        }
+      }
+    }
+  }
+  try {
+    const parent = lstatSync(dirname(path));
+    if (parent.isSymbolicLink()) {
+      throw new Error(`git_exclude_symlink: ${path}`);
+    }
+    if (!parent.isDirectory()) {
+      throw new Error(`git_exclude_parent_invalid: ${path}`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  try {
+    const exclude = lstatSync(path);
+    if (exclude.isSymbolicLink()) {
+      throw new Error(`git_exclude_symlink: ${path}`);
+    }
+    if (!exclude.isFile()) {
+      throw new Error(`git_exclude_not_regular: ${path}`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
+function renderGitExcludeBlock(includeSkill) {
+  const paths = ["/.herdr-orchestrator/", "/.orchestrator/"];
+  if (includeSkill) {
+    paths.push("/.agents/skills/herdr-orchestrator/");
+  }
+  return `${GIT_EXCLUDE_BEGIN}\n${paths.join("\n")}\n${GIT_EXCLUDE_END}\n`;
+}
+
+function installLocalGitExcludes(project, path, includeSkill) {
+  if (path === null) {
+    return "unavailable";
+  }
+  assertGitExcludeSafe(project, path);
+  const current = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const withoutManaged = removeManagedExcludeBlock(current);
+  const separator = withoutManaged.length > 0 && !withoutManaged.endsWith("\n") ? "\n" : "";
+  const desired = `${withoutManaged}${separator}${renderGitExcludeBlock(includeSkill)}`;
+  if (desired !== current) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, desired);
+  }
+  return "managed";
+}
+
+function removeLocalGitExcludesIfUnused(project, includeSkill) {
+  const managedRoots = [".herdr-orchestrator", ".orchestrator"];
+  if (includeSkill) {
+    managedRoots.push(".agents/skills/herdr-orchestrator");
+  }
+  if (managedRoots.some((relativePath) => existsSync(join(project, relativePath)))) {
+    return "retained";
+  }
+  const path = gitExcludePath(project);
+  if (path === null || !existsSync(path)) {
+    return "unavailable";
+  }
+  assertGitExcludeSafe(project, path);
+  const current = readFileSync(path, "utf8");
+  const desired = removeManagedExcludeBlock(current);
+  if (desired !== current) {
+    writeFileSync(path, desired);
+  }
+  return "removed";
+}
+
 function install(options) {
   const project = resolve(options.project);
   if (!existsSync(project)) {
@@ -133,7 +289,15 @@ function install(options) {
     throw new Error(`project_not_directory: ${project}`);
   }
   assertNoSymlink(project, ".herdr-orchestrator/manifest.json");
+  const localExcludePath = gitExcludePath(project);
+  if (localExcludePath !== null) {
+    assertGitExcludeSafe(project, localExcludePath);
+  }
   const previous = loadManifest(project);
+  const skillRouterExists = existsSync(join(project, ".agents/skills"));
+  const installSkill = options.installSkill ?? (
+    previous === null ? !skillRouterExists : previousSkillPreference(previous)
+  );
   const harnesses = options.harnesses.length > 0
     ? [...new Set(options.harnesses)]
     : previous?.harnesses ?? HARNESSES.filter((harness) => commandExists(harness));
@@ -167,13 +331,15 @@ function install(options) {
       );
     }
   }
-  const skillRoot = join(PACKAGE_ROOT, "skills/herdr-orchestrator");
-  for (const relativePath of listSkillFiles()) {
-    stageFile(
-      desiredFiles,
-      `.agents/skills/herdr-orchestrator/${relativePath}`,
-      readFileSync(join(skillRoot, relativePath)),
-    );
+  if (installSkill) {
+    const skillRoot = join(PACKAGE_ROOT, "skills/herdr-orchestrator");
+    for (const relativePath of listSkillFiles()) {
+      stageFile(
+        desiredFiles,
+        `.agents/skills/herdr-orchestrator/${relativePath}`,
+        readFileSync(join(skillRoot, relativePath)),
+      );
+    }
   }
   stageFile(desiredFiles, ".orchestrator/.gitignore", "*\n!.gitignore\n");
 
@@ -182,6 +348,14 @@ function install(options) {
   const preserved = [];
   const removals = [];
   const unmanaged = [];
+  const skillPath = ".agents/skills/herdr-orchestrator/SKILL.md";
+  if (
+    !installSkill
+    && previousFiles[skillPath] === undefined
+    && existsSync(join(project, skillPath))
+  ) {
+    unmanaged.push(skillPath);
+  }
   const manifestFiles = {};
   for (const [relativePath, content] of desiredFiles) {
     assertNoSymlink(project, relativePath);
@@ -239,6 +413,7 @@ function install(options) {
     package: "herdr-orchestrator",
     version: packageVersion(),
     harnesses,
+    install_skill: installSkill,
     files: manifestFiles,
   };
   mkdirSync(join(project, ".herdr-orchestrator"), { recursive: true });
@@ -246,12 +421,24 @@ function install(options) {
     join(project, ".herdr-orchestrator/manifest.json"),
     `${JSON.stringify(manifest, null, 2)}\n`,
   );
+  const managesSkill = Object.keys(manifestFiles).some((relativePath) =>
+    relativePath.startsWith(".agents/skills/herdr-orchestrator/")
+  );
+  const localExclude = installLocalGitExcludes(project, localExcludePath, managesSkill);
+  let skill = "skipped";
+  if (installSkill) {
+    skill = unmanaged.includes(skillPath) ? "existing_unmanaged" : "managed";
+  } else if (options.installSkill === null && previous === null && skillRouterExists) {
+    skill = "skipped_existing_router";
+  }
   process.stdout.write(`${JSON.stringify({
     harnesses,
+    local_exclude: localExclude,
     manifest: ".herdr-orchestrator/manifest.json",
     ok: preserved.length === 0,
     preserved: preserved.sort(),
     project,
+    skill,
     unmanaged: unmanaged.sort(),
     workflow: ".herdr-orchestrator/workflows/multi-harness.toml",
   })}\n`);
@@ -320,7 +507,14 @@ function doctor(options) {
     const python = process.env.PYTHON ?? "python3";
     const result = spawnSync(
       python,
-      ["-m", "herdr_orchestrator", "doctor", "--workflow", workflow],
+      [
+        "-m",
+        "herdr_orchestrator",
+        "doctor",
+        "--workflow",
+        workflow,
+        ...options.rest,
+      ],
       {
         cwd: project,
         encoding: "utf8",
@@ -358,6 +552,9 @@ function uninstall(options) {
     throw new Error(`installation_not_found: ${project}`);
   }
   const manifest = loadManifest(project);
+  const managedSkill = Object.keys(manifest.files).some((relativePath) =>
+    relativePath.startsWith(".agents/skills/herdr-orchestrator/")
+  );
   const preserved = [];
   for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
     assertNoSymlink(project, relativePath);
@@ -379,6 +576,7 @@ function uninstall(options) {
     ".herdr-orchestrator/workflows",
     ".herdr-orchestrator",
     ".agents/skills/herdr-orchestrator",
+    ".orchestrator",
   ]) {
     try {
       rmdirSync(join(project, relativePath));
@@ -388,8 +586,14 @@ function uninstall(options) {
       }
     }
   }
+  const localExclude = removeLocalGitExcludesIfUnused(project, managedSkill);
   const ok = preserved.length === 0;
-  process.stdout.write(`${JSON.stringify({ ok, preserved: preserved.sort(), project })}\n`);
+  process.stdout.write(`${JSON.stringify({
+    local_exclude: localExclude,
+    ok,
+    preserved: preserved.sort(),
+    project,
+  })}\n`);
   if (!ok) {
     process.exitCode = 1;
   }
@@ -465,28 +669,57 @@ function runRuntime(options) {
   process.exitCode = result.status ?? 1;
 }
 
-function printHelp() {
+function printHelp(command = null) {
+  if (["install", "update", "upgrade"].includes(command)) {
+    process.stdout.write(`Usage: herdr-orchestrator ${command} --project <path> [--harness <name> ...] [--install-skill | --skip-skill]
+
+Install or reconcile the managed workflow, selected harness profiles, runtime ignore file, and optional operating Skill. Existing project Skill routers are not modified unless --install-skill is explicit.
+`);
+    return;
+  }
+  if (command === "uninstall") {
+    process.stdout.write(`Usage: herdr-orchestrator uninstall --project <path>
+
+Remove only unchanged files owned by the installation manifest.
+`);
+    return;
+  }
+  if (command && command !== "help") {
+    process.stdout.write(`Usage: herdr-orchestrator ${command} --project <path> [command options]
+
+Run the ${command} command against the installed project workflow.
+`);
+    return;
+  }
   process.stdout.write(`Usage: herdr-orchestrator <command> [options]
 
 Setup:
-  install --project <path> [--harness <name> ...]
-  upgrade --project <path> [--harness <name> ...]
+  install --project <path> [--harness <name> ...] [--install-skill]
+  upgrade --project <path> [--harness <name> ...] [--install-skill | --skip-skill]
   doctor --project <path>
   uninstall --project <path>
 
 Runtime:
-  doctor | catalog | profile | seed | status | enqueue | run | dashboard | smoke
+  doctor | catalog | profile | seed | status | enqueue | run | retry | gc | dashboard | smoke
 
 Options:
   --project <path>   Target repository (default: current directory)
   --harness <name>   Harness to enable during install; repeat for more
+  --install-skill    Install the project Skill even when a Skill router exists
+  --skip-skill       Do not install, or remove an unchanged managed project Skill
   --version          Print the package version
 `);
 }
 
 function main() {
   try {
-    const options = parseArguments(process.argv.slice(2));
+    const argv = process.argv.slice(2);
+    if (argv.includes("--help") || argv.includes("-h")) {
+      const command = argv[0]?.startsWith("-") ? null : argv[0];
+      printHelp(command);
+      return;
+    }
+    const options = parseArguments(argv);
     if (["install", "update", "upgrade"].includes(options.command)) {
       install(options);
     } else if (options.command === "doctor") {

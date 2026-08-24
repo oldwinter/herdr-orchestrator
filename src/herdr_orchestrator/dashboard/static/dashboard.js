@@ -131,6 +131,14 @@ function jobCard(job) {
   const agentLabel = job.agent_name || "unassigned";
   const location = runtime.pane_id || job.herdr_workspace_id || "not observed";
   const drift = (job.drift || []).map((item) => escapeHtml(item.replaceAll("_", " "))).join(" · ");
+  const settled = job.agent_settled === true
+    ? "yes"
+    : job.agent_settled === false ? "no" : "pending";
+  const verified = job.task_verified === true
+    ? "yes"
+    : job.task_verified === false
+      ? "no"
+      : job.receipt_kind ? "pending" : "not declared";
   return `
     <article class="job-card state-${stateClass(job.state)}">
       <h3>${escapeHtml(job.title)}</h3>
@@ -144,9 +152,12 @@ function jobCard(job) {
         <dt>attempt</dt><dd>${escapeHtml(job.attempts)} / ${escapeHtml(job.max_attempts)}</dd>
         <dt>agent</dt><dd title="${escapeHtml(agentLabel)}">${escapeHtml(agentLabel)}</dd>
         <dt>location</dt><dd title="${escapeHtml(location)}">${escapeHtml(location)}</dd>
+        <dt>agent settled</dt><dd>${escapeHtml(settled)}</dd>
+        <dt>task verified</dt><dd>${escapeHtml(verified)}</dd>
         <dt>changed</dt><dd>${formatAge(job.updated_at)}</dd>
       </dl>
       ${job.error_code ? `<p class="drift-line">${escapeHtml(job.error_code)}</p>` : ""}
+      ${job.error_summary ? `<p class="error-summary">${escapeHtml(job.error_summary)}</p>` : ""}
       ${drift ? `<p class="drift-line">${drift}</p>` : ""}
     </article>
   `;
