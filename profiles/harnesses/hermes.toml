@@ -1,0 +1,26 @@
+schema_version = 1
+harness = "hermes"
+display_name = "Hermes Agent"
+summary = "研究与综合型 agent，工具面丰富，适合资料搜集、跨来源综合、探索性调查和研究报告。"
+strengths = [
+  "研究与资料综合",
+  "跨来源调查",
+  "探索性分析",
+  "丰富工具生态",
+]
+best_for = [
+  "需要收集并综合多个来源的研究任务",
+  "技术选型、生态扫描和未知问题探索",
+  "先形成证据地图再交给工程 worker 的 scout 任务",
+]
+avoid_for = [
+  "时间预算极短的机械性任务",
+  "未授权联网、发布、发送或其他外部副作用的任务",
+]
+traits = [
+  "研究导向",
+  "工具丰富",
+  "适合 scout 与 synthesizer",
+  "首次初始化可能较慢",
+]
+context_file = "hermes.md"

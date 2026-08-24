@@ -33,6 +33,7 @@ class HerdrTransportTests(unittest.TestCase):
     def test_starts_and_prompts_new_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
+            sleeps: list[float] = []
             runner = FakeRunner(
                 [
                     _error("agent_not_found"),
@@ -91,6 +92,9 @@ class HerdrTransportTests(unittest.TestCase):
                     "HERDR_WORKSPACE_ID": "w1",
                 },
                 runner=runner,
+                sleeper=sleeps.append,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
             )
 
             outcome = transport.dispatch(Harness.CODEX, "review", timeout_seconds=30)
@@ -102,6 +106,7 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(runner.calls[3][0:4], ["herdr", "agent", "start", outcome.agent_name])
         self.assertEqual(runner.calls[5][0:4], ["herdr", "agent", "prompt", outcome.agent_name])
         self.assertIn("--wait", runner.calls[5])
+        self.assertIn(3, sleeps)
 
     def test_reuses_matching_settled_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -151,6 +156,9 @@ class HerdrTransportTests(unittest.TestCase):
                     "HERDR_WORKSPACE_ID": "w1",
                 },
                 runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
             )
 
             outcome = transport.dispatch(Harness.DROID, "inspect", timeout_seconds=30)
@@ -166,6 +174,9 @@ class HerdrTransportTests(unittest.TestCase):
                 Path(temporary),
                 environ={},
                 runner=FakeRunner([]),
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
             )
 
             outcome = transport.dispatch(Harness.PI, "inspect", timeout_seconds=30)
@@ -234,6 +245,9 @@ class HerdrTransportTests(unittest.TestCase):
                     "HERDR_WORKSPACE_ID": "w1",
                 },
                 runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
             )
 
             outcome = transport.dispatch(Harness.HERMES, "inspect", timeout_seconds=30)
@@ -242,6 +256,146 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertIn(
             ["herdr", "agent", "wait", outcome.agent_name, "--timeout", "120000"],
             runner.calls,
+        )
+
+    def test_waits_when_successful_agent_start_is_still_working(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _error("agent_not_found"),
+                    _result(
+                        {
+                            "root_pane": {"pane_id": "w1:p7"},
+                            "tab": {"tab_id": "w1:t7"},
+                        }
+                    ),
+                    _result(
+                        {
+                            "process_info": {
+                                "shell_pid": 42,
+                                "foreground_processes": [{"pid": 42, "name": "zsh"}],
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "working",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 4,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.CODEX, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.state, AgentState.DONE)
+        self.assertIn(
+            ["herdr", "agent", "wait", outcome.agent_name, "--timeout", "120000"],
+            runner.calls,
+        )
+
+    def test_preserves_new_agent_tab_when_startup_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _error("agent_not_found"),
+                    _result(
+                        {
+                            "root_pane": {"pane_id": "w1:p7"},
+                            "tab": {"tab_id": "w1:t7"},
+                        }
+                    ),
+                    _result(
+                        {
+                            "process_info": {
+                                "shell_pid": 42,
+                                "foreground_processes": [{"pid": 42, "name": "zsh"}],
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "blocked",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.CODEX, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.state, AgentState.BLOCKED)
+        self.assertEqual(outcome.error_code, "agent_blocked")
+        self.assertEqual(outcome.pane_id, "w1:p7")
+        self.assertFalse(outcome.member_reused)
+        self.assertFalse(
+            any(call[0:3] == ["herdr", "tab", "close"] for call in runner.calls)
         )
 
     def test_polls_after_prompt_stalled(self) -> None:
@@ -293,6 +447,9 @@ class HerdrTransportTests(unittest.TestCase):
                     "HERDR_WORKSPACE_ID": "w1",
                 },
                 runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
             )
 
             outcome = transport.dispatch(Harness.DROID, "inspect", timeout_seconds=30)
@@ -360,6 +517,9 @@ class HerdrTransportTests(unittest.TestCase):
                     "HERDR_WORKSPACE_ID": "w1",
                 },
                 runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
             )
 
             outcome = transport.dispatch(Harness.PI, "inspect", timeout_seconds=30)
@@ -368,6 +528,213 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertIn(
             ["herdr", "agent", "send-keys", outcome.agent_name, "enter"],
             runner.calls,
+        )
+
+    def test_waits_when_settled_agent_resumes_working(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "working",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 3,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 4,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 4,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=2,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.CODEX, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.state, AgentState.DONE)
+        self.assertEqual(
+            sum(call[0:3] == ["herdr", "agent", "get"] for call in runner.calls),
+            5,
+        )
+
+    def test_reports_claude_auth_failure_in_settled_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        "⏺ Please run /login · API Error: 403 access denied",
+                        "",
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+            )
+
+            outcome = transport.dispatch(Harness.CLAUDE, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.error_code, "agent_auth_failed")
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+
+    def test_responds_to_blocked_agent_and_waits_for_settlement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            blocked = {
+                "agent": "codex",
+                "agent_status": "blocked",
+                "pane_id": "w1:p9",
+                "state_change_seq": 5,
+            }
+            runner = FakeRunner(
+                [
+                    _result({"agent": blocked}),
+                    _result({"agent": blocked}),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 6,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.respond(
+                "blocked-worker",
+                Harness.CODEX,
+                "Approve this local action.",
+                timeout_seconds=30,
+            )
+
+        self.assertEqual(outcome.state, AgentState.DONE)
+        self.assertEqual(outcome.pane_id, "w1:p9")
+        self.assertEqual(
+            runner.calls[-1][0:4],
+            ["herdr", "agent", "prompt", "blocked-worker"],
         )
 
     def test_stable_name_is_deterministic(self) -> None:

@@ -19,18 +19,34 @@ check:
 seed:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator seed --workflow {{workflow}}
 
-run-once:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} --once
-
-run:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}}
-
 status:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator status --workflow {{workflow}}
 
+catalog:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{workflow}} --format text
+
+catalog-json:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{workflow}} --format json
+
+profile harness:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator profile --workflow {{workflow}} {{quote(harness)}}
+
 enqueue harness title prompt_file dedupe_key:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --harness "$harness" --title "$title" --prompt-file "$prompt_file" --dedupe-key "$dedupe_key"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --harness {{quote(harness)}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}}
 
 [positional-arguments]
+run-once *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} --once "$@"
+
+run *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} "$@"
+
+enqueue-auto title prompt_file dedupe_key *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} "$@"
+
+[positional-arguments]
+deliver goal_file *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator deliver --workflow {{workflow}} --goal-file {{quote(goal_file)}} "$@"
+
 smoke *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator smoke --workflow {{workflow}} "$@"

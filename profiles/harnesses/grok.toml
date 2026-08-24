@@ -1,0 +1,26 @@
+schema_version = 1
+harness = "grok"
+display_name = "Grok Build"
+summary = "xAI 的工程执行型 CLI，适合快速代码实现、仓库探索、结构化输出和边界清晰的并行构建任务。"
+strengths = [
+  "代码实现与调试",
+  "仓库探索",
+  "结构化 JSON 输出",
+  "并行 agent 与 worktree 工作流",
+]
+best_for = [
+  "目标和验收条件明确的软件构建任务",
+  "需要在仓库内读取、修改并验证代码的独立子任务",
+  "需要 JSON schema 约束输出的规划或路由任务",
+]
+avoid_for = [
+  "未经授权的联网研究、外部发布或生产变更",
+  "缺少停止条件的长周期自治任务",
+]
+traits = [
+  "工程执行导向",
+  "支持交互式与 headless 模式",
+  "原生支持结构化输出",
+  "上下文与推理成本中高",
+]
+context_file = "grok.md"

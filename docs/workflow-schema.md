@@ -8,6 +8,7 @@
 | `name` | string | `[a-z][a-z0-9_-]{0,63}` |
 | `workspace` | path | worker 的 cwd，相对 workflow 文件 |
 | `state_db` | path | SQLite runtime state，相对 workflow 文件 |
+| `profiles_dir` | path | harness catalog 目录，相对 workflow 文件 |
 
 ## `[coordinator]`
 
@@ -23,11 +24,27 @@
 
 ## `[[workers]]`
 
-每个 worker 需要唯一 `name`、受支持的 `harness` 和可选 `capabilities`。同一 harness 只能声明一个 worker；并行靠可选 `replicas`（1–16，默认 1）开多个同 kind pane。v1 支持：
+每个 worker 需要唯一 `name` 和受支持的 `harness`。同一 harness 只能声明一个 worker；并行靠可选 `replicas`（1–16，默认 1）开多个同 kind pane。可选 `capabilities` 为兼容字段，主控使用的能力描述真源是 `profiles_dir` 下同名 profile。v1 支持：
 
-`droid`、`codex`、`pi`、`claude`、`hermes`、`grok`
+`droid`、`grok`、`codex`、`pi`、`claude`、`hermes`
 
 Herdr 0.8.2 还支持更多 kind，但必须先加入代码白名单和测试，才能进入此仓库的稳定面。
+
+## Harness profile
+
+每个 `<harness>.toml` 是主控预加载的 compact metadata：
+
+- `schema_version`
+- `harness`
+- `display_name`
+- `summary`
+- `strengths`
+- `best_for`
+- `avoid_for`
+- `traits`
+- `context_file`
+
+`context_file` 必须是 profile 目录内的相对 Markdown 路径。完整 Markdown 只在该 harness 被选中并 dispatch 时读取。
 
 ## `[planner]`
 
@@ -35,13 +52,49 @@ planner 默认建议关闭，明确配置 `enabled = true` 才会运行。
 
 | 字段 | 说明 |
 | --- | --- |
-| `harness` | planner 使用的 harness |
+| `harness` | planner/router 使用的主控 harness；可省略或设为 `auto` |
+| `worker_harnesses` | 可选的 worker 候选列表；省略时使用全部 `[[workers]]` |
 | `interval_seconds` | 两次 planner turn 的最短间隔 |
 | `prompt_file` | planner 基础约束 |
 | `output_file` | planner 唯一允许写入的 runtime JSON |
 | `max_tasks` | 单次最多接收任务数，1–100 |
 
 planner 的 `output_file` 必须位于 workflow workspace 内或其 `.orchestrator` runtime 路径，且不能指向已跟踪的 prompt 或源码。
+
+`harness = "auto"` 时，coordinator 按 `droid → grok → codex → claude → hermes → pi` 的固定优先级，从候选 worker 中选择本机 executable 存在的 harness。显式主控可以不在 worker 候选池中，但必须有 catalog profile 和可用 CLI。
+
+`run` 与 `enqueue` 可用 `--controller-harness` 和可重复的 `--worker-harness` 临时覆盖这些默认值。`enqueue --harness auto` 或省略 `--harness` 时，主控读取候选池 compact catalog 并输出严格的单 harness JSON；显式 `--harness` 则跳过这次路由 turn。
+
+## `[standardized_delivery]`
+
+该 table 可省略；`deliver` command 本身就是 opt-in gate。默认值：
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `tracker_backend` | `local-markdown` | `local-markdown` 或 `github` |
+| `tracker_root` | `.scratch/standardized-delivery` | local Markdown spec/ticket 根目录，相对 workspace |
+| `artifact_root` | `.orchestrator/deliveries` | runtime artifact/worktree 根目录，必须位于 workspace 的 `.orchestrator` |
+| `github_repository` | 无 | GitHub backend 必填，格式 `owner/repo` |
+| `wayfinder` | `auto` | `auto`、`always` 或 `never` |
+| `max_parallel` | `3` | 同一 frontier 最大并发，1–3 |
+| `review_repair_rounds` | `2` | accepted must-fix finding 的最大修复轮数，0–2 |
+
+`deliver` 接受同名 CLI override，以及 `--controller-harness` 和可重复
+`--worker-harness`。controller 选择和 worker compact catalog 仍遵循 `[planner]`
+及 runtime override。
+
+```toml
+[standardized_delivery]
+tracker_backend = "local-markdown"
+tracker_root = ".scratch/standardized-delivery"
+artifact_root = ".orchestrator/deliveries"
+wayfinder = "auto"
+max_parallel = 3
+review_repair_rounds = 2
+```
+
+`github` backend 会创建 spec issue、ticket issues，并在 receipt 验收后更新和关闭
+ticket。该 backend 是明确的外部写操作，仅应在用户选择它时使用。
 
 ## `[[seed_jobs]]`
 

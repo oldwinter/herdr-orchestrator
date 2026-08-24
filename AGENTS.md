@@ -12,12 +12,47 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 2. `just test`
 3. 阅读 `docs/architecture.md`
 4. 查看 `workflows/multi-harness.toml`
+5. 需要选 worker 时先跑 `just catalog`，不要一次读完所有 harness `.md`
+
+## 工作流
+
+当前只有一个声明式工作流：`workflows/multi-harness.toml`。它声明 coordinator 策略、六个 worker、紧凑 catalog 目录、可选 planner，以及可幂等 seed 的示例任务。改 TOML 字段前读 `docs/workflow-schema.md`。
+
+仓库有两条互不混用的运行面：
+
+| 模式 | 入口 | 何时用 |
+| --- | --- | --- |
+| Durable queue | `just seed` / `enqueue` / `enqueue-auto` / `run` / `run-once` / `status` | 普通派发、重试、收据、无人值守 queue |
+| Standardized delivery | 仅 `just deliver` 或显式 Skill | 用户明确触发标准交付；普通实现/修复/review/orchestrate 不走这条路 |
+
+标准交付入口是 `.agents/skills/standardized-delivery/SKILL.md`；`matt-workflow` 与 `wayfinder-delivery` 只是别名。阶段、artifact、退出码和恢复读 `docs/standardized-delivery.md`。
+
+示例 workflow 里 planner 默认关闭。主控与 worker 候选可在 TOML 或 CLI `--controller-harness` / `--worker-harness` 指定；未指定主控时按 `droid → grok → codex → claude → hermes → pi` 选本机已安装 CLI。
+
+## 能力
+
+- **六 harness**：`droid`、`grok`、`codex`、`pi`、`claude`、`hermes`。能力描述真源是 `profiles/harnesses/*.toml`；完整执行上下文在同名 `.md`，只在该 harness 被选中后加载。
+- **两级 catalog**：planner / router 只看到当前 workflow 启用的紧凑 catalog；coordinator 在 dispatch 前才注入所选完整 profile。
+- **Durable queue**：claim、lease、重试、`dedupe_key`、收据。任务状态见 `docs/architecture.md`。
+- **自动选 worker**：`enqueue` 省略 harness 时，主控只输出 `{"harness":"..."}`，coordinator 校验后入队。
+- **只读 smoke**：`just smoke` 对启用 harness 做真实 turn 连通；可用重复 `--harness` 收窄。
+- **Opt-in 标准交付**：Wayfinder（仅在有 decision fog 时）→ spec + ticket DAG → 独立 worktree 实现 → Standards ∥ Spec review → 至多 2 轮 repair。成功停在隔离 integration branch，不自动 push / merge / deploy。
+- **Tracker**：默认 local Markdown；`github` 只授权该次交付的 issue 创建、更新与关闭。
+
+稳定命令入口是 `justfile`。常用：`doctor`、`test`、`check`、`catalog`、`profile`、`seed`、`enqueue`、`enqueue-auto`、`status`、`run`、`run-once`、`deliver`、`smoke`。
 
 ## Canonical Surface
 
 - `src/herdr_orchestrator/`：调度、状态与 Herdr adapter 真源
 - `workflows/*.toml`：工作流配置真源
 - `workflows/prompts/`：任务 prompt 文件
+- `profiles/harnesses/*.toml`：主控预加载的紧凑 harness catalog 真源
+- `profiles/harnesses/*.md`：选中 harness 后才按需加载的完整执行上下文
+- `.agents/skills/standardized-delivery/`：opt-in 标准交付 Skill 与分阶段 reference
+- `.agent/skills`、`.claude/skills`：指向 `.agents/skills` 的兼容 symlink，不是独立真源
+- `docs/architecture.md`：恢复、lease、planner、delivery 运行语义
+- `docs/workflow-schema.md`：改 workflow / delivery TOML 字段时读
+- `docs/standardized-delivery.md`：仅在用户明确触发标准交付时读
 - `.orchestrator/`：本机 runtime state，禁止提交
 - `tests/`：行为契约
 - `justfile`：稳定命令入口
@@ -26,11 +61,17 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 
 - secret 只从环境变量、keychain 或 harness 自身登录态读取。
 - planner 不得直接提交 shell 命令，只能输出受校验的 task JSON。
+- planner 只能从当前 workflow 启用的紧凑 harness catalog 中选择 worker。
 - 默认任务不得 push、merge、发布、发送、删除、修改权限或触碰生产环境。
+- 标准交付模式仅在明确 Skill/CLI 触发后启用 principal proxy；规格内本地动作可自主决定，
+  secret 与 production 必须升级给用户。
+- `github` tracker backend 只授权创建、更新与关闭该次交付的 issues，不授权 push、PR、
+  merge、release 或 deploy。
 - worktree 只是 checkout 隔离，不是安全沙箱。
 - `blocked`、`unknown` 和 timeout 都不是成功。
 - 所有 Herdr wait 必须有 timeout。
 - 不关闭非本运行创建的 pane 或 agent。
+- 普通 queue 的 `blocked` 是 terminal；只有 opt-in 标准交付执行有界 controller response loop。
 - runtime state、完整终端输出和原始 prompt 不进入 Git。
 
 ## 修改约定

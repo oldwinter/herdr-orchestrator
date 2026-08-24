@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,12 @@ CONTROL_TIMEOUT_SECONDS = 10
 START_TIMEOUT_MS = 120_000
 START_RECOVERY_TIMEOUT_MS = 120_000
 SHELL_READY_TIMEOUT_SECONDS = 10
+AGENT_POST_START_SETTLE_SECONDS = 3
+SETTLED_CONFIRMATION_POLLS = 6
 SETTLED_STATES = {AgentState.IDLE, AgentState.DONE}
+CLAUDE_AUTH_FAILURE = re.compile(
+    r"(?im)^\s*⏺\s+Please run /login\b.*\bAPI Error:\s*(?:401|403)\b"
+)
 
 
 class HerdrTransport:
@@ -33,11 +39,17 @@ class HerdrTransport:
         *,
         environ: Mapping[str, str] | None = None,
         runner: CommandRunner = subprocess_runner,
+        sleeper: Callable[[float], None] = time.sleep,
+        settled_confirmation_polls: int = SETTLED_CONFIRMATION_POLLS,
+        inspect_runtime_errors: bool = True,
     ) -> None:
         self.workflow_name = workflow_name
         self.workspace = workspace.resolve()
         self.environ = dict(os.environ if environ is None else environ)
         self.runner = runner
+        self.sleeper = sleeper
+        self.settled_confirmation_polls = settled_confirmation_polls
+        self.inspect_runtime_errors = inspect_runtime_errors
         self._provision_lock = threading.Lock()
         self._created_panes: dict[str, str] = {}
         self._created_tabs: dict[str, str] = {}
@@ -63,7 +75,7 @@ class HerdrTransport:
             self.check_environment()
             with self._provision_lock:
                 pane_id, reused = self._ensure_agent(name, harness)
-            state = self._prompt(name, prompt, timeout_seconds)
+            state = self._prompt(name, harness, prompt, timeout_seconds)
         except TransportError as exc:
             return DispatchOutcome(
                 agent_name=name,
@@ -92,6 +104,40 @@ class HerdrTransport:
                 CONTROL_TIMEOUT_SECONDS,
             ),
         )
+
+    def respond(
+        self,
+        name: str,
+        harness: Harness,
+        response: str,
+        *,
+        timeout_seconds: int,
+    ) -> DispatchOutcome:
+        try:
+            self.check_environment()
+            current = _agent_payload(
+                run_json(
+                    self.runner,
+                    Command(
+                        ["herdr", "agent", "get", name],
+                        self.workspace,
+                        CONTROL_TIMEOUT_SECONDS,
+                    ),
+                )
+            )
+            if _agent_state(current) is not AgentState.BLOCKED:
+                raise TransportError("agent_not_blocked")
+            pane_id = _non_empty_string(current, "pane_id")
+            state = self._prompt(name, harness, response, timeout_seconds)
+        except TransportError as exc:
+            return DispatchOutcome(
+                agent_name=name,
+                state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
+                member_reused=True,
+                pane_id=None,
+                error_code=exc.code,
+            )
+        return DispatchOutcome(name, state, True, pane_id)
 
     def close_created_agent(self, name: str) -> None:
         self._created_panes.pop(name, None)
@@ -154,8 +200,33 @@ class HerdrTransport:
         try:
             self._wait_for_shell(pane_id)
             started = self._start_agent(name, harness, pane_id)
+            started_agent = _agent_payload(started)
+            started_state = _agent_state(started_agent)
+            if started_state is AgentState.BLOCKED:
+                raise TransportError("agent_blocked")
+            if started_state not in SETTLED_STATES:
+                started = run_json(
+                    self.runner,
+                    Command(
+                        [
+                            "herdr",
+                            "agent",
+                            "wait",
+                            name,
+                            "--timeout",
+                            str(START_RECOVERY_TIMEOUT_MS),
+                        ],
+                        self.workspace,
+                        START_RECOVERY_TIMEOUT_MS // 1000 + 10,
+                    ),
+                )
             _validate_started_agent(_agent_payload(started), name, harness, pane_id)
+            self.sleeper(AGENT_POST_START_SETTLE_SECONDS)
         except TransportError as cause:
+            if cause.code == "agent_blocked":
+                self._created_panes[name] = pane_id
+                self._created_tabs[name] = tab_id
+                raise
             self._close_failed_tab(tab_id, cause)
             raise
         self._created_panes[name] = pane_id
@@ -183,7 +254,7 @@ class HerdrTransport:
                             return
             if time.monotonic() >= deadline:
                 raise TransportError("pane_shell_not_ready")
-            time.sleep(0.25)
+            self.sleeper(0.25)
 
     def _start_agent(
         self,
@@ -212,7 +283,7 @@ class HerdrTransport:
                 return run_json(self.runner, command)
             except TransportError as exc:
                 if exc.code == "agent_pane_busy" and attempt < 2:
-                    time.sleep(1)
+                    self.sleeper(1)
                     continue
                 if exc.code == "agent_not_ready":
                     return run_json(
@@ -233,7 +304,13 @@ class HerdrTransport:
                 raise
         raise TransportError("agent_start_failed")
 
-    def _prompt(self, name: str, prompt: str, timeout_seconds: int) -> AgentState:
+    def _prompt(
+        self,
+        name: str,
+        harness: Harness,
+        prompt: str,
+        timeout_seconds: int,
+    ) -> AgentState:
         before = _agent_payload(
             run_json(
                 self.runner,
@@ -286,7 +363,9 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                return stalled_state
+                state = self._confirm_stable_settlement(name, stalled_state, deadline)
+                self._raise_for_runtime_error(name, harness, state)
+                return state
             if stalled_sequence == baseline_sequence and stalled_state is AgentState.IDLE:
                 run_json(
                     self.runner,
@@ -303,6 +382,8 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
+                state = self._confirm_stable_settlement(name, state, deadline)
+                self._raise_for_runtime_error(name, harness, state)
                 return state
             raise TransportError("agent_not_settled")
 
@@ -326,8 +407,71 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
+                state = self._confirm_stable_settlement(name, state, deadline)
+                self._raise_for_runtime_error(name, harness, state)
                 return state
-            time.sleep(0.5)
+            self.sleeper(0.5)
+
+    def _confirm_stable_settlement(
+        self,
+        name: str,
+        state: AgentState,
+        deadline: float,
+    ) -> AgentState:
+        if state is AgentState.BLOCKED:
+            return state
+
+        confirmations = 0
+        while confirmations < self.settled_confirmation_polls:
+            if time.monotonic() >= deadline:
+                raise TransportError("herdr_timeout")
+            self.sleeper(0.5)
+            current = _agent_payload(
+                run_json(
+                    self.runner,
+                    Command(
+                        ["herdr", "agent", "get", name],
+                        self.workspace,
+                        CONTROL_TIMEOUT_SECONDS,
+                    ),
+                )
+            )
+            state = _agent_state(current)
+            if state is AgentState.BLOCKED:
+                return state
+            if state in SETTLED_STATES:
+                confirmations += 1
+            else:
+                confirmations = 0
+        return state
+
+    def _raise_for_runtime_error(
+        self,
+        name: str,
+        harness: Harness,
+        state: AgentState,
+    ) -> None:
+        if not self.inspect_runtime_errors or state not in SETTLED_STATES:
+            return
+        output = run_text(
+            self.runner,
+            Command(
+                [
+                    "herdr",
+                    "agent",
+                    "read",
+                    name,
+                    "--source",
+                    "detection",
+                    "--lines",
+                    "80",
+                ],
+                self.workspace,
+                CONTROL_TIMEOUT_SECONDS,
+            ),
+        )
+        if harness is Harness.CLAUDE and CLAUDE_AUTH_FAILURE.search(output):
+            raise TransportError("agent_auth_failed")
 
     def _close_failed_tab(self, tab_id: str, cause: TransportError) -> None:
         try:
@@ -435,5 +579,8 @@ def _validate_started_agent(
         raise TransportError("agent_identity_mismatch")
     if agent.get("agent") != harness.value or agent.get("pane_id") != pane_id:
         raise TransportError("agent_identity_mismatch")
-    if _agent_state(agent) not in SETTLED_STATES:
+    state = _agent_state(agent)
+    if state is AgentState.BLOCKED:
+        raise TransportError("agent_blocked")
+    if state not in SETTLED_STATES:
         raise TransportError("agent_not_settled")

@@ -1,0 +1,26 @@
+schema_version = 1
+harness = "droid"
+display_name = "Factory Droid"
+summary = "通用本地 AI operator，擅长端到端仓库任务、工具编排、运营型工作和跨步骤交付。"
+strengths = [
+  "端到端执行",
+  "仓库与工具编排",
+  "运营工作流",
+  "多步骤交付",
+]
+best_for = [
+  "需要综合读取、修改、验证和总结的完整任务",
+  "仓库维护、自动化和本地操作型任务",
+  "需要严格遵循 AGENTS.md 与技能路由的任务",
+]
+avoid_for = [
+  "仅需极短单点回答且不值得启动完整 operator 的任务",
+  "未经明确授权的外部发布、发送、权限变更或破坏性操作",
+]
+traits = [
+  "工具面广",
+  "执行导向",
+  "适合主控或通用 worker",
+  "启动与上下文成本中等",
+]
+context_file = "droid.md"

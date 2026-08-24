@@ -2,17 +2,27 @@ schema_version = 1
 name = "multi-harness"
 workspace = ".."
 state_db = "../.orchestrator/state.db"
+profiles_dir = "../profiles/harnesses"
 
 [coordinator]
 poll_seconds = 5
-max_parallel = 5
+max_parallel = 6
 lease_seconds = 900
 max_attempts = 2
 agent_timeout_seconds = 300
 
+[standardized_delivery]
+tracker_backend = "local-markdown"
+tracker_root = ".scratch/standardized-delivery"
+artifact_root = ".orchestrator/deliveries"
+wayfinder = "auto"
+max_parallel = 3
+review_repair_rounds = 2
+
 [planner]
 enabled = false
-harness = "droid"
+harness = "auto"
+worker_harnesses = ["droid", "grok", "codex", "pi", "claude", "hermes"]
 interval_seconds = 1800
 prompt_file = "prompts/planner.md"
 output_file = "../.orchestrator/plans/multi-harness.json"
@@ -21,27 +31,26 @@ max_tasks = 20
 [[workers]]
 name = "operations"
 harness = "droid"
-capabilities = ["operations", "repository-maintenance"]
+
+[[workers]]
+name = "grok-build"
+harness = "grok"
 
 [[workers]]
 name = "implementation"
 harness = "codex"
-capabilities = ["coding", "testing"]
 
 [[workers]]
 name = "quick-analysis"
 harness = "pi"
-capabilities = ["analysis", "small-tasks"]
 
 [[workers]]
 name = "deep-review"
 harness = "claude"
-capabilities = ["review", "design"]
 
 [[workers]]
 name = "research"
 harness = "hermes"
-capabilities = ["research", "synthesis"]
 
 [[seed_jobs]]
 title = "Droid workflow inventory"
@@ -72,3 +81,9 @@ title = "Hermes documentation synthesis"
 harness = "hermes"
 prompt_file = "prompts/hermes-docs.md"
 dedupe_key = "hermes-docs-v1"
+
+[[seed_jobs]]
+title = "Grok Build catalog contract check"
+harness = "grok"
+prompt_file = "prompts/grok-build-check.md"
+dedupe_key = "grok-build-catalog-v1"

@@ -7,11 +7,11 @@ from pathlib import Path
 
 class Harness(StrEnum):
     DROID = "droid"
+    GROK = "grok"
     CODEX = "codex"
     PI = "pi"
     CLAUDE = "claude"
     HERMES = "hermes"
-    GROK = "grok"
 
 
 class JobState(StrEnum):
@@ -30,6 +30,17 @@ class AgentState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class TrackerBackend(StrEnum):
+    LOCAL_MARKDOWN = "local-markdown"
+    GITHUB = "github"
+
+
+class WayfinderMode(StrEnum):
+    AUTO = "auto"
+    ALWAYS = "always"
+    NEVER = "never"
+
+
 @dataclass(frozen=True, slots=True)
 class CoordinatorConfig:
     poll_seconds: int
@@ -40,13 +51,38 @@ class CoordinatorConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StandardizedDeliveryConfig:
+    tracker_backend: TrackerBackend
+    tracker_root: Path
+    artifact_root: Path
+    github_repository: str | None
+    wayfinder: WayfinderMode
+    max_parallel: int
+    review_repair_rounds: int
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerConfig:
     enabled: bool
-    harness: Harness
+    harness: Harness | None
+    worker_harnesses: tuple[Harness, ...]
     interval_seconds: int
     prompt_file: Path
     output_file: Path
     max_tasks: int
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessProfile:
+    schema_version: int
+    harness: Harness
+    display_name: str
+    summary: str
+    strengths: tuple[str, ...]
+    best_for: tuple[str, ...]
+    avoid_for: tuple[str, ...]
+    traits: tuple[str, ...]
+    context_file: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +109,10 @@ class WorkflowConfig:
     workspace: Path
     state_db: Path
     coordinator: CoordinatorConfig
+    standardized_delivery: StandardizedDeliveryConfig
     planner: PlannerConfig
+    profiles_dir: Path
+    profiles: tuple[HarnessProfile, ...]
     workers: tuple[WorkerConfig, ...]
     seed_jobs: tuple[SeedJobConfig, ...]
 

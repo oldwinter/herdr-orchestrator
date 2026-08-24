@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -115,6 +115,20 @@ class Store:
                 raise StoreError("dedupe_lookup_failed")
             return int(row["id"]), False
 
+    def existing_job(
+        self,
+        workflow: str,
+        dedupe_key: str,
+    ) -> tuple[int, Harness] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, harness FROM jobs WHERE workflow = ? AND dedupe_key = ?",
+                (workflow, dedupe_key),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row["id"]), Harness(str(row["harness"]))
+
     def claim(
         self,
         workflow: str,
@@ -122,9 +136,15 @@ class Store:
         limit: int,
         lease_seconds: int,
         slot_names: Mapping[str, Sequence[str]] | None = None,
+        allowed_harnesses: Iterable[Harness] | None = None,
     ) -> list[ClaimedJob]:
         now = time.time()
         lease_until = now + lease_seconds
+        allowed_values = (
+            None
+            if allowed_harnesses is None
+            else {harness.value for harness in allowed_harnesses}
+        )
         claimed: list[ClaimedJob] = []
         with self._transaction() as connection:
             connection.execute(
@@ -177,6 +197,8 @@ class Store:
             ).fetchall()
             for row in candidates:
                 harness_value = str(row["harness"])
+                if allowed_values is not None and harness_value not in allowed_values:
+                    continue
                 names = tuple(slot_names.get(harness_value, ()) if slot_names else ())
                 if not names:
                     names = (f"ho-{harness_value}",)

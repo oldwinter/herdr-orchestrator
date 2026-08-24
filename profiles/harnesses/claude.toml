@@ -1,0 +1,26 @@
+schema_version = 1
+harness = "claude"
+display_name = "Claude Code"
+summary = "深度推理与评审型 coding agent，擅长架构设计、长上下文理解、风险审查和复杂方案权衡。"
+strengths = [
+  "深度代码评审",
+  "架构设计",
+  "长上下文理解",
+  "方案权衡",
+]
+best_for = [
+  "复杂架构、接口和领域模型设计",
+  "需要从规格与代码双轴审查的任务",
+  "高不确定性问题的风险枚举和反例分析",
+]
+avoid_for = [
+  "只需数秒完成的机械性小检查",
+  "未经授权的外部写、部署、push 或破坏性操作",
+]
+traits = [
+  "推理深",
+  "长上下文",
+  "适合 reviewer 与 designer",
+  "启动与推理成本较高",
+]
+context_file = "claude.md"

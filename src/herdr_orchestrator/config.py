@@ -3,14 +3,24 @@ from __future__ import annotations
 import re
 import tomllib
 from collections.abc import Mapping
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
+from herdr_orchestrator.catalog import (
+    CatalogError,
+    load_harness_profiles,
+    profile_for_harness,
+    profiles_for_workers,
+)
 from herdr_orchestrator.model import (
     CoordinatorConfig,
     Harness,
     PlannerConfig,
     SeedJobConfig,
+    StandardizedDeliveryConfig,
+    TrackerBackend,
+    WayfinderMode,
     WorkerConfig,
     WorkflowConfig,
 )
@@ -18,6 +28,7 @@ from herdr_orchestrator.model import (
 WORKFLOW_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 WORKER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 DEDUPE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+EnumValue = TypeVar("EnumValue", bound=StrEnum)
 
 
 class ConfigError(ValueError):
@@ -43,6 +54,10 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     if not workspace.is_dir():
         raise ConfigError(f"workspace_not_found: {workspace}")
     state_db = _resolve_path(base, _string(raw, "state_db", maximum=4096))
+    profiles_dir = _resolve_path(
+        base,
+        _optional_string(raw, "profiles_dir", "../profiles/harnesses", maximum=4096),
+    )
 
     coordinator_raw = _table(raw, "coordinator")
     coordinator = CoordinatorConfig(
@@ -60,6 +75,61 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     if coordinator.lease_seconds < coordinator.agent_timeout_seconds + 90:
         raise ConfigError("lease_seconds_must_cover_agent_timeout")
 
+    delivery_raw = _optional_table(raw, "standardized_delivery")
+    tracker_backend = _enum_value(
+        delivery_raw,
+        "tracker_backend",
+        TrackerBackend,
+        TrackerBackend.LOCAL_MARKDOWN,
+    )
+    tracker_root = _optional_path(
+        workspace,
+        delivery_raw,
+        "tracker_root",
+        ".scratch/standardized-delivery",
+    )
+    artifact_root = _optional_path(
+        workspace,
+        delivery_raw,
+        "artifact_root",
+        ".orchestrator/deliveries",
+    )
+    if not artifact_root.is_relative_to(workspace) or ".orchestrator" not in artifact_root.parts:
+        raise ConfigError("delivery_artifact_root_must_be_in_workspace_runtime")
+    github_repository = _optional_nullable_string(
+        delivery_raw,
+        "github_repository",
+        maximum=200,
+    )
+    if tracker_backend is TrackerBackend.GITHUB and github_repository is None:
+        raise ConfigError("github_repository_required")
+    standardized_delivery = StandardizedDeliveryConfig(
+        tracker_backend=tracker_backend,
+        tracker_root=tracker_root,
+        artifact_root=artifact_root,
+        github_repository=github_repository,
+        wayfinder=_enum_value(
+            delivery_raw,
+            "wayfinder",
+            WayfinderMode,
+            WayfinderMode.AUTO,
+        ),
+        max_parallel=_optional_integer(
+            delivery_raw,
+            "max_parallel",
+            default=3,
+            minimum=1,
+            maximum=3,
+        ),
+        review_repair_rounds=_optional_integer(
+            delivery_raw,
+            "review_repair_rounds",
+            default=2,
+            minimum=0,
+            maximum=2,
+        ),
+    )
+
     planner_raw = _table(raw, "planner")
     planner_output = _resolve_path(
         base,
@@ -67,20 +137,6 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     )
     if not planner_output.is_relative_to(workspace) or ".orchestrator" not in planner_output.parts:
         raise ConfigError("planner_output_must_be_in_workspace_runtime")
-    planner = PlannerConfig(
-        enabled=_boolean(planner_raw, "enabled"),
-        harness=_harness(planner_raw, "harness"),
-        interval_seconds=_integer(
-            planner_raw,
-            "interval_seconds",
-            minimum=60,
-            maximum=86400,
-        ),
-        prompt_file=_existing_file(base, planner_raw, "prompt_file"),
-        output_file=planner_output,
-        max_tasks=_integer(planner_raw, "max_tasks", minimum=1, maximum=100),
-    )
-
     worker_rows = _table_list(raw, "workers")
     if not worker_rows:
         raise ConfigError("workers_empty")
@@ -101,6 +157,32 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         workers.append(WorkerConfig(worker_name, harness, capabilities, replicas))
         worker_names.add(worker_name)
         harnesses.add(harness)
+
+    planner_worker_harnesses = _optional_harness_list(planner_raw, "worker_harnesses")
+    if any(harness not in harnesses for harness in planner_worker_harnesses):
+        raise ConfigError("planner_worker_harness_has_no_worker")
+    planner = PlannerConfig(
+        enabled=_boolean(planner_raw, "enabled"),
+        harness=_optional_harness(planner_raw, "harness"),
+        worker_harnesses=planner_worker_harnesses,
+        interval_seconds=_integer(
+            planner_raw,
+            "interval_seconds",
+            minimum=60,
+            maximum=86400,
+        ),
+        prompt_file=_existing_file(base, planner_raw, "prompt_file"),
+        output_file=planner_output,
+        max_tasks=_integer(planner_raw, "max_tasks", minimum=1, maximum=100),
+    )
+
+    try:
+        profiles = load_harness_profiles(profiles_dir)
+        profiles_for_workers(profiles, workers)
+        if planner.harness is not None:
+            profile_for_harness(profiles, planner.harness)
+    except CatalogError as exc:
+        raise ConfigError(str(exc)) from exc
 
     seed_jobs: list[SeedJobConfig] = []
     seed_keys: set[str] = set()
@@ -130,7 +212,10 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         workspace=workspace,
         state_db=state_db,
         coordinator=coordinator,
+        standardized_delivery=standardized_delivery,
         planner=planner,
+        profiles_dir=profiles_dir,
+        profiles=profiles,
         workers=tuple(workers),
         seed_jobs=tuple(seed_jobs),
     )
@@ -148,6 +233,13 @@ def _table(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     return value
 
 
+def _optional_table(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = data.get(key, {})
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key}_must_be_table")
+    return value
+
+
 def _table_list(data: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
     value = data.get(key, [])
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
@@ -157,6 +249,19 @@ def _table_list(data: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
 
 def _string(data: Mapping[str, Any], key: str, *, maximum: int) -> str:
     value = data.get(key)
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise ConfigError(f"{key}_must_be_non_empty_string")
+    return value.strip()
+
+
+def _optional_string(
+    data: Mapping[str, Any],
+    key: str,
+    default: str,
+    *,
+    maximum: int,
+) -> str:
+    value = data.get(key, default)
     if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         raise ConfigError(f"{key}_must_be_non_empty_string")
     return value.strip()
@@ -186,9 +291,10 @@ def _optional_integer(
     maximum: int,
     default: int,
 ) -> int:
-    if key not in data:
-        return default
-    return _integer(data, key, minimum=minimum, maximum=maximum)
+    value = data.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise ConfigError(f"{key}_must_be_integer_{minimum}_{maximum}")
+    return value
 
 
 def _integer(
@@ -217,6 +323,86 @@ def _harness(data: Mapping[str, Any], key: str) -> Harness:
         return Harness(value)
     except ValueError as exc:
         raise ConfigError(f"unsupported_harness: {value}") from exc
+
+
+def _optional_harness(data: Mapping[str, Any], key: str) -> Harness | None:
+    value = data.get(key, "auto")
+    if not isinstance(value, str) or not value.strip() or len(value) > 32:
+        raise ConfigError(f"{key}_must_be_harness_or_auto")
+    value = value.strip()
+    if value == "auto":
+        return None
+    try:
+        return Harness(value)
+    except ValueError as exc:
+        raise ConfigError(f"unsupported_harness: {value}") from exc
+
+
+def _optional_harness_list(
+    data: Mapping[str, Any],
+    key: str,
+) -> tuple[Harness, ...]:
+    value = data.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{key}_must_be_non_empty_harness_list")
+    harnesses: list[Harness] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"{key}_must_be_non_empty_harness_list")
+        try:
+            harness = Harness(item.strip())
+        except ValueError as exc:
+            raise ConfigError(f"unsupported_harness: {item}") from exc
+        if harness in harnesses:
+            raise ConfigError(f"{key}_duplicate: {harness.value}")
+        harnesses.append(harness)
+    return tuple(harnesses)
+
+
+def _optional_nullable_string(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    maximum: int,
+) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise ConfigError(f"{key}_must_be_non_empty_string")
+    return value.strip()
+
+
+def _optional_path(
+    workspace: Path,
+    data: Mapping[str, Any],
+    key: str,
+    default: str,
+) -> Path:
+    value = data.get(key, default)
+    if not isinstance(value, str) or not value.strip() or len(value) > 4096:
+        raise ConfigError(f"{key}_must_be_non_empty_string")
+    candidate = Path(value).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (workspace / candidate).resolve()
+
+
+def _enum_value(
+    data: Mapping[str, Any],
+    key: str,
+    enum_type: type[EnumValue],
+    default: EnumValue,
+) -> EnumValue:
+    value = data.get(key, default.value)
+    if not isinstance(value, str):
+        raise ConfigError(f"{key}_must_be_string")
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise ConfigError(f"{key}_unsupported: {value}") from exc
 
 
 def _existing_file(base: Path, data: Mapping[str, Any], key: str) -> Path:

@@ -34,6 +34,10 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(first_created)
         self.assertFalse(second_created)
         self.assertEqual(first_id, second_id)
+        self.assertEqual(
+            self.store.existing_job("example", "same"),
+            (first_id, Harness.CODEX),
+        )
 
     def test_claims_only_one_job_per_harness(self) -> None:
         self.store.enqueue(_job("one", Harness.CODEX))
@@ -63,6 +67,20 @@ class StoreTests(unittest.TestCase):
             [job.agent_name for job in claimed],
             ["ho-grok-01-slot", "ho-grok-02-slot"],
         )
+
+    def test_claim_respects_runtime_worker_pool(self) -> None:
+        self.store.enqueue(_job("codex", Harness.CODEX))
+        self.store.enqueue(_job("grok", Harness.GROK))
+
+        claimed = self.store.claim(
+            "example",
+            limit=2,
+            lease_seconds=60,
+            allowed_harnesses=(Harness.GROK,),
+        )
+
+        self.assertEqual([job.harness for job in claimed], [Harness.GROK])
+        self.assertEqual(self.store.status_counts("example")["pending"], 1)
 
     def test_success_records_receipt_and_terminal_state(self) -> None:
         self.store.enqueue(_job("one"))

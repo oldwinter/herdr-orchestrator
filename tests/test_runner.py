@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -19,9 +20,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeDispatcher:
-    def __init__(self, outcomes: dict[Harness, DispatchOutcome]) -> None:
+    def __init__(
+        self,
+        outcomes: dict[Harness, DispatchOutcome],
+        *,
+        route_output: Path | None = None,
+        routed_harness: Harness | None = None,
+    ) -> None:
         self.outcomes = outcomes
+        self.route_output = route_output
+        self.routed_harness = routed_harness
         self.calls: list[Harness] = []
+        self.prompts: dict[Harness, str] = {}
 
     def dispatch(
         self,
@@ -32,6 +42,12 @@ class FakeDispatcher:
         agent_name: str | None = None,
     ) -> DispatchOutcome:
         self.calls.append(harness)
+        self.prompts[harness] = prompt
+        if self.route_output is not None and self.routed_harness is not None:
+            self.route_output.write_text(
+                json.dumps({"harness": self.routed_harness.value}),
+                encoding="utf-8",
+            )
         return self.outcomes[harness]
 
 
@@ -69,6 +85,10 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result["succeeded"], 1)
         self.assertEqual(result["blocked"], 1)
         self.assertCountEqual(dispatcher.calls, [Harness.DROID, Harness.CLAUDE])
+        self.assertIn("# Factory Droid execution profile", dispatcher.prompts[Harness.DROID])
+        self.assertIn("# Claude Code execution profile", dispatcher.prompts[Harness.CLAUDE])
+        self.assertIn("# Task packet\n\nRead only.", dispatcher.prompts[Harness.DROID])
+        self.assertNotIn("Hermes Agent execution profile", dispatcher.prompts[Harness.DROID])
 
     def test_seed_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -81,8 +101,92 @@ class CoordinatorTests(unittest.TestCase):
             first = coordinator.seed()
             second = coordinator.seed()
 
-        self.assertEqual(first, (5, 0))
-        self.assertEqual(second, (0, 5))
+        self.assertEqual(first, (6, 0))
+        self.assertEqual(second, (0, 6))
+
+    def test_auto_enqueue_uses_controller_to_select_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+                planner=replace(
+                    load_workflow(
+                        REPO_ROOT / "workflows/multi-harness.toml"
+                    ).planner,
+                    output_file=root / "plans/planner.json",
+                ),
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Implement a focused change.", encoding="utf-8")
+            route_output = root / "plans/route-1446f8ee80d5.json"
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "router",
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                    )
+                },
+                route_output=route_output,
+                routed_harness=Harness.GROK,
+            )
+            coordinator = Coordinator(
+                config,
+                dispatcher=dispatcher,
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.GROK, Harness.CODEX),
+            )
+
+            job_id, created, selected = coordinator.enqueue_prompt_file(
+                harness=None,
+                title="Build",
+                prompt_file=prompt_file,
+                dedupe_key="auto-route",
+            )
+
+            jobs = coordinator.store.jobs(config.name)
+            repeated = coordinator.enqueue_prompt_file(
+                harness=None,
+                title="Build again",
+                prompt_file=prompt_file,
+                dedupe_key="auto-route",
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(job_id, jobs[0]["id"])
+        self.assertEqual(selected, Harness.GROK)
+        self.assertEqual(jobs[0]["harness"], "grok")
+        self.assertEqual(dispatcher.calls, [Harness.DROID])
+        self.assertEqual(repeated, (job_id, False, Harness.GROK))
+        self.assertIn('"harness": "grok"', dispatcher.prompts[Harness.DROID])
+        self.assertIn('"harness": "codex"', dispatcher.prompts[Harness.DROID])
+        self.assertNotIn('"harness": "claude"', dispatcher.prompts[Harness.DROID])
+        self.assertIn("Title: Build", dispatcher.prompts[Harness.DROID])
+
+    def test_explicit_enqueue_does_not_start_router(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Implement a focused change.", encoding="utf-8")
+            dispatcher = FakeDispatcher({})
+            coordinator = Coordinator(config, dispatcher=dispatcher)
+
+            _, created, selected = coordinator.enqueue_prompt_file(
+                harness=Harness.GROK,
+                title="Build",
+                prompt_file=prompt_file,
+                dedupe_key="explicit-grok",
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(selected, Harness.GROK)
+        self.assertEqual(dispatcher.calls, [])
 
 
 def _job(workflow: str, harness: Harness) -> NewJob:

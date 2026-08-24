@@ -1,0 +1,26 @@
+schema_version = 1
+harness = "codex"
+display_name = "OpenAI Codex CLI"
+summary = "代码实现型 agent，擅长精确修改、测试驱动修复、代码库探索和可验证的软件工程交付。"
+strengths = [
+  "代码实现与重构",
+  "测试驱动修复",
+  "代码库探索",
+  "精确 diff",
+]
+best_for = [
+  "有明确验收条件的软件实现与 bug 修复",
+  "需要读取代码、修改文件并运行测试的任务",
+  "可拆成边界清晰模块的并行工程子任务",
+]
+avoid_for = [
+  "主要依赖广泛公开网络研究而非本地代码证据的任务",
+  "未经授权的发布、push、生产变更或破坏性 Git 操作",
+]
+traits = [
+  "工程实现导向",
+  "重视验证",
+  "适合独立 worktree",
+  "上下文与推理成本中高",
+]
+context_file = "codex.md"
