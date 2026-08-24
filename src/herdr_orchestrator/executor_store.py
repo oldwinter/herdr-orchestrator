@@ -57,6 +57,7 @@ __all__ = [
     "RunRecord",
     "RUN_STORE_SCHEMA_VERSION",
     "SCHEMA_VERSION",
+    "WORK_KERNEL_SCHEMA_VERSION",
     "canonical_definition",
     "canonical_json",
     "canonicalize_definition",
@@ -72,6 +73,7 @@ __all__ = [
 SCHEMA_VERSION = 1
 EXECUTOR_SCHEMA_VERSION = SCHEMA_VERSION
 RUN_STORE_SCHEMA_VERSION = SCHEMA_VERSION
+WORK_KERNEL_SCHEMA_VERSION = 1
 _RUN_STATES = frozenset(
     {
         "pending",
@@ -230,6 +232,164 @@ class ExecutorStore:
                 """
                 CREATE INDEX IF NOT EXISTS executor_runs_state_order
                 ON executor_runs(workflow, state, created_at, run_id)
+                """
+            )
+            # Work-item storage is a separate additive component.  Keeping
+            # its feature version independent lets later attempt/receipt
+            # migrations advance without changing the run-store contract.
+            work_component = connection.execute(
+                "SELECT version FROM executor_schema_meta WHERE component = ?",
+                ("work-kernel",),
+            ).fetchone()
+            if work_component is None:
+                connection.execute(
+                    "INSERT INTO executor_schema_meta(component, version) VALUES (?, ?)",
+                    ("work-kernel", WORK_KERNEL_SCHEMA_VERSION),
+                )
+            elif int(work_component["version"]) != WORK_KERNEL_SCHEMA_VERSION:
+                raise ExecutorStoreError(
+                    f"unsupported_executor_schema_version: {work_component['version']}"
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_work_items (
+                    run_id TEXT NOT NULL,
+                    work_id TEXT NOT NULL,
+                    work_key TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    worker TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'pending', 'running', 'succeeded', 'blocked',
+                            'failed', 'skipped'
+                        )
+                    ),
+                    available_at REAL NOT NULL,
+                    claim_id TEXT,
+                    replica_slot TEXT,
+                    agent_name TEXT,
+                    error_code TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (run_id, work_id),
+                    UNIQUE (run_id, work_key),
+                    FOREIGN KEY (run_id) REFERENCES executor_runs(run_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_work_items_order
+                ON executor_work_items(run_id, state, ordinal, created_at, work_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_dependencies (
+                    run_id TEXT NOT NULL,
+                    work_id TEXT NOT NULL,
+                    depends_on_work_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    PRIMARY KEY (run_id, work_id, depends_on_work_id),
+                    FOREIGN KEY (run_id, work_id)
+                        REFERENCES executor_work_items(run_id, work_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (run_id, depends_on_work_id)
+                        REFERENCES executor_work_items(run_id, work_id)
+                        ON DELETE CASCADE,
+                    CHECK (work_id <> depends_on_work_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_dependencies_parent
+                ON executor_dependencies(run_id, depends_on_work_id, work_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_barriers (
+                    run_id TEXT NOT NULL,
+                    barrier_id TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('pending', 'succeeded', 'failed')),
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    error_code TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (run_id, barrier_id),
+                    FOREIGN KEY (run_id) REFERENCES executor_runs(run_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_barrier_members (
+                    run_id TEXT NOT NULL,
+                    barrier_id TEXT NOT NULL,
+                    work_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    PRIMARY KEY (run_id, barrier_id, work_id),
+                    FOREIGN KEY (run_id, barrier_id)
+                        REFERENCES executor_barriers(run_id, barrier_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (run_id, work_id)
+                        REFERENCES executor_work_items(run_id, work_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_barrier_releases (
+                    run_id TEXT NOT NULL,
+                    barrier_id TEXT NOT NULL,
+                    work_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    PRIMARY KEY (run_id, barrier_id, work_id),
+                    FOREIGN KEY (run_id, barrier_id)
+                        REFERENCES executor_barriers(run_id, barrier_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (run_id, work_id)
+                        REFERENCES executor_work_items(run_id, work_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_barrier_releases_order
+                ON executor_barrier_releases(run_id, barrier_id, ordinal, work_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_replica_slots (
+                    workflow TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    slot_name TEXT NOT NULL,
+                    slot_ordinal INTEGER NOT NULL CHECK (slot_ordinal >= 0),
+                    active_run_id TEXT,
+                    active_work_id TEXT,
+                    claim_id TEXT,
+                    agent_name TEXT,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (workflow, harness, slot_name),
+                    UNIQUE (workflow, claim_id),
+                    FOREIGN KEY (active_run_id, active_work_id)
+                        REFERENCES executor_work_items(run_id, work_id)
+                        ON DELETE SET NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_replica_slots_active
+                ON executor_replica_slots(workflow, harness, active_run_id, active_work_id)
                 """
             )
 
