@@ -114,13 +114,57 @@ reported and retained.
 Uninstall removes the manifest after processing it. User-modified managed files remain in
 place and are listed in the JSON result; they are no longer managed after that point.
 
-## Maintainer release check
+## Automated npm releases
 
-Before publishing the npm package:
+The `ci` GitHub Actions workflow publishes from `main` without an npm token:
+
+1. the Python compile and test job must pass;
+2. the publish job runs only for a push to `main`;
+3. `npm run release:plan` compares `package.json` with public registry versions;
+4. an existing version is a successful no-op;
+5. a missing version is published with npm Trusted Publishing and provenance.
+
+Registry lookup failures stop the job. The workflow never guesses that a failed lookup means
+a new package version.
+
+### One-time trusted publisher setup
+
+1. Create the GitHub Environment `npm`. Optional required reviewers can protect production
+   releases.
+2. From an authenticated maintainer terminal, register the exact repository, workflow file,
+   and Environment:
+
+   ```bash
+   npm trust github herdr-orchestrator \
+     --file ci.yml \
+     --repo oldwinter/herdr-orchestrator \
+     --env npm \
+     --allow-publish \
+     -y
+   ```
+
+3. Ensure GitHub Actions can start hosted runners. Account billing or spending-limit failures
+   prevent both CI and publishing before any step executes.
+
+The publish job grants only `contents: read` and `id-token: write`. Do not add
+`NODE_AUTH_TOKEN` or an npm token secret.
+
+### Releasing a new version
+
+Create a normal pull request that updates both npm manifests:
 
 ```bash
-npm pack --dry-run --json
+npm version patch --no-git-tag-version
+npm run release:plan
 just check
 ```
 
-Publishing is intentionally separate from the repository test and install flows.
+Use `minor` or `major` instead of `patch` when appropriate. After the version PR merges,
+the `main` workflow publishes that exact version. npm versions are immutable, so changing
+runtime code without changing `package.json` does not create a release.
+
+For a local package-content preview:
+
+```bash
+npm pack --dry-run --json
+```
