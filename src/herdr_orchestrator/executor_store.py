@@ -43,6 +43,10 @@ __all__ = [
     "EXECUTOR_SCHEMA_VERSION",
     "ExecutorStore",
     "ExecutorStoreError",
+    "ATTEMPT_SCHEMA_VERSION",
+    "RECEIPT_SCHEMA_VERSION",
+    "RECEIPT_CONTRACT_VERSION",
+    "EVENT_CONTRACT_VERSION",
     "DefinitionError",
     "DefinitionIdentity",
     "ManifestValidationError",
@@ -74,6 +78,10 @@ SCHEMA_VERSION = 1
 EXECUTOR_SCHEMA_VERSION = SCHEMA_VERSION
 RUN_STORE_SCHEMA_VERSION = SCHEMA_VERSION
 WORK_KERNEL_SCHEMA_VERSION = 1
+ATTEMPT_SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 1
+RECEIPT_CONTRACT_VERSION = 1
+EVENT_CONTRACT_VERSION = 1
 _RUN_STATES = frozenset(
     {
         "pending",
@@ -271,6 +279,11 @@ class ExecutorStore:
                     replica_slot TEXT,
                     agent_name TEXT,
                     error_code TEXT,
+                    attempt_id TEXT,
+                    attempt_number INTEGER NOT NULL DEFAULT 0 CHECK (attempt_number >= 0),
+                    fencing_token TEXT,
+                    lease_until REAL,
+                    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (run_id, work_id),
@@ -280,6 +293,35 @@ class ExecutorStore:
                 )
                 """
             )
+            # The work table predates the attempt layer.  Keep its original
+            # rows authoritative and add only nullable/current-attempt
+            # columns.  ALTER TABLE is intentionally performed in this same
+            # transaction so a failed migration cannot leave a half-created
+            # execution surface.
+            existing_columns = {
+                str(column["name"])
+                for column in connection.execute(
+                    "PRAGMA table_info(executor_work_items)"
+                ).fetchall()
+            }
+            for column_name, column_definition in (
+                ("attempt_id", "TEXT"),
+                (
+                    "attempt_number",
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (attempt_number >= 0)",
+                ),
+                ("fencing_token", "TEXT"),
+                ("lease_until", "REAL"),
+                (
+                    "retry_count",
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0)",
+                ),
+            ):
+                if column_name not in existing_columns:
+                    connection.execute(
+                        f"ALTER TABLE executor_work_items "
+                        f"ADD COLUMN {column_name} {column_definition}"
+                    )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS executor_work_items_order
@@ -392,6 +434,176 @@ class ExecutorStore:
                 ON executor_replica_slots(workflow, harness, active_run_id, active_work_id)
                 """
             )
+            self._ensure_feature_component(
+                connection,
+                "attempt-kernel",
+                ATTEMPT_SCHEMA_VERSION,
+            )
+            self._ensure_feature_component(
+                connection,
+                "receipt-events",
+                RECEIPT_SCHEMA_VERSION,
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    work_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
+                    claim_id TEXT NOT NULL,
+                    fencing_token TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'running', 'succeeded', 'blocked', 'failed',
+                            'retryable', 'expired', 'rejected', 'cancelled',
+                            'skipped'
+                        )
+                    ),
+                    lease_started REAL NOT NULL,
+                    lease_until REAL NOT NULL,
+                    replica_slot TEXT,
+                    agent_name TEXT,
+                    error_code TEXT,
+                    retry_at REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    settled_at REAL,
+                    UNIQUE (run_id, work_id, attempt_number),
+                    FOREIGN KEY (run_id, work_id)
+                        REFERENCES executor_work_items(run_id, work_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_attempts_work_order
+                ON executor_attempts(run_id, work_id, attempt_number)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_attempts_lease
+                ON executor_attempts(state, lease_until, run_id, work_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_receipts (
+                    run_id TEXT NOT NULL,
+                    receipt_seq INTEGER NOT NULL CHECK (receipt_seq >= 1),
+                    receipt_id TEXT NOT NULL,
+                    receipt_version INTEGER NOT NULL CHECK (receipt_version >= 1),
+                    work_id TEXT NOT NULL,
+                    attempt_id TEXT NOT NULL,
+                    fencing_token TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    error_code TEXT,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (run_id, receipt_seq),
+                    UNIQUE (run_id, receipt_id),
+                    UNIQUE (run_id, work_id, attempt_id, kind),
+                    FOREIGN KEY (run_id, work_id)
+                        REFERENCES executor_work_items(run_id, work_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (attempt_id)
+                        REFERENCES executor_attempts(attempt_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            receipt_columns = {
+                str(column["name"])
+                for column in connection.execute(
+                    "PRAGMA table_info(executor_receipts)"
+                ).fetchall()
+            }
+            if "receipt_version" not in receipt_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE executor_receipts
+                    ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1
+                    """
+                )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_receipts_order
+                ON executor_receipts(run_id, receipt_seq, work_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_events (
+                    run_id TEXT NOT NULL,
+                    event_seq INTEGER NOT NULL CHECK (event_seq >= 1),
+                    event_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_version INTEGER NOT NULL CHECK (event_version >= 1),
+                    work_id TEXT,
+                    attempt_id TEXT,
+                    fencing_token TEXT,
+                    payload_json TEXT NOT NULL,
+                    error_code TEXT,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (run_id, event_seq),
+                    UNIQUE (run_id, event_id),
+                    UNIQUE (run_id, event_key),
+                    FOREIGN KEY (run_id) REFERENCES executor_runs(run_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            event_columns = {
+                str(column["name"])
+                for column in connection.execute(
+                    "PRAGMA table_info(executor_events)"
+                ).fetchall()
+            }
+            if "event_version" not in event_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE executor_events
+                    ADD COLUMN event_version INTEGER NOT NULL DEFAULT 1
+                    """
+                )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_events_order
+                ON executor_events(run_id, event_seq)
+                """
+            )
+
+    @staticmethod
+    def _ensure_feature_component(
+        connection: sqlite3.Connection,
+        component: str,
+        version: int,
+    ) -> None:
+        row = connection.execute(
+            "SELECT version FROM executor_schema_meta WHERE component = ?",
+            (component,),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO executor_schema_meta(component, version) VALUES (?, ?)",
+                (component, version),
+            )
+            return
+        stored = int(row["version"])
+        if stored > version:
+            raise ExecutorStoreError(
+                f"unsupported_executor_schema_version: {component}={stored}"
+            )
+        if stored < version:
+            connection.execute(
+                "UPDATE executor_schema_meta SET version = ? WHERE component = ?",
+                (version, component),
+            )
 
     def feature_version(self) -> int:
         self.initialize()
@@ -403,6 +615,25 @@ class ExecutorStore:
         if row is None:
             raise ExecutorStoreError("executor_schema_version_missing")
         return int(row["version"])
+
+    def feature_versions(self) -> dict[str, int]:
+        """Return independent additive schema component versions."""
+
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT component, version FROM executor_schema_meta
+                ORDER BY component
+                """
+            ).fetchall()
+        return {str(row["component"]): int(row["version"]) for row in rows}
+
+    def attempt_feature_version(self) -> int:
+        return self.feature_versions().get("attempt-kernel", 0)
+
+    def receipt_feature_version(self) -> int:
+        return self.feature_versions().get("receipt-events", 0)
 
     def create_run(
         self,

@@ -6,8 +6,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from herdr_orchestrator.executor_kernel import (
+    ClaimLostError,
     DependencyError,
     ExecutionKernel,
+    FailpointError,
     ReplicaCapacityError,
     WorkItemConflict,
     WorkItemNotFound,
@@ -489,6 +491,251 @@ class ExecutionKernelTests(unittest.TestCase):
                     barrier_ids=("barrier",),
                     depends_on_barriers=("barrier",),
                 )
+
+    def test_each_claim_creates_a_fenced_attempt_with_a_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            now = [100.0]
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "attempt")
+            kernel = ExecutionKernel(
+                store,
+                lease_seconds=10,
+                clock=lambda: now[0],
+            )
+            kernel.add_work_item(run_id, "source")
+
+            claim = kernel.claim_ready(run_id)[0]
+
+            self.assertEqual(claim.attempt_number, 1)
+            self.assertTrue(claim.attempt_id.startswith("attempt_"))
+            self.assertTrue(claim.fencing_token.startswith("fence_"))
+            self.assertEqual(claim.lease_until, 110.0)
+            attempts = kernel.list_attempts(run_id, "source")
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0].attempt_id, claim.attempt_id)
+            self.assertEqual(attempts[0].fencing_token, claim.fencing_token)
+            self.assertEqual(attempts[0].state, "running")
+            self.assertEqual(kernel.get_work_item(run_id, "source").attempt_id, claim.attempt_id)
+
+    def test_expired_attempt_is_reclaimed_with_a_replacement_fencing_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            now = [100.0]
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "reclaim")
+            kernel = ExecutionKernel(
+                store,
+                lease_seconds=10,
+                clock=lambda: now[0],
+            )
+            kernel.add_work_item(run_id, "source")
+            old_claim = kernel.claim_ready(run_id)[0]
+
+            now[0] = 110.0
+            self.assertEqual(kernel.reclaim_expired(run_id), [old_claim.attempt_id])
+            self.assertEqual(kernel.get_attempt(run_id, "source", old_claim.attempt_id).state, "expired")
+            self.assertEqual(kernel.get_work_item(run_id, "source").state, "pending")
+            self.assertIsNone(kernel.current_attempt(run_id, "source"))
+
+            replacement = kernel.claim_ready(run_id)[0]
+            self.assertEqual(replacement.attempt_number, 2)
+            self.assertNotEqual(replacement.fencing_token, old_claim.fencing_token)
+            self.assertNotEqual(replacement.attempt_id, old_claim.attempt_id)
+            with self.assertRaises(ClaimLostError):
+                kernel.complete_work_item(old_claim)
+
+    def test_attempt_authority_expires_at_the_lease_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            now = [100.0]
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "deadline")
+            kernel = ExecutionKernel(store, lease_seconds=10, clock=lambda: now[0])
+            kernel.add_work_item(run_id, "source")
+            claim = kernel.claim_ready(run_id)[0]
+
+            self.assertEqual(
+                kernel.authorize_attempt(
+                    run_id,
+                    "source",
+                    claim.attempt_id,
+                    claim.fencing_token,
+                ).attempt_id,
+                claim.attempt_id,
+            )
+            now[0] = 110.0
+            with self.assertRaises(ClaimLostError):
+                kernel.authorize_attempt(
+                    run_id,
+                    "source",
+                    claim.attempt_id,
+                    claim.fencing_token,
+                )
+
+    def test_stale_attempt_rejection_is_recorded_once_without_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            now = [100.0]
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "stale")
+            kernel = ExecutionKernel(store, lease_seconds=10, clock=lambda: now[0])
+            kernel.add_work_item(run_id, "source")
+            old = kernel.claim_ready(run_id)[0]
+            now[0] = 110.0
+            kernel.reclaim_expired(run_id)
+            replacement = kernel.claim_ready(run_id)[0]
+            before_receipts = len(kernel.list_receipts(run_id))
+
+            first = kernel.record_stale_attempt(old, error_code="stale_attempt")
+            second = kernel.record_stale_attempt(old, error_code="stale_attempt")
+
+            self.assertEqual(first.event_id, second.event_id)
+            self.assertEqual(len(kernel.list_receipts(run_id)), before_receipts)
+            self.assertEqual(kernel.get_work_item(run_id, "source").attempt_id, replacement.attempt_id)
+            self.assertEqual(
+                [event.event_type for event in kernel.list_events(run_id)].count(
+                    "attempt_rejected"
+                ),
+                1,
+            )
+
+    def test_current_attempt_can_renew_only_before_its_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            now = [100.0]
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "renew")
+            kernel = ExecutionKernel(store, lease_seconds=10, clock=lambda: now[0])
+            kernel.add_work_item(run_id, "source")
+            claim = kernel.claim_ready(run_id)[0]
+
+            renewed = kernel.renew_lease(claim, lease_seconds=20)
+            self.assertEqual(renewed.lease_until, 120.0)
+            self.assertEqual(kernel.get_work_item(run_id, "source").lease_until, 120.0)
+            now[0] = 120.0
+            with self.assertRaises(ClaimLostError):
+                kernel.renew_lease(claim)
+
+    def test_settlement_commits_attempt_receipt_and_readiness_as_one_idempotent_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "receipt")
+            kernel = ExecutionKernel(store)
+            kernel.add_work_item(run_id, "source")
+            kernel.add_work_item(run_id, "report", depends_on=("source",))
+            claim = kernel.claim_ready(run_id)[0]
+
+            settled = kernel.complete_work_item(
+                claim,
+                receipt_payload={"artifact_digest": "sha256:" + "a" * 64},
+            )
+
+            self.assertEqual(settled.state, "succeeded")
+            self.assertEqual(len(kernel.list_receipts(run_id)), 1)
+            receipt = kernel.list_receipts(run_id)[0]
+            self.assertEqual(receipt.receipt_version, 1)
+            self.assertEqual(receipt.attempt_id, claim.attempt_id)
+            self.assertEqual(receipt.fencing_token, claim.fencing_token)
+            self.assertEqual(receipt.kind, "semantic")
+            self.assertEqual(
+                [item.work_id for item in kernel.ready_work_items(run_id)],
+                ["report"],
+            )
+            self.assertEqual(
+                [event.event_type for event in kernel.list_events(run_id)],
+                ["attempt_claimed", "work_succeeded", "readiness_released"],
+            )
+
+            kernel.complete_work_item(
+                claim,
+                receipt_payload={"artifact_digest": "sha256:" + "a" * 64},
+            )
+            self.assertEqual(len(kernel.list_receipts(run_id)), 1)
+            self.assertEqual(len(kernel.list_events(run_id)), 3)
+
+    def test_retryable_outcome_uses_bounded_backoff_and_fails_at_attempt_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            now = [100.0]
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "retry")
+            kernel = ExecutionKernel(
+                store,
+                lease_seconds=30,
+                max_attempts=2,
+                backoff_seconds=5,
+                backoff_multiplier=2,
+                clock=lambda: now[0],
+            )
+            kernel.add_work_item(run_id, "source")
+
+            first = kernel.claim_ready(run_id)[0]
+            pending = kernel.retry_work_item(first, error_code="transport_failed")
+            self.assertEqual(pending.state, "pending")
+            self.assertEqual(pending.retry_count, 1)
+            self.assertEqual(pending.available_at, 105.0)
+            self.assertEqual(kernel.ready_work_items(run_id), [])
+            self.assertEqual(kernel.get_attempt(run_id, "source", first.attempt_id).state, "retryable")
+
+            now[0] = 105.0
+            second = kernel.claim_ready(run_id)[0]
+            terminal = kernel.retry_work_item(second, error_code="transport_failed")
+            self.assertEqual(terminal.state, "failed")
+            self.assertEqual(terminal.error_code, "max_attempts_exhausted")
+            self.assertEqual(len(kernel.list_receipts(run_id)), 2)
+            self.assertEqual(
+                [attempt.state for attempt in kernel.list_attempts(run_id, "source")],
+                ["retryable", "failed"],
+            )
+
+    def test_recovery_and_run_controls_are_bounded_and_fence_cancelled_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "controls")
+            kernel = ExecutionKernel(store)
+            kernel.add_work_item(run_id, "source")
+
+            self.assertEqual(kernel.pause_run(run_id).state, "paused")
+            self.assertEqual(kernel.claim_ready(run_id), [])
+            self.assertEqual(kernel.resume_run(run_id).state, "running")
+            claim = kernel.claim_ready(run_id)[0]
+
+            cancelled = kernel.cancel_run(run_id)
+            self.assertEqual(cancelled.state, "cancelled")
+            self.assertEqual(kernel.get_attempt(run_id, "source", claim.attempt_id).state, "cancelled")
+            with self.assertRaises(ClaimLostError):
+                kernel.complete_work_item(claim)
+            self.assertEqual(kernel.cancel_run(run_id).state, "cancelled")
+
+    def test_failpoint_is_named_bounded_and_fires_once_after_durable_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "failpoint")
+            kernel = ExecutionKernel(store, failpoint="after_claim")
+            kernel.add_work_item(run_id, "source")
+
+            with self.assertRaisesRegex(FailpointError, "case_id=after_claim"):
+                kernel.claim_ready(run_id)
+            durable = ExecutionKernel(ExecutorStore(Path(temporary) / "state.db"))
+            self.assertEqual(durable.get_work_item(run_id, "source").state, "running")
+            self.assertEqual(len(durable.list_attempts(run_id, "source")), 1)
+            self.assertEqual(durable.claim_ready(run_id), [])
+
+            with self.assertRaisesRegex(Exception, "failpoint_invalid"):
+                ExecutionKernel(ExecutorStore(Path(temporary) / "other.db"), failpoint="unbounded")
+
+    def test_before_receipt_failpoint_rolls_back_state_and_is_one_shot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ExecutorStore(Path(temporary) / "state.db")
+            run_id, _ = store.create_run("research", "research-synthesis", "receipt-failpoint")
+            kernel = ExecutionKernel(store, failpoint="before_receipt_commit")
+            kernel.add_work_item(run_id, "source")
+            claim = kernel.claim_ready(run_id)[0]
+
+            with self.assertRaisesRegex(FailpointError, "before_receipt_commit"):
+                kernel.complete_work_item(claim)
+            self.assertEqual(kernel.get_work_item(run_id, "source").state, "running")
+            self.assertEqual(len(kernel.list_receipts(run_id)), 0)
+            self.assertEqual(kernel.get_attempt(run_id, "source", claim.attempt_id).state, "running")
+
+            kernel.complete_work_item(claim)
+            self.assertEqual(kernel.get_work_item(run_id, "source").state, "succeeded")
+            self.assertEqual(len(kernel.list_receipts(run_id)), 1)
 
 
 if __name__ == "__main__":

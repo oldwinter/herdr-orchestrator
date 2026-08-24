@@ -83,6 +83,17 @@ class ExecutorStoreTests(unittest.TestCase):
             self.assertEqual(legacy.status_counts("legacy"), before_counts)
             self.assertEqual(legacy.jobs("legacy"), before_jobs)
             self.assertEqual(v2.feature_version(), 1)
+            self.assertEqual(
+                v2.feature_versions(),
+                {
+                    "attempt-kernel": 1,
+                    "receipt-events": 1,
+                    "run-store": 1,
+                    "work-kernel": 1,
+                },
+            )
+            self.assertEqual(v2.attempt_feature_version(), 1)
+            self.assertEqual(v2.receipt_feature_version(), 1)
 
     def test_run_persists_the_complete_pinned_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

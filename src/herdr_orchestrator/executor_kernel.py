@@ -13,6 +13,10 @@ from typing import Any
 
 from herdr_orchestrator.executor_protocol import DefinitionError, canonical_json
 from herdr_orchestrator.executor_store import (
+    ATTEMPT_SCHEMA_VERSION,
+    EVENT_CONTRACT_VERSION,
+    RECEIPT_CONTRACT_VERSION,
+    RECEIPT_SCHEMA_VERSION,
     WORK_KERNEL_SCHEMA_VERSION,
     ExecutorStore,
     ExecutorStoreError,
@@ -21,19 +25,32 @@ from herdr_orchestrator.executor_store import (
 
 
 __all__ = [
+    "ATTEMPT_SCHEMA_VERSION",
+    "RECEIPT_SCHEMA_VERSION",
+    "RECEIPT_CONTRACT_VERSION",
+    "EVENT_CONTRACT_VERSION",
     "BarrierRecord",
     "Barrier",
     "Dependency",
     "ClaimLostError",
     "ClaimedWork",
+    "EventRecord",
     "DependencyError",
     "DependencyRecord",
     "ExecutionKernel",
     "ExecutionKernelError",
+    "FailpointError",
+    "FAILPOINTS",
     "KernelError",
+    "MAX_ATTEMPTS",
+    "MAX_BACKOFF_SECONDS",
+    "MAX_LEASE_SECONDS",
     "ReplicaCapacityError",
     "ReplicaSlot",
     "ReplicaSlotRecord",
+    "ReceiptRecord",
+    "AttemptRecord",
+    "AttemptState",
     "RunNotFoundError",
     "WorkItem",
     "WorkItemState",
@@ -49,6 +66,25 @@ __all__ = [
 MAX_ID_LENGTH = 128
 MAX_WORK_ITEMS_PER_RUN = 10_000
 MAX_REPLICA_SLOTS = 64
+MAX_ATTEMPTS = 100
+MAX_LEASE_SECONDS = 86_400.0
+MAX_BACKOFF_SECONDS = 86_400.0
+FAILPOINTS = frozenset(
+    {
+        "after_claim",
+        "after_artifact_write",
+        "before_admission",
+        "after_admission",
+        "before_receipt_commit",
+        "after_reclaim",
+        "after_receipt_commit",
+        "before_readiness_commit",
+        "after_readiness_commit",
+        "before_settlement",
+        "after_settlement",
+        "after_phase_transition",
+    }
+)
 
 
 class WorkState(StrEnum):
@@ -68,6 +104,32 @@ class WorkState(StrEnum):
     @classmethod
     def all(cls) -> frozenset[WorkState]:
         return frozenset({cls.PENDING, cls.RUNNING, *cls.terminal()})
+
+
+class AttemptState(StrEnum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    RETRYABLE = "retryable"
+    EXPIRED = "expired"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+    @classmethod
+    def terminal(cls) -> frozenset[AttemptState]:
+        return frozenset(
+            {
+                cls.SUCCEEDED,
+                cls.BLOCKED,
+                cls.FAILED,
+                cls.EXPIRED,
+                cls.REJECTED,
+                cls.CANCELLED,
+                cls.SKIPPED,
+            }
+        )
 
 
 class KernelError(ExecutorStoreError):
@@ -97,6 +159,20 @@ class ReplicaCapacityError(KernelError):
 
 
 ExecutionKernelError = KernelError
+
+
+class FailpointError(KernelError):
+    """A bounded, one-shot deterministic crash boundary."""
+
+    code = "failpoint_triggered"
+
+    def __init__(self, name: str, stop_point: str | None = None) -> None:
+        self.name = name
+        self.case_id = name
+        self.stop_point = stop_point or name
+        super().__init__(
+            f"{self.code}: case_id={name} stop_point={self.stop_point}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +219,11 @@ class WorkItem:
     dependencies: tuple[str, ...] = ()
     barriers: tuple[str, ...] = ()
     ready: bool = False
+    attempt_id: str | None = None
+    attempt_number: int = 0
+    fencing_token: str | None = None
+    lease_until: float | None = None
+    retry_count: int = 0
 
     @property
     def id(self) -> str:
@@ -167,6 +248,22 @@ class WorkItem:
     @property
     def input(self) -> Any:
         return self.payload
+
+    @property
+    def attempt(self) -> int:
+        return self.attempt_number
+
+    @property
+    def lease_deadline(self) -> float | None:
+        return self.lease_until
+
+    @property
+    def lease_expires_at(self) -> float | None:
+        return self.lease_until
+
+    @property
+    def attempt_token(self) -> str | None:
+        return self.fencing_token
 
     @property
     def dependency_ids(self) -> tuple[str, ...]:
@@ -200,6 +297,11 @@ class WorkItem:
             "dependencies": list(self.dependencies),
             "barriers": list(self.barriers),
             "ready": self.ready,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "fencing_token": self.fencing_token,
+            "lease_until": self.lease_until,
+            "retry_count": self.retry_count,
         }
 
 
@@ -216,6 +318,10 @@ class ClaimedWork:
     replica_slot: str
     agent_name: str
     claimed_at: float
+    attempt_id: str = ""
+    attempt_number: int = 0
+    fencing_token: str = ""
+    lease_until: float = 0.0
 
     @property
     def id(self) -> str:
@@ -237,6 +343,26 @@ class ClaimedWork:
     def replica(self) -> str:
         return self.replica_slot
 
+    @property
+    def attempt(self) -> int:
+        return self.attempt_number
+
+    @property
+    def lease_deadline(self) -> float:
+        return self.lease_until
+
+    @property
+    def lease_expires_at(self) -> float:
+        return self.lease_until
+
+    @property
+    def token(self) -> str:
+        return self.fencing_token
+
+    @property
+    def fence(self) -> str:
+        return self.fencing_token
+
     def to_dict(self) -> dict[str, object]:
         return {
             "run_id": self.run_id,
@@ -252,6 +378,155 @@ class ClaimedWork:
             "agent_name": self.agent_name,
             "state": WorkState.RUNNING.value,
             "claimed_at": self.claimed_at,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "fencing_token": self.fencing_token,
+            "lease_until": self.lease_until,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRecord:
+    run_id: str
+    work_id: str
+    attempt_id: str
+    attempt_number: int
+    claim_id: str
+    fencing_token: str
+    state: str
+    lease_started: float
+    lease_until: float
+    replica_slot: str | None
+    agent_name: str | None
+    error_code: str | None
+    retry_at: float | None
+    created_at: float
+    updated_at: float
+    settled_at: float | None
+
+    @property
+    def current(self) -> bool:
+        return self.state == AttemptState.RUNNING
+
+    @property
+    def attempt(self) -> int:
+        return self.attempt_number
+
+    @property
+    def lease_deadline(self) -> float:
+        return self.lease_until
+
+    @property
+    def lease_expires_at(self) -> float:
+        return self.lease_until
+
+    @property
+    def token(self) -> str:
+        return self.fencing_token
+
+    @property
+    def fence(self) -> str:
+        return self.fencing_token
+
+    @property
+    def expired(self) -> bool:
+        return self.state in {
+            AttemptState.EXPIRED,
+            AttemptState.REJECTED,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "work_id": self.work_id,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "claim_id": self.claim_id,
+            "fencing_token": self.fencing_token,
+            "state": self.state,
+            "lease_started": self.lease_started,
+            "lease_until": self.lease_until,
+            "replica_slot": self.replica_slot,
+            "agent_name": self.agent_name,
+            "error_code": self.error_code,
+            "retry_at": self.retry_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "settled_at": self.settled_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptRecord:
+    run_id: str
+    receipt_seq: int
+    receipt_id: str
+    receipt_version: int
+    work_id: str
+    attempt_id: str
+    fencing_token: str
+    kind: str
+    outcome: str
+    state: str
+    payload: Any
+    error_code: str | None
+    created_at: float
+
+    @property
+    def contract_version(self) -> int:
+        return self.receipt_version
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "receipt_seq": self.receipt_seq,
+            "receipt_id": self.receipt_id,
+            "receipt_version": self.receipt_version,
+            "work_id": self.work_id,
+            "attempt_id": self.attempt_id,
+            "fencing_token": self.fencing_token,
+            "kind": self.kind,
+            "outcome": self.outcome,
+            "state": self.state,
+            "payload": self.payload,
+            "error_code": self.error_code,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EventRecord:
+    run_id: str
+    event_seq: int
+    event_id: str
+    event_key: str
+    event_type: str
+    event_version: int
+    work_id: str | None
+    attempt_id: str | None
+    fencing_token: str | None
+    payload: Any
+    error_code: str | None
+    created_at: float
+
+    @property
+    def contract_version(self) -> int:
+        return self.event_version
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "event_seq": self.event_seq,
+            "event_id": self.event_id,
+            "event_key": self.event_key,
+            "event_type": self.event_type,
+            "event_version": self.event_version,
+            "work_id": self.work_id,
+            "attempt_id": self.attempt_id,
+            "fencing_token": self.fencing_token,
+            "payload": self.payload,
+            "error_code": self.error_code,
+            "created_at": self.created_at,
         }
 
 
@@ -354,9 +629,9 @@ class ExecutionKernel:
     The kernel deliberately stores opaque JSON payloads and string worker
     identities.  It does not inspect or interpret executor-specific objects.
     Work readiness is derived from durable predecessor/barrier state; claims
-    reserve a shared workflow/harness replica slot until a caller completes
-    the claim.  Leases, retries, and fencing are added by the later attempt
-    layer and therefore are not inferred from a settled claim here.
+    reserve a shared workflow/harness replica slot and create an attempt with
+    a bounded lease and fencing token.  Settlement, retry, expiry, receipts,
+    and readiness release remain domain-neutral kernel mechanics.
     """
 
     def __init__(
@@ -368,6 +643,12 @@ class ExecutionKernel:
         replica_slots: Mapping[str, Sequence[str]] | None = None,
         workspace: Path | str | None = None,
         clock: Callable[[], float] = time.time,
+        lease_seconds: float = 900.0,
+        max_attempts: int = 3,
+        backoff_seconds: float = 0.0,
+        backoff_multiplier: float = 2.0,
+        max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
+        failpoint: str | None = None,
     ) -> None:
         if not isinstance(store, ExecutorStore):
             if isinstance(store, (Path, str)):
@@ -381,6 +662,41 @@ class ExecutionKernel:
         self.store = store
         self.max_parallel = max_parallel
         self._clock = clock
+        self.lease_seconds = _validate_seconds(
+            lease_seconds,
+            "lease_seconds",
+            minimum=0.001,
+            maximum=MAX_LEASE_SECONDS,
+        )
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or not 1 <= max_attempts <= MAX_ATTEMPTS
+        ):
+            raise KernelError("max_attempts_out_of_range")
+        self.max_attempts = max_attempts
+        self.backoff_seconds = _validate_seconds(
+            backoff_seconds,
+            "backoff_seconds",
+            minimum=0.0,
+            maximum=MAX_BACKOFF_SECONDS,
+        )
+        if (
+            not isinstance(backoff_multiplier, (int, float))
+            or isinstance(backoff_multiplier, bool)
+            or not math.isfinite(float(backoff_multiplier))
+            or float(backoff_multiplier) < 1.0
+            or float(backoff_multiplier) > 32.0
+        ):
+            raise KernelError("backoff_multiplier_out_of_range")
+        self.backoff_multiplier = float(backoff_multiplier)
+        self.max_backoff_seconds = _validate_seconds(
+            max_backoff_seconds,
+            "max_backoff_seconds",
+            minimum=0.0,
+            maximum=MAX_BACKOFF_SECONDS,
+        )
+        self._failpoint = _normalize_failpoint(failpoint)
         self.workspace = None if workspace is None else Path(workspace).resolve()
         self._replica_capacity = _validate_capacity_mapping(replica_capacity)
         self._replica_slots = _validate_slot_mapping(replica_slots)
@@ -401,6 +717,33 @@ class ExecutionKernel:
         """Idempotently ensure the additive kernel tables exist."""
 
         self.store.initialize()
+
+    def set_failpoint(self, failpoint: str | None) -> None:
+        """Arm one bounded, one-shot crash fixture for this kernel instance."""
+
+        self._failpoint = _normalize_failpoint(failpoint)
+
+    def clear_failpoint(self) -> None:
+        self._failpoint = None
+
+    def _consume_failpoint(self, stop_point: str) -> bool:
+        if self._failpoint != stop_point:
+            return False
+        self._failpoint = None
+        return True
+
+    def _raise_failpoint(self, stop_point: str) -> None:
+        if self._consume_failpoint(stop_point):
+            raise FailpointError(stop_point)
+
+    def hit_failpoint(self, stop_point: str) -> None:
+        """Trigger a selected one-shot fixture boundary, if armed."""
+
+        normalized = _normalize_failpoint(stop_point)
+        if normalized is not None:
+            self._raise_failpoint(normalized)
+
+    trigger_failpoint = hit_failpoint
 
     # ------------------------------------------------------------------
     # Work creation and durable dependencies
@@ -1086,6 +1429,7 @@ class ExecutionKernel:
         limit: int | None = None,
     ) -> list[ClaimedWork]:
         run_id = _identifier(run_id, "run_id")
+        self.reclaim_expired(run_id)
         return self._claim_candidates(run_id=run_id, limit=limit)
 
     claim_work = claim_ready
@@ -1104,6 +1448,7 @@ class ExecutionKernel:
             if run_ids is None
             else _identifier_sequence(run_ids, "run_ids")
         )
+        self.reclaim_expired(workflow=workflow)
         return self._claim_candidates(
             workflow=workflow,
             run_ids=normalized_runs,
@@ -1120,21 +1465,59 @@ class ExecutionKernel:
         *,
         state: str = WorkState.SUCCEEDED,
         error_code: str | None = None,
+        receipt_payload: Any = None,
+        receipt: Any = None,
+        receipt_kind: str = "semantic",
+        outcome: str | None = None,
+        attempt_id: str | None = None,
+        fencing_token: str | None = None,
     ) -> WorkItem:
-        """Settle a current claim and atomically release its replica slot."""
+        """Settle a current claim and atomically commit its receipt/readiness.
+
+        The current attempt, lease deadline, and fencing token are checked
+        while holding the same write transaction that updates the work item,
+        appends the semantic receipt, releases the slot, and releases any
+        newly-ready dependents.  Replaying an already-settled claim is an
+        idempotent no-op and never creates a second receipt.
+        """
 
         if isinstance(claim, ClaimedWork):
             run_id = claim.run_id
             actual_work_id = claim.work_id
             claim_id = claim.claim_id
+            if attempt_id is not None and attempt_id != claim.attempt_id:
+                raise ClaimLostError(f"{ClaimLostError.code}: attempt_mismatch")
+            if fencing_token is not None and fencing_token != claim.fencing_token:
+                raise ClaimLostError(f"{ClaimLostError.code}: fencing_mismatch")
+            attempt_id = claim.attempt_id
+            fencing_token = claim.fencing_token
         else:
             run_id = _identifier(claim, "run_id")
             actual_work_id = _identifier(work_id, "work_id")
             claim_id = None
+            if attempt_id is None or fencing_token is None:
+                raise ClaimLostError(f"{ClaimLostError.code}: fenced_claim_required")
+            attempt_id = _identifier(attempt_id, "attempt_id")
+            fencing_token = _identifier(fencing_token, "fencing_token")
         if state not in {item.value for item in WorkState.terminal()}:
             raise KernelError(f"work_terminal_state_invalid: {state}")
         if error_code is not None:
             error_code = _identifier(error_code, "error_code")
+        receipt_kind = _identifier(receipt_kind, "receipt_kind")
+        if outcome is None:
+            outcome = state
+        outcome = _identifier(outcome, "outcome")
+        if receipt is not None:
+            if receipt_payload is not None:
+                raise KernelError("receipt_payload_duplicate")
+            receipt_payload = receipt
+        try:
+            receipt_json = canonical_json(receipt_payload)
+        except (DefinitionError, TypeError, ValueError) as exc:
+            raise KernelError(f"receipt_payload_invalid: {exc}") from exc
+        trigger_after_receipt = False
+        trigger_after_readiness = False
+        trigger_after_settlement = False
         with self.store._transaction() as connection:
             self._require_run(connection, run_id)
             row = connection.execute(
@@ -1152,6 +1535,30 @@ class ExecutionKernel:
                 and str(row["state"]) in {item.value for item in WorkState.terminal()}
                 and current_claim == claim_id
             ):
+                existing_receipt = connection.execute(
+                    """
+                    SELECT payload_json, state, outcome, fencing_token
+                    FROM executor_receipts
+                    WHERE run_id = ? AND work_id = ? AND attempt_id = ?
+                      AND kind = ?
+                    """,
+                    (
+                        run_id,
+                        actual_work_id,
+                        str(row["attempt_id"]),
+                        receipt_kind,
+                    ),
+                ).fetchone()
+                if existing_receipt is not None and (
+                    str(existing_receipt["payload_json"]) != receipt_json
+                    or str(existing_receipt["state"]) != state
+                    or str(existing_receipt["outcome"]) != outcome
+                    or (
+                        fencing_token is not None
+                        and str(existing_receipt["fencing_token"]) != fencing_token
+                    )
+                ):
+                    raise KernelError("receipt_conflict")
                 return self._work_record(connection, run_id, actual_work_id)
             if str(row["state"]) != WorkState.RUNNING or (
                 claim_id is not None and current_claim != claim_id
@@ -1159,21 +1566,84 @@ class ExecutionKernel:
                 raise ClaimLostError(
                     f"{ClaimLostError.code}: run_id={run_id} work_id={actual_work_id}"
                 )
+            current_attempt_id = (
+                attempt_id
+                if attempt_id is not None
+                else (
+                    None
+                    if row["attempt_id"] is None
+                    else str(row["attempt_id"])
+                )
+            )
+            current_fencing_token = (
+                fencing_token
+                if fencing_token is not None
+                else (
+                    None
+                    if row["fencing_token"] is None
+                    else str(row["fencing_token"])
+                )
+            )
+            if current_attempt_id is None or current_fencing_token is None:
+                raise ClaimLostError(f"{ClaimLostError.code}: attempt_missing")
+            attempt = connection.execute(
+                """
+                SELECT * FROM executor_attempts
+                WHERE run_id = ? AND work_id = ? AND attempt_id = ?
+                  AND fencing_token = ? AND state = ?
+                """,
+                (
+                    run_id,
+                    actual_work_id,
+                    current_attempt_id,
+                    current_fencing_token,
+                    AttemptState.RUNNING,
+                ),
+            ).fetchone()
+            if attempt is None:
+                raise ClaimLostError(f"{ClaimLostError.code}: attempt_not_current")
             now = self._clock()
+            if float(attempt["lease_until"]) <= now:
+                raise ClaimLostError(f"{ClaimLostError.code}: lease_expired")
+            ready_before = self._ready_work_ids_locked(connection, run_id, now)
+            self.hit_failpoint("before_settlement")
             connection.execute(
                 """
                 UPDATE executor_work_items
-                SET state = ?, error_code = ?, updated_at = ?
+                SET state = ?, error_code = ?, updated_at = ?,
+                    attempt_id = ?, fencing_token = ?, lease_until = ?
                 WHERE run_id = ? AND work_id = ? AND state = ? AND claim_id = ?
+                  AND attempt_id = ? AND fencing_token = ?
                 """,
                 (
                     state,
                     error_code,
                     now,
+                    current_attempt_id,
+                    current_fencing_token,
+                    float(attempt["lease_until"]),
                     run_id,
                     actual_work_id,
                     WorkState.RUNNING,
                     current_claim,
+                    current_attempt_id,
+                    current_fencing_token,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE executor_attempts
+                SET state = ?, error_code = ?, updated_at = ?, settled_at = ?
+                WHERE attempt_id = ? AND fencing_token = ? AND state = ?
+                """,
+                (
+                    _attempt_state_for_work_state(state),
+                    error_code,
+                    now,
+                    now,
+                    current_attempt_id,
+                    current_fencing_token,
+                    AttemptState.RUNNING,
                 ),
             )
             if row["replica_slot"] is not None:
@@ -1197,11 +1667,271 @@ class ExecutionKernel:
                         current_claim,
                     ),
                 )
+            connection.execute(
+                "UPDATE executor_runs SET updated_at = ? WHERE run_id = ?",
+                (now, run_id),
+            )
+            self.hit_failpoint("before_receipt_commit")
+            receipt = self._append_receipt_locked(
+                connection,
+                run_id,
+                work_id=actual_work_id,
+                attempt_id=current_attempt_id,
+                fencing_token=current_fencing_token,
+                kind=receipt_kind,
+                outcome=outcome,
+                state=state,
+                payload_json=receipt_json,
+                error_code=error_code,
+                created_at=now,
+            )
+            trigger_after_receipt = self._consume_failpoint("after_receipt_commit")
+            self.hit_failpoint("before_readiness_commit")
             self._refresh_readiness(connection, run_id)
-            return self._work_record(connection, run_id, actual_work_id)
+            ready_after = self._ready_work_ids_locked(connection, run_id, now)
+            released = sorted(ready_after - ready_before)
+            self._append_event_locked(
+                connection,
+                run_id,
+                event_key=f"work-settled:{current_attempt_id}",
+                event_type=f"work_{state}",
+                work_id=actual_work_id,
+                attempt_id=current_attempt_id,
+                fencing_token=current_fencing_token,
+                payload={"receipt_id": receipt.receipt_id},
+                error_code=error_code,
+                created_at=now,
+            )
+            if released:
+                self._append_event_locked(
+                    connection,
+                    run_id,
+                    event_key=f"readiness-release:{current_attempt_id}",
+                    event_type="readiness_released",
+                    work_id=actual_work_id,
+                    attempt_id=current_attempt_id,
+                    fencing_token=current_fencing_token,
+                    payload={"work_ids": released},
+                    error_code=None,
+                    created_at=now,
+                )
+            trigger_after_readiness = self._consume_failpoint(
+                "after_readiness_commit"
+            )
+            trigger_after_settlement = self._consume_failpoint("after_settlement")
+            result = self._work_record(connection, run_id, actual_work_id)
+        if trigger_after_receipt:
+            raise FailpointError("after_receipt_commit")
+        if trigger_after_readiness:
+            raise FailpointError("after_readiness_commit")
+        if trigger_after_settlement:
+            raise FailpointError("after_settlement")
+        return result
 
     complete_work = complete_work_item
     settle_work_item = complete_work_item
+    settle_attempt = complete_work_item
+    commit_attempt = complete_work_item
+
+    def retry_work_item(
+        self,
+        claim: ClaimedWork,
+        *,
+        error_code: str = "work_retryable",
+        receipt_payload: Any = None,
+        receipt: Any = None,
+    ) -> WorkItem:
+        """Record a bounded transport failure and schedule the next attempt."""
+
+        if not isinstance(claim, ClaimedWork):
+            raise ClaimLostError(f"{ClaimLostError.code}: claim_required")
+        error_code = _identifier(error_code, "error_code")
+        if receipt is not None:
+            if receipt_payload is not None:
+                raise KernelError("receipt_payload_duplicate")
+            receipt_payload = receipt
+        payload = (
+            {"error_code": error_code}
+            if receipt_payload is None
+            else receipt_payload
+        )
+        try:
+            payload_json = canonical_json(payload)
+        except (DefinitionError, TypeError, ValueError) as exc:
+            raise KernelError(f"receipt_payload_invalid: {exc}") from exc
+        trigger_after_receipt = False
+        trigger_after_readiness = False
+        trigger_after_settlement = False
+        with self.store._transaction() as connection:
+            self._require_run(connection, claim.run_id)
+            row = connection.execute(
+                """
+                SELECT * FROM executor_work_items
+                WHERE run_id = ? AND work_id = ?
+                """,
+                (claim.run_id, claim.work_id),
+            ).fetchone()
+            if row is None:
+                raise WorkItemNotFound(f"work_item_not_found: {claim.work_id}")
+            if (
+                str(row["state"]) != WorkState.RUNNING
+                or str(row["claim_id"]) != claim.claim_id
+                or str(row["attempt_id"]) != claim.attempt_id
+                or str(row["fencing_token"]) != claim.fencing_token
+            ):
+                raise ClaimLostError(
+                    f"{ClaimLostError.code}: run_id={claim.run_id} work_id={claim.work_id}"
+                )
+            attempt = connection.execute(
+                """
+                SELECT * FROM executor_attempts
+                WHERE attempt_id = ? AND run_id = ? AND work_id = ?
+                  AND fencing_token = ? AND state = ?
+                """,
+                (
+                    claim.attempt_id,
+                    claim.run_id,
+                    claim.work_id,
+                    claim.fencing_token,
+                    AttemptState.RUNNING,
+                ),
+            ).fetchone()
+            if attempt is None:
+                raise ClaimLostError(f"{ClaimLostError.code}: attempt_not_current")
+            now = self._clock()
+            if float(attempt["lease_until"]) <= now:
+                raise ClaimLostError(f"{ClaimLostError.code}: lease_expired")
+            ready_before = self._ready_work_ids_locked(connection, claim.run_id, now)
+            attempt_number = int(attempt["attempt_number"])
+            exhausted = attempt_number >= self.max_attempts
+            next_state = WorkState.FAILED if exhausted else WorkState.PENDING
+            terminal_error = "max_attempts_exhausted" if exhausted else error_code
+            backoff = 0.0
+            if not exhausted:
+                backoff = min(
+                    self.max_backoff_seconds,
+                    self.backoff_seconds
+                    * (self.backoff_multiplier ** max(0, attempt_number - 1)),
+                )
+            available_at = now + backoff
+            self.hit_failpoint("before_settlement")
+            connection.execute(
+                """
+                UPDATE executor_work_items
+                SET state = ?, error_code = ?, available_at = ?,
+                    retry_count = retry_count + 1, claim_id = NULL,
+                    replica_slot = NULL, agent_name = NULL, attempt_id = NULL,
+                    fencing_token = NULL, lease_until = NULL, updated_at = ?
+                WHERE run_id = ? AND work_id = ? AND state = ?
+                  AND claim_id = ? AND attempt_id = ? AND fencing_token = ?
+                """,
+                (
+                    next_state,
+                    terminal_error,
+                    available_at,
+                    now,
+                    claim.run_id,
+                    claim.work_id,
+                    WorkState.RUNNING,
+                    claim.claim_id,
+                    claim.attempt_id,
+                    claim.fencing_token,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE executor_attempts
+                SET state = ?, error_code = ?, retry_at = ?, updated_at = ?,
+                    settled_at = ?
+                WHERE attempt_id = ? AND fencing_token = ? AND state = ?
+                """,
+                (
+                    AttemptState.FAILED if exhausted else AttemptState.RETRYABLE,
+                    terminal_error,
+                    None if exhausted else available_at,
+                    now,
+                    now,
+                    claim.attempt_id,
+                    claim.fencing_token,
+                    AttemptState.RUNNING,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE executor_replica_slots
+                SET active_run_id = NULL, active_work_id = NULL,
+                    claim_id = NULL, agent_name = NULL, updated_at = ?
+                WHERE active_run_id = ? AND active_work_id = ?
+                  AND claim_id = ?
+                """,
+                (now, claim.run_id, claim.work_id, claim.claim_id),
+            )
+            connection.execute(
+                "UPDATE executor_runs SET updated_at = ? WHERE run_id = ?",
+                (now, claim.run_id),
+            )
+            self._append_receipt_locked(
+                connection,
+                claim.run_id,
+                work_id=claim.work_id,
+                attempt_id=claim.attempt_id,
+                fencing_token=claim.fencing_token,
+                kind="transport",
+                outcome=error_code,
+                state=next_state,
+                payload_json=payload_json,
+                error_code=terminal_error,
+                created_at=now,
+            )
+            trigger_after_receipt = self._consume_failpoint("after_receipt_commit")
+            self.hit_failpoint("before_readiness_commit")
+            self._refresh_readiness(connection, claim.run_id)
+            ready_after = self._ready_work_ids_locked(connection, claim.run_id, now)
+            released = sorted(ready_after - ready_before)
+            self._append_event_locked(
+                connection,
+                claim.run_id,
+                event_key=f"work-retry:{claim.attempt_id}",
+                event_type="work_failed" if exhausted else "work_retry_scheduled",
+                work_id=claim.work_id,
+                attempt_id=claim.attempt_id,
+                fencing_token=claim.fencing_token,
+                payload={
+                    "backoff_seconds": backoff,
+                    "next_state": next_state,
+                    "attempt_number": attempt_number,
+                },
+                error_code=terminal_error,
+                created_at=now,
+            )
+            if released:
+                self._append_event_locked(
+                    connection,
+                    claim.run_id,
+                    event_key=f"readiness-release:{claim.attempt_id}",
+                    event_type="readiness_released",
+                    work_id=claim.work_id,
+                    attempt_id=claim.attempt_id,
+                    fencing_token=claim.fencing_token,
+                    payload={"work_ids": released},
+                    error_code=None,
+                    created_at=now,
+                )
+            trigger_after_readiness = self._consume_failpoint(
+                "after_readiness_commit"
+            )
+            trigger_after_settlement = self._consume_failpoint("after_settlement")
+            result = self._work_record(connection, claim.run_id, claim.work_id)
+        if trigger_after_receipt:
+            raise FailpointError("after_receipt_commit")
+        if trigger_after_readiness:
+            raise FailpointError("after_readiness_commit")
+        if trigger_after_settlement:
+            raise FailpointError("after_settlement")
+        return result
+
+    retry_work = retry_work_item
+    record_retry = retry_work_item
 
     def fail_work_item(
         self,
@@ -1242,6 +1972,782 @@ class ExecutionKernel:
     # ------------------------------------------------------------------
     # Durable views and replica capacity
     # ------------------------------------------------------------------
+
+    def list_attempts(
+        self,
+        run_id: str,
+        work_id: str | None = None,
+    ) -> list[AttemptRecord]:
+        run_id = _identifier(run_id, "run_id")
+        if work_id is not None:
+            work_id = _identifier(work_id, "work_id")
+        with self.store._connect() as connection:
+            self._require_run(connection, run_id)
+            if work_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM executor_attempts
+                    WHERE run_id = ?
+                    ORDER BY work_id, attempt_number, attempt_id
+                    """,
+                    (run_id,),
+                ).fetchall()
+            else:
+                self._require_work(connection, run_id, work_id)
+                rows = connection.execute(
+                    """
+                    SELECT * FROM executor_attempts
+                    WHERE run_id = ? AND work_id = ?
+                    ORDER BY attempt_number, attempt_id
+                    """,
+                    (run_id, work_id),
+                ).fetchall()
+            return [self._attempt_record(row) for row in rows]
+
+    attempts = list_attempts
+
+    def get_attempt(
+        self,
+        run_id: str,
+        work_id: str,
+        attempt_id: str,
+    ) -> AttemptRecord:
+        run_id = _identifier(run_id, "run_id")
+        work_id = _identifier(work_id, "work_id")
+        attempt_id = _identifier(attempt_id, "attempt_id")
+        with self.store._connect() as connection:
+            self._require_run(connection, run_id)
+            row = connection.execute(
+                """
+                SELECT * FROM executor_attempts
+                WHERE run_id = ? AND work_id = ? AND attempt_id = ?
+                """,
+                (run_id, work_id, attempt_id),
+            ).fetchone()
+            if row is None:
+                raise KernelError(f"attempt_not_found: {attempt_id}")
+            return self._attempt_record(row)
+
+    def authorize_attempt(
+        self,
+        run_id: str,
+        work_id: str,
+        attempt_id: str,
+        fencing_token: str,
+        *,
+        now: float | None = None,
+    ) -> AttemptRecord:
+        """Atomically prove that an attempt may perform a kernel mutation."""
+
+        run_id = _identifier(run_id, "run_id")
+        work_id = _identifier(work_id, "work_id")
+        attempt_id = _identifier(attempt_id, "attempt_id")
+        fencing_token = _identifier(fencing_token, "fencing_token")
+        check_now = self._clock() if now is None else _validate_seconds(
+            now,
+            "authority_now",
+            minimum=-MAX_BACKOFF_SECONDS,
+            maximum=float("inf"),
+        )
+        with self.store._transaction() as connection:
+            run = self._require_run(connection, run_id)
+            row = connection.execute(
+                """
+                SELECT a.*, w.attempt_id AS current_attempt_id,
+                       w.fencing_token AS current_fencing_token,
+                       w.state AS work_state
+                FROM executor_attempts a
+                JOIN executor_work_items w
+                  ON w.run_id = a.run_id AND w.work_id = a.work_id
+                WHERE a.run_id = ? AND a.work_id = ? AND a.attempt_id = ?
+                  AND a.fencing_token = ?
+                """,
+                (run_id, work_id, attempt_id, fencing_token),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["state"]) != AttemptState.RUNNING
+                or str(row["work_state"]) != WorkState.RUNNING
+                or str(row["current_attempt_id"]) != attempt_id
+                or str(row["current_fencing_token"]) != fencing_token
+                or float(row["lease_until"]) <= float(check_now)
+                or str(run["state"]) in {"cancelled", "succeeded", "failed", "blocked"}
+            ):
+                raise ClaimLostError(
+                    f"{ClaimLostError.code}: run_id={run_id} work_id={work_id}"
+                )
+            return self._attempt_record(row)
+
+    is_current_attempt = authorize_attempt
+    check_attempt_authority = authorize_attempt
+
+    def renew_lease(
+        self,
+        claim: ClaimedWork,
+        *,
+        lease_seconds: float | None = None,
+    ) -> AttemptRecord:
+        """Extend a still-authoritative attempt lease once, bounded by policy."""
+
+        if not isinstance(claim, ClaimedWork):
+            raise ClaimLostError(f"{ClaimLostError.code}: claim_required")
+        duration = (
+            self.lease_seconds
+            if lease_seconds is None
+            else _validate_seconds(
+                lease_seconds,
+                "lease_seconds",
+                minimum=0.001,
+                maximum=MAX_LEASE_SECONDS,
+            )
+        )
+        with self.store._transaction() as connection:
+            self._require_run(connection, claim.run_id)
+            now = self._clock()
+            row = connection.execute(
+                """
+                SELECT a.* FROM executor_attempts a
+                JOIN executor_work_items w
+                  ON w.run_id = a.run_id AND w.work_id = a.work_id
+                WHERE a.run_id = ? AND a.work_id = ? AND a.attempt_id = ?
+                  AND a.fencing_token = ? AND a.claim_id = ?
+                  AND a.state = ? AND w.state = ?
+                  AND w.claim_id = ? AND w.attempt_id = ?
+                  AND w.fencing_token = ? AND a.lease_until > ?
+                """,
+                (
+                    claim.run_id,
+                    claim.work_id,
+                    claim.attempt_id,
+                    claim.fencing_token,
+                    claim.claim_id,
+                    AttemptState.RUNNING,
+                    WorkState.RUNNING,
+                    claim.claim_id,
+                    claim.attempt_id,
+                    claim.fencing_token,
+                    now,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ClaimLostError(
+                    f"{ClaimLostError.code}: run_id={claim.run_id} work_id={claim.work_id}"
+                )
+            deadline = now + duration
+            connection.execute(
+                """
+                UPDATE executor_attempts
+                SET lease_until = ?, updated_at = ?
+                WHERE attempt_id = ? AND fencing_token = ? AND state = ?
+                """,
+                (
+                    deadline,
+                    now,
+                    claim.attempt_id,
+                    claim.fencing_token,
+                    AttemptState.RUNNING,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE executor_work_items
+                SET lease_until = ?, updated_at = ?
+                WHERE run_id = ? AND work_id = ? AND attempt_id = ?
+                  AND fencing_token = ? AND claim_id = ? AND state = ?
+                """,
+                (
+                    deadline,
+                    now,
+                    claim.run_id,
+                    claim.work_id,
+                    claim.attempt_id,
+                    claim.fencing_token,
+                    claim.claim_id,
+                    WorkState.RUNNING,
+                ),
+            )
+            refreshed = connection.execute(
+                "SELECT * FROM executor_attempts WHERE attempt_id = ?",
+                (claim.attempt_id,),
+            ).fetchone()
+            if refreshed is None:
+                raise ClaimLostError(f"{ClaimLostError.code}: attempt_missing")
+            return self._attempt_record(refreshed)
+
+    renew_attempt_lease = renew_lease
+    heartbeat = renew_lease
+
+    def record_stale_attempt(
+        self,
+        claim: ClaimedWork,
+        *,
+        error_code: str = "stale_attempt",
+    ) -> EventRecord:
+        """Record one late/stale submission without mutating workflow truth."""
+
+        if not isinstance(claim, ClaimedWork):
+            raise ClaimLostError(f"{ClaimLostError.code}: claim_required")
+        error_code = _identifier(error_code, "error_code")
+        with self.store._transaction() as connection:
+            self._require_run(connection, claim.run_id)
+            attempt = connection.execute(
+                """
+                SELECT * FROM executor_attempts
+                WHERE run_id = ? AND work_id = ? AND attempt_id = ?
+                  AND fencing_token = ?
+                """,
+                (
+                    claim.run_id,
+                    claim.work_id,
+                    claim.attempt_id,
+                    claim.fencing_token,
+                ),
+            ).fetchone()
+            if attempt is None:
+                raise ClaimLostError(f"{ClaimLostError.code}: attempt_not_found")
+            current = connection.execute(
+                """
+                SELECT attempt_id, fencing_token, state
+                FROM executor_work_items
+                WHERE run_id = ? AND work_id = ?
+                """,
+                (claim.run_id, claim.work_id),
+            ).fetchone()
+            if (
+                current is not None
+                and str(current["state"]) == WorkState.RUNNING
+                and str(current["attempt_id"]) == claim.attempt_id
+                and str(current["fencing_token"]) == claim.fencing_token
+            ):
+                raise ClaimLostError(f"{ClaimLostError.code}: attempt_is_current")
+            now = self._clock()
+            result = self._append_event_locked(
+                connection,
+                claim.run_id,
+                event_key=f"attempt-rejected:{claim.attempt_id}:{claim.fencing_token}",
+                event_type="attempt_rejected",
+                work_id=claim.work_id,
+                attempt_id=claim.attempt_id,
+                fencing_token=claim.fencing_token,
+                payload={
+                    "attempt_state": str(attempt["state"]),
+                    "reason": error_code,
+                },
+                error_code=error_code,
+                created_at=now,
+            )
+            connection.execute(
+                "UPDATE executor_runs SET updated_at = ? WHERE run_id = ?",
+                (now, claim.run_id),
+            )
+            return result
+
+    reject_stale_attempt = record_stale_attempt
+    record_rejected_attempt = record_stale_attempt
+
+    def current_attempt(self, run_id: str, work_id: str) -> AttemptRecord | None:
+        run_id = _identifier(run_id, "run_id")
+        work_id = _identifier(work_id, "work_id")
+        with self.store._connect() as connection:
+            self._require_run(connection, run_id)
+            self._require_work(connection, run_id, work_id)
+            row = connection.execute(
+                """
+                SELECT * FROM executor_attempts
+                WHERE run_id = ? AND work_id = ? AND state = ?
+                ORDER BY attempt_number DESC
+                LIMIT 1
+                """,
+                (run_id, work_id, AttemptState.RUNNING),
+            ).fetchone()
+            return None if row is None else self._attempt_record(row)
+
+    def list_receipts(
+        self,
+        run_id: str,
+        work_id: str | None = None,
+    ) -> list[ReceiptRecord]:
+        run_id = _identifier(run_id, "run_id")
+        if work_id is not None:
+            work_id = _identifier(work_id, "work_id")
+        with self.store._connect() as connection:
+            self._require_run(connection, run_id)
+            if work_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM executor_receipts
+                    WHERE run_id = ?
+                    ORDER BY receipt_seq, receipt_id
+                    """,
+                    (run_id,),
+                ).fetchall()
+            else:
+                self._require_work(connection, run_id, work_id)
+                rows = connection.execute(
+                    """
+                    SELECT * FROM executor_receipts
+                    WHERE run_id = ? AND work_id = ?
+                    ORDER BY receipt_seq, receipt_id
+                    """,
+                    (run_id, work_id),
+                ).fetchall()
+            return [self._receipt_record(row) for row in rows]
+
+    receipts = list_receipts
+
+    def list_events(self, run_id: str) -> list[EventRecord]:
+        run_id = _identifier(run_id, "run_id")
+        with self.store._connect() as connection:
+            self._require_run(connection, run_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM executor_events
+                WHERE run_id = ?
+                ORDER BY event_seq, event_id
+                """,
+                (run_id,),
+            ).fetchall()
+            return [self._event_record(row) for row in rows]
+
+    events = list_events
+
+    def append_event(
+        self,
+        run_id: str,
+        *,
+        event_key: str,
+        event_type: str,
+        work_id: str | None = None,
+        attempt_id: str | None = None,
+        fencing_token: str | None = None,
+        payload: Any = None,
+        error_code: str | None = None,
+    ) -> EventRecord:
+        run_id = _identifier(run_id, "run_id")
+        if work_id is not None:
+            work_id = _identifier(work_id, "work_id")
+        if attempt_id is not None:
+            attempt_id = _identifier(attempt_id, "attempt_id")
+        if fencing_token is not None:
+            fencing_token = _identifier(fencing_token, "fencing_token")
+        if error_code is not None:
+            error_code = _identifier(error_code, "error_code")
+        with self.store._transaction() as connection:
+            self._require_run(connection, run_id)
+            if work_id is not None:
+                self._require_work(connection, run_id, work_id)
+            now = self._clock()
+            result = self._append_event_locked(
+                connection,
+                run_id,
+                event_key=event_key,
+                event_type=event_type,
+                work_id=work_id,
+                attempt_id=attempt_id,
+                fencing_token=fencing_token,
+                payload=payload,
+                error_code=error_code,
+                created_at=now,
+            )
+            connection.execute(
+                "UPDATE executor_runs SET updated_at = ? WHERE run_id = ?",
+                (now, run_id),
+            )
+            return result
+
+    record_event = append_event
+
+    def reclaim_expired(
+        self,
+        run_id: str | None = None,
+        *,
+        workflow: str | None = None,
+        now: float | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Fence and release every current attempt whose lease has expired.
+
+        Reclamation is one SQLite transaction: the old attempt is marked
+        expired, its work is returned to the pending frontier, its slot is
+        released, and the recovery event is appended together.  A later
+        claim therefore receives a different attempt and fencing token.
+        """
+
+        if run_id is not None:
+            run_id = _identifier(run_id, "run_id")
+        if workflow is not None:
+            workflow = _identifier(workflow, "workflow")
+        if run_id is None and workflow is None:
+            raise KernelError("reclaim_scope_required")
+        if run_id is not None and workflow is not None:
+            raise KernelError("reclaim_scope_ambiguous")
+        limit = _validate_limit(limit, MAX_WORK_ITEMS_PER_RUN)
+        recovery_now = self._clock() if now is None else _validate_seconds(
+            now,
+            "recovery_now",
+            minimum=-MAX_BACKOFF_SECONDS,
+            maximum=float("inf"),
+        )
+        expired_ids: list[str] = []
+        with self.store._transaction() as connection:
+            if run_id is not None:
+                self._require_run(connection, run_id)
+                scope_sql = "AND a.run_id = ?"
+                legacy_scope_sql = "AND w.run_id = ?"
+                scope_values: tuple[object, ...] = (run_id,)
+            else:
+                scope_sql = "AND r.workflow = ?"
+                legacy_scope_sql = "AND r.workflow = ?"
+                scope_values = (workflow,)
+            rows = connection.execute(
+                f"""
+                SELECT a.*, w.claim_id AS work_claim_id, w.state AS work_state,
+                       w.replica_slot AS work_replica_slot,
+                       w.agent_name AS work_agent_name
+                FROM executor_attempts a
+                JOIN executor_work_items w
+                  ON w.run_id = a.run_id AND w.work_id = a.work_id
+                JOIN executor_runs r ON r.run_id = a.run_id
+                WHERE a.state = ?
+                  AND a.lease_until <= ?
+                  AND w.state = ?
+                  AND w.attempt_id = a.attempt_id
+                  {scope_sql}
+                ORDER BY a.run_id, a.work_id, a.attempt_number, a.attempt_id
+                """,
+                (
+                    AttemptState.RUNNING,
+                    float(recovery_now),
+                    WorkState.RUNNING,
+                    *scope_values,
+                ),
+            ).fetchall()
+            selected = rows if limit is None else rows[:limit]
+            for row in selected:
+                attempt_id = str(row["attempt_id"])
+                selected_run_id = str(row["run_id"])
+                selected_work_id = str(row["work_id"])
+                now_value = float(recovery_now)
+                connection.execute(
+                    """
+                    UPDATE executor_attempts
+                    SET state = ?, error_code = ?, updated_at = ?,
+                        settled_at = ?
+                    WHERE attempt_id = ? AND state = ?
+                    """,
+                    (
+                        AttemptState.EXPIRED,
+                        "lease_expired",
+                        now_value,
+                        now_value,
+                        attempt_id,
+                        AttemptState.RUNNING,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE executor_work_items
+                    SET state = ?, claim_id = NULL, replica_slot = NULL,
+                        agent_name = NULL, attempt_id = NULL,
+                        fencing_token = NULL, lease_until = NULL,
+                        error_code = ?, available_at = ?, updated_at = ?
+                    WHERE run_id = ? AND work_id = ? AND state = ?
+                      AND attempt_id = ?
+                    """,
+                    (
+                        WorkState.PENDING,
+                        "lease_expired",
+                        now_value,
+                        now_value,
+                        selected_run_id,
+                        selected_work_id,
+                        WorkState.RUNNING,
+                        attempt_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE executor_replica_slots
+                    SET active_run_id = NULL, active_work_id = NULL,
+                        claim_id = NULL, agent_name = NULL, updated_at = ?
+                    WHERE active_run_id = ? AND active_work_id = ?
+                      AND claim_id = ?
+                    """,
+                    (
+                        now_value,
+                        selected_run_id,
+                        selected_work_id,
+                        str(row["claim_id"]),
+                    ),
+                )
+                self._append_event_locked(
+                    connection,
+                    selected_run_id,
+                    event_key=f"attempt-expired:{attempt_id}",
+                    event_type="attempt_expired",
+                    work_id=selected_work_id,
+                    attempt_id=attempt_id,
+                    fencing_token=str(row["fencing_token"]),
+                    payload={"reason": "lease_expired"},
+                    error_code="lease_expired",
+                    created_at=now_value,
+                )
+                connection.execute(
+                    "UPDATE executor_runs SET updated_at = ? WHERE run_id = ?",
+                    (now_value, selected_run_id),
+                )
+                expired_ids.append(attempt_id)
+            legacy_rows = connection.execute(
+                f"""
+                SELECT w.*, r.workflow
+                FROM executor_work_items w
+                JOIN executor_runs r ON r.run_id = w.run_id
+                WHERE w.state = ? AND w.claim_id IS NOT NULL
+                  AND w.attempt_id IS NULL
+                  {legacy_scope_sql}
+                ORDER BY w.run_id, w.work_id
+                """,
+                (
+                    WorkState.RUNNING,
+                    *scope_values,
+                ),
+            ).fetchall()
+            for row in legacy_rows[: (limit if limit is not None else len(legacy_rows))]:
+                selected_run_id = str(row["run_id"])
+                selected_work_id = str(row["work_id"])
+                now_value = float(recovery_now)
+                connection.execute(
+                    """
+                    UPDATE executor_work_items
+                    SET state = ?, claim_id = NULL, replica_slot = NULL,
+                        agent_name = NULL, error_code = ?,
+                        available_at = ?, updated_at = ?
+                    WHERE run_id = ? AND work_id = ? AND state = ?
+                      AND attempt_id IS NULL
+                    """,
+                    (
+                        WorkState.PENDING,
+                        "unfenced_claim_reclaimed",
+                        now_value,
+                        now_value,
+                        selected_run_id,
+                        selected_work_id,
+                        WorkState.RUNNING,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE executor_replica_slots
+                    SET active_run_id = NULL, active_work_id = NULL,
+                        claim_id = NULL, agent_name = NULL, updated_at = ?
+                    WHERE active_run_id = ? AND active_work_id = ?
+                    """,
+                    (now_value, selected_run_id, selected_work_id),
+                )
+                self._append_event_locked(
+                    connection,
+                    selected_run_id,
+                    event_key=f"unfenced-claim-reclaimed:{selected_work_id}",
+                    event_type="unfenced_claim_reclaimed",
+                    work_id=selected_work_id,
+                    attempt_id=None,
+                    fencing_token=None,
+                    payload={"reason": "claim_missing_fenced_attempt"},
+                    error_code="unfenced_claim_reclaimed",
+                    created_at=now_value,
+                )
+                connection.execute(
+                    "UPDATE executor_runs SET updated_at = ? WHERE run_id = ?",
+                    (now_value, selected_run_id),
+                )
+            for selected_run_id in sorted({str(row["run_id"]) for row in selected}):
+                self._refresh_readiness(connection, selected_run_id)
+            for selected_run_id in sorted(
+                {str(row["run_id"]) for row in legacy_rows}
+            ):
+                self._refresh_readiness(connection, selected_run_id)
+            trigger_after_reclaim = bool(expired_ids) and self._consume_failpoint(
+                "after_reclaim"
+            )
+        if trigger_after_reclaim:
+            raise FailpointError("after_reclaim")
+        return expired_ids
+
+    reclaim_expired_attempts = reclaim_expired
+    recover_expired = reclaim_expired
+
+    @staticmethod
+    def _append_event_locked(
+        connection: Any,
+        run_id: str,
+        *,
+        event_key: str,
+        event_type: str,
+        work_id: str | None,
+        attempt_id: str | None,
+        fencing_token: str | None,
+        payload: Any,
+        error_code: str | None,
+        created_at: float,
+    ) -> EventRecord:
+        event_key = _identifier(event_key, "event_key")
+        event_type = _identifier(event_type, "event_type")
+        payload_json = canonical_json(payload)
+        existing = connection.execute(
+            """
+            SELECT * FROM executor_events
+            WHERE run_id = ? AND event_key = ?
+            """,
+            (run_id, event_key),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["event_type"]) != event_type
+                or (
+                    None
+                    if existing["work_id"] is None
+                    else str(existing["work_id"])
+                )
+                != work_id
+                or (
+                    None
+                    if existing["attempt_id"] is None
+                    else str(existing["attempt_id"])
+                )
+                != attempt_id
+                or (
+                    None
+                    if existing["fencing_token"] is None
+                    else str(existing["fencing_token"])
+                )
+                != fencing_token
+                or str(existing["payload_json"]) != payload_json
+                or (
+                    None
+                    if existing["error_code"] is None
+                    else str(existing["error_code"])
+                )
+                != error_code
+            ):
+                raise KernelError("event_conflict")
+            return ExecutionKernel._event_record(existing)
+        row = connection.execute(
+            """
+            SELECT COALESCE(MAX(event_seq) + 1, 1) AS next_seq
+            FROM executor_events WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        sequence = int(row["next_seq"]) if row is not None else 1
+        event_id = f"event_{uuid.uuid4().hex}"
+        connection.execute(
+            """
+            INSERT INTO executor_events(
+                run_id, event_seq, event_id, event_key, event_type,
+                event_version, work_id, attempt_id, fencing_token, payload_json,
+                error_code, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                sequence,
+                event_id,
+                event_key,
+                event_type,
+                EVENT_CONTRACT_VERSION,
+                work_id,
+                attempt_id,
+                fencing_token,
+                payload_json,
+                error_code,
+                created_at,
+            ),
+        )
+        inserted = connection.execute(
+            """
+            SELECT * FROM executor_events
+            WHERE run_id = ? AND event_seq = ?
+            """,
+            (run_id, sequence),
+        ).fetchone()
+        if inserted is None:
+            raise KernelError("event_insert_failed")
+        return ExecutionKernel._event_record(inserted)
+
+    @staticmethod
+    def _append_receipt_locked(
+        connection: Any,
+        run_id: str,
+        *,
+        work_id: str,
+        attempt_id: str,
+        fencing_token: str,
+        kind: str,
+        outcome: str,
+        state: str,
+        payload_json: str,
+        error_code: str | None,
+        created_at: float,
+    ) -> ReceiptRecord:
+        existing = connection.execute(
+            """
+            SELECT * FROM executor_receipts
+            WHERE run_id = ? AND work_id = ? AND attempt_id = ? AND kind = ?
+            """,
+            (run_id, work_id, attempt_id, kind),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["fencing_token"]) != fencing_token
+                or str(existing["payload_json"]) != payload_json
+                or str(existing["state"]) != state
+                or str(existing["outcome"]) != outcome
+            ):
+                raise KernelError("receipt_conflict")
+            return ExecutionKernel._receipt_record(existing)
+        row = connection.execute(
+            """
+            SELECT COALESCE(MAX(receipt_seq) + 1, 1) AS next_seq
+            FROM executor_receipts WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        sequence = int(row["next_seq"]) if row is not None else 1
+        receipt_id = f"receipt_{uuid.uuid4().hex}"
+        connection.execute(
+            """
+            INSERT INTO executor_receipts(
+                run_id, receipt_seq, receipt_id, receipt_version, work_id, attempt_id,
+                fencing_token, kind, outcome, state, payload_json,
+                error_code, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                sequence,
+                receipt_id,
+                RECEIPT_CONTRACT_VERSION,
+                work_id,
+                attempt_id,
+                fencing_token,
+                kind,
+                outcome,
+                state,
+                payload_json,
+                error_code,
+                created_at,
+            ),
+        )
+        inserted = connection.execute(
+            """
+            SELECT * FROM executor_receipts
+            WHERE run_id = ? AND receipt_seq = ?
+            """,
+            (run_id, sequence),
+        ).fetchone()
+        if inserted is None:
+            raise KernelError("receipt_insert_failed")
+        return ExecutionKernel._receipt_record(inserted)
 
     def get_work_item(self, run_id: str, work_id: str) -> WorkItem:
         run_id = _identifier(run_id, "run_id")
@@ -1414,16 +2920,192 @@ class ExecutionKernel:
         barriers = self.list_barriers(run_id)
         dependencies = self.list_dependencies(run_id)
         slots = self.replica_slots(run.workflow)
+        attempts = self.list_attempts(run_id)
+        receipts = self.list_receipts(run_id)
+        events = self.list_events(run_id)
         return {
             **run.to_dict(),
+            "feature_versions": self.store.feature_versions(),
+            "attempt_schema_version": self.store.attempt_feature_version(),
+            "receipt_schema_version": self.store.receipt_feature_version(),
+            "receipt_contract_version": RECEIPT_CONTRACT_VERSION,
+            "event_contract_version": EVENT_CONTRACT_VERSION,
             "work_counts": self.work_state_counts(run_id),
             "work_items": [item.to_dict() for item in work],
             "dependencies": dependencies,
             "barriers": [barrier.to_dict() for barrier in barriers],
             "replica_slots": [slot.to_dict() for slot in slots],
+            "attempts": [attempt.to_dict() for attempt in attempts],
+            "receipts": [receipt.to_dict() for receipt in receipts],
+            "events": [event.to_dict() for event in events],
         }
 
     inspect = inspect_run
+
+    def transition_run(self, run_id: str, state: str) -> Any:
+        """Apply a small kernel-owned run control state machine."""
+
+        run_id = _identifier(run_id, "run_id")
+        state = _identifier(state, "run_state")
+        if state not in {
+            "pending",
+            "running",
+            "paused",
+            "succeeded",
+            "blocked",
+            "failed",
+            "cancelled",
+        }:
+            raise KernelError(f"run_state_invalid: {state}")
+        with self.store._transaction() as connection:
+            row = self._require_run(connection, run_id)
+            current = str(row["state"])
+            if current == state:
+                return self.store._record(row)
+            allowed = {
+                "pending": {"running", "paused", "cancelled", "blocked", "failed"},
+                "running": {"paused", "cancelled", "succeeded", "blocked", "failed"},
+                "paused": {"running", "cancelled", "failed"},
+                "succeeded": set(),
+                "blocked": set(),
+                "failed": set(),
+                "cancelled": set(),
+            }
+            if state not in allowed[current]:
+                raise KernelError(
+                    f"run_transition_invalid: {current}_to_{state}"
+                )
+            now = self._clock()
+            if state == "cancelled":
+                active = connection.execute(
+                    """
+                    SELECT * FROM executor_attempts
+                    WHERE run_id = ? AND state = ?
+                    ORDER BY work_id, attempt_number, attempt_id
+                    """,
+                    (run_id, AttemptState.RUNNING),
+                ).fetchall()
+                connection.execute(
+                    """
+                    UPDATE executor_attempts
+                    SET state = ?, error_code = ?, updated_at = ?,
+                        settled_at = ?
+                    WHERE run_id = ? AND state = ?
+                    """,
+                    (
+                        AttemptState.CANCELLED,
+                        "run_cancelled",
+                        now,
+                        now,
+                        run_id,
+                        AttemptState.RUNNING,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE executor_work_items
+                    SET state = ?, error_code = ?, claim_id = NULL,
+                        replica_slot = NULL, agent_name = NULL, attempt_id = NULL,
+                        fencing_token = NULL, lease_until = NULL, updated_at = ?
+                    WHERE run_id = ? AND state = ?
+                    """,
+                    (
+                        WorkState.FAILED,
+                        "run_cancelled",
+                        now,
+                        run_id,
+                        WorkState.RUNNING,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE executor_replica_slots
+                    SET active_run_id = NULL, active_work_id = NULL,
+                        claim_id = NULL, agent_name = NULL, updated_at = ?
+                    WHERE active_run_id = ?
+                    """,
+                    (now, run_id),
+                )
+                for attempt in active:
+                    self._append_event_locked(
+                        connection,
+                        run_id,
+                        event_key=f"attempt-cancelled:{attempt['attempt_id']}",
+                        event_type="attempt_cancelled",
+                        work_id=str(attempt["work_id"]),
+                        attempt_id=str(attempt["attempt_id"]),
+                        fencing_token=str(attempt["fencing_token"]),
+                        payload={"reason": "run_cancelled"},
+                        error_code="run_cancelled",
+                        created_at=now,
+                    )
+            connection.execute(
+                """
+                UPDATE executor_runs SET state = ?, updated_at = ?
+                WHERE run_id = ? AND state = ?
+                """,
+                (state, now, run_id, current),
+            )
+            self._append_event_locked(
+                connection,
+                run_id,
+                event_key=f"run-state:{state}",
+                event_type=f"run_{state}",
+                work_id=None,
+                attempt_id=None,
+                fencing_token=None,
+                payload={"from": current, "to": state},
+                error_code=None,
+                created_at=now,
+            )
+            updated = connection.execute(
+                "SELECT * FROM executor_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if updated is None:
+                raise RunNotFoundError(f"{RunNotFoundError.code}: {run_id}")
+            result = self.store._record(updated)
+            trigger_after_phase = self._consume_failpoint("after_phase_transition")
+        if trigger_after_phase:
+            raise FailpointError("after_phase_transition")
+        return result
+
+    set_run_state = transition_run
+
+    def pause_run(self, run_id: str) -> Any:
+        return self.transition_run(run_id, "paused")
+
+    def resume_run(self, run_id: str) -> Any:
+        return self.transition_run(run_id, "running")
+
+    def cancel_run(self, run_id: str) -> Any:
+        return self.transition_run(run_id, "cancelled")
+
+    def reconcile(
+        self,
+        run_id: str,
+        *,
+        now: float | None = None,
+    ) -> dict[str, object]:
+        """Run the bounded common recovery prelude for one run."""
+
+        run_id = _identifier(run_id, "run_id")
+        before = len(self.list_events(run_id))
+        reclaimed = self.reclaim_expired(run_id, now=now)
+        after_events = self.list_events(run_id)
+        return {
+            "schema_version": 2,
+            "run_id": run_id,
+            "reclaimed_attempt_ids": reclaimed,
+            "events_added": len(after_events) - before,
+            "state": self.store.require_run(run_id).state,
+            "bound": {
+                "max_attempts": self.max_attempts,
+                "max_reclaims": MAX_WORK_ITEMS_PER_RUN,
+            },
+        }
+
+    recover = reconcile
 
     def register_replica_capacity(
         self,
@@ -1483,6 +3165,7 @@ class ExecutionKernel:
             workflow = _identifier(workflow, "workflow")
         limit = _validate_limit(limit, self.max_parallel)
         requested_limit = self.max_parallel if limit is None else limit
+        trigger_after_claim = False
         with self.store._transaction() as connection:
             if run_id is not None:
                 run = self._require_run(connection, run_id)
@@ -1596,12 +3279,34 @@ class ExecutionKernel:
                 if slot is None:
                     continue
                 claim_id = f"claim_{uuid.uuid4().hex}"
+                attempt_number = int(row["attempt_number"]) + 1
+                if attempt_number > self.max_attempts:
+                    connection.execute(
+                        """
+                        UPDATE executor_work_items
+                        SET state = ?, error_code = ?, updated_at = ?
+                        WHERE run_id = ? AND work_id = ? AND state = ?
+                        """,
+                        (
+                            WorkState.FAILED,
+                            "max_attempts_exhausted",
+                            now,
+                            candidate_run_id,
+                            candidate_work_id,
+                            WorkState.PENDING,
+                        ),
+                    )
+                    self._refresh_readiness(connection, candidate_run_id)
+                    continue
+                attempt_id = f"attempt_{uuid.uuid4().hex}"
+                fencing_token = f"fence_{uuid.uuid4().hex}"
                 agent_name = slot
                 updated = connection.execute(
                     """
                     UPDATE executor_work_items
                     SET state = ?, claim_id = ?, replica_slot = ?, agent_name = ?,
-                        error_code = NULL, updated_at = ?
+                        error_code = NULL, attempt_id = ?, attempt_number = ?,
+                        fencing_token = ?, lease_until = ?, updated_at = ?
                     WHERE run_id = ? AND work_id = ? AND state = ?
                     """,
                     (
@@ -1609,6 +3314,10 @@ class ExecutionKernel:
                         claim_id,
                         slot,
                         agent_name,
+                        attempt_id,
+                        attempt_number,
+                        fencing_token,
+                        now + self.lease_seconds,
                         now,
                         candidate_run_id,
                         candidate_work_id,
@@ -1617,6 +3326,31 @@ class ExecutionKernel:
                 )
                 if updated.rowcount != 1:
                     continue
+                connection.execute(
+                    """
+                    INSERT INTO executor_attempts(
+                        attempt_id, run_id, work_id, attempt_number, claim_id,
+                        fencing_token, state, lease_started, lease_until,
+                        replica_slot, agent_name, error_code, retry_at,
+                        created_at, updated_at, settled_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL)
+                    """,
+                    (
+                        attempt_id,
+                        candidate_run_id,
+                        candidate_work_id,
+                        attempt_number,
+                        claim_id,
+                        fencing_token,
+                        AttemptState.RUNNING,
+                        now,
+                        now + self.lease_seconds,
+                        slot,
+                        agent_name,
+                        now,
+                        now,
+                    ),
+                )
                 slot_updated = connection.execute(
                     """
                     UPDATE executor_replica_slots
@@ -1662,6 +3396,23 @@ class ExecutionKernel:
                     """,
                     (now, candidate_run_id),
                 )
+                self._append_event_locked(
+                    connection,
+                    candidate_run_id,
+                    event_key=f"attempt-claimed:{attempt_id}",
+                    event_type="attempt_claimed",
+                    work_id=candidate_work_id,
+                    attempt_id=attempt_id,
+                    fencing_token=fencing_token,
+                    payload={
+                        "attempt_number": attempt_number,
+                        "lease_until": now + self.lease_seconds,
+                        "replica_slot": slot,
+                        "agent_name": agent_name,
+                    },
+                    error_code=None,
+                    created_at=now,
+                )
                 used.add(slot)
                 claims.append(
                     ClaimedWork(
@@ -1676,9 +3427,16 @@ class ExecutionKernel:
                         replica_slot=slot,
                         agent_name=agent_name,
                         claimed_at=now,
+                        attempt_id=attempt_id,
+                        attempt_number=attempt_number,
+                        fencing_token=fencing_token,
+                        lease_until=now + self.lease_seconds,
                     )
                 )
-            return claims
+            trigger_after_claim = bool(claims) and self._consume_failpoint("after_claim")
+        if trigger_after_claim:
+            raise FailpointError("after_claim")
+        return claims
 
     def _refresh_readiness(self, connection: Any, run_id: str) -> None:
         """Propagate terminal dependency/barrier outcomes to a fixed point."""
@@ -1837,6 +3595,26 @@ class ExecutionKernel:
             for item in (*dependency_states, *barrier_states)
         )
 
+    def _ready_work_ids_locked(
+        self,
+        connection: Any,
+        run_id: str,
+        now: float,
+    ) -> set[str]:
+        rows = connection.execute(
+            """
+            SELECT work_id FROM executor_work_items
+            WHERE run_id = ? AND state = ? AND available_at <= ?
+            ORDER BY ordinal, created_at, work_id
+            """,
+            (run_id, WorkState.PENDING, now),
+        ).fetchall()
+        return {
+            str(row["work_id"])
+            for row in rows
+            if self._is_ready(connection, run_id, str(row["work_id"]))
+        }
+
     def _work_record(
         self,
         connection: Any,
@@ -1899,6 +3677,79 @@ class ExecutionKernel:
             dependencies=dependencies,
             barriers=barriers,
             ready=bool(ready),
+            attempt_id=(
+                None if row["attempt_id"] is None else str(row["attempt_id"])
+            ),
+            attempt_number=int(row["attempt_number"]),
+            fencing_token=(
+                None
+                if row["fencing_token"] is None
+                else str(row["fencing_token"])
+            ),
+            lease_until=(
+                None if row["lease_until"] is None else float(row["lease_until"])
+            ),
+            retry_count=int(row["retry_count"]),
+        )
+
+    @staticmethod
+    def _attempt_record(row: Any) -> AttemptRecord:
+        return AttemptRecord(
+            run_id=str(row["run_id"]),
+            work_id=str(row["work_id"]),
+            attempt_id=str(row["attempt_id"]),
+            attempt_number=int(row["attempt_number"]),
+            claim_id=str(row["claim_id"]),
+            fencing_token=str(row["fencing_token"]),
+            state=str(row["state"]),
+            lease_started=float(row["lease_started"]),
+            lease_until=float(row["lease_until"]),
+            replica_slot=(
+                None if row["replica_slot"] is None else str(row["replica_slot"])
+            ),
+            agent_name=None if row["agent_name"] is None else str(row["agent_name"]),
+            error_code=None if row["error_code"] is None else str(row["error_code"]),
+            retry_at=None if row["retry_at"] is None else float(row["retry_at"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+            settled_at=None if row["settled_at"] is None else float(row["settled_at"]),
+        )
+
+    @staticmethod
+    def _event_record(row: Any) -> EventRecord:
+        return EventRecord(
+            run_id=str(row["run_id"]),
+            event_seq=int(row["event_seq"]),
+            event_id=str(row["event_id"]),
+            event_key=str(row["event_key"]),
+            event_type=str(row["event_type"]),
+            event_version=int(row["event_version"]),
+            work_id=None if row["work_id"] is None else str(row["work_id"]),
+            attempt_id=None if row["attempt_id"] is None else str(row["attempt_id"]),
+            fencing_token=(
+                None if row["fencing_token"] is None else str(row["fencing_token"])
+            ),
+            payload=json.loads(str(row["payload_json"])),
+            error_code=None if row["error_code"] is None else str(row["error_code"]),
+            created_at=float(row["created_at"]),
+        )
+
+    @staticmethod
+    def _receipt_record(row: Any) -> ReceiptRecord:
+        return ReceiptRecord(
+            run_id=str(row["run_id"]),
+            receipt_seq=int(row["receipt_seq"]),
+            receipt_id=str(row["receipt_id"]),
+            receipt_version=int(row["receipt_version"]),
+            work_id=str(row["work_id"]),
+            attempt_id=str(row["attempt_id"]),
+            fencing_token=str(row["fencing_token"]),
+            kind=str(row["kind"]),
+            outcome=str(row["outcome"]),
+            state=str(row["state"]),
+            payload=json.loads(str(row["payload_json"])),
+            error_code=None if row["error_code"] is None else str(row["error_code"]),
+            created_at=float(row["created_at"]),
         )
 
     def _barrier_record(self, connection: Any, row: Any) -> BarrierRecord:
@@ -2432,6 +4283,40 @@ def _validate_limit(value: int | None, maximum: int) -> int | None:
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
         raise KernelError(f"claim_limit_must_be_integer_1_{maximum}")
     return value
+
+
+def _validate_seconds(
+    value: float,
+    field: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < minimum
+        or float(value) > maximum
+    ):
+        raise KernelError(f"{field}_out_of_range")
+    return float(value)
+
+
+def _normalize_failpoint(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in FAILPOINTS:
+        allowed = ",".join(sorted(FAILPOINTS))
+        raise KernelError(f"failpoint_invalid: allowed={allowed}")
+    return value
+
+
+def _attempt_state_for_work_state(state: str) -> AttemptState:
+    try:
+        return AttemptState(state)
+    except ValueError as exc:
+        raise KernelError(f"attempt_state_invalid: {state}") from exc
 
 
 def _validate_capacity_mapping(
