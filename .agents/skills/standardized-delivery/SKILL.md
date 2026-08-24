@@ -1,6 +1,6 @@
 ---
 name: standardized-delivery
-description: Run the opt-in principal-proxy engineering pipeline only when the user explicitly invokes /standardized-delivery, /matt-workflow, or /wayfinder-delivery, or uses one of these exact phrases as a requested workflow: “标准化交付”, “完整工程流程”, “Matt workflow”, “Pocock workflow”, “Wayfinder 全流程”, “自主交付”. Ordinary coding requests never trigger it.
+description: "Run the opt-in principal-proxy engineering pipeline only when the user explicitly invokes /standardized-delivery, /matt-workflow, or /wayfinder-delivery, or uses one of these exact phrases as a requested workflow: “标准化交付”, “完整工程流程”, “Matt workflow”, “Pocock workflow”, “Wayfinder 全流程”, “自主交付”. Ordinary coding requests never trigger it."
 ---
 
 # Standardized Delivery

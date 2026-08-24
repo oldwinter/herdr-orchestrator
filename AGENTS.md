@@ -60,6 +60,9 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - `.orchestrator/`：本机 runtime state，禁止提交
 - `tests/`：行为契约
 - `justfile`：稳定命令入口
+- `skills/herdr-orchestrator/`：`npx skills` 分发的通用 orchestrator Skill
+- `bin/herdr-orchestrator.mjs`：npm 安装、诊断、升级、卸载和 runtime 包装入口
+- `package.json`：`herdr-orchestrator` npm 分发清单
 
 ## 安全边界
 

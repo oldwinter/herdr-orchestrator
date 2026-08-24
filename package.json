@@ -1,0 +1,47 @@
+{
+  "name": "herdr-orchestrator",
+  "version": "0.1.0",
+  "description": "Install and run durable multi-harness orchestration over Herdr",
+  "keywords": [
+    "agents",
+    "herdr",
+    "orchestration",
+    "codex",
+    "claude",
+    "droid"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "herdr-orchestrator": "bin/herdr-orchestrator.mjs"
+  },
+  "files": [
+    "bin/",
+    "profiles/",
+    "skills/",
+    "src/herdr_orchestrator/**/*.py",
+    "src/herdr_orchestrator/dashboard/static/*.html",
+    "src/herdr_orchestrator/dashboard/static/*.css",
+    "src/herdr_orchestrator/dashboard/static/*.js",
+    "workflows/prompts/planner.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "python3 -m unittest tests.test_distribution -v"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oldwinter/herdr-orchestrator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/oldwinter/herdr-orchestrator/issues"
+  },
+  "homepage": "https://github.com/oldwinter/herdr-orchestrator#readme"
+}

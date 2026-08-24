@@ -8,6 +8,18 @@ SKILLS = REPO_ROOT / ".agents/skills"
 
 
 class StandardizedDeliverySkillTests(unittest.TestCase):
+    def test_portable_skill_uses_the_npm_runtime(self) -> None:
+        skill = (REPO_ROOT / "skills/herdr-orchestrator/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        frontmatter = skill.split("---", 2)[1]
+
+        self.assertIn("name: herdr-orchestrator", frontmatter)
+        self.assertIn("npx --yes herdr-orchestrator install --project .", skill)
+        self.assertIn("npx --yes herdr-orchestrator doctor --project .", skill)
+        self.assertNotIn("PYTHONPATH=src", skill)
+        self.assertNotIn("workflows/multi-harness.toml", skill)
+
     def test_canonical_skill_has_only_exact_opt_in_keyword_triggers(self) -> None:
         skill = (SKILLS / "standardized-delivery/SKILL.md").read_text(
             encoding="utf-8"

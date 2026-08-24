@@ -56,9 +56,45 @@ Droid · Grok Build · Codex · pi · Claude Code · Hermes
 - Python 3.12+
 - Herdr 0.8.2+，并且从 Herdr pane 内运行（`HERDR_ENV=1`）
 - 至少一个已登录的 harness CLI
-- `just`
+- Node.js 20+（仅一键安装与 `npx` 包装需要）
+- `just`（仅源码 checkout 开发需要）
 
-## 快速开始
+## 一键安装到其他仓库
+
+Skill 和 runtime 是两个互补入口。Skill 让 coding agent 知道何时、如何使用；npm CLI
+负责确定性安装 Python runtime、workflow 和 harness profiles。
+
+```bash
+# 安装 agent Skill，可用 -g 改为用户级安装
+npx skills add oldwinter/herdr-orchestrator \
+  --skill herdr-orchestrator --agent '*' -y
+
+# 在目标 Git 仓库安装 runtime 与默认 workflow
+cd /path/to/target-repository
+npx --yes herdr-orchestrator install --project .
+npx --yes herdr-orchestrator doctor --project .
+```
+
+安装器默认检测本机可执行的 harness。也可显式固定：
+
+```bash
+npx --yes herdr-orchestrator install --project . \
+  --harness droid --harness codex
+```
+
+它只管理 `.herdr-orchestrator/`、`.agents/skills/herdr-orchestrator/` 和
+`.orchestrator/.gitignore` 中 manifest 记录的文件。重复安装或升级不会覆盖用户修改；
+卸载也只删除 hash 未变化的托管文件。若 Skill 已由 `npx skills` 安装，npm installer
+会复用但不会接管它。
+
+```bash
+npx --yes herdr-orchestrator upgrade --project .
+npx --yes herdr-orchestrator uninstall --project .
+```
+
+完整安装契约见 [`docs/installation.md`](docs/installation.md)。
+
+## 源码 checkout 快速开始
 
 ```bash
 just doctor
