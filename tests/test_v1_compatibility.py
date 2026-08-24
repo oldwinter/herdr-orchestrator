@@ -125,7 +125,9 @@ class V1CompatibilityTests(unittest.TestCase):
             self.assertEqual(smoke_exit, 0)
             smoke_payload = json.loads(smoke_output.getvalue())
             self.assertEqual(smoke_payload["failures"], [])
-            self.assertEqual(smoke_payload["results"], [{"harness": "droid", "state": "done"}])
+            self.assertEqual(len(smoke_payload["results"]), 1)
+            self.assertEqual(smoke_payload["results"][0]["harness"], "droid")
+            self.assertEqual(smoke_payload["results"][0]["state"], "done")
 
     def test_same_harness_replicas_preserve_slots_leases_and_single_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -369,6 +371,10 @@ class _SettledSmokeTransport:
             AgentState.DONE,
             False,
             f"pane:{harness.value}",
+            prompt_accepted=True,
+            baseline_state_change_seq=1,
+            final_state_change_seq=2,
+            dispatch_attempted=True,
         )
 
     def close_created_agent(self, name: str) -> None:

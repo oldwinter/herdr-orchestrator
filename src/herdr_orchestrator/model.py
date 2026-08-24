@@ -112,6 +112,10 @@ class DispatchOutcome:
     member_reused: bool
     pane_id: str | None
     error_code: str | None = None
+    prompt_accepted: bool | None = None
+    baseline_state_change_seq: int | None = None
+    final_state_change_seq: int | None = None
+    dispatch_attempted: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -63,7 +63,11 @@ class HerdrTransport:
             self.check_environment()
             with self._provision_lock:
                 pane_id, reused = self._ensure_agent(name, harness)
-            state = self._prompt(name, prompt, timeout_seconds)
+            (
+                state,
+                baseline_state_change_seq,
+                final_state_change_seq,
+            ) = self._prompt(name, prompt, timeout_seconds)
         except TransportError as exc:
             return DispatchOutcome(
                 agent_name=name,
@@ -71,8 +75,19 @@ class HerdrTransport:
                 member_reused=name not in self._created_panes,
                 pane_id=self._created_panes.get(name),
                 error_code=exc.code,
+                prompt_accepted=False,
+                dispatch_attempted=True,
             )
-        return DispatchOutcome(name, state, reused, pane_id)
+        return DispatchOutcome(
+            name,
+            state,
+            reused,
+            pane_id,
+            prompt_accepted=True,
+            baseline_state_change_seq=baseline_state_change_seq,
+            final_state_change_seq=final_state_change_seq,
+            dispatch_attempted=True,
+        )
 
     def read_agent(self, name: str, *, lines: int = 120) -> str:
         return run_text(
@@ -92,6 +107,11 @@ class HerdrTransport:
                 CONTROL_TIMEOUT_SECONDS,
             ),
         )
+
+    @property
+    def created_agent_names(self) -> tuple[str, ...]:
+        """Return only agents provisioned by this transport instance."""
+        return tuple(self._created_panes)
 
     def close_created_agent(self, name: str) -> None:
         self._created_panes.pop(name, None)
@@ -233,7 +253,12 @@ class HerdrTransport:
                 raise
         raise TransportError("agent_start_failed")
 
-    def _prompt(self, name: str, prompt: str, timeout_seconds: int) -> AgentState:
+    def _prompt(
+        self,
+        name: str,
+        prompt: str,
+        timeout_seconds: int,
+    ) -> tuple[AgentState, int, int]:
         before = _agent_payload(
             run_json(
                 self.runner,
@@ -286,7 +311,7 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                return stalled_state
+                return stalled_state, baseline_sequence, stalled_sequence
             if stalled_sequence == baseline_sequence and stalled_state is AgentState.IDLE:
                 run_json(
                     self.runner,
@@ -303,7 +328,7 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                return state
+                return state, baseline_sequence, _state_change_sequence(prompted)
             raise TransportError("agent_not_settled")
 
         while True:
@@ -326,7 +351,7 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                return state
+                return state, baseline_sequence, sequence
             time.sleep(0.5)
 
     def _close_failed_tab(self, tab_id: str, cause: TransportError) -> None:

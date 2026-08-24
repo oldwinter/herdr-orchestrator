@@ -23,7 +23,7 @@ from herdr_orchestrator.executor_kernel import (
     ExecutionKernel,
     KernelError,
 )
-from herdr_orchestrator.executor_protocol import MANIFEST_DIGEST_FIELDS
+from herdr_orchestrator.executor_protocol import MANIFEST_DIGEST_FIELDS, definition_digest
 from herdr_orchestrator.executor_store import (
     ExecutorStore,
     ExecutorStoreError,
@@ -982,50 +982,291 @@ def smoke(
     *,
     selected_harnesses: list[str] | None = None,
 ) -> int:
+    requested = _requested_smoke_harnesses(workflow, selected_harnesses)
+    enabled = {worker.harness.value for worker in workflow.workers}
+    absent = [harness for harness in requested if harness not in enabled]
+    if absent:
+        reason = f"harness_not_enabled:{','.join(absent)}"
+        failure_rows = [
+            {
+                "harness": harness,
+                "error": "harness_not_enabled",
+            }
+            for harness in absent
+        ]
+        _print_smoke_payload(
+            failures=failure_rows,
+            results=[],
+            success=False,
+            code="harness_not_enabled",
+            reason=reason,
+            workflow=_smoke_workflow_summary(workflow),
+            selected_harnesses=requested,
+            dispatched_harnesses=[],
+        )
+        return 1
+
     transport = HerdrTransport(workflow.name, workflow.workspace)
-    failures: list[dict[str, str]] = []
-    results: list[dict[str, str]] = []
+    failures: list[dict[str, object]] = []
+    results: list[dict[str, object]] = []
     created_names: list[str] = []
-    selected = set(selected_harnesses or ())
+    dispatched_harnesses: list[str] = []
+    selected = set(requested)
     workers = [
         worker
         for worker in workflow.workers
-        if not selected or worker.harness.value in selected
+        if worker.harness.value in selected
     ]
     try:
         for worker in workers:
             harness = worker.harness
+            metadata = _smoke_probe_metadata(workflow, harness)
+            metadata_json = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            prompt_metadata_digest = _smoke_metadata_digest(metadata)
             prompt = (
-                "这是只读连通性测试。必须使用本地只读工具检查 pyproject.toml 和 "
-                "workflows/multi-harness.toml；不得修改或创建文件，不得联网，不得执行任何"
-                "外部动作。完成后简短回复 project.name、schema_version 和 workers 数量。"
+                "This is a read-only workflow lifecycle probe. Do not modify or create "
+                "files, access the network, or perform external actions. Use only the "
+                "canonical supplied workflow identified in the following metadata, and "
+                "briefly acknowledge the metadata after the turn settles.\n"
+                f"probe_metadata={metadata_json}\n"
+                f"prompt_metadata_digest={prompt_metadata_digest}"
             )
             name = smoke_agent_name(workflow.name, harness)
-            outcome = transport.dispatch(
-                harness,
-                prompt,
-                timeout_seconds=workflow.coordinator.agent_timeout_seconds,
-                agent_name=name,
-            )
-            if not outcome.member_reused:
-                created_names.append(name)
-            if outcome.error_code is not None or outcome.state not in {
-                AgentState.IDLE,
-                AgentState.DONE,
-            }:
+            dispatched_harnesses.append(harness.value)
+            try:
+                outcome = transport.dispatch(
+                    harness,
+                    prompt,
+                    timeout_seconds=workflow.coordinator.agent_timeout_seconds,
+                    agent_name=name,
+                )
+            except Exception as exc:
                 failures.append(
-                    {
-                        "harness": harness.value,
-                        "error": outcome.error_code or outcome.state.value,
-                    }
+                    _smoke_failure(
+                        harness,
+                        metadata,
+                        prompt_metadata_digest,
+                        name,
+                        error=f"dispatch_{type(exc).__name__.lower()}",
+                    )
                 )
                 continue
-            results.append({"harness": harness.value, "state": outcome.state.value})
+            if not outcome.member_reused and outcome.agent_name == name:
+                if name not in created_names:
+                    created_names.append(name)
+            probe = _smoke_probe_result(
+                harness,
+                name,
+                metadata,
+                prompt_metadata_digest,
+                outcome,
+            )
+            if probe["error"] is not None:
+                failures.append(probe)
+            else:
+                probe.pop("error")
+                probe.pop("reason")
+                results.append(probe)
     finally:
-        for name in reversed(created_names):
+        owned_names = list(created_names)
+        transport_owned_names = getattr(transport, "created_agent_names", ())
+        if isinstance(transport_owned_names, (list, tuple, set, frozenset)):
+            names = transport_owned_names
+        else:
+            names = ()
+        for name in names:
+            if name not in owned_names:
+                owned_names.append(name)
+        for name in reversed(owned_names):
             try:
                 transport.close_created_agent(name)
             except Exception as exc:
-                failures.append({"harness": name, "error": f"cleanup:{type(exc).__name__}"})
-    print(json.dumps({"failures": failures, "results": results}, indent=2, sort_keys=True))
-    return 0 if not failures and len(results) == len(workers) else 1
+                failures.append(
+                    {
+                        "harness": name,
+                        "error": f"cleanup:{type(exc).__name__.lower()}",
+                        "reason": "validation_owned_resource_cleanup_failed",
+                    }
+                )
+    success = not failures and len(results) == len(workers)
+    _print_smoke_payload(
+        failures=failures,
+        results=results,
+        success=success,
+        code=None if success else "smoke_failed",
+        reason=None if success else "one_or_more_probes_failed",
+        workflow=_smoke_workflow_summary(workflow),
+        selected_harnesses=requested,
+        dispatched_harnesses=dispatched_harnesses,
+    )
+    return 0 if success else 1
+
+
+def _requested_smoke_harnesses(
+    workflow: WorkflowConfig,
+    selected_harnesses: list[str] | None,
+) -> list[str]:
+    if not selected_harnesses:
+        return [worker.harness.value for worker in workflow.workers]
+    # Keep the first occurrence so repeated --harness arguments cannot create
+    # multiple probes for one enabled harness.
+    return list(dict.fromkeys(selected_harnesses))
+
+
+def _smoke_probe_metadata(
+    workflow: WorkflowConfig,
+    harness: Harness,
+) -> dict[str, object]:
+    return {
+        **_smoke_workflow_summary(workflow),
+        "selected_harness": harness.value,
+    }
+
+
+def _smoke_workflow_summary(workflow: WorkflowConfig) -> dict[str, object]:
+    return {
+        "workflow_path": str(workflow.path.resolve()),
+        "workflow_name": workflow.name,
+        "schema_version": workflow.schema_version,
+        "worker_count": len(workflow.workers),
+        "total_replica_capacity": sum(worker.replicas for worker in workflow.workers),
+    }
+
+
+def _smoke_metadata_digest(metadata: dict[str, object]) -> str:
+    return definition_digest(metadata)
+
+
+def _smoke_probe_result(
+    harness: Harness,
+    requested_name: str,
+    metadata: dict[str, object],
+    prompt_metadata_digest: str,
+    outcome: object,
+) -> dict[str, object]:
+    state = getattr(outcome, "state", AgentState.UNKNOWN)
+    state_value = state.value if isinstance(state, AgentState) else str(state)
+    agent_name = getattr(outcome, "agent_name", None)
+    pane_id = getattr(outcome, "pane_id", None)
+    prompt_accepted = getattr(outcome, "prompt_accepted", None)
+    dispatch_attempted = getattr(outcome, "dispatch_attempted", None)
+    member_reused = getattr(outcome, "member_reused", None)
+    baseline_sequence = getattr(outcome, "baseline_state_change_seq", None)
+    final_sequence = getattr(outcome, "final_state_change_seq", None)
+    error_code = getattr(outcome, "error_code", None)
+
+    if dispatch_attempted is not True:
+        error = "dispatch_not_confirmed"
+    elif not isinstance(member_reused, bool):
+        error = "resource_ownership_unverified"
+    elif agent_name != requested_name:
+        error = "agent_identity_mismatch"
+    elif error_code is not None:
+        error = str(error_code)
+    elif prompt_accepted is not True:
+        error = "prompt_not_accepted"
+    elif state not in {AgentState.IDLE, AgentState.DONE}:
+        error = state_value
+    elif not isinstance(pane_id, str) or not pane_id:
+        error = "pane_identity_missing"
+    elif not (
+        isinstance(baseline_sequence, int)
+        and not isinstance(baseline_sequence, bool)
+        and isinstance(final_sequence, int)
+        and not isinstance(final_sequence, bool)
+    ):
+        error = "lifecycle_sequence_unverified"
+    elif (
+        isinstance(baseline_sequence, int)
+        and isinstance(final_sequence, int)
+        and final_sequence <= baseline_sequence
+    ):
+        error = "lifecycle_unchanged"
+    else:
+        error = None
+
+    lifecycle_advanced = (
+        final_sequence > baseline_sequence
+        if isinstance(baseline_sequence, int) and isinstance(final_sequence, int)
+        else error is None
+    )
+    result: dict[str, object] = {
+        **metadata,
+        "harness": harness.value,
+        "agent_name": agent_name,
+        "pane_id": pane_id,
+        "state": state_value if error is None else None,
+        "settled_state": state_value if state in {AgentState.IDLE, AgentState.DONE} else None,
+        "prompt_accepted": prompt_accepted if prompt_accepted is not None else error is None,
+        "dispatch_attempted": dispatch_attempted if dispatch_attempted is not None else True,
+        "member_reused": member_reused,
+        "created_by_validation": member_reused is False,
+        "baseline_state_change_seq": baseline_sequence,
+        "final_state_change_seq": final_sequence,
+        "lifecycle_sequence_advanced": lifecycle_advanced,
+        "prompt_metadata": metadata,
+        "prompt_metadata_digest": prompt_metadata_digest,
+        "error": error,
+        "reason": error,
+    }
+    return result
+
+
+def _smoke_failure(
+    harness: Harness,
+    metadata: dict[str, object],
+    prompt_metadata_digest: str,
+    agent_name: str,
+    *,
+    error: str,
+) -> dict[str, object]:
+    return {
+        **metadata,
+        "harness": harness.value,
+        "agent_name": agent_name,
+        "pane_id": None,
+        "state": None,
+        "settled_state": None,
+        "prompt_accepted": False,
+        "dispatch_attempted": True,
+        "member_reused": None,
+        "created_by_validation": False,
+        "baseline_state_change_seq": None,
+        "final_state_change_seq": None,
+        "lifecycle_sequence_advanced": False,
+        "prompt_metadata": metadata,
+        "prompt_metadata_digest": prompt_metadata_digest,
+        "error": error,
+        "reason": error,
+    }
+
+
+def _print_smoke_payload(
+    *,
+    failures: list[dict[str, object]],
+    results: list[dict[str, object]],
+    success: bool,
+    code: str | None,
+    reason: str | None,
+    workflow: dict[str, object],
+    selected_harnesses: list[str],
+    dispatched_harnesses: list[str],
+) -> None:
+    payload: dict[str, object] = {
+        "failures": failures,
+        "results": results,
+        "success": success,
+        "workflow": workflow,
+        "selected_harnesses": selected_harnesses,
+        "dispatched_harnesses": dispatched_harnesses,
+    }
+    if code is not None:
+        payload["code"] = code
+    if reason is not None:
+        payload["reason"] = reason
+    print(json.dumps(payload, indent=2, sort_keys=True))

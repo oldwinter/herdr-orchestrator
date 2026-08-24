@@ -45,9 +45,12 @@ just run
 just status
 ```
 
-## 五 harness 真实只读 smoke
+## Workflow-aware harness smoke
 
-下面的命令会依次启动或复用五种 harness，要求它们只读检查两个本地配置文件，并验证五个 agent 都经历真实 turn 后回到 settled state：
+下面的命令会依次启动或复用当前 workflow 启用的 harness，并验证每个 agent
+都经历真实 turn 后回到 settled state。每个 probe 的 JSON 结果包含所选
+workflow 的 canonical path/name/schema version、worker 数量、replica 总容量、
+agent/pane identity 和 lifecycle sequence；probe 不会硬编码另一个 workflow：
 
 ```bash
 just smoke
@@ -56,7 +59,10 @@ just smoke
 just smoke --harness pi --harness claude
 ```
 
-smoke 不把终端文本当完整 transcript，因为 full-screen agent 的历史可能不进入 Herdr scrollback。验证依据是 agent 成功启动、prompt 被接受并经过 lifecycle change 后返回 `idle` 或 `done`。临时 pane 会在成功或失败后关闭；已存在并被安全复用的 agent 不会被关闭。
+smoke 不把终端文本当完整 transcript，因为 full-screen agent 的历史可能不进入
+Herdr scrollback。验证依据是 agent 成功启动、prompt 被接受并经过 lifecycle
+change 后返回 `idle` 或 `done`。请求 workflow 未启用的 harness 会在 dispatch
+前失败；临时 pane 会在成功或失败后关闭，已存在并被安全复用的 agent 不会被关闭。
 
 ## 添加一个任务
 
