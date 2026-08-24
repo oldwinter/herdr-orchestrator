@@ -38,6 +38,8 @@ class Coordinator:
         store: Store | None = None,
         dispatcher: Dispatcher | None = None,
     ) -> None:
+        if config.schema_version != 1:
+            raise ValueError("schema_mismatch: legacy_coordinator_requires_schema_v1")
         self.config = config
         self.store = store or Store(config.state_db)
         self.dispatcher = dispatcher or HerdrTransport(config.name, config.workspace)

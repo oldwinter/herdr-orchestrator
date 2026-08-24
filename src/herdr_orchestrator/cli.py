@@ -52,10 +52,12 @@ def main(argv: list[str] | None = None) -> int:
             case "doctor":
                 return doctor(config)
             case "seed":
+                _require_schema_v1(config, args.command)
                 added, existing = Coordinator(config).seed()
                 print(json.dumps({"added": added, "existing": existing}, sort_keys=True))
                 return 0
             case "enqueue":
+                _require_schema_v1(config, args.command)
                 prompt_file = Path(args.prompt_file).expanduser().resolve()
                 job_id, created = Coordinator(config).enqueue_prompt_file(
                     harness=Harness(args.harness),
@@ -66,6 +68,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"created": created, "job_id": str(job_id)}, sort_keys=True))
                 return 0
             case "run":
+                if config.schema_version == 2:
+                    raise ConfigError(
+                        "executor_dispatch_unavailable: schema-v2 requires its executor namespace"
+                    )
                 coordinator = Coordinator(config)
                 if args.once:
                     print(json.dumps(coordinator.run_once(), sort_keys=True))
@@ -76,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
                     print("coordinator_stopped", file=sys.stderr)
                 return 0
             case "status":
+                _require_schema_v1(config, args.command)
                 store = Store(config.state_db)
                 store.initialize()
                 print(
@@ -91,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
             case "smoke":
+                _require_schema_v1(config, args.command)
                 return smoke(config, selected_harnesses=args.harness)
     except (ConfigError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -148,8 +156,21 @@ def doctor(workflow: WorkflowConfig) -> int:
             }
         )
     ok = all(bool(check["ok"]) for check in checks)
-    print(json.dumps({"checks": checks, "ok": ok}, indent=2, sort_keys=True))
+    payload: dict[str, object] = {"checks": checks, "ok": ok}
+    if workflow.schema_version == 2:
+        payload.update(
+            {
+                "executor": workflow.executor.kind.value if workflow.executor else None,
+                "schema_version": workflow.schema_version,
+            }
+        )
+    print(json.dumps(payload, indent=2, sort_keys=True))
     return 0 if ok else 1
+
+
+def _require_schema_v1(workflow: WorkflowConfig, command: str) -> None:
+    if workflow.schema_version != 1:
+        raise ConfigError(f"schema_mismatch: {command}_requires_schema_v1")
 
 
 def smoke(

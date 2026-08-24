@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from herdr_orchestrator.executor_config import ExecutorConfig
+
 
 class Harness(StrEnum):
     DROID = "droid"
@@ -73,9 +75,11 @@ class WorkflowConfig:
     workspace: Path
     state_db: Path
     coordinator: CoordinatorConfig
-    planner: PlannerConfig
+    planner: PlannerConfig | None
     workers: tuple[WorkerConfig, ...]
     seed_jobs: tuple[SeedJobConfig, ...]
+    runtime_dir: Path | None = None
+    executor: ExecutorConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
