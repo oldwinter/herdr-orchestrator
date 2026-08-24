@@ -653,15 +653,18 @@ def _replay_verification_fixture(
         else _verification_outcome(register)
     )
     run = store.require_run(run_id)
-    if event is None and run.state not in {"succeeded", "failed"}:
-        if run.state == "pending":
-            kernel.transition_run(run_id, "running")
-        kernel.transition_run(
-            run_id,
+    if event is None:
+        target_state = (
             "succeeded"
             if outcome_code in {"claim_contested", "critical_claim_verified"}
-            else "failed",
+            else "failed"
         )
+        if run.state not in {"succeeded", "failed"}:
+            if run.state == "pending":
+                kernel.transition_run(run_id, "running")
+            kernel.transition_run(run_id, target_state)
+        elif run.state != target_state:
+            raise ExecutorStoreError("verification_fixture_terminal_state_mismatch")
         kernel.append_event(
             run_id,
             event_key=f"research-verification-fixture:{requested_case_id}",
@@ -994,6 +997,7 @@ def _validate_kernel_verification_assignment(
         work_item.get("state") != "succeeded"
         or not isinstance(work_item.get("payload"), dict)
         or work_item["payload"].get("research_kind") != "verification"
+        or work_item["payload"].get("claim_id") != assignment.claim_id
         or work_item.get("attempt_id") != assignment.verification_attempt_id
         or work_item.get("fencing_token")
         != assignment.verification_fencing_token
@@ -1040,6 +1044,8 @@ def _validate_kernel_verification_assignment(
         receipts[0].get("kind") != "semantic"
         or not isinstance(receipt_payload, dict)
         or receipt_payload.get("research_kind") != "verification"
+        or not isinstance(receipt_payload.get("payload"), dict)
+        or receipt_payload["payload"].get("claim_id") != assignment.claim_id
     ):
         raise ExecutorStoreError("verification_assignment_semantic_receipt_missing")
     artifacts = [
@@ -1063,7 +1069,11 @@ def _validate_kernel_verification_assignment(
     ]
     if len(verification_payloads) != len(artifacts):
         raise ExecutorStoreError("verification_assignment_artifact_payload_missing")
-    if receipt_payload.get("payload") not in verification_payloads:
+    if (
+        receipt_payload.get("payload") not in verification_payloads
+        or not isinstance(receipt_payload.get("payload"), dict)
+        or receipt_payload["payload"].get("claim_id") != assignment.claim_id
+    ):
         raise ExecutorStoreError("verification_assignment_receipt_artifact_mismatch")
     for artifact in artifacts:
         if (
@@ -1114,6 +1124,8 @@ def _validate_kernel_verification_assignment(
             not isinstance(source_payload, dict)
             or not isinstance(excerpt_payload, dict)
             or not isinstance(content, str)
+            or payload.get("claim_id") != assignment.claim_id
+            or source_payload.get("source_id") not in assignment.source_ids
         ):
             raise ExecutorStoreError("verification_assignment_evidence_payload_missing")
         if source_payload.get("source_id") not in assignment.source_ids:

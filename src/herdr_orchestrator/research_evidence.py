@@ -1812,6 +1812,8 @@ class ResearchEvidenceRegister:
     def admit_verification_disposition(
         self,
         value: VerificationDisposition | Mapping[str, Any],
+        *,
+        _allow_historical: bool = False,
     ) -> VerificationDisposition:
         disposition = (
             value
@@ -1831,7 +1833,9 @@ class ResearchEvidenceRegister:
             )
         if assignment.claim_id != disposition.claim_id:
             raise _error("verification_disposition_assignment_claim_mismatch")
-        if not assignment.current:
+        if not assignment.current and not _allow_historical:
+            raise _error("verification_disposition_assignment_not_current")
+        if disposition.current and not assignment.current:
             raise _error("verification_disposition_assignment_not_current")
         if (
             disposition.verifier_logical_agent_id
@@ -1882,11 +1886,13 @@ class ResearchEvidenceRegister:
                 raise _error("verification_disposition_kernel_authority_required")
             if (
                 derive_criticality(claim, self._verification_policy)
+                and disposition.current
                 and self._verification_authorizer is None
             ):
                 raise _error("verification_disposition_kernel_authority_unbound")
             if (
                 derive_criticality(claim, self._verification_policy)
+                and disposition.current
                 and self._verification_authorizer is not None
             ):
                 self._verification_authorizer(assignment)
@@ -2315,7 +2321,15 @@ class ResearchEvidenceRegister:
         for assignment in assignments:
             register.admit_verification_assignment(assignment)
         for disposition in dispositions:
-            register.admit_verification_disposition(disposition)
+            parsed_disposition = (
+                disposition
+                if isinstance(disposition, VerificationDisposition)
+                else VerificationDisposition.from_mapping(disposition)
+            )
+            register.admit_verification_disposition(
+                parsed_disposition,
+                _allow_historical=not parsed_disposition.current,
+            )
         declared_credit = value.get("creditable_relation_ids")
         if declared_credit is not None:
             if (
