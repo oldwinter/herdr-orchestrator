@@ -11,6 +11,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from herdr_orchestrator.executor_artifacts import (
+    ArtifactEnvelope,
+    ArtifactError,
+    ArtifactRecord,
+    ArtifactStore,
+    ArtifactValidationError,
+    AttemptRoots,
+    PreparedArtifact,
+)
 from herdr_orchestrator.executor_protocol import DefinitionError, canonical_json
 from herdr_orchestrator.executor_store import (
     ATTEMPT_SCHEMA_VERSION,
@@ -26,6 +35,12 @@ from herdr_orchestrator.executor_store import (
 
 __all__ = [
     "ATTEMPT_SCHEMA_VERSION",
+    "ArtifactEnvelope",
+    "ArtifactError",
+    "ArtifactRecord",
+    "ArtifactStore",
+    "ArtifactValidationError",
+    "AttemptRoots",
     "RECEIPT_SCHEMA_VERSION",
     "RECEIPT_CONTRACT_VERSION",
     "EVENT_CONTRACT_VERSION",
@@ -642,6 +657,7 @@ class ExecutionKernel:
         replica_capacity: Mapping[str, int] | None = None,
         replica_slots: Mapping[str, Sequence[str]] | None = None,
         workspace: Path | str | None = None,
+        runtime_dir: Path | str | None = None,
         clock: Callable[[], float] = time.time,
         lease_seconds: float = 900.0,
         max_attempts: int = 3,
@@ -698,6 +714,20 @@ class ExecutionKernel:
         )
         self._failpoint = _normalize_failpoint(failpoint)
         self.workspace = None if workspace is None else Path(workspace).resolve()
+        self.runtime_dir = (
+            None if runtime_dir is None else Path(runtime_dir).expanduser().resolve()
+        )
+        if (
+            self.workspace is not None
+            and self.runtime_dir is not None
+            and not self.runtime_dir.is_relative_to(self.workspace)
+        ):
+            raise KernelError("runtime_dir_escape")
+        self.artifacts = (
+            None
+            if self.runtime_dir is None
+            else ArtifactStore(store, self.runtime_dir, clock=self._clock)
+        )
         self._replica_capacity = _validate_capacity_mapping(replica_capacity)
         self._replica_slots = _validate_slot_mapping(replica_slots)
         all_configured_slots = [
@@ -1458,6 +1488,202 @@ class ExecutionKernel:
     claim_work_for_workflow = claim_ready_for_workflow
     claim_ready_workflow = claim_ready_for_workflow
 
+    def attempt_roots(self, claim: ClaimedWork) -> AttemptRoots:
+        if self.artifacts is None:
+            raise KernelError("artifact_runtime_dir_required")
+        return self.artifacts.roots(claim)
+
+    roots_for_attempt = attempt_roots
+
+    def stage_artifact(
+        self,
+        claim: ClaimedWork,
+        relative_path: str | Path,
+        content: bytes,
+    ) -> tuple[Path, str, int]:
+        if self.artifacts is None:
+            raise KernelError("artifact_runtime_dir_required")
+        return self.artifacts.stage(claim, relative_path, content)
+
+    stage_output = stage_artifact
+
+    def record_lifecycle_settlement(
+        self,
+        claim: ClaimedWork,
+        *,
+        lifecycle: str,
+    ) -> dict[str, object]:
+        """Record a Herdr lifecycle observation without semantic progress."""
+
+        if not isinstance(claim, ClaimedWork):
+            raise ClaimLostError(f"{ClaimLostError.code}: claim_required")
+        lifecycle = _identifier(lifecycle, "lifecycle")
+        if lifecycle not in {"idle", "done", "blocked", "unknown", "timeout"}:
+            raise KernelError(f"lifecycle_invalid: {lifecycle}")
+        try:
+            self.authorize_attempt(
+                claim.run_id,
+                claim.work_id,
+                claim.attempt_id,
+                claim.fencing_token,
+            )
+        except ClaimLostError:
+            self.record_stale_attempt(claim, error_code="stale_lifecycle")
+            raise
+        event = self.append_event(
+            claim.run_id,
+            event_key=f"lifecycle:{claim.attempt_id}:{lifecycle}",
+            event_type="lifecycle_observed",
+            work_id=claim.work_id,
+            attempt_id=claim.attempt_id,
+            fencing_token=claim.fencing_token,
+            payload={
+                "lifecycle": lifecycle,
+                "semantic_success": False,
+                "artifact_required": True,
+            },
+            error_code=None if lifecycle in {"idle", "done"} else lifecycle,
+        )
+        return {
+            "schema_version": 2,
+            "run_id": claim.run_id,
+            "work_id": claim.work_id,
+            "attempt_id": claim.attempt_id,
+            "fencing_token": claim.fencing_token,
+            "lifecycle": lifecycle,
+            "semantic_success": False,
+            "artifact_required": True,
+            "event_id": event.event_id,
+            "code": "lifecycle_observed",
+            "reason": "typed_artifact_required",
+        }
+
+    observe_lifecycle = record_lifecycle_settlement
+
+    def admit_artifact(
+        self,
+        claim: ClaimedWork,
+        envelope: ArtifactEnvelope | Mapping[str, Any],
+        *,
+        expected_lineage: tuple[str, ...] | list[str] | None = None,
+        expected_path: str | Path | None = None,
+    ) -> ArtifactRecord:
+        """Atomically admit current-attempt typed output without settlement."""
+
+        if not isinstance(claim, ClaimedWork):
+            raise ClaimLostError(f"{ClaimLostError.code}: claim_required")
+        if self.artifacts is None:
+            raise KernelError("artifact_runtime_dir_required")
+        try:
+            self.authorize_attempt(
+                claim.run_id,
+                claim.work_id,
+                claim.attempt_id,
+                claim.fencing_token,
+            )
+        except ClaimLostError:
+            self._record_artifact_rejection(
+                claim,
+                error_code="stale_attempt",
+                envelope=envelope,
+                stale=True,
+            )
+            raise
+        try:
+            prepared = self.artifacts.prepare(
+                claim,
+                envelope,
+                expected_lineage=expected_lineage,
+                expected_path=expected_path,
+            )
+        except ArtifactValidationError as exc:
+            self._record_artifact_rejection(
+                claim,
+                error_code=_artifact_error_code(exc),
+                envelope=envelope,
+            )
+            raise
+        try:
+            with self.store._transaction() as connection:
+                self._require_current_attempt_locked(connection, claim)
+                self.artifacts.materialize(prepared)
+                self._require_current_attempt_locked(connection, claim)
+                record = self.artifacts.admit_prepared(
+                    connection,
+                    claim.run_id,
+                    prepared,
+                    created_at=self._clock(),
+                )
+                self._append_event_locked(
+                    connection,
+                    claim.run_id,
+                    event_key=f"artifact-admitted:{record.artifact_id}",
+                    event_type="artifact_admitted",
+                    work_id=claim.work_id,
+                    attempt_id=claim.attempt_id,
+                    fencing_token=claim.fencing_token,
+                    payload={
+                        "artifact_id": record.artifact_id,
+                        "content_digest": record.content_digest,
+                        "path": record.path,
+                    },
+                    error_code=None,
+                    created_at=self._clock(),
+                )
+                return record
+        except ClaimLostError:
+            self._record_artifact_rejection(
+                claim,
+                error_code="stale_attempt",
+                envelope=envelope,
+                stale=True,
+            )
+            raise
+        except ArtifactError:
+            self.artifacts.discard_unreferenced(prepared)
+            raise
+
+    admit_typed_artifact = admit_artifact
+    ingest_artifact = admit_artifact
+
+    def list_artifacts(
+        self,
+        run_id: str,
+        *,
+        work_id: str | None = None,
+    ) -> list[ArtifactRecord]:
+        if self.artifacts is None:
+            # Views do not need a runtime directory.  Keep the filesystem
+            # staging restriction while still exposing externally admitted
+            # rows from a kernel opened for read-only inspection.
+            return ArtifactStore(
+                self.store,
+                Path(".orchestrator") / "unused",
+            ).list_artifacts(run_id, work_id=work_id)
+        return self.artifacts.list_artifacts(run_id, work_id=work_id)
+
+    artifacts_for_run = list_artifacts
+
+    def cleanup_attempt(
+        self,
+        claim: ClaimedWork | AttemptRecord,
+        *,
+        preserve_admitted: bool = True,
+    ) -> bool:
+        if self.artifacts is None:
+            raise KernelError("artifact_runtime_dir_required")
+        roots = (
+            self.artifacts.roots(claim)
+            if isinstance(claim, ClaimedWork)
+            else self._roots_for_attempt_record(claim)
+        )
+        # Admitted bytes are content-addressed outside this tree.  The flag
+        # is explicit to make a future retention policy visible at the seam.
+        _ = preserve_admitted
+        return roots.cleanup()
+
+    cleanup_attempt_root = cleanup_attempt
+
     def complete_work_item(
         self,
         claim: ClaimedWork | str,
@@ -1471,6 +1697,9 @@ class ExecutionKernel:
         outcome: str | None = None,
         attempt_id: str | None = None,
         fencing_token: str | None = None,
+        artifact: ArtifactEnvelope | Mapping[str, Any] | None = None,
+        expected_lineage: tuple[str, ...] | list[str] | None = None,
+        expected_path: str | Path | None = None,
     ) -> WorkItem:
         """Settle a current claim and atomically commit its receipt/readiness.
 
@@ -1481,6 +1710,26 @@ class ExecutionKernel:
         idempotent no-op and never creates a second receipt.
         """
 
+        if artifact is not None:
+            if not isinstance(claim, ClaimedWork):
+                raise ClaimLostError(f"{ClaimLostError.code}: claim_required")
+            return self._complete_with_artifact(
+                claim,
+                artifact,
+                state=state,
+                error_code=error_code,
+                receipt_payload=receipt_payload,
+                receipt=receipt,
+                receipt_kind=receipt_kind,
+                outcome=outcome,
+                expected_lineage=expected_lineage,
+                expected_path=expected_path,
+            )
+        if self.runtime_dir is not None and state == WorkState.SUCCEEDED:
+            if not isinstance(claim, ClaimedWork):
+                raise ClaimLostError(f"{ClaimLostError.code}: claim_required")
+            self.record_lifecycle_settlement(claim, lifecycle="done")
+            raise ArtifactValidationError("artifact_required")
         if isinstance(claim, ClaimedWork):
             run_id = claim.run_id
             actual_work_id = claim.work_id
@@ -1732,6 +1981,293 @@ class ExecutionKernel:
     settle_work_item = complete_work_item
     settle_attempt = complete_work_item
     commit_attempt = complete_work_item
+
+    def _complete_with_artifact(
+        self,
+        claim: ClaimedWork,
+        envelope: ArtifactEnvelope | Mapping[str, Any],
+        *,
+        state: str,
+        error_code: str | None,
+        receipt_payload: Any,
+        receipt: Any,
+        receipt_kind: str,
+        outcome: str | None,
+        expected_lineage: tuple[str, ...] | list[str] | None,
+        expected_path: str | Path | None,
+    ) -> WorkItem:
+        if self.artifacts is None:
+            raise KernelError("artifact_runtime_dir_required")
+        if state not in {item.value for item in WorkState.terminal()}:
+            raise KernelError(f"work_terminal_state_invalid: {state}")
+        if error_code is not None:
+            error_code = _identifier(error_code, "error_code")
+        receipt_kind = _identifier(receipt_kind, "receipt_kind")
+        if outcome is None:
+            outcome = state
+        outcome = _identifier(outcome, "outcome")
+        if receipt is not None:
+            if receipt_payload is not None:
+                raise KernelError("receipt_payload_duplicate")
+            receipt_payload = receipt
+        try:
+            self.authorize_attempt(
+                claim.run_id,
+                claim.work_id,
+                claim.attempt_id,
+                claim.fencing_token,
+            )
+        except ClaimLostError:
+            self._record_artifact_rejection(
+                claim,
+                error_code="stale_attempt",
+                envelope=envelope,
+                stale=True,
+            )
+            raise
+        try:
+            prepared = self.artifacts.prepare(
+                claim,
+                envelope,
+                expected_lineage=expected_lineage,
+                expected_path=expected_path,
+            )
+        except ArtifactValidationError as exc:
+            self._record_artifact_rejection(
+                claim,
+                error_code=_artifact_error_code(exc),
+                envelope=envelope,
+            )
+            raise
+        artifact_payload = {
+            "artifact_id": prepared.artifact_id,
+            "artifact_digest": prepared.envelope.content_digest,
+            "artifact_type": prepared.envelope.artifact_type,
+            "path": prepared.envelope.path,
+            "run_id": claim.run_id,
+            "work_id": claim.work_id,
+            "attempt_id": claim.attempt_id,
+            "fencing_token": claim.fencing_token,
+            "harness": claim.harness,
+            "worker": claim.worker,
+            "agent": claim.agent_name,
+            "pane": prepared.envelope.pane,
+        }
+        if receipt_payload is None:
+            receipt_value: Any = artifact_payload
+        elif isinstance(receipt_payload, Mapping):
+            receipt_value = {**receipt_payload, **artifact_payload}
+        else:
+            receipt_value = {"value": receipt_payload, **artifact_payload}
+        try:
+            receipt_json = canonical_json(receipt_value)
+        except (DefinitionError, TypeError, ValueError) as exc:
+            raise KernelError(f"receipt_payload_invalid: {exc}") from exc
+        trigger_after_receipt = False
+        trigger_after_readiness = False
+        trigger_after_settlement = False
+        trigger_after_admission = False
+        try:
+            with self.store._transaction() as connection:
+                self._require_run(connection, claim.run_id)
+                row = connection.execute(
+                    """
+                    SELECT * FROM executor_work_items
+                    WHERE run_id = ? AND work_id = ?
+                    """,
+                    (claim.run_id, claim.work_id),
+                ).fetchone()
+                if row is None:
+                    raise WorkItemNotFound(f"work_item_not_found: {claim.work_id}")
+                if (
+                    str(row["state"]) != WorkState.RUNNING
+                    or str(row["claim_id"]) != claim.claim_id
+                    or str(row["attempt_id"]) != claim.attempt_id
+                    or str(row["fencing_token"]) != claim.fencing_token
+                ):
+                    raise ClaimLostError(
+                        f"{ClaimLostError.code}: run_id={claim.run_id} "
+                        f"work_id={claim.work_id}"
+                    )
+                attempt = self._require_current_attempt_locked(connection, claim)
+                now = self._clock()
+                if float(attempt["lease_until"]) <= now:
+                    raise ClaimLostError(
+                        f"{ClaimLostError.code}: lease_expired"
+                    )
+                ready_before = self._ready_work_ids_locked(
+                    connection,
+                    claim.run_id,
+                    now,
+                )
+                self.hit_failpoint("before_admission")
+                self.artifacts.materialize(prepared)
+                self._require_current_attempt_locked(connection, claim)
+                artifact_record = self.artifacts.admit_prepared(
+                    connection,
+                    claim.run_id,
+                    prepared,
+                    created_at=now,
+                )
+                self._append_event_locked(
+                    connection,
+                    claim.run_id,
+                    event_key=f"artifact-admitted:{artifact_record.artifact_id}",
+                    event_type="artifact_admitted",
+                    work_id=claim.work_id,
+                    attempt_id=claim.attempt_id,
+                    fencing_token=claim.fencing_token,
+                    payload={
+                        "artifact_id": artifact_record.artifact_id,
+                        "content_digest": artifact_record.content_digest,
+                        "path": artifact_record.path,
+                    },
+                    error_code=None,
+                    created_at=now,
+                )
+                trigger_after_admission = self._consume_failpoint("after_admission")
+                self.hit_failpoint("before_settlement")
+                connection.execute(
+                    """
+                    UPDATE executor_work_items
+                    SET state = ?, error_code = ?, updated_at = ?,
+                        attempt_id = ?, fencing_token = ?, lease_until = ?
+                    WHERE run_id = ? AND work_id = ? AND state = ?
+                      AND claim_id = ? AND attempt_id = ? AND fencing_token = ?
+                    """,
+                    (
+                        state,
+                        error_code,
+                        now,
+                        claim.attempt_id,
+                        claim.fencing_token,
+                        float(attempt["lease_until"]),
+                        claim.run_id,
+                        claim.work_id,
+                        WorkState.RUNNING,
+                        claim.claim_id,
+                        claim.attempt_id,
+                        claim.fencing_token,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE executor_attempts
+                    SET state = ?, error_code = ?, updated_at = ?, settled_at = ?
+                    WHERE attempt_id = ? AND fencing_token = ? AND state = ?
+                    """,
+                    (
+                        _attempt_state_for_work_state(state),
+                        error_code,
+                        now,
+                        now,
+                        claim.attempt_id,
+                        claim.fencing_token,
+                        AttemptState.RUNNING,
+                    ),
+                )
+                if row["replica_slot"] is not None:
+                    connection.execute(
+                        """
+                        UPDATE executor_replica_slots
+                        SET active_run_id = NULL, active_work_id = NULL,
+                            claim_id = NULL, agent_name = NULL, updated_at = ?
+                        WHERE workflow = (SELECT workflow FROM executor_runs WHERE run_id = ?)
+                          AND harness = ? AND slot_name = ?
+                          AND active_run_id = ? AND active_work_id = ?
+                          AND claim_id = ?
+                        """,
+                        (
+                            now,
+                            claim.run_id,
+                            str(row["harness"]),
+                            str(row["replica_slot"]),
+                            claim.run_id,
+                            claim.work_id,
+                            claim.claim_id,
+                        ),
+                    )
+                connection.execute(
+                    "UPDATE executor_runs SET updated_at = ? WHERE run_id = ?",
+                    (now, claim.run_id),
+                )
+                self.hit_failpoint("before_receipt_commit")
+                receipt_record = self._append_receipt_locked(
+                    connection,
+                    claim.run_id,
+                    work_id=claim.work_id,
+                    attempt_id=claim.attempt_id,
+                    fencing_token=claim.fencing_token,
+                    kind=receipt_kind,
+                    outcome=outcome,
+                    state=state,
+                    payload_json=receipt_json,
+                    error_code=error_code,
+                    created_at=now,
+                )
+                trigger_after_receipt = self._consume_failpoint("after_receipt_commit")
+                self.hit_failpoint("before_readiness_commit")
+                self._refresh_readiness(connection, claim.run_id)
+                ready_after = self._ready_work_ids_locked(connection, claim.run_id, now)
+                released = sorted(ready_after - ready_before)
+                self._append_event_locked(
+                    connection,
+                    claim.run_id,
+                    event_key=f"work-settled:{claim.attempt_id}",
+                    event_type=f"work_{state}",
+                    work_id=claim.work_id,
+                    attempt_id=claim.attempt_id,
+                    fencing_token=claim.fencing_token,
+                    payload={
+                        "receipt_id": receipt_record.receipt_id,
+                        "artifact_id": artifact_record.artifact_id,
+                    },
+                    error_code=error_code,
+                    created_at=now,
+                )
+                if released:
+                    self._append_event_locked(
+                        connection,
+                        claim.run_id,
+                        event_key=f"readiness-release:{claim.attempt_id}",
+                        event_type="readiness_released",
+                        work_id=claim.work_id,
+                        attempt_id=claim.attempt_id,
+                        fencing_token=claim.fencing_token,
+                        payload={"work_ids": released},
+                        error_code=None,
+                        created_at=now,
+                    )
+                trigger_after_readiness = self._consume_failpoint(
+                    "after_readiness_commit"
+                )
+                trigger_after_settlement = self._consume_failpoint("after_settlement")
+                result = self._work_record(connection, claim.run_id, claim.work_id)
+        except ClaimLostError:
+            self._record_artifact_rejection(
+                claim,
+                error_code="stale_attempt",
+                envelope=envelope,
+                stale=True,
+            )
+            raise
+        except ArtifactError as exc:
+            self.artifacts.discard_unreferenced(prepared)
+            self._record_artifact_rejection(
+                claim,
+                error_code=_artifact_error_code(exc),
+                envelope=envelope,
+            )
+            raise
+        if trigger_after_admission:
+            raise FailpointError("after_admission")
+        if trigger_after_receipt:
+            raise FailpointError("after_receipt_commit")
+        if trigger_after_readiness:
+            raise FailpointError("after_readiness_commit")
+        if trigger_after_settlement:
+            raise FailpointError("after_settlement")
+        return result
 
     def retry_work_item(
         self,
@@ -2809,6 +3345,49 @@ class ExecutionKernel:
             )
             return counts
 
+    def status(
+        self,
+        run_id: str | None = None,
+        *,
+        workflow: str | None = None,
+    ) -> dict[str, object]:
+        """Return a deterministic run/work summary for automation clients."""
+
+        if run_id is not None:
+            run = self.store.require_run(run_id)
+            if workflow is not None and run.workflow != workflow:
+                raise RunNotFoundError(f"{RunNotFoundError.code}: {run_id}")
+            runs = [run]
+        else:
+            runs = self.store.runs(workflow)
+        summaries: list[dict[str, object]] = []
+        run_state_counts: dict[str, int] = {}
+        work_state_counts: dict[str, int] = {}
+        for run in runs:
+            counts = self.work_state_counts(run.run_id)
+            run_state_counts[run.state] = run_state_counts.get(run.state, 0) + 1
+            for state, count in counts.items():
+                work_state_counts[state] = work_state_counts.get(state, 0) + count
+            summaries.append(
+                {
+                    "run_id": run.run_id,
+                    "workflow": run.workflow,
+                    "executor": run.executor_kind,
+                    "dedupe_key": run.dedupe_key,
+                    "state": run.state,
+                    "work_counts": counts,
+                    "updated_at": run.updated_at,
+                }
+            )
+        return {
+            "schema_version": 2,
+            "runs": summaries,
+            "run_counts": dict(sorted(run_state_counts.items())),
+            "work_counts": dict(sorted(work_state_counts.items())),
+        }
+
+    status_summary = status
+
     def get_barrier(self, run_id: str, barrier_id: str) -> BarrierRecord:
         run_id = _identifier(run_id, "run_id")
         barrier_id = _identifier(barrier_id, "barrier_id")
@@ -2923,6 +3502,7 @@ class ExecutionKernel:
         attempts = self.list_attempts(run_id)
         receipts = self.list_receipts(run_id)
         events = self.list_events(run_id)
+        artifacts = self.list_artifacts(run_id)
         return {
             **run.to_dict(),
             "feature_versions": self.store.feature_versions(),
@@ -2937,6 +3517,7 @@ class ExecutionKernel:
             "replica_slots": [slot.to_dict() for slot in slots],
             "attempts": [attempt.to_dict() for attempt in attempts],
             "receipts": [receipt.to_dict() for receipt in receipts],
+            "artifacts": [artifact.to_dict() for artifact in artifacts],
             "events": [event.to_dict() for event in events],
         }
 
@@ -3918,6 +4499,101 @@ class ExecutionKernel:
                 raise KernelError("barrier_not_found")
             return self._barrier_record(connection, row)
 
+    def _require_current_attempt_locked(
+        self,
+        connection: Any,
+        claim: ClaimedWork,
+    ) -> Any:
+        row = connection.execute(
+            """
+            SELECT a.*, w.state AS work_state,
+                   w.attempt_id AS current_attempt_id,
+                   w.fencing_token AS current_fencing_token,
+                   w.claim_id AS current_claim_id
+            FROM executor_attempts a
+            JOIN executor_work_items w
+              ON w.run_id = a.run_id AND w.work_id = a.work_id
+            WHERE a.run_id = ? AND a.work_id = ? AND a.attempt_id = ?
+              AND a.fencing_token = ? AND a.claim_id = ?
+              AND a.state = ? AND w.state = ?
+              AND w.attempt_id = ? AND w.fencing_token = ? AND w.claim_id = ?
+            """,
+            (
+                claim.run_id,
+                claim.work_id,
+                claim.attempt_id,
+                claim.fencing_token,
+                claim.claim_id,
+                AttemptState.RUNNING,
+                WorkState.RUNNING,
+                claim.attempt_id,
+                claim.fencing_token,
+                claim.claim_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise ClaimLostError(
+                f"{ClaimLostError.code}: run_id={claim.run_id} work_id={claim.work_id}"
+            )
+        if float(row["lease_until"]) <= self._clock():
+            raise ClaimLostError(f"{ClaimLostError.code}: lease_expired")
+        return row
+
+    def _record_artifact_rejection(
+        self,
+        claim: ClaimedWork,
+        *,
+        error_code: str,
+        envelope: ArtifactEnvelope | Mapping[str, Any] | None,
+        stale: bool = False,
+    ) -> ArtifactRecord | None:
+        if self.artifacts is None:
+            return None
+        try:
+            record = self.artifacts.reject(
+                claim,
+                error_code=error_code,
+                envelope=envelope,
+                stale=stale,
+            )
+            self.append_event(
+                claim.run_id,
+                event_key=f"artifact-rejected:{record.artifact_id}",
+                event_type="artifact_rejected",
+                work_id=claim.work_id,
+                attempt_id=claim.attempt_id,
+                fencing_token=claim.fencing_token,
+                payload={
+                    "artifact_id": record.artifact_id,
+                    "state": record.state,
+                    "reason": error_code,
+                },
+                error_code=error_code,
+            )
+            return record
+        except (ArtifactError, ExecutorStoreError):
+            # Rejection recording must not turn a stable validation failure
+            # into an unrelated operational failure.  The original failure
+            # remains the observable result.
+            return None
+
+    def _roots_for_attempt_record(self, attempt: AttemptRecord) -> AttemptRoots:
+        if self.runtime_dir is None:
+            raise KernelError("artifact_runtime_dir_required")
+        root = (
+            self.runtime_dir
+            / attempt.run_id
+            / "attempts"
+            / attempt.work_id
+            / f"{attempt.attempt_number}-{attempt.fencing_token}"
+        )
+        return AttemptRoots(
+            root=root,
+            out=root / "out",
+            scratch=root / "scratch",
+            boundary=self.runtime_dir,
+        )
+
     @staticmethod
     def _require_run(connection: Any, run_id: str) -> Any:
         row = connection.execute(
@@ -4310,6 +4986,11 @@ def _normalize_failpoint(value: str | None) -> str | None:
         allowed = ",".join(sorted(FAILPOINTS))
         raise KernelError(f"failpoint_invalid: allowed={allowed}")
     return value
+
+
+def _artifact_error_code(error: ArtifactError) -> str:
+    message = str(error)
+    return message.split(":", 1)[0] if message else getattr(error, "code", "artifact_invalid")
 
 
 def _attempt_state_for_work_state(state: str) -> AttemptState:

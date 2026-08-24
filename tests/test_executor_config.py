@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -170,15 +171,49 @@ class ExecutorConfigTests(unittest.TestCase):
             for command in ("seed", "status", "smoke"):
                 with self.subTest(command=command):
                     error = StringIO()
-                    with redirect_stderr(error):
+                    output = StringIO()
+                    with redirect_stderr(error), redirect_stdout(output):
                         exit_code = main([command, "--workflow", str(workflow)])
-                    self.assertEqual(exit_code, 2)
-                    self.assertIn(
-                        f"schema_mismatch: {command}_requires_schema_v1",
-                        error.getvalue(),
-                    )
+                    if command == "status":
+                        self.assertEqual(exit_code, 0)
+                        self.assertEqual(error.getvalue(), "")
+                        payload = json.loads(output.getvalue())
+                        self.assertEqual(payload["schema_version"], 2)
+                        self.assertEqual(payload["executor"], "incident-response")
+                    else:
+                        self.assertEqual(exit_code, 2)
+                        self.assertIn(
+                            f"schema_mismatch: {command}_requires_schema_v1",
+                            error.getvalue(),
+                        )
 
-            self.assertFalse((root / ".orchestrator" / "state.db").exists())
+            self.assertTrue((root / ".orchestrator" / "state.db").exists())
+
+    def test_v1_run_rejects_v2_fixture_options_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _v1_prefix(root) + "\n" + _v1_tables(root),
+                encoding="utf-8",
+            )
+            error = StringIO()
+
+            with redirect_stderr(error):
+                exit_code = main(
+                    [
+                        "run",
+                        "--workflow",
+                        str(workflow),
+                        "--once",
+                        "--dispatcher-fixture",
+                        "valid",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 2)
+            self.assertIn("schema_mismatch: run_options_require_schema_v2", error.getvalue())
+            self.assertFalse((root / ".orchestrator").exists())
 
     def test_legacy_coordinator_rejects_v2_without_initializing_store(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

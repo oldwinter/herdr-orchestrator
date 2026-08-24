@@ -77,6 +77,37 @@ just enqueue codex review docs/prompts/review.md review-docs-v1
 
 配置说明见 [`docs/workflow-schema.md`](docs/workflow-schema.md)，运行与恢复语义见 [`docs/architecture.md`](docs/architecture.md)。
 
+## Schema v2 status、inspect 与 artifact fixture
+
+Schema v2 workflow 使用独立的 executor state，可通过 JSON CLI 查看 durable
+run/work/attempt/receipt/artifact/event 真相：
+
+```bash
+PYTHONPATH=src python3 -m herdr_orchestrator start \
+  --workflow path/to/schema-v2-workflow.toml \
+  --dedupe-key example-1 --input "question"
+PYTHONPATH=src python3 -m herdr_orchestrator status \
+  --workflow path/to/schema-v2-workflow.toml
+PYTHONPATH=src python3 -m herdr_orchestrator inspect \
+  --workflow path/to/schema-v2-workflow.toml --run-id RUN_ID
+PYTHONPATH=src python3 -m herdr_orchestrator run \
+  --workflow path/to/schema-v2-workflow.toml --once
+PYTHONPATH=src python3 -m herdr_orchestrator artifact-fixture \
+  --workflow path/to/schema-v2-workflow.toml --case malformed
+```
+
+`artifact-fixture` 是不启动 provider turn 的确定性负向/正向测试入口。每次
+调用只使用 disposable workflow state，并返回 `fixture_case_id`、`bound`、
+`code`、`reason`、`attempt_consumed`、`attempt_consumption_decision` 以及
+work/run state。可用 case 包括 `valid`、`lifecycle-only`、`missing-output`、
+`malformed`、`unknown-key`、`oversize`、`wrong-run`、`wrong-work`、
+`wrong-attempt`、`wrong-token`、`wrong-digest`、`wrong-input`、
+`invalid-lineage`、`absolute-path`、`parent-path`、`path-escape`、
+`symlink-escape`、`another-attempt` 和 `unassigned-output`。这些 case 的
+`stale` 与 `stale-token` 还覆盖 lease replacement fencing。上述 case 的
+domain-negative 结果仍是可解析 JSON，`success` 为 `false`；参数或 selector
+错误返回 `success: false` 的结构化错误和非零退出码。
+
 ## 明确不做
 
 - 不把 `done` 当成质量证明；

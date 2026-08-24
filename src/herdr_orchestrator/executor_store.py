@@ -44,6 +44,8 @@ __all__ = [
     "ExecutorStore",
     "ExecutorStoreError",
     "ATTEMPT_SCHEMA_VERSION",
+    "ARTIFACT_SCHEMA_VERSION",
+    "ARTIFACT_CONTRACT_VERSION",
     "RECEIPT_SCHEMA_VERSION",
     "RECEIPT_CONTRACT_VERSION",
     "EVENT_CONTRACT_VERSION",
@@ -82,6 +84,8 @@ ATTEMPT_SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 1
 RECEIPT_CONTRACT_VERSION = 1
 EVENT_CONTRACT_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 1
+ARTIFACT_CONTRACT_VERSION = 1
 _RUN_STATES = frozenset(
     {
         "pending",
@@ -575,6 +579,58 @@ class ExecutorStore:
                 """
                 CREATE INDEX IF NOT EXISTS executor_events_order
                 ON executor_events(run_id, event_seq)
+                """
+            )
+            self._ensure_feature_component(
+                connection,
+                "artifacts",
+                ARTIFACT_SCHEMA_VERSION,
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executor_artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    work_id TEXT NOT NULL,
+                    attempt_id TEXT NOT NULL,
+                    fencing_token TEXT NOT NULL,
+                    artifact_type TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    content_digest TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                    lineage_json TEXT NOT NULL,
+                    pinned_digests_json TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    worker TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    pane TEXT,
+                    state TEXT NOT NULL CHECK (state IN ('admitted', 'rejected', 'stale')),
+                    error_code TEXT,
+                    envelope_json TEXT NOT NULL,
+                    admitted_path TEXT,
+                    created_at REAL NOT NULL,
+                    UNIQUE (run_id, artifact_id),
+                    FOREIGN KEY (run_id) REFERENCES executor_runs(run_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (run_id, work_id)
+                        REFERENCES executor_work_items(run_id, work_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (attempt_id)
+                        REFERENCES executor_attempts(attempt_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_artifacts_order
+                ON executor_artifacts(run_id, created_at, artifact_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS executor_artifacts_work
+                ON executor_artifacts(run_id, work_id, state, created_at)
                 """
             )
 

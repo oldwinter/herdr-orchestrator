@@ -86,6 +86,7 @@ class ExecutorStoreTests(unittest.TestCase):
             self.assertEqual(
                 v2.feature_versions(),
                 {
+                    "artifacts": 1,
                     "attempt-kernel": 1,
                     "receipt-events": 1,
                     "run-store": 1,
