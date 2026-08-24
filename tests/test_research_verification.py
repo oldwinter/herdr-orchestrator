@@ -274,7 +274,7 @@ class ResearchVerificationTests(unittest.TestCase):
         self.assertEqual(inspect_exit, 0)
         self.assertEqual(export_exit, 0)
         self.assertEqual(replay_exit, 0)
-        self.assertEqual(inspected["state"], "failed")
+        self.assertEqual(inspected["state"], "succeeded")
         self.assertEqual(
             inspected["research"]["verification"]["state"],
             "contested",
@@ -301,6 +301,35 @@ class ResearchVerificationTests(unittest.TestCase):
         self.assertFalse(payload["success"])
         self.assertEqual(payload["code"], "verification_disposition_source_reuse")
         self.assertFalse(payload["verification"]["gate_credit"])
+
+    def test_failed_verification_run_cannot_export(self) -> None:
+        with TemporaryDirectory() as temporary:
+            workflow = _workflow(Path(temporary))
+            fixture_exit, fixture = _invoke(
+                "research",
+                "verification-fixture",
+                "--workflow",
+                str(workflow),
+                "--case",
+                "critical-unverified",
+            )
+            export_exit, exported = _invoke(
+                "research",
+                "export",
+                "--workflow",
+                str(workflow),
+                "--run-id",
+                fixture["run_id"],
+            )
+
+        self.assertEqual(fixture_exit, 0)
+        self.assertFalse(fixture["success"])
+        self.assertEqual(export_exit, 64)
+        self.assertFalse(exported["success"])
+        self.assertEqual(
+            exported["code"],
+            "research_export_requires_succeeded_run",
+        )
 
     def test_disposition_must_account_for_every_contradiction_and_current_assignment(
         self,
@@ -381,6 +410,9 @@ class ResearchVerificationTests(unittest.TestCase):
                 collector_harnesses=("grok",),
                 source_ids=("source-verification",),
                 excerpt_ids=(verification_excerpt.excerpt_id,),
+                run_id="run-1",
+                verification_attempt_id="attempt-3",
+                verification_fencing_token="fence-3",
             )
         )
 
@@ -525,6 +557,9 @@ class ResearchVerificationTests(unittest.TestCase):
                 collector_harnesses=("grok",),
                 source_ids=("source-verification",),
                 excerpt_ids=(verification_excerpt.excerpt_id,),
+                run_id="run-1",
+                verification_attempt_id="attempt-3",
+                verification_fencing_token="fence-3",
             )
         )
         register.admit_verification_disposition(
@@ -594,6 +629,9 @@ class ResearchVerificationTests(unittest.TestCase):
                 collector_harnesses=("grok",),
                 source_ids=("source-verification",),
                 excerpt_ids=(verification_excerpt.excerpt_id,),
+                run_id="run-1",
+                verification_attempt_id="attempt-3",
+                verification_fencing_token="fence-3",
             )
         )
         register.admit_verification_disposition(

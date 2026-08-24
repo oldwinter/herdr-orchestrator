@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import tempfile
 from dataclasses import replace
 from pathlib import Path
 
 from herdr_orchestrator.config import ConfigError
-from herdr_orchestrator.executor_artifacts import ARTIFACT_CONTRACT_VERSION, digest_bytes
+from herdr_orchestrator.executor_artifacts import (
+    ARTIFACT_CONTRACT_VERSION,
+    digest_bytes,
+    digest_file,
+)
 from herdr_orchestrator.executor_kernel import ExecutionKernel
 from herdr_orchestrator.executor_protocol import MANIFEST_DIGEST_FIELDS
 from herdr_orchestrator.executor_store import ExecutorStore, ExecutorStoreError
 from herdr_orchestrator.model import WorkflowConfig
 from herdr_orchestrator.research_executor import (
+    CriticalityPolicy,
     ResearchConfig,
     ResearchEvidenceError,
     ResearchEvidenceRegister,
@@ -230,7 +236,15 @@ def _research_evidence_fixture(
         raise ConfigError(
             f"research_evidence_fixture_unknown_case:{requested_case_id}"
         )
+    if (
+        route == "research.verification-fixture"
+        and case_id not in _RESEARCH_VERIFICATION_FIXTURE_CASES
+    ):
+        raise ConfigError(
+            f"research_verification_fixture_unknown_case:{requested_case_id}"
+        )
     if route == "research.verification-fixture":
+        _require_verification_fixture_roles(config)
         return _research_evidence_fixture_in_state(
             config,
             requested_case_id=requested_case_id,
@@ -260,6 +274,22 @@ def _research_evidence_fixture(
         shutil.rmtree(fixture_workspace, ignore_errors=True)
 
 
+def _require_verification_fixture_roles(config: WorkflowConfig) -> None:
+    if config.executor is None:
+        raise ConfigError("executor_missing")
+    research_config = ResearchConfig.from_mapping(config.executor.settings)
+    workers = {worker.name: worker for worker in config.workers}
+    collector_name = research_config.roles.get("collector")
+    verifier_name = (
+        research_config.roles.get("verifier")
+        or research_config.roles.get("independent_verifier")
+    )
+    if collector_name not in workers:
+        raise ConfigError("research_verification_collector_role_required")
+    if verifier_name not in workers:
+        raise ConfigError("research_verification_verifier_role_required")
+
+
 def _research_evidence_fixture_in_state(
     config: WorkflowConfig,
     *,
@@ -269,6 +299,7 @@ def _research_evidence_fixture_in_state(
 ) -> int:
     if config.executor is None:
         raise ConfigError("executor_missing")
+    research_config = ResearchConfig.from_mapping(config.executor.settings)
     store = ExecutorStore(config.state_db)
     kernel = _research_kernel(config, store)
     worker = config.workers[0]
@@ -287,7 +318,22 @@ def _research_evidence_fixture_in_state(
             "schema_version": 2,
             "fixture_case_id": requested_case_id,
         },
-        config_definition={"fixture": requested_case_id},
+        config_definition={
+            "fixture_case_id": requested_case_id,
+            "research": dict(config.executor.settings),
+            "verification_policy": research_config.verification.to_dict()
+            if case_id in _RESEARCH_VERIFICATION_FIXTURE_CASES
+            else None,
+            "roles": dict(research_config.roles),
+            "workers": [
+                {
+                    "name": item.name,
+                    "harness": item.harness.value,
+                    "replicas": item.replicas,
+                }
+                for item in config.workers
+            ],
+        },
         input_value={"question": "evidence fixture"},
         route_definition={
             "worker": worker.name,
@@ -475,6 +521,7 @@ def _replay_verification_fixture(
     requested_case_id: str,
     route: str,
 ) -> int:
+    persisted_evidence = _persisted_verification_evidence(kernel, run_id)
     event = next(
         (
             item
@@ -483,25 +530,44 @@ def _replay_verification_fixture(
         ),
         None,
     )
-    if event is None or not isinstance(event.payload, dict):
-        raise ExecutorStoreError("verification_fixture_event_missing")
-    raw_evidence = event.payload.get("evidence")
+    if event is not None and not isinstance(event.payload, dict):
+        raise ExecutorStoreError("verification_fixture_event_invalid")
+    raw_evidence = (
+        event.payload.get("evidence")
+        if event is not None and isinstance(event.payload, dict)
+        else persisted_evidence
+    )
     if not isinstance(raw_evidence, dict):
         raise ExecutorStoreError("verification_fixture_evidence_missing")
-    research_config = ResearchConfig.from_mapping(
-        config.executor.settings if config.executor is not None else {}
+    if persisted_evidence != raw_evidence:
+        raise ExecutorStoreError("verification_fixture_evidence_integrity_mismatch")
+    register = _register_from_persisted_evidence(raw_evidence)
+    for assignment in register.verification_assignments:
+        if assignment.current:
+            _validate_kernel_verification_assignment(kernel, assignment)
+    if (
+        event is not None
+        and isinstance(event.payload, dict)
+        and event.payload.get("verification_policy")
+        != register.verification_policy.to_dict()
+    ):
+        raise ExecutorStoreError("verification_fixture_policy_integrity_mismatch")
+    outcome_code = (
+        str(event.payload.get("outcome_code", "unknown"))
+        if event is not None and isinstance(event.payload, dict)
+        else _verification_outcome(register)
     )
-    register = ResearchEvidenceRegister.from_mapping(
-        raw_evidence,
-        verification_policy=research_config.verification,
-    )
-    outcome_code = str(event.payload.get("outcome_code", "unknown"))
     verification = register.claim_status(register.claims[0].claim_id)
     current_disposition = next(
         (
             item.to_dict()
             for item in register.verification_dispositions
             if item.current
+            and any(
+                assignment.assignment_id == item.assignment_id
+                and assignment.current
+                for assignment in register.verification_assignments
+            )
         ),
         None,
     )
@@ -520,19 +586,29 @@ def _replay_verification_fixture(
                     "max_submissions": 1,
                     "max_dispositions": 2,
                     "independent_logical_agent_required": (
-                        research_config.verification.require_independent_logical_agent
+                        register.verification_policy.require_independent_logical_agent
                     ),
                     "harness_separation_required": (
-                        research_config.verification.require_harness_separation
+                        register.verification_policy.require_harness_separation
                     ),
                 },
                 "run_id": run_id,
                 "execution_state": run.state,
                 "code": outcome_code,
-                "reason": str(event.payload.get("reason", outcome_code)),
+                "reason": (
+                    str(event.payload.get("reason", outcome_code))
+                    if event is not None and isinstance(event.payload, dict)
+                    else outcome_code
+                ),
                 "verification": verification,
-                "verification_assignment": event.payload.get(
-                    "verification_assignment"
+                "verification_assignment": (
+                    event.payload.get("verification_assignment")
+                    if event is not None and isinstance(event.payload, dict)
+                    else (
+                        register.verification_assignments[0].to_dict()
+                        if register.verification_assignments
+                        else None
+                    )
                 ),
                 "verification_disposition": current_disposition,
                 "evidence": register.to_dict(),
@@ -543,6 +619,216 @@ def _replay_verification_fixture(
         )
     )
     return 0
+
+
+def _register_from_persisted_evidence(
+    value: dict[str, object],
+) -> ResearchEvidenceRegister:
+    policy = CriticalityPolicy.from_mapping(value.get("verification_policy"))
+    return ResearchEvidenceRegister.from_mapping(
+        value,
+        verification_policy=policy,
+    )
+
+
+def _persisted_verification_evidence(
+    kernel: ExecutionKernel,
+    run_id: str,
+) -> dict[str, object] | None:
+    inspected = kernel.inspect_run(run_id)
+    admitted_payloads: list[dict[str, object]] = []
+    for raw_artifact in inspected["artifacts"]:
+        if not isinstance(raw_artifact, dict):
+            continue
+        if raw_artifact.get("state") == "admitted":
+            admitted_path = raw_artifact.get("admitted_path")
+            content_digest = raw_artifact.get("content_digest")
+            size_bytes = raw_artifact.get("size_bytes")
+            if (
+                not isinstance(admitted_path, str)
+                or not isinstance(content_digest, str)
+                or not isinstance(size_bytes, int)
+            ):
+                raise ExecutorStoreError("admitted_artifact_integrity_error")
+            path = Path(admitted_path)
+            if path.is_symlink() or not path.is_file():
+                raise ExecutorStoreError("admitted_artifact_missing")
+            actual_digest, actual_size = digest_file(path)
+            if actual_digest != content_digest or actual_size != size_bytes:
+                raise ExecutorStoreError("admitted_artifact_integrity_error")
+            envelope = raw_artifact.get("envelope")
+            if not isinstance(envelope, dict):
+                raise ExecutorStoreError("admitted_artifact_envelope_missing")
+            try:
+                decoded_artifact = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ExecutorStoreError(
+                    "admitted_artifact_decode_error"
+                ) from exc
+            if envelope.get("payload") != decoded_artifact:
+                raise ExecutorStoreError(
+                    "admitted_artifact_payload_mismatch"
+                )
+            if isinstance(decoded_artifact, dict):
+                admitted_payloads.append(
+                    {
+                        "artifact": raw_artifact,
+                        "payload": decoded_artifact,
+                    }
+                )
+        if raw_artifact.get("artifact_type") != "research-verification-register":
+            continue
+        if raw_artifact.get("state") != "admitted":
+            raise ExecutorStoreError("verification_register_artifact_not_admitted")
+        admitted_path = raw_artifact.get("admitted_path")
+        content_digest = raw_artifact.get("content_digest")
+        size_bytes = raw_artifact.get("size_bytes")
+        if (
+            not isinstance(admitted_path, str)
+            or not isinstance(content_digest, str)
+            or not isinstance(size_bytes, int)
+        ):
+            raise ExecutorStoreError("verification_register_artifact_invalid")
+        path = Path(admitted_path)
+        if path.is_symlink() or not path.is_file():
+            raise ExecutorStoreError("verification_register_artifact_missing")
+        actual_digest, actual_size = digest_file(path)
+        if actual_digest != content_digest or actual_size != size_bytes:
+            raise ExecutorStoreError("verification_register_artifact_integrity_error")
+        try:
+            decoded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ExecutorStoreError(
+                "verification_register_artifact_decode_error"
+            ) from exc
+        envelope = raw_artifact.get("envelope")
+        if not isinstance(envelope, dict) or envelope.get("payload") != decoded:
+            raise ExecutorStoreError("verification_register_artifact_payload_mismatch")
+        payload = decoded.get("evidence") if isinstance(decoded, dict) else None
+        if not isinstance(payload, dict):
+            raise ExecutorStoreError("verification_register_evidence_missing")
+        sources = payload.get("sources")
+        if not isinstance(sources, list):
+            raise ExecutorStoreError("verification_register_sources_missing")
+        for source in sources:
+            if not isinstance(source, dict):
+                raise ExecutorStoreError("verification_register_source_invalid")
+            source_id = source.get("source_id")
+            matches = [
+                item
+                for item in admitted_payloads
+                if item["payload"].get("source_id") == source_id
+            ]
+            if len(matches) != 1:
+                raise ExecutorStoreError("verification_register_source_artifact_mismatch")
+            artifact = matches[0]["artifact"]
+            for source_field, artifact_field in (
+                ("run_id", "run_id"),
+                ("work_id", "work_id"),
+                ("attempt_id", "attempt_id"),
+                ("fencing_token", "fencing_token"),
+                ("harness", "harness"),
+                ("worker", "worker"),
+                ("agent", "agent"),
+            ):
+                if source.get(source_field) != artifact.get(artifact_field):
+                    raise ExecutorStoreError(
+                        "verification_register_source_lineage_mismatch"
+                    )
+        return payload
+    return None
+
+
+def _validate_kernel_verification_assignment(
+    kernel: ExecutionKernel,
+    assignment: VerificationAssignment,
+) -> None:
+    if (
+        assignment.run_id is None
+        or assignment.verification_attempt_id is None
+        or assignment.verification_fencing_token is None
+    ):
+        raise ExecutorStoreError("verification_assignment_kernel_authority_required")
+    inspected = kernel.inspect_run(assignment.run_id)
+    work_items = [
+        item
+        for item in inspected["work_items"]
+        if item.get("work_id") == assignment.verification_work_id
+    ]
+    if len(work_items) != 1:
+        raise ExecutorStoreError("verification_assignment_work_not_found")
+    work_item = work_items[0]
+    if (
+        work_item.get("state") != "succeeded"
+        or not isinstance(work_item.get("payload"), dict)
+        or work_item["payload"].get("research_kind") != "verification"
+    ):
+        raise ExecutorStoreError("verification_assignment_work_not_settled")
+    attempts = [
+        attempt
+        for attempt in inspected["attempts"]
+        if attempt.get("work_id") == assignment.verification_work_id
+    ]
+    if not attempts:
+        raise ExecutorStoreError("verification_assignment_attempt_missing")
+    current_attempts = [
+        attempt
+        for attempt in attempts
+        if (
+            attempt.get("attempt_id") == assignment.verification_attempt_id
+            and attempt.get("fencing_token")
+            == assignment.verification_fencing_token
+            and attempt.get("state") == "succeeded"
+        )
+    ]
+    if len(current_attempts) != 1 or current_attempts[0].get("attempt_number") != max(
+        int(attempt.get("attempt_number", 0)) for attempt in attempts
+    ):
+        raise ExecutorStoreError("verification_assignment_attempt_not_current")
+    receipts = [
+        receipt
+        for receipt in inspected["receipts"]
+        if (
+            receipt.get("work_id") == assignment.verification_work_id
+            and receipt.get("attempt_id") == assignment.verification_attempt_id
+            and receipt.get("fencing_token")
+            == assignment.verification_fencing_token
+            and receipt.get("state") == "succeeded"
+        )
+    ]
+    if not receipts:
+        raise ExecutorStoreError("verification_assignment_receipt_missing")
+    artifacts = [
+        artifact
+        for artifact in inspected["artifacts"]
+        if (
+            artifact.get("state") == "admitted"
+            and artifact.get("work_id") == assignment.verification_work_id
+            and artifact.get("attempt_id") == assignment.verification_attempt_id
+            and artifact.get("fencing_token")
+            == assignment.verification_fencing_token
+        )
+    ]
+    if not artifacts:
+        raise ExecutorStoreError("verification_assignment_artifact_missing")
+    artifact_source_ids = {
+        artifact.get("envelope", {}).get("payload", {}).get("source_id")
+        for artifact in artifacts
+        if isinstance(artifact.get("envelope"), dict)
+        and isinstance(artifact["envelope"].get("payload"), dict)
+    }
+    if not set(assignment.source_ids).issubset(artifact_source_ids):
+        raise ExecutorStoreError("verification_assignment_source_artifact_missing")
+
+
+def _verification_outcome(register: ResearchEvidenceRegister) -> str:
+    if register.verification_credit_claim_ids:
+        return "critical_claim_verified"
+    if register.contested_claim_ids:
+        return "claim_contested"
+    return "critical_claim_unverified"
 
 
 def _research_verification_fixture_in_state(
@@ -564,10 +850,12 @@ def _research_verification_fixture_in_state(
         research_config.roles.get("verifier")
         or research_config.roles.get("independent_verifier")
     )
-    collector = workers_by_name.get(collector_name) or config.workers[0]
+    collector = workers_by_name.get(collector_name)
     verifier = workers_by_name.get(verifier_name)
+    if collector is None:
+        raise ConfigError("research_verification_collector_role_required")
     if verifier is None:
-        verifier = config.workers[1] if len(config.workers) > 1 else collector
+        raise ConfigError("research_verification_verifier_role_required")
 
     register = ResearchEvidenceRegister(
         verification_policy=research_config.verification,
@@ -616,6 +904,23 @@ def _research_verification_fixture_in_state(
                     ],
                 },
             },
+            {
+                "work_id": "persist-verification-register",
+                "worker": verifier.name,
+                "harness": verifier.harness.value,
+                "depends_on": ["verify-claim-critical"],
+                "payload": {
+                    "research_kind": "verification-register",
+                    "claim_id": "claim-critical",
+                    "assigned_path": "evidence/verification-register.json",
+                    "lineage": [
+                        "collect-support",
+                        "collect-contradiction",
+                        "verify-claim-critical",
+                        "persist-verification-register",
+                    ],
+                },
+            },
         ],
     )
     sources: dict[str, SourceReceipt] = {}
@@ -634,14 +939,16 @@ def _research_verification_fixture_in_state(
     collection_specs = (
         (
             "source-support",
-            "The disputed observation supports the claim.",
+            "https://www.rfc-editor.org/rfc/rfc9110.html",
+            "The GET method requests transfer of a current selected representation for the target resource.",
         ),
         (
             "source-contradiction",
-            "The disputed observation contradicts the claim.",
+            "https://www.iana.org/assignments/http-methods/http-methods.xhtml",
+            "The opposing observation remains admitted for contradiction accounting.",
         ),
     )
-    for work_id, (source_id, text) in zip(
+    for work_id, (source_id, requested_url, text) in zip(
         ("collect-support", "collect-contradiction"),
         collection_specs,
     ):
@@ -650,8 +957,8 @@ def _research_verification_fixture_in_state(
             raise ExecutorStoreError("verification_fixture_collection_not_ready")
         collection_claim = collection_claims[0]
         source = SourceReceipt.from_retrieval(
-            requested_url=f"https://example.test/{source_id}",
-            final_url=f"https://example.test/{source_id}",
+            requested_url=requested_url,
+            final_url=requested_url,
             redirect_chain=(),
             retrieved_content=text.encode("utf-8"),
             retrieval_order=1 if work_id == "collect-support" else 2,
@@ -705,10 +1012,18 @@ def _research_verification_fixture_in_state(
     if len(verification_claims) != 1:
         raise ExecutorStoreError("verification_fixture_verification_not_ready")
     verification_claim = verification_claims[0]
-    verification_text = "Independent verification matches the claim."
+    verification_text = (
+        "The GET HTTP method requests a representation of the specified resource."
+    )
     verification_source = SourceReceipt.from_retrieval(
-        requested_url="https://example.test/source-verification",
-        final_url="https://example.test/source-verification",
+        requested_url=(
+            "https://developer.mozilla.org/en-US/docs/Web/HTTP/"
+            "Reference/Methods/GET"
+        ),
+        final_url=(
+            "https://developer.mozilla.org/en-US/docs/Web/HTTP/"
+            "Reference/Methods/GET"
+        ),
         redirect_chain=(),
         retrieved_content=verification_text.encode("utf-8"),
         retrieval_order=3,
@@ -787,6 +1102,7 @@ def _research_verification_fixture_in_state(
         )
         try:
             register.admit_verification_assignment(assignment)
+            _validate_kernel_verification_assignment(kernel, assignment)
             if case_id == "stale-assignment":
                 assignment = register.supersede_verification_assignment(
                     assignment.assignment_id
@@ -939,6 +1255,16 @@ def _research_verification_fixture_in_state(
             rejection_code = str(exc).split(":", 1)[0]
 
     verification = register.claim_status(claim.claim_id)
+    register_claims = kernel.claim_ready(run_id, limit=1)
+    if len(register_claims) != 1:
+        raise ExecutorStoreError("verification_fixture_register_not_ready")
+    register_claim = register_claims[0]
+    _settle_verification_fixture_work(
+        kernel,
+        register_claim,
+        artifact_type="research-verification-register",
+        payload={"evidence": register.to_dict()},
+    )
     if case_id == "contradiction-pack" or case_id == "contested":
         outcome_code = "claim_contested"
         reason = "opposing admitted evidence remains contested"
@@ -961,10 +1287,7 @@ def _research_verification_fixture_in_state(
         reason = rejection_code or "critical_claim_requires_independent_verification"
         success = False
     evidence = register.to_dict()
-    kernel.transition_run(
-        run_id,
-        "succeeded" if verification["state"] == "verified" else "failed",
-    )
+    kernel.transition_run(run_id, "succeeded" if success else "failed")
     kernel.append_event(
         run_id,
         event_key=f"research-verification-fixture:{requested_case_id}",
@@ -973,6 +1296,7 @@ def _research_verification_fixture_in_state(
             "fixture_case_id": requested_case_id,
             "outcome_code": outcome_code,
             "reason": reason,
+            "verification_policy": research_config.verification.to_dict(),
             "verification": verification,
             "verification_assignment": (
                 None if assignment is None else assignment.to_dict()
@@ -1428,8 +1752,8 @@ def _research_export(
     run = store.require_run(run_id)
     if run.workflow != config.name or run.executor_kind != "research-synthesis":
         raise ExecutorStoreError("run_not_found")
-    if run.state not in {"succeeded", "failed"}:
-        raise ResearchEvidenceError("research_export_requires_terminal_run")
+    if run.state != "succeeded":
+        raise ResearchEvidenceError("research_export_requires_succeeded_run")
     kernel = _research_kernel(config, store)
     verification_event = next(
         (
@@ -1439,26 +1763,53 @@ def _research_export(
         ),
         None,
     )
-    if verification_event is None or not isinstance(verification_event.payload, dict):
-        raise ResearchEvidenceError("research_export_evidence_missing")
-    raw_evidence = verification_event.payload.get("evidence")
-    if not isinstance(raw_evidence, dict):
-        raise ResearchEvidenceError("research_export_evidence_missing")
-    research_config = ResearchConfig.from_mapping(
-        config.executor.settings if config.executor is not None else {}
+    if verification_event is not None and not isinstance(
+        verification_event.payload,
+        dict,
+    ):
+        raise ResearchEvidenceError("research_export_evidence_event_invalid")
+    event_payload = (
+        verification_event.payload
+        if verification_event is not None
+        and isinstance(verification_event.payload, dict)
+        else None
     )
-    register = ResearchEvidenceRegister.from_mapping(
-        raw_evidence,
-        verification_policy=research_config.verification,
+    raw_evidence = event_payload.get("evidence") if event_payload else None
+    try:
+        persisted_evidence = _persisted_verification_evidence(kernel, run_id)
+    except ExecutorStoreError as exc:
+        raise ResearchEvidenceError(str(exc)) from exc
+    if persisted_evidence is None:
+        raise ResearchEvidenceError("research_export_evidence_artifact_missing")
+    if raw_evidence is None:
+        raw_evidence = persisted_evidence
+    if persisted_evidence != raw_evidence:
+        raise ResearchEvidenceError("research_export_evidence_integrity_mismatch")
+    try:
+        register = _register_from_persisted_evidence(raw_evidence)
+    except ResearchEvidenceError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise ResearchEvidenceError("research_export_evidence_invalid") from exc
+    for assignment in register.verification_assignments:
+        if not assignment.current:
+            continue
+        try:
+            _validate_kernel_verification_assignment(kernel, assignment)
+        except ExecutorStoreError as exc:
+            raise ResearchEvidenceError(str(exc)) from exc
+    outcome_code = (
+        str(event_payload.get("outcome_code", "unknown"))
+        if event_payload is not None
+        else _verification_outcome(register)
     )
-    outcome_code = str(verification_event.payload.get("outcome_code", "unknown"))
     if (
         not register.verification_credit_claim_ids
         and outcome_code != "claim_contested"
     ):
         raise ResearchEvidenceError("research_export_critical_verification_required")
 
-    export_root = (config.workspace / ".orchestrator" / "exports").resolve()
+    export_root = _export_root(config.workspace)
     report_path = (
         (export_root / run_id / "report.md")
         if output is None
@@ -1470,8 +1821,7 @@ def _research_export(
         f"{report_path.stem}.source-claim-register.json"
     )
     for path in (report_path, register_path):
-        if not path.parent.resolve().is_relative_to(export_root):
-            raise ResearchEvidenceError("research_export_path_outside_root")
+        _validate_export_path(export_root, path)
     register_bytes = (
         json.dumps(register.to_dict(), indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
@@ -1530,10 +1880,12 @@ def _research_export(
             f"`{relation.source_id}` | `{relation.excerpt_id}` |"
         )
     report_bytes = ("\n".join(report_lines) + "\n").encode("utf-8")
-    _check_export_target(report_path, report_bytes)
-    _check_export_target(register_path, register_bytes)
-    _atomic_export_bytes(report_path, report_bytes)
-    _atomic_export_bytes(register_path, register_bytes)
+    _atomic_export_bundle(
+        (
+            (report_path, report_bytes),
+            (register_path, register_bytes),
+        )
+    )
     print(
         json.dumps(
             {
@@ -1565,31 +1917,81 @@ def _resolve_export_path(workspace: Path, value: str) -> Path:
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
         candidate = workspace / ".orchestrator" / "exports" / candidate
-    return candidate.resolve()
+    return Path(os.path.abspath(candidate))
+
+
+def _export_root(workspace: Path) -> Path:
+    return Path(os.path.abspath(workspace / ".orchestrator" / "exports"))
+
+
+def _validate_export_path(root: Path, path: Path) -> None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ResearchEvidenceError("research_export_path_outside_root") from exc
+    if not relative.parts or relative.parts[-1] in {".", ".."}:
+        raise ResearchEvidenceError("research_export_path_invalid")
+    current = root
+    for component in relative.parts[:-1]:
+        current = current / component
+        if current.is_symlink():
+            raise ResearchEvidenceError("research_export_path_symlink")
+    for ancestor in (root.parent, root):
+        if ancestor.is_symlink():
+            raise ResearchEvidenceError("research_export_path_symlink")
 
 
 def _atomic_export_bytes(path: Path, content: bytes) -> None:
-    _check_export_target(path, content)
-    temporary = path.with_name(f".{path.name}.tmp")
+    _atomic_export_bundle(((path, content),))
+
+
+def _atomic_export_bundle(
+    files: tuple[tuple[Path, bytes], ...],
+) -> None:
+    for path, content in files:
+        _check_export_target(path, content)
+    temporary_paths: list[tuple[Path, Path]] = []
+    published: list[Path] = []
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_bytes(content)
-        temporary.replace(path)
+        for path, content in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.tmp")
+            if temporary.exists():
+                raise ResearchEvidenceError("research_export_temporary_exists")
+            temporary.write_bytes(content)
+            temporary_paths.append((temporary, path))
+        for temporary, path in temporary_paths:
+            if path.exists():
+                continue
+            temporary.replace(path)
+            published.append(path)
     except OSError as exc:
-        if temporary.exists():
-            temporary.unlink()
+        for path in published:
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
         raise ResearchEvidenceError("research_export_write_failed") from exc
+    except ResearchEvidenceError:
+        for path in published:
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
+        raise
+    finally:
+        for temporary, _ in temporary_paths:
+            if temporary.exists():
+                temporary.unlink()
 
 
 def _check_export_target(path: Path, content: bytes) -> None:
+    if path.is_symlink():
+        raise ResearchEvidenceError("research_export_existing_path_invalid")
     if path.exists():
-        if path.is_symlink() or not path.is_file():
+        if not path.is_file():
             raise ResearchEvidenceError("research_export_existing_path_invalid")
         if path.read_bytes() != content:
             raise ResearchEvidenceError("research_export_overwrite_conflict")
         return
     temporary = path.with_name(f".{path.name}.tmp")
-    if temporary.exists():
+    if temporary.exists() or temporary.is_symlink():
         raise ResearchEvidenceError("research_export_temporary_exists")
 
 

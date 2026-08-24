@@ -1766,6 +1766,14 @@ class ResearchEvidenceRegister:
             return assignment
         superseded = replace(assignment, current=False)
         self._verification_assignments[assignment_id] = superseded
+        for disposition in tuple(self._verification_dispositions.values()):
+            if (
+                disposition.assignment_id == assignment_id
+                and disposition.current
+            ):
+                self._verification_dispositions[
+                    disposition.disposition_id
+                ] = replace(disposition, current=False)
         return superseded
 
     supersede_assignment = supersede_verification_assignment
@@ -1832,10 +1840,15 @@ class ResearchEvidenceRegister:
                 raise _error("verification_disposition_evidence_required")
             if supplied_contradictions != contradiction_ids:
                 raise _error("verification_disposition_contradictions_unaccounted")
-            if not derive_criticality(claim, self._verification_policy):
-                # Non-critical claims may be verified, but a verified
-                # disposition still needs the same evidence-bound checks.
-                pass
+            if (
+                derive_criticality(claim, self._verification_policy)
+                and (
+                    assignment.run_id is None
+                    or assignment.verification_attempt_id is None
+                    or assignment.verification_fencing_token is None
+                )
+            ):
+                raise _error("verification_disposition_kernel_authority_required")
         elif disposition.disposition == "contested":
             if supplied_contradictions != contradiction_ids:
                 raise _error("verification_disposition_contradictions_unaccounted")
@@ -1898,7 +1911,16 @@ class ResearchEvidenceRegister:
             (
                 disposition
                 for disposition in self._verification_dispositions.values()
-                if disposition.claim_id == claim_id and disposition.current
+                if (
+                    disposition.claim_id == claim_id
+                    and disposition.current
+                    and self._verification_assignments.get(
+                        disposition.assignment_id
+                    ) is not None
+                    and self._verification_assignments[
+                        disposition.assignment_id
+                    ].current
+                )
             ),
             None,
         )
