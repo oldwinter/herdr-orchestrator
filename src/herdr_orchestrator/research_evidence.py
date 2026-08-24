@@ -1965,9 +1965,21 @@ class ResearchEvidenceRegister:
             ),
             None,
         )
-        if current is not None and current.disposition == "verified":
+        authority_current = True
+        if current is not None and current.disposition == "verified" and critical:
+            authority_current = self._verification_assignment_is_authorized(
+                current.assignment_id,
+            )
+        if (
+            current is not None
+            and current.disposition == "verified"
+            and authority_current
+        ):
             state = "verified"
             gate_credit = True
+        elif current is not None and current.disposition == "verified":
+            state = "contested" if contradiction_ids else "unverified"
+            gate_credit = False
         elif current is not None and current.disposition in {
             "unverified",
             "rejected",
@@ -1993,11 +2005,27 @@ class ResearchEvidenceRegister:
             "contradiction_relation_ids": contradiction_ids,
             "context_relation_ids": context_ids,
             "disposition_id": None if current is None else current.disposition_id,
+            "authority_current": authority_current,
             "disposition_history": history,
         }
 
     def verification_status(self) -> tuple[dict[str, Any], ...]:
         return tuple(self.claim_status(claim.claim_id) for claim in self.claims)
+
+    def _verification_assignment_is_authorized(
+        self,
+        assignment_id: str,
+    ) -> bool:
+        assignment = self._verification_assignments.get(assignment_id)
+        if assignment is None or not assignment.current:
+            return False
+        if self._verification_authorizer is None:
+            return False
+        try:
+            self._verification_authorizer(assignment)
+        except Exception:
+            return False
+        return True
 
     def _validate_disposition_evidence(
         self,

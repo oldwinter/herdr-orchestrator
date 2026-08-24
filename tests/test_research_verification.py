@@ -130,6 +130,121 @@ class ResearchVerificationTests(unittest.TestCase):
             "research_verification_collector_capability_required",
         )
 
+    def test_evidence_fixture_cannot_bypass_verification_role_preflight(self) -> None:
+        with TemporaryDirectory() as temporary:
+            workflow = _workflow(Path(temporary))
+            workflow.write_text(
+                workflow.read_text(encoding="utf-8").replace(
+                    'capabilities = ["research.collect"]',
+                    'capabilities = ["research.verify"]',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            exit_code, payload = _invoke(
+                "research",
+                "evidence-fixture",
+                "--workflow",
+                str(workflow),
+                "--case",
+                "critical-independent",
+            )
+
+        self.assertEqual(exit_code, 64)
+        self.assertFalse(payload["success"])
+        self.assertEqual(
+            payload["code"],
+            "research_verification_collector_capability_required",
+        )
+
+    def test_verification_alias_replays_canonical_run(self) -> None:
+        with TemporaryDirectory() as temporary:
+            workflow = _workflow(Path(temporary))
+            canonical_exit, canonical = _invoke(
+                "research",
+                "verification-fixture",
+                "--workflow",
+                str(workflow),
+                "--case",
+                "critical-independent",
+            )
+            alias_exit, alias = _invoke(
+                "research",
+                "verification-fixture",
+                "--workflow",
+                str(workflow),
+                "--case",
+                "critical",
+            )
+
+        self.assertEqual(canonical_exit, 0)
+        self.assertEqual(alias_exit, 0)
+        self.assertEqual(alias["run_id"], canonical["run_id"])
+        self.assertTrue(alias["idempotent"])
+        self.assertEqual(alias["execution_state"], "succeeded")
+
+    def test_lost_kernel_authority_removes_gate_credit(self) -> None:
+        authority_current = True
+
+        def authorize(_assignment: VerificationAssignment) -> None:
+            if not authority_current:
+                raise ValueError("stale")
+
+        register, claim, _, contradiction = _register_with_opposing_evidence(
+            verification_authorizer=authorize,
+        )
+        verification_excerpt = next(
+            excerpt
+            for excerpt in register.excerpts
+            if excerpt.source_id == "source-verification"
+        )
+        relation = register.admit_relation(
+            EvidenceRelation(
+                relation_id="relation-authority",
+                claim_id=claim.claim_id,
+                relation="support",
+                source_id="source-verification",
+                excerpt_id=verification_excerpt.excerpt_id,
+            )
+        )
+        assignment = register.admit_verification_assignment(
+            VerificationAssignment(
+                assignment_id="assignment-authority",
+                claim_id=claim.claim_id,
+                verification_work_id="verify-claim",
+                verifier_logical_agent_id="agent-verifier",
+                verifier_harness="claude",
+                collector_logical_agent_ids=("agent-collector",),
+                collector_harnesses=("grok",),
+                source_ids=("source-verification",),
+                excerpt_ids=(verification_excerpt.excerpt_id,),
+                run_id="run-1",
+                verification_attempt_id="attempt-3",
+                verification_fencing_token="fence-3",
+            )
+        )
+        register.admit_verification_disposition(
+            VerificationDisposition(
+                disposition_id="disposition-authority",
+                claim_id=claim.claim_id,
+                assignment_id=assignment.assignment_id,
+                disposition="verified",
+                reason="current authority",
+                evidence_ids=(relation.relation_id,),
+                contradiction_ids=(contradiction.relation_id,),
+                verifier_logical_agent_id="agent-verifier",
+                verifier_harness="claude",
+                source_ids=("source-verification",),
+                excerpt_ids=(verification_excerpt.excerpt_id,),
+            )
+        )
+        self.assertTrue(register.claim_status(claim.claim_id)["gate_credit"])
+        authority_current = False
+        status = register.claim_status(claim.claim_id)
+        self.assertFalse(status["authority_current"])
+        self.assertFalse(status["gate_credit"])
+        self.assertEqual(status["state"], "contested")
+
     def test_export_rejects_parent_components_before_normalization(self) -> None:
         with TemporaryDirectory() as temporary:
             workflow = _workflow(Path(temporary))
@@ -882,14 +997,21 @@ class ResearchVerificationTests(unittest.TestCase):
         self.assertEqual(restored.verification_status(), ())
 
 
-def _register_with_opposing_evidence() -> tuple[
+def _register_with_opposing_evidence(
+    *,
+    verification_authorizer: object | None = None,
+) -> tuple[
     ResearchEvidenceRegister,
     TypedClaim,
     EvidenceRelation,
     EvidenceRelation,
 ]:
     register = ResearchEvidenceRegister(
-        verification_authorizer=lambda _assignment: None,
+        verification_authorizer=(
+            verification_authorizer
+            if verification_authorizer is not None
+            else lambda _assignment: None
+        ),
     )
     sources = []
     excerpts = []

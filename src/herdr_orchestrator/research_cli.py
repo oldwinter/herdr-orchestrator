@@ -248,8 +248,9 @@ def _research_evidence_fixture(
         raise ConfigError(
             f"research_verification_fixture_unknown_case:{requested_case_id}"
         )
-    if route == "research.verification-fixture":
+    if case_id in _RESEARCH_VERIFICATION_FIXTURE_CASES:
         _require_verification_fixture_roles(config)
+    if route == "research.verification-fixture":
         return _research_evidence_fixture_in_state(
             config,
             requested_case_id=requested_case_id,
@@ -319,11 +320,11 @@ def _verification_fixture_manifest_definitions(
         "workflow": {
             "name": config.name,
             "schema_version": 2,
-            "fixture_case_id": requested_case_id,
+            "fixture_case_id": case_id,
             "workflow_source": config.path.read_text(encoding="utf-8"),
         },
         "config": {
-            "fixture_case_id": requested_case_id,
+            "fixture_case_id": case_id,
             "research": dict(config.executor.settings)
             if config.executor is not None
             else {},
@@ -653,6 +654,8 @@ def _replay_verification_fixture(
     )
     run = store.require_run(run_id)
     if event is None and run.state not in {"succeeded", "failed"}:
+        if run.state == "pending":
+            kernel.transition_run(run_id, "running")
         kernel.transition_run(
             run_id,
             "succeeded"
@@ -991,6 +994,11 @@ def _validate_kernel_verification_assignment(
         work_item.get("state") != "succeeded"
         or not isinstance(work_item.get("payload"), dict)
         or work_item["payload"].get("research_kind") != "verification"
+        or work_item.get("attempt_id") != assignment.verification_attempt_id
+        or work_item.get("fencing_token")
+        != assignment.verification_fencing_token
+        or work_item.get("agent_name") != assignment.verifier_logical_agent_id
+        or work_item.get("harness") != assignment.verifier_harness
     ):
         raise ExecutorStoreError("verification_assignment_work_not_settled")
     attempts = [
@@ -1025,8 +1033,15 @@ def _validate_kernel_verification_assignment(
             and receipt.get("state") == "succeeded"
         )
     ]
-    if not receipts:
+    if len(receipts) != 1:
         raise ExecutorStoreError("verification_assignment_receipt_missing")
+    receipt_payload = receipts[0].get("payload")
+    if (
+        receipts[0].get("kind") != "semantic"
+        or not isinstance(receipt_payload, dict)
+        or receipt_payload.get("research_kind") != "verification"
+    ):
+        raise ExecutorStoreError("verification_assignment_semantic_receipt_missing")
     artifacts = [
         artifact
         for artifact in inspected["artifacts"]
@@ -1048,17 +1063,40 @@ def _validate_kernel_verification_assignment(
     ]
     if len(verification_payloads) != len(artifacts):
         raise ExecutorStoreError("verification_assignment_artifact_payload_missing")
+    if receipt_payload.get("payload") not in verification_payloads:
+        raise ExecutorStoreError("verification_assignment_receipt_artifact_mismatch")
+    for artifact in artifacts:
+        if (
+            artifact.get("run_id") != assignment.run_id
+            or artifact.get("work_id") != assignment.verification_work_id
+            or artifact.get("attempt_id") != assignment.verification_attempt_id
+            or artifact.get("fencing_token")
+            != assignment.verification_fencing_token
+            or artifact.get("agent") != assignment.verifier_logical_agent_id
+            or artifact.get("harness") != assignment.verifier_harness
+        ):
+            raise ExecutorStoreError("verification_assignment_artifact_lineage_mismatch")
 
     def artifact_payload_for(
         *,
         work_id: str,
         kind: str,
+        attempt_id: str | None = None,
+        fencing_token: str | None = None,
     ) -> list[dict[str, object]]:
         matches: list[dict[str, object]] = []
         for artifact in inspected["artifacts"]:
             if (
                 artifact.get("state") != "admitted"
                 or artifact.get("work_id") != work_id
+                or (
+                    attempt_id is not None
+                    and artifact.get("attempt_id") != attempt_id
+                )
+                or (
+                    fencing_token is not None
+                    and artifact.get("fencing_token") != fencing_token
+                )
                 or not isinstance(artifact.get("envelope"), dict)
                 or not isinstance(artifact["envelope"].get("payload"), dict)
             ):
@@ -1130,13 +1168,51 @@ def _validate_kernel_verification_assignment(
             or collector_item["payload"].get("research_kind") != "collection"
         ):
             raise ExecutorStoreError("verification_assignment_collector_work_not_settled")
+        collector_attempts = [
+            attempt
+            for attempt in inspected["attempts"]
+            if (
+                attempt.get("work_id") == collector_work_id
+                and attempt.get("attempt_id") == collector_item.get("attempt_id")
+                and attempt.get("fencing_token")
+                == collector_item.get("fencing_token")
+                and attempt.get("state") == "succeeded"
+                and attempt.get("agent_name") == collector_item.get("agent_name")
+            )
+        ]
+        if len(collector_attempts) != 1:
+            raise ExecutorStoreError("verification_assignment_collector_attempt_missing")
+        collector_receipts = [
+            receipt
+            for receipt in inspected["receipts"]
+            if (
+                receipt.get("work_id") == collector_work_id
+                and receipt.get("attempt_id") == collector_item.get("attempt_id")
+                and receipt.get("fencing_token")
+                == collector_item.get("fencing_token")
+                and receipt.get("state") == "succeeded"
+                and receipt.get("kind") == "semantic"
+                and isinstance(receipt.get("payload"), dict)
+                and receipt["payload"].get("research_kind") == "collection"
+            )
+        ]
+        if len(collector_receipts) != 1:
+            raise ExecutorStoreError(
+                "verification_assignment_collector_receipt_missing"
+            )
         collector_payloads = artifact_payload_for(
             work_id=collector_work_id,
             kind="collection",
+            attempt_id=str(collector_item.get("attempt_id")),
+            fencing_token=str(collector_item.get("fencing_token")),
         )
         if len(collector_payloads) != 1:
             raise ExecutorStoreError("verification_assignment_collector_artifact_missing")
         collector_payload = collector_payloads[0]
+        if collector_receipts[0]["payload"].get("payload") != collector_payload:
+            raise ExecutorStoreError(
+                "verification_assignment_collector_receipt_artifact_mismatch"
+            )
         source_payload = collector_payload.get("source_receipt")
         excerpt_payload = collector_payload.get("excerpt_receipt")
         if (
@@ -1151,6 +1227,7 @@ def _validate_kernel_verification_assignment(
             != collector_item.get("fencing_token")
             or source_payload.get("harness") != collector_item.get("harness")
             or source_payload.get("worker") != collector_item.get("worker")
+            or source_payload.get("agent") != collector_item.get("agent_name")
             or excerpt_payload.get("source_id") != source_payload.get("source_id")
         ):
             raise ExecutorStoreError("verification_assignment_collector_lineage_mismatch")
