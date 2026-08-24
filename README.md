@@ -114,6 +114,30 @@ work/run state。可用 case 包括 `valid`、`lifecycle-only`、`missing-output
 domain-negative 结果仍是可解析 JSON，`success` 为 `false`；参数或 selector
 错误返回 `success: false` 的结构化错误和非零退出码。
 
+## Research verification fixtures
+
+Research workflows expose a deterministic contradiction and independent
+verification seam:
+
+```bash
+PYTHONPATH=src python3 -m herdr_orchestrator research verification-fixture \
+  --workflow path/to/research-workflow.toml --case critical-independent
+PYTHONPATH=src python3 -m herdr_orchestrator research inspect \
+  --workflow path/to/research-workflow.toml --run-id RUN_ID
+PYTHONPATH=src python3 -m herdr_orchestrator research export \
+  --workflow path/to/research-workflow.toml --run-id RUN_ID
+```
+
+Canonical cases include `contradiction-pack`, `critical-unverified`,
+`critical-independent`, `critical-self-verification`, `critical-downgrade`,
+`disposition-history`, `source-reuse`, `unaccounted-contradiction`, and
+`stale-assignment`. Fixture runs retain shared-kernel attempts, typed
+artifacts, evidence receipts, contradiction history, and terminal
+verification state. Repeating a case replays the existing terminal run
+without dispatching another attempt. Export writes a Markdown report and
+source-claim register below the workspace `.orchestrator/exports` boundary;
+contested exports preserve both opposing relations.
+
 ## 明确不做
 
 - 不把 `done` 当成质量证明；

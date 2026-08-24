@@ -89,6 +89,20 @@ def build_parser() -> argparse.ArgumentParser:
         dest="case",
         required=True,
     )
+    research_verification_fixture = research_subparsers.add_parser(
+        "verification-fixture"
+    )
+    research_verification_fixture.add_argument("--workflow", required=True)
+    research_verification_fixture.add_argument(
+        "--case",
+        "--fixture-case",
+        dest="case",
+        required=True,
+    )
+    research_export = research_subparsers.add_parser("export")
+    research_export.add_argument("--workflow", required=True)
+    research_export.add_argument("--run-id", "--run", required=True)
+    research_export.add_argument("--output")
 
     smoke_parser = subparsers.add_parser("smoke")
     smoke_parser.add_argument("--workflow", required=True)

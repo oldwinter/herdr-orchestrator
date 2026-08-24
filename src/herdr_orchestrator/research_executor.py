@@ -10,6 +10,7 @@ from typing import Any
 from herdr_orchestrator.research_evidence import (
     Claim,
     ClaimRecord,
+    CriticalityPolicy,
     EVIDENCE_NORMALIZATION_VERSION,
     EvidenceRelation,
     EvidenceRelationRecord,
@@ -27,6 +28,9 @@ from herdr_orchestrator.research_evidence import (
     SourceExcerptReceipt,
     SourceReceipt,
     TypedClaim,
+    VerificationAssignment,
+    VerificationDisposition,
+    derive_criticality,
     parse_evidence_relation,
     parse_evidence_register,
     parse_excerpt_receipt,
@@ -181,6 +185,7 @@ class ResearchConfig:
     coverage: CoveragePolicy
     input_policy: InputPolicy
     roles: Mapping[str, str]
+    verification: CriticalityPolicy
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> ResearchConfig:
@@ -188,7 +193,7 @@ class ResearchConfig:
             value = {}
         if not isinstance(value, Mapping):
             raise ResearchInputError("research_config_must_be_table")
-        allowed = {"decomposition", "coverage", "input", "roles"}
+        allowed = {"decomposition", "coverage", "input", "roles", "verification"}
         unknown = set(value) - allowed
         if unknown:
             raise ResearchInputError(
@@ -198,7 +203,8 @@ class ResearchConfig:
         coverage = _parse_coverage(value.get("coverage"))
         input_policy = _parse_input_policy(value.get("input"))
         roles = _parse_roles(value.get("roles"))
-        return cls(decomposition, coverage, input_policy, roles)
+        verification = CriticalityPolicy.from_mapping(value.get("verification"))
+        return cls(decomposition, coverage, input_policy, roles, verification)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -206,6 +212,7 @@ class ResearchConfig:
             "coverage": self.coverage.to_dict(),
             "input": self.input_policy.to_dict(),
             "roles": dict(self.roles),
+            "verification": self.verification.to_dict(),
         }
 
 
@@ -383,6 +390,7 @@ def build_research_view(
     decomposition: QuestionDecomposition,
     *,
     input_policy: InputPolicy | None = None,
+    verification_policy: CriticalityPolicy | Mapping[str, Any] | None = None,
     required_input_admitted: bool = False,
     required_input_digest: str | None = None,
 ) -> dict[str, object]:
@@ -412,6 +420,11 @@ def build_research_view(
         }
         if required_input_digest is not None:
             required_input["content_digest"] = required_input_digest
+    policy = (
+        verification_policy
+        if isinstance(verification_policy, CriticalityPolicy)
+        else CriticalityPolicy.from_mapping(verification_policy)
+    )
     return {
         "input": value.to_dict(),
         "classification": classification.to_dict(),
@@ -419,6 +432,7 @@ def build_research_view(
         "coverage": coverage.to_dict(),
         "phase": "input_required" if classification.requires_input else "decomposed",
         "required_input": required_input,
+        "verification_policy": policy.to_dict(),
     }
 
 

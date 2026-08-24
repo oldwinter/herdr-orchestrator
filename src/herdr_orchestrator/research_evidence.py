@@ -5,7 +5,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -27,8 +27,13 @@ SUPPORTED_EVIDENCE_RELATIONS = frozenset(
 SUPPORTED_SOURCE_OUTCOMES = frozenset(
     {"retrieved", "unavailable", "denied", "changed"}
 )
+VERIFICATION_SCHEMA_VERSION = 1
+SUPPORTED_VERIFICATION_DISPOSITIONS = frozenset(
+    {"contested", "verified", "unverified", "rejected"}
+)
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,127}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_POLICY_UNSET = object()
 
 
 class ResearchEvidenceError(ValueError):
@@ -39,6 +44,109 @@ class ResearchEvidenceError(ValueError):
 
 def _error(code: str) -> ResearchEvidenceError:
     return ResearchEvidenceError(code)
+
+
+@dataclass(frozen=True, slots=True)
+class CriticalityPolicy:
+    """Pinned policy for deriving which claims require independent verification.
+
+    ``TypedClaim.critical`` is intentionally only producer metadata.  A claim
+    is critical when its type is in ``critical_claim_types`` and it is used by
+    a required conclusion.  An empty ``required_conclusion_ids`` policy means
+    that any explicit required-conclusion use is in scope; a non-empty policy
+    restricts that use to the pinned conclusion IDs.
+    """
+
+    critical_claim_types: tuple[str, ...] = ("factual", "quantitative", "causal")
+    required_conclusion_ids: tuple[str, ...] = ()
+    require_independent_logical_agent: bool = True
+    require_harness_separation: bool = True
+    forbid_source_reuse: bool = True
+    policy_version: int = VERIFICATION_SCHEMA_VERSION
+
+    EXACT_KEYS = frozenset(
+        {
+            "policy_version",
+            "critical_claim_types",
+            "required_conclusion_ids",
+            "required_conclusions",
+            "require_independent_logical_agent",
+            "require_harness_separation",
+            "forbid_source_reuse",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        types = _string_tuple(
+            self.critical_claim_types,
+            "criticality_claim_types",
+            required=True,
+        )
+        if not set(types).issubset(SUPPORTED_CLAIM_TYPES):
+            unsupported = sorted(set(types) - SUPPORTED_CLAIM_TYPES)[0]
+            raise _error(f"criticality_claim_type_unsupported:{unsupported}")
+        conclusion_ids = _string_tuple(
+            self.required_conclusion_ids,
+            "criticality_required_conclusion_ids",
+        )
+        if (
+            not isinstance(self.require_independent_logical_agent, bool)
+            or not isinstance(self.require_harness_separation, bool)
+            or not isinstance(self.forbid_source_reuse, bool)
+        ):
+            raise _error("criticality_policy_boolean_invalid")
+        if (
+            not isinstance(self.policy_version, int)
+            or isinstance(self.policy_version, bool)
+            or self.policy_version != VERIFICATION_SCHEMA_VERSION
+        ):
+            raise _error("criticality_policy_version_unsupported")
+        object.__setattr__(self, "critical_claim_types", types)
+        object.__setattr__(self, "required_conclusion_ids", conclusion_ids)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> CriticalityPolicy:
+        if value is None:
+            return cls()
+        if not isinstance(value, Mapping):
+            raise _error("criticality_policy_object_required")
+        unknown = set(value) - cls.EXACT_KEYS
+        if unknown:
+            raise _error(f"criticality_policy_unknown_field:{sorted(unknown)[0]}")
+        if "required_conclusion_ids" in value and "required_conclusions" in value:
+            if value["required_conclusion_ids"] != value["required_conclusions"]:
+                raise _error("criticality_policy_duplicate_conclusions")
+        raw_conclusions = value.get(
+            "required_conclusion_ids",
+            value.get("required_conclusions", ()),
+        )
+        return cls(
+            critical_claim_types=value.get(
+                "critical_claim_types",
+                ("factual", "quantitative", "causal"),
+            ),
+            required_conclusion_ids=raw_conclusions,
+            require_independent_logical_agent=value.get(
+                "require_independent_logical_agent",
+                True,
+            ),
+            require_harness_separation=value.get(
+                "require_harness_separation",
+                True,
+            ),
+            forbid_source_reuse=value.get("forbid_source_reuse", True),
+            policy_version=value.get("policy_version", VERIFICATION_SCHEMA_VERSION),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "policy_version": self.policy_version,
+            "critical_claim_types": list(self.critical_claim_types),
+            "required_conclusion_ids": list(self.required_conclusion_ids),
+            "require_independent_logical_agent": self.require_independent_logical_agent,
+            "require_harness_separation": self.require_harness_separation,
+            "forbid_source_reuse": self.forbid_source_reuse,
+        }
 
 
 def _identifier(value: Any, field: str) -> str:
@@ -747,6 +855,7 @@ class TypedClaim:
     critical: bool = False
     facet_ids: tuple[str, ...] = ()
     perspective_ids: tuple[str, ...] = ()
+    required_conclusion_ids: tuple[str, ...] = ()
     schema_version: int = RESEARCH_EVIDENCE_SCHEMA_VERSION
 
     EXACT_KEYS = frozenset(
@@ -767,6 +876,7 @@ class TypedClaim:
             "critical",
             "facet_ids",
             "perspective_ids",
+            "required_conclusion_ids",
         }
     )
     REQUIRED_KEYS = frozenset({"schema_version", "claim_id", "claim_type", "text"})
@@ -789,6 +899,14 @@ class TypedClaim:
             self,
             "perspective_ids",
             _string_tuple(self.perspective_ids, "claim_perspective_ids"),
+        )
+        object.__setattr__(
+            self,
+            "required_conclusion_ids",
+            _string_tuple(
+                self.required_conclusion_ids,
+                "claim_required_conclusion_ids",
+            ),
         )
         if not isinstance(self.critical, bool):
             raise _error("claim_critical_invalid")
@@ -873,6 +991,7 @@ class TypedClaim:
             critical=value.get("critical", False),
             facet_ids=value.get("facet_ids", ()),
             perspective_ids=value.get("perspective_ids", ()),
+            required_conclusion_ids=value.get("required_conclusion_ids", ()),
             schema_version=value["schema_version"],
         )
 
@@ -891,6 +1010,16 @@ class TypedClaim:
     @property
     def range(self) -> Mapping[str, int | float] | None:
         return self.value_range
+
+    @property
+    def derived_critical(self) -> bool:
+        return derive_criticality(self, None)
+
+    def is_critical(
+        self,
+        policy: CriticalityPolicy | Mapping[str, Any] | None = None,
+    ) -> bool:
+        return derive_criticality(self, policy)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -911,7 +1040,38 @@ class TypedClaim:
             "critical": self.critical,
             "facet_ids": list(self.facet_ids),
             "perspective_ids": list(self.perspective_ids),
+            "required_conclusion_ids": list(self.required_conclusion_ids),
         }
+
+
+def derive_criticality(
+    claim: TypedClaim,
+    policy: CriticalityPolicy | Mapping[str, Any] | None = None,
+) -> bool:
+    """Derive criticality from the pinned policy and conclusion use.
+
+    Collector-provided ``critical`` metadata is deliberately ignored.  This
+    keeps a producer from downgrading a claim simply by changing a flag and
+    makes the required-conclusion relationship the durable source of truth.
+    """
+
+    if not isinstance(claim, TypedClaim):
+        raise _error("criticality_claim_required")
+    resolved_policy = (
+        policy
+        if isinstance(policy, CriticalityPolicy)
+        else CriticalityPolicy.from_mapping(policy)
+    )
+    if claim.claim_type not in resolved_policy.critical_claim_types:
+        return False
+    if not claim.required_conclusion_ids:
+        return False
+    if not resolved_policy.required_conclusion_ids:
+        return True
+    return bool(
+        set(claim.required_conclusion_ids)
+        & set(resolved_policy.required_conclusion_ids)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -992,14 +1152,371 @@ class EvidenceRelation:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class VerificationAssignment:
+    """Pinned assignment for an independent verification work item."""
+
+    assignment_id: str
+    claim_id: str
+    verification_work_id: str
+    verifier_logical_agent_id: str
+    verifier_harness: str
+    collector_logical_agent_ids: tuple[str, ...]
+    collector_harnesses: tuple[str, ...]
+    source_ids: tuple[str, ...] = ()
+    excerpt_ids: tuple[str, ...] = ()
+    current: bool = True
+    schema_version: int = VERIFICATION_SCHEMA_VERSION
+    collector_work_ids: tuple[str, ...] = ()
+    run_id: str | None = None
+    verification_attempt_id: str | None = None
+    verification_fencing_token: str | None = None
+
+    EXACT_KEYS = frozenset(
+        {
+            "schema_version",
+            "assignment_id",
+            "claim_id",
+            "verification_work_id",
+            "verifier_logical_agent_id",
+            "verifier_agent_id",
+            "verifier_harness",
+            "collector_logical_agent_ids",
+            "collector_agent_ids",
+            "collector_harnesses",
+            "source_ids",
+            "excerpt_ids",
+            "current",
+            "collector_work_ids",
+            "run_id",
+            "verification_attempt_id",
+            "verification_fencing_token",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        _identifier(self.assignment_id, "verification_assignment_id")
+        _identifier(self.claim_id, "verification_assignment_claim_id")
+        _identifier(self.verification_work_id, "verification_work_id")
+        verifier = _identifier(
+            self.verifier_logical_agent_id,
+            "verification_verifier_logical_agent_id",
+        )
+        _non_empty_text(
+            self.verifier_harness,
+            "verification_verifier_harness",
+            max_bytes=128,
+        )
+        collectors = _string_tuple(
+            self.collector_logical_agent_ids,
+            "verification_collector_logical_agent_ids",
+            required=True,
+        )
+        collector_harnesses = _string_tuple(
+            self.collector_harnesses,
+            "verification_collector_harnesses",
+            required=True,
+        )
+        source_ids = _string_tuple(
+            self.source_ids,
+            "verification_source_ids",
+        )
+        excerpt_ids = _string_tuple(
+            self.excerpt_ids,
+            "verification_excerpt_ids",
+        )
+        collector_work_ids = _string_tuple(
+            self.collector_work_ids,
+            "verification_collector_work_ids",
+        )
+        for field, value in (
+            ("verification_run_id", self.run_id),
+            ("verification_attempt_id", self.verification_attempt_id),
+            ("verification_fencing_token", self.verification_fencing_token),
+        ):
+            if value is not None:
+                _identifier(value, field)
+        authority = (
+            self.run_id,
+            self.verification_attempt_id,
+            self.verification_fencing_token,
+        )
+        if any(item is not None for item in authority) and not all(
+            item is not None for item in authority
+        ):
+            raise _error("verification_assignment_authority_incomplete")
+        if not isinstance(self.current, bool):
+            raise _error("verification_assignment_current_invalid")
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version != VERIFICATION_SCHEMA_VERSION
+        ):
+            raise _error("verification_assignment_schema_version_unsupported")
+        object.__setattr__(self, "verifier_logical_agent_id", verifier)
+        object.__setattr__(self, "collector_logical_agent_ids", collectors)
+        object.__setattr__(self, "collector_harnesses", collector_harnesses)
+        object.__setattr__(self, "source_ids", source_ids)
+        object.__setattr__(self, "excerpt_ids", excerpt_ids)
+        object.__setattr__(self, "collector_work_ids", collector_work_ids)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> VerificationAssignment:
+        if not isinstance(value, Mapping):
+            raise _error("verification_assignment_object_required")
+        unknown = set(value) - cls.EXACT_KEYS
+        required = {
+            "schema_version",
+            "assignment_id",
+            "claim_id",
+            "verification_work_id",
+            "verifier_harness",
+            "collector_harnesses",
+        }
+        missing = required - set(value)
+        if "verifier_logical_agent_id" not in value and "verifier_agent_id" not in value:
+            missing.add("verifier_logical_agent_id")
+        if (
+            "collector_logical_agent_ids" not in value
+            and "collector_agent_ids" not in value
+        ):
+            missing.add("collector_logical_agent_ids")
+        if unknown:
+            raise _error(
+                f"verification_assignment_unknown_field:{sorted(unknown)[0]}"
+            )
+        if (
+            "verifier_logical_agent_id" in value
+            and "verifier_agent_id" in value
+        ):
+            raise _error("verification_assignment_duplicate_verifier_agent")
+        if (
+            "collector_logical_agent_ids" in value
+            and "collector_agent_ids" in value
+        ):
+            raise _error("verification_assignment_duplicate_collector_agents")
+        if missing:
+            raise _error(
+                f"verification_assignment_missing_field:{sorted(missing)[0]}"
+            )
+        return cls(
+            assignment_id=value["assignment_id"],
+            claim_id=value["claim_id"],
+            verification_work_id=value["verification_work_id"],
+            verifier_logical_agent_id=value.get(
+                "verifier_logical_agent_id",
+                value.get("verifier_agent_id"),
+            ),
+            verifier_harness=value["verifier_harness"],
+            collector_logical_agent_ids=value.get(
+                "collector_logical_agent_ids",
+                value.get("collector_agent_ids"),
+            ),
+            collector_harnesses=value["collector_harnesses"],
+            source_ids=value.get("source_ids", ()),
+            excerpt_ids=value.get("excerpt_ids", ()),
+            current=value.get("current", True),
+            schema_version=value["schema_version"],
+            collector_work_ids=value.get("collector_work_ids", ()),
+            run_id=value.get("run_id"),
+            verification_attempt_id=value.get("verification_attempt_id"),
+            verification_fencing_token=value.get("verification_fencing_token"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "assignment_id": self.assignment_id,
+            "claim_id": self.claim_id,
+            "verification_work_id": self.verification_work_id,
+            "verifier_logical_agent_id": self.verifier_logical_agent_id,
+            "verifier_harness": self.verifier_harness,
+            "collector_logical_agent_ids": list(self.collector_logical_agent_ids),
+            "collector_harnesses": list(self.collector_harnesses),
+            "source_ids": list(self.source_ids),
+            "excerpt_ids": list(self.excerpt_ids),
+            "current": self.current,
+        }
+        if self.collector_work_ids:
+            result["collector_work_ids"] = list(self.collector_work_ids)
+        if self.run_id is not None:
+            result["run_id"] = self.run_id
+        if self.verification_attempt_id is not None:
+            result["verification_attempt_id"] = self.verification_attempt_id
+        if self.verification_fencing_token is not None:
+            result["verification_fencing_token"] = self.verification_fencing_token
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationDisposition:
+    """Evidence-bound, append-only verification disposition."""
+
+    disposition_id: str
+    claim_id: str
+    assignment_id: str
+    disposition: str
+    reason: str
+    evidence_ids: tuple[str, ...]
+    contradiction_ids: tuple[str, ...]
+    verifier_logical_agent_id: str
+    verifier_harness: str
+    source_ids: tuple[str, ...]
+    excerpt_ids: tuple[str, ...]
+    current: bool = True
+    schema_version: int = VERIFICATION_SCHEMA_VERSION
+
+    EXACT_KEYS = frozenset(
+        {
+            "schema_version",
+            "disposition_id",
+            "claim_id",
+            "assignment_id",
+            "disposition",
+            "reason",
+            "evidence_ids",
+            "contradiction_ids",
+            "verifier_logical_agent_id",
+            "verifier_agent_id",
+            "verifier_harness",
+            "source_ids",
+            "excerpt_ids",
+            "current",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        _identifier(self.disposition_id, "verification_disposition_id")
+        _identifier(self.claim_id, "verification_disposition_claim_id")
+        _identifier(self.assignment_id, "verification_disposition_assignment_id")
+        if self.disposition not in SUPPORTED_VERIFICATION_DISPOSITIONS:
+            raise _error("verification_disposition_unsupported")
+        _non_empty_text(
+            self.reason,
+            "verification_disposition_reason",
+            max_bytes=MAX_CLAIM_BYTES,
+        )
+        evidence_ids = _string_tuple(
+            self.evidence_ids,
+            "verification_disposition_evidence_ids",
+        )
+        contradiction_ids = _string_tuple(
+            self.contradiction_ids,
+            "verification_disposition_contradiction_ids",
+        )
+        verifier = _identifier(
+            self.verifier_logical_agent_id,
+            "verification_disposition_verifier_logical_agent_id",
+        )
+        _non_empty_text(
+            self.verifier_harness,
+            "verification_disposition_verifier_harness",
+            max_bytes=128,
+        )
+        source_ids = _string_tuple(
+            self.source_ids,
+            "verification_disposition_source_ids",
+        )
+        excerpt_ids = _string_tuple(
+            self.excerpt_ids,
+            "verification_disposition_excerpt_ids",
+        )
+        if not isinstance(self.current, bool):
+            raise _error("verification_disposition_current_invalid")
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version != VERIFICATION_SCHEMA_VERSION
+        ):
+            raise _error("verification_disposition_schema_version_unsupported")
+        object.__setattr__(self, "evidence_ids", evidence_ids)
+        object.__setattr__(self, "contradiction_ids", contradiction_ids)
+        object.__setattr__(self, "verifier_logical_agent_id", verifier)
+        object.__setattr__(self, "source_ids", source_ids)
+        object.__setattr__(self, "excerpt_ids", excerpt_ids)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> VerificationDisposition:
+        if not isinstance(value, Mapping):
+            raise _error("verification_disposition_object_required")
+        unknown = set(value) - cls.EXACT_KEYS
+        required = cls.EXACT_KEYS - {
+            "verifier_agent_id",
+            "current",
+        }
+        missing = required - set(value)
+        if "verifier_logical_agent_id" not in value and "verifier_agent_id" not in value:
+            missing.add("verifier_logical_agent_id")
+        if unknown:
+            raise _error(
+                f"verification_disposition_unknown_field:{sorted(unknown)[0]}"
+            )
+        if (
+            "verifier_logical_agent_id" in value
+            and "verifier_agent_id" in value
+        ):
+            raise _error("verification_disposition_duplicate_verifier_agent")
+        if missing:
+            raise _error(
+                f"verification_disposition_missing_field:{sorted(missing)[0]}"
+            )
+        return cls(
+            disposition_id=value["disposition_id"],
+            claim_id=value["claim_id"],
+            assignment_id=value["assignment_id"],
+            disposition=value["disposition"],
+            reason=value["reason"],
+            evidence_ids=value["evidence_ids"],
+            contradiction_ids=value["contradiction_ids"],
+            verifier_logical_agent_id=value.get(
+                "verifier_logical_agent_id",
+                value.get("verifier_agent_id"),
+            ),
+            verifier_harness=value["verifier_harness"],
+            source_ids=value["source_ids"],
+            excerpt_ids=value["excerpt_ids"],
+            current=value.get("current", True),
+            schema_version=value["schema_version"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "disposition_id": self.disposition_id,
+            "claim_id": self.claim_id,
+            "assignment_id": self.assignment_id,
+            "disposition": self.disposition,
+            "reason": self.reason,
+            "evidence_ids": list(self.evidence_ids),
+            "contradiction_ids": list(self.contradiction_ids),
+            "verifier_logical_agent_id": self.verifier_logical_agent_id,
+            "verifier_harness": self.verifier_harness,
+            "source_ids": list(self.source_ids),
+            "excerpt_ids": list(self.excerpt_ids),
+            "current": self.current,
+        }
+
+
 class ResearchEvidenceRegister:
     """Append-only admission register for immutable research evidence."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        verification_policy: CriticalityPolicy | Mapping[str, Any] | None = None,
+    ) -> None:
         self._sources: dict[str, SourceReceipt] = {}
         self._excerpts: dict[str, ExcerptReceipt] = {}
         self._claims: dict[str, TypedClaim] = {}
         self._relations: dict[str, EvidenceRelation] = {}
+        self._verification_policy = (
+            verification_policy
+            if isinstance(verification_policy, CriticalityPolicy)
+            else CriticalityPolicy.from_mapping(verification_policy)
+        )
+        self._verification_assignments: dict[str, VerificationAssignment] = {}
+        self._verification_dispositions: dict[str, VerificationDisposition] = {}
+        self._verification_disposition_order: list[str] = []
 
     @property
     def sources(self) -> tuple[SourceReceipt, ...]:
@@ -1018,8 +1535,64 @@ class ResearchEvidenceRegister:
         return tuple(self._relations[key] for key in sorted(self._relations))
 
     @property
+    def verification_policy(self) -> CriticalityPolicy:
+        return self._verification_policy
+
+    @property
+    def verification_assignments(self) -> tuple[VerificationAssignment, ...]:
+        return tuple(
+            self._verification_assignments[key]
+            for key in sorted(self._verification_assignments)
+        )
+
+    @property
+    def verification_dispositions(self) -> tuple[VerificationDisposition, ...]:
+        return tuple(
+            self._verification_dispositions[key]
+            for key in self._verification_disposition_order
+        )
+
+    @property
+    def contested_claim_ids(self) -> tuple[str, ...]:
+        return tuple(
+            claim.claim_id
+            for claim in self.claims
+            if self.claim_status(claim.claim_id)["state"] == "contested"
+        )
+
+    @property
     def creditable_relation_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._relations))
+
+    @property
+    def verification_credit_claim_ids(self) -> tuple[str, ...]:
+        return tuple(
+            claim.claim_id
+            for claim in self.claims
+            if self.claim_status(claim.claim_id)["gate_credit"]
+        )
+
+    @property
+    def gate_credit_relation_ids(self) -> tuple[str, ...]:
+        """Relations eligible for settled factual gate credit.
+
+        Admission and gate credit are intentionally separate.  Contradictory
+        observations remain in ``creditable_relation_ids`` for auditability,
+        but only support relations on a claim whose current disposition is
+        settled/verified are eligible for a factual conclusion.
+        """
+
+        result: list[str] = []
+        for claim in self.claims:
+            status = self.claim_status(claim.claim_id)
+            if not status["gate_credit"]:
+                continue
+            result.extend(status["support_relation_ids"])
+        return tuple(sorted(result))
+
+    @property
+    def settled_claim_ids(self) -> tuple[str, ...]:
+        return self.verification_credit_claim_ids
 
     def admit_source(
         self,
@@ -1093,26 +1666,412 @@ class ResearchEvidenceRegister:
             if existing != relation:
                 raise _error("evidence_relation_immutable_conflict")
             return existing
+        if relation.relation == "contradiction":
+            # A newly admitted opposing observation invalidates a previously
+            # current verification disposition.  The old disposition remains
+            # in history, but cannot continue to grant gate credit until a
+            # later disposition accounts for this contradiction.
+            for disposition in tuple(self._verification_dispositions.values()):
+                if (
+                    disposition.claim_id == relation.claim_id
+                    and disposition.current
+                ):
+                    self._verification_dispositions[
+                        disposition.disposition_id
+                    ] = replace(disposition, current=False)
         self._relations[relation.relation_id] = relation
         return relation
+
+    def admit_verification_assignment(
+        self,
+        value: VerificationAssignment | Mapping[str, Any],
+    ) -> VerificationAssignment:
+        assignment = (
+            value
+            if isinstance(value, VerificationAssignment)
+            else VerificationAssignment.from_mapping(value)
+        )
+        if assignment.claim_id not in self._claims:
+            raise _error(
+                f"verification_assignment_claim_not_admitted:{assignment.claim_id}"
+            )
+        if (
+            self._verification_policy.require_independent_logical_agent
+            and assignment.verifier_logical_agent_id
+            in assignment.collector_logical_agent_ids
+        ):
+            raise _error("verification_assignment_self_verification")
+        if (
+            self._verification_policy.require_harness_separation
+            and assignment.verifier_harness in assignment.collector_harnesses
+        ):
+            raise _error("verification_assignment_harness_not_independent")
+        if any(source_id not in self._sources for source_id in assignment.source_ids):
+            raise _error("verification_assignment_source_not_admitted")
+        if any(
+            excerpt_id not in self._excerpts
+            for excerpt_id in assignment.excerpt_ids
+        ):
+            raise _error("verification_assignment_excerpt_not_admitted")
+        for source_id in assignment.source_ids:
+            source = self._sources[source_id]
+            if (
+                source.agent != assignment.verifier_logical_agent_id
+                or source.harness != assignment.verifier_harness
+            ):
+                raise _error("verification_assignment_source_attribution_mismatch")
+            if source.role not in {"verifier", "verification", "independent-verifier"}:
+                raise _error("verification_assignment_source_role_mismatch")
+            if assignment.run_id is not None:
+                if source.run_id != assignment.run_id:
+                    raise _error("verification_assignment_run_mismatch")
+                if source.work_id != assignment.verification_work_id:
+                    raise _error("verification_assignment_work_mismatch")
+                if (
+                    source.attempt_id != assignment.verification_attempt_id
+                    or source.fencing_token != assignment.verification_fencing_token
+                ):
+                    raise _error("verification_assignment_authority_mismatch")
+        for excerpt_id in assignment.excerpt_ids:
+            excerpt = self._excerpts[excerpt_id]
+            if excerpt.source_id not in assignment.source_ids:
+                raise _error("verification_assignment_excerpt_source_mismatch")
+        existing = self._verification_assignments.get(assignment.assignment_id)
+        if existing is not None:
+            if existing != assignment:
+                raise _error("verification_assignment_immutable_conflict")
+            return existing
+        current_for_claim = [
+            item
+            for item in self._verification_assignments.values()
+            if item.claim_id == assignment.claim_id and item.current
+        ]
+        if current_for_claim:
+            raise _error("verification_assignment_current_conflict")
+        self._verification_assignments[assignment.assignment_id] = assignment
+        return assignment
+
+    admit_assignment = admit_verification_assignment
+
+    def supersede_verification_assignment(
+        self,
+        assignment_id: str,
+    ) -> VerificationAssignment:
+        """Fence a coordinator-owned assignment so a retry may replace it."""
+
+        assignment = self._verification_assignments.get(assignment_id)
+        if assignment is None:
+            raise _error(f"verification_assignment_not_admitted:{assignment_id}")
+        if not assignment.current:
+            return assignment
+        superseded = replace(assignment, current=False)
+        self._verification_assignments[assignment_id] = superseded
+        return superseded
+
+    supersede_assignment = supersede_verification_assignment
+
+    def admit_verification_disposition(
+        self,
+        value: VerificationDisposition | Mapping[str, Any],
+    ) -> VerificationDisposition:
+        disposition = (
+            value
+            if isinstance(value, VerificationDisposition)
+            else VerificationDisposition.from_mapping(value)
+        )
+        claim = self._claims.get(disposition.claim_id)
+        if claim is None:
+            raise _error(
+                f"verification_disposition_claim_not_admitted:{disposition.claim_id}"
+            )
+        assignment = self._verification_assignments.get(disposition.assignment_id)
+        if assignment is None:
+            raise _error(
+                "verification_disposition_assignment_not_admitted:"
+                f"{disposition.assignment_id}"
+            )
+        if assignment.claim_id != disposition.claim_id:
+            raise _error("verification_disposition_assignment_claim_mismatch")
+        if not assignment.current:
+            raise _error("verification_disposition_assignment_not_current")
+        if (
+            disposition.verifier_logical_agent_id
+            != assignment.verifier_logical_agent_id
+        ):
+            raise _error("verification_disposition_verifier_mismatch")
+        if disposition.verifier_harness != assignment.verifier_harness:
+            raise _error("verification_disposition_harness_mismatch")
+        if self._verification_policy.require_independent_logical_agent:
+            if (
+                disposition.verifier_logical_agent_id
+                in assignment.collector_logical_agent_ids
+            ):
+                raise _error("verification_disposition_not_independent")
+        if (
+            self._verification_policy.require_harness_separation
+            and disposition.verifier_harness in assignment.collector_harnesses
+        ):
+            raise _error("verification_disposition_harness_not_independent")
+
+        evidence = self._validate_disposition_evidence(
+            disposition,
+            claim=claim,
+            assignment=assignment,
+        )
+        contradiction_ids = {
+            relation.relation_id
+            for relation in self._relations.values()
+            if relation.claim_id == claim.claim_id
+            and relation.relation == "contradiction"
+        }
+        supplied_contradictions = set(disposition.contradiction_ids)
+        if not supplied_contradictions.issubset(contradiction_ids):
+            raise _error("verification_disposition_contradiction_not_admitted")
+        if disposition.disposition == "verified":
+            if not evidence:
+                raise _error("verification_disposition_evidence_required")
+            if supplied_contradictions != contradiction_ids:
+                raise _error("verification_disposition_contradictions_unaccounted")
+            if not derive_criticality(claim, self._verification_policy):
+                # Non-critical claims may be verified, but a verified
+                # disposition still needs the same evidence-bound checks.
+                pass
+        elif disposition.disposition == "contested":
+            if supplied_contradictions != contradiction_ids:
+                raise _error("verification_disposition_contradictions_unaccounted")
+
+        existing = self._verification_dispositions.get(disposition.disposition_id)
+        if existing is not None:
+            if existing != disposition:
+                raise _error("verification_disposition_immutable_conflict")
+            return existing
+        current_for_claim = [
+            item
+            for item in self._verification_dispositions.values()
+            if item.claim_id == disposition.claim_id and item.current
+        ]
+        if current_for_claim:
+            # History is retained, but only one disposition is current.  The
+            # replacement is deterministic and does not rewrite its payload.
+            for previous in current_for_claim:
+                self._verification_dispositions[previous.disposition_id] = replace(
+                    previous,
+                    current=False,
+                )
+        self._verification_dispositions[disposition.disposition_id] = disposition
+        self._verification_disposition_order.append(disposition.disposition_id)
+        return disposition
+
+    admit_disposition = admit_verification_disposition
+
+    def claim_status(self, claim_id: str) -> dict[str, Any]:
+        claim = self._claims.get(claim_id)
+        if claim is None:
+            raise _error(f"claim_not_admitted:{claim_id}")
+        critical = derive_criticality(claim, self._verification_policy)
+        relations = [
+            relation
+            for relation in self._relations.values()
+            if relation.claim_id == claim_id
+        ]
+        support_ids = sorted(
+            relation.relation_id
+            for relation in relations
+            if relation.relation == "support"
+        )
+        contradiction_ids = sorted(
+            relation.relation_id
+            for relation in relations
+            if relation.relation == "contradiction"
+        )
+        context_ids = sorted(
+            relation.relation_id
+            for relation in relations
+            if relation.relation == "context"
+        )
+        history = [
+            disposition.to_dict()
+            for disposition in self.verification_dispositions
+            if disposition.claim_id == claim_id
+        ]
+        current = next(
+            (
+                disposition
+                for disposition in self._verification_dispositions.values()
+                if disposition.claim_id == claim_id and disposition.current
+            ),
+            None,
+        )
+        if current is not None and current.disposition == "verified":
+            state = "verified"
+            gate_credit = True
+        elif current is not None and current.disposition in {
+            "unverified",
+            "rejected",
+        }:
+            state = "unverified"
+            gate_credit = False
+        elif contradiction_ids:
+            state = "contested"
+            gate_credit = False
+        elif critical:
+            state = "unverified"
+            gate_credit = False
+        else:
+            state = "settled"
+            gate_credit = bool(support_ids)
+        return {
+            "claim_id": claim_id,
+            "claim_type": claim.claim_type,
+            "critical": critical,
+            "state": state,
+            "gate_credit": gate_credit,
+            "support_relation_ids": support_ids,
+            "contradiction_relation_ids": contradiction_ids,
+            "context_relation_ids": context_ids,
+            "disposition_id": None if current is None else current.disposition_id,
+            "disposition_history": history,
+        }
+
+    def verification_status(self) -> tuple[dict[str, Any], ...]:
+        return tuple(self.claim_status(claim.claim_id) for claim in self.claims)
+
+    def _validate_disposition_evidence(
+        self,
+        disposition: VerificationDisposition,
+        *,
+        claim: TypedClaim,
+        assignment: VerificationAssignment,
+    ) -> tuple[EvidenceRelation, ...]:
+        declared_source_ids = set(disposition.source_ids)
+        declared_excerpt_ids = set(disposition.excerpt_ids)
+        if any(source_id not in self._sources for source_id in declared_source_ids):
+            raise _error("verification_disposition_source_not_admitted")
+        if any(
+            excerpt_id not in self._excerpts
+            for excerpt_id in declared_excerpt_ids
+        ):
+            raise _error("verification_disposition_excerpt_not_admitted")
+        evidence: list[EvidenceRelation] = []
+        for relation_id in disposition.evidence_ids:
+            relation = self._relations.get(relation_id)
+            if relation is None:
+                raise _error(
+                    f"verification_disposition_evidence_not_admitted:{relation_id}"
+                )
+            if relation.claim_id != claim.claim_id:
+                raise _error("verification_disposition_evidence_claim_mismatch")
+            if relation.relation != "support":
+                raise _error("verification_disposition_evidence_must_support")
+            source = self._sources.get(relation.source_id)
+            excerpt = self._excerpts.get(relation.excerpt_id)
+            if source is None or excerpt is None:
+                raise _error("verification_disposition_evidence_lineage_missing")
+            if self._verification_policy.forbid_source_reuse:
+                reused_source_ids = {
+                    prior.source_id
+                    for prior in self._relations.values()
+                    if prior.claim_id == claim.claim_id
+                    and (
+                        self._sources.get(prior.source_id) is None
+                        or self._sources[prior.source_id].agent
+                        != disposition.verifier_logical_agent_id
+                        or self._sources[prior.source_id].harness
+                        != disposition.verifier_harness
+                    )
+                }
+                if relation.source_id in reused_source_ids:
+                    raise _error("verification_disposition_source_reuse")
+            if (
+                source.agent != disposition.verifier_logical_agent_id
+                or source.harness != disposition.verifier_harness
+            ):
+                raise _error("verification_disposition_source_attribution_mismatch")
+            if source.role not in {"verifier", "verification", "independent-verifier"}:
+                raise _error("verification_disposition_source_role_mismatch")
+            if source.work_id != assignment.verification_work_id:
+                raise _error("verification_disposition_work_mismatch")
+            if assignment.run_id is not None:
+                if source.run_id != assignment.run_id:
+                    raise _error("verification_disposition_run_mismatch")
+                if (
+                    source.attempt_id != assignment.verification_attempt_id
+                    or source.fencing_token != assignment.verification_fencing_token
+                ):
+                    raise _error("verification_disposition_authority_mismatch")
+            if source.source_id not in disposition.source_ids:
+                raise _error("verification_disposition_source_not_declared")
+            if excerpt.excerpt_id not in disposition.excerpt_ids:
+                raise _error("verification_disposition_excerpt_not_declared")
+            if assignment.source_ids and source.source_id not in assignment.source_ids:
+                raise _error("verification_disposition_source_not_assigned")
+            if assignment.excerpt_ids and excerpt.excerpt_id not in assignment.excerpt_ids:
+                raise _error("verification_disposition_excerpt_not_assigned")
+            evidence.append(relation)
+        actual_source_ids = {relation.source_id for relation in evidence}
+        actual_excerpt_ids = {relation.excerpt_id for relation in evidence}
+        if actual_source_ids != declared_source_ids:
+            raise _error("verification_disposition_source_ids_mismatch")
+        if actual_excerpt_ids != declared_excerpt_ids:
+            raise _error("verification_disposition_excerpt_ids_mismatch")
+        return tuple(evidence)
 
     def admit_bundle(self, value: Mapping[str, Any]) -> ResearchEvidenceRegister:
         """Atomically admit a complete source/excerpt/claim/relation bundle."""
 
-        candidate = type(self).from_mapping(value)
-        for current, incoming, conflict in (
-            (self._sources, candidate._sources, "source_receipt_immutable_conflict"),
-            (self._excerpts, candidate._excerpts, "excerpt_receipt_immutable_conflict"),
-            (self._claims, candidate._claims, "claim_immutable_conflict"),
-            (self._relations, candidate._relations, "evidence_relation_immutable_conflict"),
-        ):
-            for key, item in incoming.items():
-                if key in current and current[key] != item:
-                    raise _error(conflict)
-        self._sources.update(candidate._sources)
-        self._excerpts.update(candidate._excerpts)
-        self._claims.update(candidate._claims)
-        self._relations.update(candidate._relations)
+        candidate = type(self).from_mapping(
+            value,
+            verification_policy=self._verification_policy,
+        )
+        snapshot = (
+            dict(self._sources),
+            dict(self._excerpts),
+            dict(self._claims),
+            dict(self._relations),
+            dict(self._verification_assignments),
+            dict(self._verification_dispositions),
+            list(self._verification_disposition_order),
+            self._verification_policy,
+        )
+        try:
+            for current, incoming, conflict in (
+                (self._sources, candidate._sources, "source_receipt_immutable_conflict"),
+                (self._excerpts, candidate._excerpts, "excerpt_receipt_immutable_conflict"),
+                (self._claims, candidate._claims, "claim_immutable_conflict"),
+                (self._relations, candidate._relations, "evidence_relation_immutable_conflict"),
+            ):
+                for key, item in incoming.items():
+                    if key in current and current[key] != item:
+                        raise _error(conflict)
+            self._sources.update(candidate._sources)
+            self._excerpts.update(candidate._excerpts)
+            self._claims.update(candidate._claims)
+            for item in candidate._relations.values():
+                self.admit_relation(item)
+            for key, item in candidate._verification_assignments.items():
+                if key in self._verification_assignments:
+                    if self._verification_assignments[key] != item:
+                        raise _error("verification_assignment_immutable_conflict")
+                else:
+                    self.admit_verification_assignment(item)
+            for key, item in candidate._verification_dispositions.items():
+                if key in self._verification_dispositions:
+                    if self._verification_dispositions[key] != item:
+                        raise _error("verification_disposition_immutable_conflict")
+                else:
+                    self.admit_verification_disposition(item)
+        except BaseException:
+            (
+                self._sources,
+                self._excerpts,
+                self._claims,
+                self._relations,
+                self._verification_assignments,
+                self._verification_dispositions,
+                self._verification_disposition_order,
+                self._verification_policy,
+            ) = snapshot
+            raise
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -1123,10 +2082,31 @@ class ResearchEvidenceRegister:
             "claims": [claim.to_dict() for claim in self.claims],
             "relations": [relation.to_dict() for relation in self.relations],
             "creditable_relation_ids": list(self.creditable_relation_ids),
+            "verification_policy": self.verification_policy.to_dict(),
+            "verification_assignments": [
+                assignment.to_dict()
+                for assignment in self.verification_assignments
+            ],
+            "verification_dispositions": [
+                disposition.to_dict()
+                for disposition in self.verification_dispositions
+            ],
+            "claim_statuses": list(self.verification_status()),
+            "contested_claim_ids": list(self.contested_claim_ids),
+            "verification_credit_claim_ids": list(self.verification_credit_claim_ids),
+            "settled_claim_ids": list(self.settled_claim_ids),
+            "gate_credit_relation_ids": list(self.gate_credit_relation_ids),
         }
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> ResearchEvidenceRegister:
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        verification_policy: CriticalityPolicy
+        | Mapping[str, Any]
+        | object = _POLICY_UNSET,
+    ) -> ResearchEvidenceRegister:
         if not isinstance(value, Mapping):
             raise _error("research_evidence_register_object_required")
         expected = {
@@ -1136,8 +2116,25 @@ class ResearchEvidenceRegister:
             "claims",
             "relations",
             "creditable_relation_ids",
+            "verification_policy",
+            "verification_assignments",
+            "verification_dispositions",
+            "claim_statuses",
+            "contested_claim_ids",
+            "verification_credit_claim_ids",
+            "settled_claim_ids",
+            "gate_credit_relation_ids",
         }
-        required = expected - {"creditable_relation_ids"}
+        # Verification fields were added after the source/excerpt/claim
+        # register contract.  They are optional when reading a schema-v1
+        # register so prior admitted evidence remains durable and readable.
+        required = {
+            "schema_version",
+            "sources",
+            "excerpts",
+            "claims",
+            "relations",
+        }
         unknown = set(value) - expected
         missing = required - set(value)
         if unknown:
@@ -1186,6 +2183,37 @@ class ResearchEvidenceRegister:
             for evidence_id in claim.evidence_ids:
                 if evidence_id not in relation_ids:
                     raise _error(f"claim_evidence_not_admitted:{evidence_id}")
+        expected_policy: CriticalityPolicy | None = None
+        if verification_policy is not _POLICY_UNSET:
+            expected_policy = (
+                verification_policy
+                if isinstance(verification_policy, CriticalityPolicy)
+                else CriticalityPolicy.from_mapping(verification_policy)
+            )
+        raw_policy = value.get("verification_policy", _POLICY_UNSET)
+        if raw_policy is _POLICY_UNSET:
+            payload_policy = expected_policy or CriticalityPolicy()
+        else:
+            payload_policy = CriticalityPolicy.from_mapping(raw_policy)
+        if expected_policy is not None:
+            if raw_policy is not _POLICY_UNSET and payload_policy != expected_policy:
+                raise _error("verification_policy_pinned_mismatch")
+            register._verification_policy = expected_policy
+        else:
+            register._verification_policy = payload_policy
+        assignments = value.get("verification_assignments", [])
+        dispositions = value.get("verification_dispositions", [])
+        if (
+            isinstance(assignments, (str, bytes))
+            or not isinstance(assignments, list)
+            or isinstance(dispositions, (str, bytes))
+            or not isinstance(dispositions, list)
+        ):
+            raise _error("verification_history_must_be_array")
+        for assignment in assignments:
+            register.admit_verification_assignment(assignment)
+        for disposition in dispositions:
+            register.admit_verification_disposition(disposition)
         declared_credit = value.get("creditable_relation_ids")
         if declared_credit is not None:
             if (
@@ -1194,6 +2222,27 @@ class ResearchEvidenceRegister:
                 or tuple(declared_credit) != register.creditable_relation_ids
             ):
                 raise _error("creditable_relation_ids_mismatch")
+        declared_contested = value.get("contested_claim_ids")
+        if declared_contested is not None and tuple(declared_contested) != register.contested_claim_ids:
+            raise _error("contested_claim_ids_mismatch")
+        declared_credit_claims = value.get("verification_credit_claim_ids")
+        if (
+            declared_credit_claims is not None
+            and tuple(declared_credit_claims) != register.verification_credit_claim_ids
+        ):
+            raise _error("verification_credit_claim_ids_mismatch")
+        declared_settled = value.get("settled_claim_ids")
+        if declared_settled is not None and tuple(declared_settled) != register.settled_claim_ids:
+            raise _error("settled_claim_ids_mismatch")
+        declared_gate_relations = value.get("gate_credit_relation_ids")
+        if (
+            declared_gate_relations is not None
+            and tuple(declared_gate_relations) != register.gate_credit_relation_ids
+        ):
+            raise _error("gate_credit_relation_ids_mismatch")
+        declared_statuses = value.get("claim_statuses")
+        if declared_statuses is not None and tuple(declared_statuses) != register.verification_status():
+            raise _error("claim_statuses_mismatch")
         return register
 
 
@@ -1217,6 +2266,18 @@ def parse_evidence_relation(value: Mapping[str, Any]) -> EvidenceRelation:
     return EvidenceRelation.from_mapping(value)
 
 
+def parse_verification_assignment(
+    value: Mapping[str, Any],
+) -> VerificationAssignment:
+    return VerificationAssignment.from_mapping(value)
+
+
+def parse_verification_disposition(
+    value: Mapping[str, Any],
+) -> VerificationDisposition:
+    return VerificationDisposition.from_mapping(value)
+
+
 def parse_evidence_register(value: Mapping[str, Any]) -> ResearchEvidenceRegister:
     return ResearchEvidenceRegister.from_mapping(value)
 
@@ -1225,6 +2286,8 @@ validate_source_receipt = parse_source_receipt
 validate_excerpt_receipt = parse_excerpt_receipt
 validate_claim = parse_typed_claim
 validate_evidence_relation = parse_evidence_relation
+validate_verification_assignment = parse_verification_assignment
+validate_verification_disposition = parse_verification_disposition
 validate_evidence_register = parse_evidence_register
 
 
@@ -1239,6 +2302,7 @@ EvidenceRelationRecord = EvidenceRelation
 __all__ = [
     "Claim",
     "ClaimRecord",
+    "CriticalityPolicy",
     "EVIDENCE_NORMALIZATION_VERSION",
     "EvidenceRelation",
     "EvidenceRelationRecord",
@@ -1246,24 +2310,33 @@ __all__ = [
     "MAX_CLAIM_BYTES",
     "MAX_EXCERPT_BYTES",
     "MAX_SOURCE_URL_BYTES",
+    "derive_criticality",
     "parse_evidence_relation",
     "parse_evidence_register",
     "parse_excerpt_receipt",
     "parse_source_receipt",
     "parse_typed_claim",
+    "parse_verification_assignment",
+    "parse_verification_disposition",
     "RESEARCH_EVIDENCE_SCHEMA_VERSION",
     "ResearchEvidenceError",
     "ResearchEvidenceRegister",
     "SUPPORTED_CLAIM_TYPES",
     "SUPPORTED_EVIDENCE_RELATIONS",
     "SUPPORTED_SOURCE_OUTCOMES",
+    "SUPPORTED_VERIFICATION_DISPOSITIONS",
     "SourceExcerpt",
     "SourceExcerptReceipt",
     "SourceReceipt",
     "TypedClaim",
+    "VERIFICATION_SCHEMA_VERSION",
+    "VerificationAssignment",
+    "VerificationDisposition",
     "validate_claim",
     "validate_evidence_relation",
     "validate_evidence_register",
     "validate_excerpt_receipt",
     "validate_source_receipt",
+    "validate_verification_assignment",
+    "validate_verification_disposition",
 ]
