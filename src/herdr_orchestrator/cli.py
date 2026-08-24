@@ -17,6 +17,7 @@ from herdr_orchestrator.catalog import (
     render_compact_catalog,
 )
 from herdr_orchestrator.config import ConfigError, load_workflow
+from herdr_orchestrator.dashboard import DashboardServer
 from herdr_orchestrator.delivery import (
     DeliveryError,
     DeliveryEscalation,
@@ -29,6 +30,7 @@ from herdr_orchestrator.model import (
     AgentState,
     Harness,
     HarnessProfile,
+    PlacementTarget,
     TrackerBackend,
     WayfinderMode,
     WorkflowConfig,
@@ -63,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
     profile_parser.add_argument("harness", choices=[item.value for item in Harness])
     profile_parser.add_argument("--format", choices=("json", "text"), default="text")
 
+    dashboard = subparsers.add_parser("dashboard")
+    dashboard.add_argument("--workflow", required=True)
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--poll-seconds", type=float, default=2.0)
+
     run = subparsers.add_parser("run")
     run.add_argument("--workflow", required=True)
     run.add_argument("--once", action="store_true")
@@ -78,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--title", required=True)
     enqueue.add_argument("--prompt-file", required=True)
     enqueue.add_argument("--dedupe-key", required=True)
+    enqueue.add_argument(
+        "--placement",
+        choices=["auto", *(item.value for item in PlacementTarget)],
+        default="auto",
+        help="Override topology selection for this task.",
+    )
     _add_selection_arguments(enqueue)
 
     deliver = subparsers.add_parser("deliver")
@@ -120,6 +134,11 @@ def main(argv: list[str] | None = None) -> int:
                     title=args.title,
                     prompt_file=prompt_file,
                     dedupe_key=args.dedupe_key,
+                    placement=(
+                        None
+                        if args.placement == "auto"
+                        else PlacementTarget(args.placement)
+                    ),
                 )
                 print(
                     json.dumps(
@@ -224,6 +243,29 @@ def main(argv: list[str] | None = None) -> int:
                     print(render_compact_catalog(profiles))
                 else:
                     print(_catalog_text(profiles))
+                return 0
+            case "dashboard":
+                dashboard = DashboardServer(
+                    config,
+                    host=args.host,
+                    port=args.port,
+                    poll_seconds=args.poll_seconds,
+                )
+                host, port = dashboard.address
+                print(
+                    json.dumps(
+                        {
+                            "status": "dashboard_started",
+                            "url": f"http://{host}:{port}",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                try:
+                    dashboard.serve_forever()
+                except KeyboardInterrupt:
+                    print("dashboard_stopped", file=sys.stderr)
                 return 0
             case "profile":
                 profile = profile_for_harness(

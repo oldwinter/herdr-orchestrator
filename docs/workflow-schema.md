@@ -22,6 +22,34 @@
 
 `lease_seconds` 必须至少比 `agent_timeout_seconds` 长 90 秒，为 agent 启动、Herdr 控制请求和收据提交留出窗口，防止同一任务在旧 turn 尚未结束时被重复 claim。
 
+## `[placement]`
+
+该 table 可省略。它决定普通 durable queue 如何把任务映射到 Herdr 拓扑：
+
+```toml
+[placement]
+mode = "hybrid"
+worktree_root = ".orchestrator/worktrees"
+```
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | `hybrid` | `hybrid`、`tab`、`pane` 或 `worktree` |
+| `worktree_root` | `.orchestrator/worktrees` | 原生 worktree checkout 根目录，必须位于 workspace 的 `.orchestrator` |
+
+`hybrid` 的决策顺序是：
+
+1. enqueue/seed 的显式 `placement`；
+2. worker 的默认 `placement`；
+3. 确定性语义规则：明确只读任务用 `pane`，明确仓库写任务用 `worktree`；
+4. 仍模糊时，controller 只写严格
+   `{"placement":"tab|pane|worktree","rationale":"..."}` JSON；
+5. coordinator 校验 Git 能力与枚举后才写入 queue。
+
+非 Git workspace 不接受 `worktree`。选择 `pane` 时，同一次 `run_once` 的任务共享一个
+短标题 tab，但每个 agent 仍占独立 pane。选择 `worktree` 时使用 Herdr 原生
+`worktree create/open`，并保留 workspace、checkout 和 branch。
+
 ## `[[workers]]`
 
 每个 worker 需要唯一 `name` 和受支持的 `harness`。同一 harness 只能声明一个 worker；并行靠可选 `replicas`（1–16，默认 1）开多个同 kind pane。可选 `capabilities` 为兼容字段，主控使用的能力描述真源是 `profiles_dir` 下同名 profile。v1 支持：
@@ -29,6 +57,10 @@
 `droid`、`grok`、`codex`、`pi`、`claude`、`hermes`
 
 Herdr 0.8.2 还支持更多 kind，但必须先加入代码白名单和测试，才能进入此仓库的稳定面。
+
+worker 可选 `placement = "tab"|"pane"|"worktree"` 作为该 harness 的 topology 默认值；
+省略时由 `[placement]` 决定。`replicas` 始终限制同 harness 总并发，不因 topology
+种类增加。
 
 ## Harness profile
 
@@ -104,5 +136,6 @@ seed job 用于可复现的固定工作包：
 - `harness`
 - `prompt_file`
 - `dedupe_key`
+- 可选 `placement = "tab"|"pane"|"worktree"`
 
 `seed` 可重复执行；同一 workflow 的 `dedupe_key` 唯一。

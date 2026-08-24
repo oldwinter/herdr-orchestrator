@@ -18,6 +18,9 @@ herdr-orchestrator = "herdr_orchestrator.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"herdr_orchestrator.dashboard.static" = ["*.html", "*.css", "*.js"]
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100

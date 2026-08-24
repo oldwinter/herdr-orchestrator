@@ -77,6 +77,20 @@ just run
 just status
 ```
 
+## 实时 Dashboard
+
+```bash
+just dashboard
+
+# 自定义本地端口与刷新周期
+just dashboard --port 9000 --poll-seconds 1
+```
+
+浏览器页面实时展示 durable queue 看板、blocked/failed/runtime drift、Herdr
+workspace/tab/pane/agent 拓扑、原生 worktree 和 receipt 时间线。Dashboard 是只读投影，
+默认只监听 `127.0.0.1:8765`，不读取 prompt、环境变量或 terminal output。详细行为见
+[`docs/dashboard.md`](docs/dashboard.md)。
+
 ## 六 harness 真实只读 smoke
 
 下面的命令会依次启动或复用六种 harness，要求它们只读检查两个本地配置文件，并验证六个 agent 都经历真实 turn 后回到 settled state：
@@ -91,6 +105,10 @@ just smoke --harness grok
 
 smoke 不把终端文本当完整 transcript，因为 full-screen agent 的历史可能不进入 Herdr scrollback。验证依据是 agent 成功启动、prompt 被接受并经过 lifecycle change 后返回 `idle` 或 `done`。临时 tab 会在成功或失败后关闭；已存在并被安全复用的 agent 不会被关闭。
 
+若任务长时间停在 `running`、首次启动 timeout、或 agent 看似启动却没有真实执行，按
+[`docs/runtime-troubleshooting.md`](docs/runtime-troubleshooting.md) 区分 provisioning、
+prompt acceptance、working 与 settled，不要只根据 pane 存在或最终标题判断。
+
 ## 添加一个任务
 
 ```bash
@@ -98,11 +116,29 @@ smoke 不把终端文本当完整 transcript，因为 full-screen agent 的历�
 just enqueue codex review docs/prompts/review.md review-docs-v1
 just enqueue grok build workflows/prompts/grok-build-check.md build-v1
 
+# 可显式覆盖执行拓扑
+just enqueue codex build workflows/prompts/build.md build-v2 --placement worktree
+just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v2 --placement pane
+
 # 不指定 worker，由主控读取 compact catalog 后选择
 just enqueue-auto review workflows/prompts/codex-architecture.md review-auto-v1
 ```
 
 参数依次为 `harness`、`title`、`prompt_file`、`dedupe_key`。相同 workflow 下重复的 `dedupe_key` 不会重复入队。
+
+### Tab、pane 与原生 worktree
+
+普通 queue 默认使用混合 topology policy：
+
+- 明确只读任务进入本轮共享 tab 的独立 pane；
+- 明确会修改仓库的任务进入 Herdr 原生 worktree workspace；
+- 需要完整终端但不需要 checkout 隔离时使用独立 tab；
+- 模糊任务由 controller 输出受 schema 约束的 topology JSON。
+
+内部 agent 名为了唯一性仍保留短 hash，但新建 tab/worktree 的可见标题使用截断后的任务
+标题，不再显示 hash 后缀。Pane 模式按 `run_once` 批次分组；worktree 完成后保留
+workspace、checkout 和 branch，不自动 merge 或删除。配置见
+[`docs/workflow-schema.md`](docs/workflow-schema.md)。
 
 ## 分别选择主控与 worker
 

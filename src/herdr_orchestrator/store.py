@@ -14,9 +14,10 @@ from herdr_orchestrator.model import (
     Harness,
     JobState,
     NewJob,
+    PlacementTarget,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class StoreError(RuntimeError):
@@ -42,6 +43,7 @@ class Store:
                     harness TEXT NOT NULL,
                     prompt TEXT NOT NULL,
                     dedupe_key TEXT NOT NULL,
+                    placement TEXT,
                     state TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL,
@@ -49,6 +51,8 @@ class Store:
                     lease_until REAL,
                     agent_name TEXT,
                     error_code TEXT,
+                    execution_path TEXT,
+                    herdr_workspace_id TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(workflow, dedupe_key)
@@ -65,6 +69,9 @@ class Store:
                     member_reused INTEGER NOT NULL,
                     pane_id TEXT,
                     error_code TEXT,
+                    placement TEXT,
+                    execution_path TEXT,
+                    herdr_workspace_id TEXT,
                     observed_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -77,8 +84,24 @@ class Store:
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
+            elif row["version"] == 1:
+                self._migrate_v1_to_v2(connection)
             elif row["version"] != SCHEMA_VERSION:
                 raise StoreError(f"unsupported_schema_version: {row['version']}")
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        connection.execute("ALTER TABLE jobs ADD COLUMN placement TEXT")
+        connection.execute("UPDATE jobs SET placement = ?", (PlacementTarget.TAB.value,))
+        connection.execute("ALTER TABLE jobs ADD COLUMN execution_path TEXT")
+        connection.execute("ALTER TABLE jobs ADD COLUMN herdr_workspace_id TEXT")
+        connection.execute("ALTER TABLE receipts ADD COLUMN placement TEXT")
+        connection.execute(
+            "UPDATE receipts SET placement = ?",
+            (PlacementTarget.TAB.value,),
+        )
+        connection.execute("ALTER TABLE receipts ADD COLUMN execution_path TEXT")
+        connection.execute("ALTER TABLE receipts ADD COLUMN herdr_workspace_id TEXT")
+        connection.execute("UPDATE schema_meta SET version = 2")
 
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
@@ -86,10 +109,10 @@ class Store:
             cursor = connection.execute(
                 """
                 INSERT INTO jobs(
-                    workflow, title, harness, prompt, dedupe_key, state,
+                    workflow, title, harness, prompt, dedupe_key, placement, state,
                     attempts, max_attempts, available_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 ON CONFLICT(workflow, dedupe_key) DO NOTHING
                 """,
                 (
@@ -98,6 +121,7 @@ class Store:
                     job.harness.value,
                     job.prompt,
                     job.dedupe_key,
+                    job.placement.value if job.placement is not None else None,
                     JobState.PENDING.value,
                     job.max_attempts,
                     now,
@@ -136,6 +160,7 @@ class Store:
         limit: int,
         lease_seconds: int,
         slot_names: Mapping[str, Sequence[str]] | None = None,
+        slot_limits: Mapping[str, int] | None = None,
         allowed_harnesses: Iterable[Harness] | None = None,
     ) -> list[ClaimedJob]:
         now = time.time()
@@ -163,7 +188,7 @@ class Store:
             )
             active_rows = connection.execute(
                 """
-                SELECT harness, agent_name FROM jobs
+                SELECT harness, placement, agent_name FROM jobs
                 WHERE workflow = ? AND state = ? AND lease_until > ?
                 """,
                 (workflow, JobState.RUNNING.value, now),
@@ -180,6 +205,7 @@ class Store:
                 """
                 SELECT * FROM jobs
                 WHERE workflow = ?
+                  AND placement IS NOT NULL
                   AND attempts < max_attempts
                   AND (
                     (state = ? AND available_at <= ?)
@@ -197,12 +223,31 @@ class Store:
             ).fetchall()
             for row in candidates:
                 harness_value = str(row["harness"])
+                placement_value = str(row["placement"])
                 if allowed_values is not None and harness_value not in allowed_values:
                     continue
-                names = tuple(slot_names.get(harness_value, ()) if slot_names else ())
+                slot_key = (
+                    f"{harness_value}:{placement_value}:{row['id']}"
+                    if placement_value == PlacementTarget.WORKTREE.value
+                    else f"{harness_value}:{placement_value}"
+                )
+                names = tuple(
+                    (
+                        slot_names.get(slot_key)
+                        or slot_names.get(harness_value)
+                        or ()
+                    )
+                    if slot_names
+                    else ()
+                )
                 if not names:
                     names = (f"ho-{harness_value}",)
-                if busy_counts[harness_value] >= len(names):
+                slot_limit = (
+                    slot_limits.get(harness_value, len(names))
+                    if slot_limits is not None
+                    else len(names)
+                )
+                if busy_counts[harness_value] >= slot_limit:
                     continue
                 agent_name = next(
                     (name for name in names if name not in busy_names.get(harness_value, set())),
@@ -238,6 +283,7 @@ class Store:
                         attempt=attempt,
                         max_attempts=int(row["max_attempts"]),
                         agent_name=agent_name,
+                        placement=PlacementTarget(placement_value),
                     )
                 )
                 busy_counts[harness_value] += 1
@@ -278,7 +324,8 @@ class Store:
                 """
                 UPDATE jobs
                 SET state = ?, available_at = ?, lease_until = NULL, agent_name = ?,
-                    error_code = ?, updated_at = ?
+                    error_code = ?, execution_path = ?, herdr_workspace_id = ?,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -286,6 +333,8 @@ class Store:
                     available_at,
                     outcome.agent_name,
                     error_code,
+                    outcome.execution_path,
+                    outcome.herdr_workspace_id,
                     now,
                     job.job_id,
                 ),
@@ -294,9 +343,10 @@ class Store:
                 """
                 INSERT INTO receipts(
                     job_id, attempt, state, agent_name, agent_state,
-                    member_reused, pane_id, error_code, observed_at
+                    member_reused, pane_id, error_code, placement,
+                    execution_path, herdr_workspace_id, observed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -307,6 +357,13 @@ class Store:
                     int(outcome.member_reused),
                     outcome.pane_id,
                     error_code,
+                    (
+                        outcome.placement.value
+                        if outcome.placement is not None
+                        else job.placement.value
+                    ),
+                    outcome.execution_path,
+                    outcome.herdr_workspace_id,
                     now,
                 ),
             )
@@ -327,12 +384,63 @@ class Store:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, title, harness, state, attempts, max_attempts, agent_name, error_code
+                SELECT id, title, harness, placement, state, attempts, max_attempts,
+                       agent_name, error_code, execution_path, herdr_workspace_id
                 FROM jobs WHERE workflow = ? ORDER BY id
                 """,
                 (workflow,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def unplaced_jobs(
+        self,
+        workflow: str,
+        *,
+        allowed_harnesses: Iterable[Harness] | None = None,
+    ) -> list[dict[str, object]]:
+        allowed_values = (
+            None
+            if allowed_harnesses is None
+            else {harness.value for harness in allowed_harnesses}
+        )
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, title, harness, prompt, dedupe_key
+                FROM jobs
+                WHERE workflow = ? AND state = ? AND placement IS NULL
+                ORDER BY created_at, id
+                """,
+                (workflow, JobState.PENDING.value),
+            ).fetchall()
+        return [
+            dict(row)
+            for row in rows
+            if allowed_values is None or str(row["harness"]) in allowed_values
+        ]
+
+    def set_placement(
+        self,
+        job_id: int,
+        placement: PlacementTarget,
+    ) -> None:
+        now = time.time()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET placement = ?, updated_at = ?
+                WHERE id = ? AND state = ? AND attempts = 0 AND placement IS NULL
+                """,
+                (
+                    placement.value,
+                    now,
+                    job_id,
+                    JobState.PENDING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("job_placement_not_assignable")
 
     def metadata_float(self, key: str) -> float | None:
         with self._connect() as connection:

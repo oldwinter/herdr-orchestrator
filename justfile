@@ -22,6 +22,10 @@ seed:
 status:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator status --workflow {{workflow}}
 
+[positional-arguments]
+dashboard *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator dashboard --workflow {{workflow}} "$@"
+
 catalog:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{workflow}} --format text
 
@@ -31,8 +35,9 @@ catalog-json:
 profile harness:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator profile --workflow {{workflow}} {{quote(harness)}}
 
-enqueue harness title prompt_file dedupe_key:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --harness {{quote(harness)}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}}
+[positional-arguments]
+enqueue harness title prompt_file dedupe_key *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --harness {{quote(harness)}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} "$@"
 
 [positional-arguments]
 run-once *args:

@@ -16,6 +16,9 @@ from herdr_orchestrator.catalog import (
 from herdr_orchestrator.model import (
     CoordinatorConfig,
     Harness,
+    PlacementConfig,
+    PlacementMode,
+    PlacementTarget,
     PlannerConfig,
     SeedJobConfig,
     StandardizedDeliveryConfig,
@@ -74,6 +77,27 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     )
     if coordinator.lease_seconds < coordinator.agent_timeout_seconds + 90:
         raise ConfigError("lease_seconds_must_cover_agent_timeout")
+
+    placement_raw = _optional_table(raw, "placement")
+    placement = PlacementConfig(
+        mode=_enum_value(
+            placement_raw,
+            "mode",
+            PlacementMode,
+            PlacementMode.HYBRID,
+        ),
+        worktree_root=_optional_path(
+            workspace,
+            placement_raw,
+            "worktree_root",
+            ".orchestrator/worktrees",
+        ),
+    )
+    if (
+        not placement.worktree_root.is_relative_to(workspace)
+        or ".orchestrator" not in placement.worktree_root.parts
+    ):
+        raise ConfigError("placement_worktree_root_must_be_in_workspace_runtime")
 
     delivery_raw = _optional_table(raw, "standardized_delivery")
     tracker_backend = _enum_value(
@@ -154,7 +178,15 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             raise ConfigError(f"worker_harness_duplicate: {harness.value}")
         capabilities = _string_list(row, "capabilities", maximum_items=32)
         replicas = _optional_integer(row, "replicas", minimum=1, maximum=16, default=1)
-        workers.append(WorkerConfig(worker_name, harness, capabilities, replicas))
+        workers.append(
+            WorkerConfig(
+                worker_name,
+                harness,
+                capabilities,
+                replicas,
+                _optional_placement(row, "placement"),
+            )
+        )
         worker_names.add(worker_name)
         harnesses.add(harness)
 
@@ -201,6 +233,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
                 harness=harness,
                 prompt_file=_existing_file(base, row, "prompt_file"),
                 dedupe_key=dedupe_key,
+                placement=_optional_placement(row, "placement"),
             )
         )
         seed_keys.add(dedupe_key)
@@ -212,6 +245,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         workspace=workspace,
         state_db=state_db,
         coordinator=coordinator,
+        placement=placement,
         standardized_delivery=standardized_delivery,
         planner=planner,
         profiles_dir=profiles_dir,
@@ -359,6 +393,21 @@ def _optional_harness_list(
             raise ConfigError(f"{key}_duplicate: {harness.value}")
         harnesses.append(harness)
     return tuple(harnesses)
+
+
+def _optional_placement(
+    data: Mapping[str, Any],
+    key: str,
+) -> PlacementTarget | None:
+    value = data.get(key, "auto")
+    if not isinstance(value, str):
+        raise ConfigError(f"{key}_must_be_placement_or_auto")
+    if value == "auto":
+        return None
+    try:
+        return PlacementTarget(value)
+    except ValueError as exc:
+        raise ConfigError(f"{key}_unsupported: {value}") from exc
 
 
 def _optional_nullable_string(

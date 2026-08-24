@@ -23,6 +23,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 | 模式 | 入口 | 何时用 |
 | --- | --- | --- |
 | Durable queue | `just seed` / `enqueue` / `enqueue-auto` / `run` / `run-once` / `status` | 普通派发、重试、收据、无人值守 queue |
+| Read-only dashboard | `just dashboard` | 实时查看 queue、attention、Herdr topology 与 receipt timeline |
 | Standardized delivery | 仅 `just deliver` 或显式 Skill | 用户明确触发标准交付；普通实现/修复/review/orchestrate 不走这条路 |
 
 标准交付入口是 `.agents/skills/standardized-delivery/SKILL.md`；`matt-workflow` 与 `wayfinder-delivery` 只是别名。阶段、artifact、退出码和恢复读 `docs/standardized-delivery.md`。
@@ -36,10 +37,12 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - **Durable queue**：claim、lease、重试、`dedupe_key`、收据。任务状态见 `docs/architecture.md`。
 - **自动选 worker**：`enqueue` 省略 harness 时，主控只输出 `{"harness":"..."}`，coordinator 校验后入队。
 - **只读 smoke**：`just smoke` 对启用 harness 做真实 turn 连通；可用重复 `--harness` 收窄。
+- **实时 Dashboard**：本地只读 Web 投影，异步展示 durable queue、runtime drift、
+  Herdr workspace/tab/pane/worktree 拓扑与 receipt 时间线。
 - **Opt-in 标准交付**：Wayfinder（仅在有 decision fog 时）→ spec + ticket DAG → 独立 worktree 实现 → Standards ∥ Spec review → 至多 2 轮 repair。成功停在隔离 integration branch，不自动 push / merge / deploy。
 - **Tracker**：默认 local Markdown；`github` 只授权该次交付的 issue 创建、更新与关闭。
 
-稳定命令入口是 `justfile`。常用：`doctor`、`test`、`check`、`catalog`、`profile`、`seed`、`enqueue`、`enqueue-auto`、`status`、`run`、`run-once`、`deliver`、`smoke`。
+稳定命令入口是 `justfile`。常用：`doctor`、`test`、`check`、`catalog`、`profile`、`seed`、`enqueue`、`enqueue-auto`、`status`、`dashboard`、`run`、`run-once`、`deliver`、`smoke`。
 
 ## Canonical Surface
 
@@ -51,6 +54,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - `.agents/skills/standardized-delivery/`：opt-in 标准交付 Skill 与分阶段 reference
 - `.agent/skills`、`.claude/skills`：指向 `.agents/skills` 的兼容 symlink，不是独立真源
 - `docs/architecture.md`：恢复、lease、planner、delivery 运行语义
+- `docs/dashboard.md`：只读实时 Dashboard、SSE 和数据安全语义
 - `docs/workflow-schema.md`：改 workflow / delivery TOML 字段时读
 - `docs/standardized-delivery.md`：仅在用户明确触发标准交付时读
 - `.orchestrator/`：本机 runtime state，禁止提交

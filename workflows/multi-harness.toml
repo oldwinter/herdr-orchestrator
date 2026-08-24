@@ -11,6 +11,10 @@ lease_seconds = 900
 max_attempts = 2
 agent_timeout_seconds = 300
 
+[placement]
+mode = "hybrid"
+worktree_root = ".orchestrator/worktrees"
+
 [standardized_delivery]
 tracker_backend = "local-markdown"
 tracker_root = ".scratch/standardized-delivery"
