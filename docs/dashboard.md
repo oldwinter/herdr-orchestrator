@@ -1,0 +1,87 @@
+# Local Operations Dashboard
+
+Dashboard 是 durable queue 的只读实时投影，不是第二个 coordinator。它把 SQLite 任务与
+receipt、Herdr workspace/tab/pane/agent、原生 Git worktree 关联成一张本地 Web 图景。
+
+## 启动
+
+```bash
+just dashboard
+
+# 可调整本地端口和观察间隔
+just dashboard --port 9000 --poll-seconds 1
+```
+
+启动后命令会输出 automation-friendly JSON：
+
+```json
+{"status":"dashboard_started","url":"http://127.0.0.1:8765"}
+```
+
+Dashboard 只允许绑定 `127.0.0.1` 或 `localhost`。默认每 2 秒生成一次快照，
+浏览器通过 Server-Sent Events 异步接收；断线会自动重连。
+
+## 页面
+
+### Workflow summary
+
+顶部指标来自 durable job state 与实时 Herdr observation：
+
+- running、pending、succeeded；
+- blocked、failed 或 runtime drift 构成的 attention；
+- working/blocked Herdr agent；
+- Herdr 原生 linked worktree。
+
+### Work in flight
+
+任务按 `pending`、`running`、`blocked/failed`、`succeeded` 分列。任务卡显示 harness、
+placement、attempt、agent、pane/workspace location 与最后 durable state change。
+
+Dashboard 不推测任务完成百分比。`working` 只表示 Herdr 当前观察，任务成功仍以 SQLite
+receipt 为准。
+
+### Attention
+
+当前检测：
+
+- durable `blocked` 或 `failed`；
+- job 为 `running`，但对应 agent 不存在；
+- job 已 terminal，但 agent 仍为 `working`；
+- receipt workspace 与实时 workspace 不一致；
+- lease 过期；
+- running job 超过 5 分钟没有 durable state change；
+- Herdr observation 不可用。
+
+这些是只读诊断，不会自动重试、终止或修改 job。
+
+### Herdr topology
+
+只显示与 workflow workspace 相关的 Herdr workspace，包括该仓库的原生 worktree。
+结构为 `workspace → tab → pane → agent`。Dashboard 不读取 pane output。
+
+### Recent lifecycle
+
+时间线来自 durable job 创建时间与 receipt。当前最多返回最近 100 条，页面显示最近 24
+条。Dashboard 重启不会丢失这些 durable 证据。
+
+## 数据与安全
+
+SQLite observer 使用只读连接，查询白名单列：
+
+- 不读取 `jobs.prompt`；
+- 不读取环境变量或 secret；
+- 不读取 terminal/pane output。
+
+Herdr observer 只保留 topology 与 lifecycle 白名单字段。HTTP 静态资源设置 CSP，
+所有接口 `Cache-Control: no-store`。服务不会监听非 loopback 地址。
+
+## HTTP interface
+
+| 路径 | 说明 |
+| --- | --- |
+| `GET /` | Dashboard 页面 |
+| `GET /api/health` | monitor 是否已有快照 |
+| `GET /api/snapshot` | 当前完整快照与 event ID |
+| `GET /api/events` | SSE snapshot stream |
+
+Dashboard 目前不提供 POST、retry、focus 或 blocked response 操作。

@@ -76,6 +76,25 @@ Worktree path 与 branch 从 workflow 和 task key 稳定派生，retry 可恢�
 审查。Standardized delivery 仍使用自己的 integration/ticket worktree DAG 和收据协议，
 不与普通 queue topology 混用。
 
+### Local operations dashboard
+
+Dashboard 位于 coordinator 之外：
+
+```text
+SQLite read-only observer ─┐
+                           ├─> RuntimeProjector ─> SnapshotFeed ─> HTTP + SSE
+Herdr whitelist observer ──┘
+```
+
+`RuntimeProjector.snapshot()` 是页面和测试共用的 interface。实现内部关联
+`job → named agent → pane → tab → workspace`，并计算 durable/runtime drift。
+Dashboard monitor 独立运行；它失败、退出或断线不改变 coordinator、lease 或 receipt。
+
+SQLite observer 不读取 `jobs.prompt`。Herdr observer 不读取 pane output，只投影
+workspace、tab、pane、agent lifecycle 和 worktree 的白名单字段。浏览器通过 SSE
+接收完整、幂等 snapshot；snapshot event ID 只用于当前 dashboard 进程的重连，durable
+历史仍来自 job 与 receipt。
+
 ### Harness catalog 与按需 profile
 
 - `profiles/harnesses/*.toml` 是紧凑 catalog 真源，只包含主控做选择所需的元数据；

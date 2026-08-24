@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Herdr Operations</title>
+    <link rel="stylesheet" href="/assets/dashboard.css">
+    <script src="/assets/dashboard.js" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="masthead">
+        <div class="identity">
+          <div class="mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <p class="eyebrow">Local operations console</p>
+            <h1 id="workflow-name">Herdr Orchestrator</h1>
+          </div>
+        </div>
+        <div class="connection" aria-live="polite">
+          <span id="connection-dot" class="connection-dot"></span>
+          <div>
+            <strong id="connection-label">Connecting</strong>
+            <span id="last-updated">Waiting for first snapshot</span>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <section id="source-warning" class="source-warning is-hidden" aria-live="polite"></section>
+
+        <section class="metrics" aria-label="Workflow summary">
+          <article class="metric metric-primary">
+            <span class="metric-label">In motion</span>
+            <strong id="metric-running">—</strong>
+            <span class="metric-note">durable running jobs</span>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Needs attention</span>
+            <strong id="metric-attention">—</strong>
+            <span class="metric-note">blocked, failed, or drifted</span>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Queue</span>
+            <strong id="metric-pending">—</strong>
+            <span class="metric-note">waiting to dispatch</span>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Live agents</span>
+            <strong id="metric-agents">—</strong>
+            <span class="metric-note">working or blocked in Herdr</span>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Worktrees</span>
+            <strong id="metric-worktrees">—</strong>
+            <span class="metric-note">native isolated checkouts</span>
+          </article>
+          <article class="metric">
+            <span class="metric-label">Completed</span>
+            <strong id="metric-succeeded">—</strong>
+            <span class="metric-note">durable receipts settled</span>
+          </article>
+        </section>
+
+        <section class="main-grid">
+          <article class="panel board-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Durable state</p>
+                <h2>Work in flight</h2>
+              </div>
+              <span id="job-total" class="quiet-badge">0 jobs</span>
+            </div>
+            <div id="kanban" class="kanban">
+              <div class="empty-state">Loading queue state…</div>
+            </div>
+          </article>
+
+          <aside class="right-rail">
+            <article class="panel attention-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">Intervention queue</p>
+                  <h2>Attention</h2>
+                </div>
+                <span id="attention-count" class="quiet-badge">0</span>
+              </div>
+              <div id="attention-list" class="attention-list">
+                <div class="empty-state compact">No active alerts</div>
+              </div>
+            </article>
+
+            <article class="panel topology-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">Observed runtime</p>
+                  <h2>Herdr topology</h2>
+                </div>
+                <span id="topology-count" class="quiet-badge">0 workspaces</span>
+              </div>
+              <div id="topology" class="topology">
+                <div class="empty-state compact">Waiting for Herdr…</div>
+              </div>
+            </article>
+          </aside>
+        </section>
+
+        <section class="panel timeline-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Durable evidence</p>
+              <h2>Recent lifecycle</h2>
+            </div>
+            <span class="quiet-badge">latest 100 events</span>
+          </div>
+          <div id="timeline" class="timeline">
+            <div class="empty-state compact">No lifecycle events yet</div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

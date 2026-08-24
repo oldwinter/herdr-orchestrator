@@ -22,6 +22,10 @@ seed:
 status:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator status --workflow {{workflow}}
 
+[positional-arguments]
+dashboard *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator dashboard --workflow {{workflow}} "$@"
+
 catalog:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{workflow}} --format text
 

@@ -77,6 +77,20 @@ just run
 just status
 ```
 
+## 实时 Dashboard
+
+```bash
+just dashboard
+
+# 自定义本地端口与刷新周期
+just dashboard --port 9000 --poll-seconds 1
+```
+
+浏览器页面实时展示 durable queue 看板、blocked/failed/runtime drift、Herdr
+workspace/tab/pane/agent 拓扑、原生 worktree 和 receipt 时间线。Dashboard 是只读投影，
+默认只监听 `127.0.0.1:8765`，不读取 prompt、环境变量或 terminal output。详细行为见
+[`docs/dashboard.md`](docs/dashboard.md)。
+
 ## 六 harness 真实只读 smoke
 
 下面的命令会依次启动或复用六种 harness，要求它们只读检查两个本地配置文件，并验证六个 agent 都经历真实 turn 后回到 settled state：

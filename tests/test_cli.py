@@ -6,6 +6,19 @@ from herdr_orchestrator.cli import build_parser
 
 
 class CliTests(unittest.TestCase):
+    def test_dashboard_defaults_to_loopback_live_view(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "dashboard",
+                "--workflow",
+                "workflow.toml",
+            ]
+        )
+
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 8765)
+        self.assertEqual(args.poll_seconds, 2.0)
+
     def test_enqueue_defaults_to_automatic_selection(self) -> None:
         args = build_parser().parse_args(
             [
