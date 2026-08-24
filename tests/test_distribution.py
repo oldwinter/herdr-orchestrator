@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tarfile
 import tempfile
 import tomllib
 import unittest
@@ -216,6 +217,16 @@ class DistributionCliTests(unittest.TestCase):
             )
             self.assertEqual(packed.returncode, 0, packed.stderr)
             tarball = package_directory / packed.stdout.strip().splitlines()[-1]
+            with tarfile.open(tarball) as archive:
+                packaged_files = set(archive.getnames())
+            self.assertIn(
+                "package/src/herdr_orchestrator/dashboard/static/cytoscape.min.js",
+                packaged_files,
+            )
+            self.assertIn(
+                "package/src/herdr_orchestrator/dashboard/static/cytoscape.LICENSE.txt",
+                packaged_files,
+            )
 
             install = subprocess.run(
                 [

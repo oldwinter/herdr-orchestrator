@@ -73,7 +73,7 @@ class RuntimeProjector:
             "summary": summary,
             "jobs": jobs,
             "attention": attention,
-            "topology": _topology(herdr),
+            "topology": _topology(herdr, self.workflow),
             "timeline": _timeline(queue, jobs),
         }
 
@@ -212,7 +212,7 @@ def _job_attention(
     }
 
 
-def _topology(herdr: HerdrObservation) -> dict[str, object]:
+def _topology(herdr: HerdrObservation, project_label: str) -> dict[str, object]:
     agents_by_pane = {
         str(row["pane_id"]): row
         for row in herdr.agents
@@ -242,18 +242,59 @@ def _topology(herdr: HerdrObservation) -> dict[str, object]:
         if isinstance(row.get("open_workspace_id"), str)
     }
     workspaces: list[dict[str, object]] = []
+    worktrees: list[dict[str, object]] = []
     for workspace in herdr.workspaces:
         workspace_id = workspace.get("workspace_id")
         if not isinstance(workspace_id, str):
             continue
         projected = dict(workspace)
         projected["tabs"] = tabs_by_workspace.get(workspace_id, [])
-        projected["worktree"] = worktree_by_workspace.get(
+        linked_worktree = worktree_by_workspace.get(
             workspace_id,
             projected.get("worktree"),
         )
+        projected["worktree"] = linked_worktree
         workspaces.append(projected)
-    return {"workspaces": workspaces}
+        worktrees.append(
+            {
+                "worktree_id": workspace_id,
+                "workspace_id": workspace_id,
+                "label": (
+                    linked_worktree.get("label")
+                    if isinstance(linked_worktree, dict)
+                    else None
+                )
+                or projected.get("label")
+                or workspace_id,
+                "path": (
+                    linked_worktree.get("path")
+                    if isinstance(linked_worktree, dict)
+                    else None
+                ),
+                "branch": (
+                    linked_worktree.get("branch")
+                    if isinstance(linked_worktree, dict)
+                    else None
+                ),
+                "is_linked_worktree": bool(
+                    isinstance(linked_worktree, dict)
+                    and linked_worktree.get("is_linked_worktree") is True
+                ),
+                "tabs": projected["tabs"],
+            }
+        )
+    projects = (
+        [
+            {
+                "project_id": f"workflow:{project_label}",
+                "label": project_label,
+                "worktrees": worktrees,
+            }
+        ]
+        if worktrees
+        else []
+    )
+    return {"workspaces": workspaces, "projects": projects}
 
 
 def _timeline(

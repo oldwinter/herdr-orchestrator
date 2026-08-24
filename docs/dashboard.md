@@ -57,7 +57,24 @@ receipt 为准。
 ### Herdr topology
 
 只显示与 workflow workspace 相关的 Herdr workspace，包括该仓库的原生 worktree。
-结构为 `workspace → tab → pane → agent`。Dashboard 不读取 pane output。
+页面以可平移、缩放的 Canvas 白板展示
+`project → worktree/workspace → tab → pane` compound graph；agent 名称与 lifecycle 状态显示在
+pane 上，不形成额外结构层。点击节点只显示白名单详情，不会 focus、移动或修改 Herdr runtime。
+
+工具栏支持放大、缩小和适配全部节点，鼠标/触控可平移与缩放。SSE 状态刷新只更新节点样式；
+只有 project、worktree、tab 或 pane 结构变化时才重新运行确定性的层级分组布局，并保留用户
+当前 viewport。
+Canvas 同时维护一份屏幕阅读器可读的 DOM topology tree。
+
+Snapshot v1 继续提供原有的 `topology.workspaces`，并以 additive 字段提供
+`topology.projects`，其中嵌套 worktree、tab 与 pane。旧消费者无需修改。
+
+渲染器使用自托管的 Cytoscape.js 3.34.1 Canvas build，不从 CDN 加载，也不增加浏览器运行时
+网络依赖。vendored bundle SHA-256 为
+`5141892eb19898946e5af8300e14cec15a63a22186a4ca56d76819a91e2a3fe6`，MIT notice 位于
+`src/herdr_orchestrator/dashboard/static/cytoscape.LICENSE.txt`。选型比较见
+[`research/topology-canvas-options.md`](research/topology-canvas-options.md)。Dashboard 仍不读取
+pane output。
 
 ### Recent lifecycle
 

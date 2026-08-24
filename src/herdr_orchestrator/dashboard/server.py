@@ -261,7 +261,12 @@ def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
                 return
 
         def _asset(self, name: str) -> None:
-            if name not in {"index.html", "dashboard.css", "dashboard.js"}:
+            if name not in {
+                "index.html",
+                "dashboard.css",
+                "cytoscape.min.js",
+                "dashboard.js",
+            }:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             asset = files("herdr_orchestrator.dashboard.static").joinpath(name)
