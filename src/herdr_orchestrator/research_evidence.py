@@ -1777,7 +1777,7 @@ class ResearchEvidenceRegister:
             for item in self._verification_assignments.values()
             if item.claim_id == assignment.claim_id and item.current
         ]
-        if current_for_claim:
+        if assignment.current and current_for_claim:
             raise _error("verification_assignment_current_conflict")
         self._verification_assignments[assignment.assignment_id] = assignment
         return assignment

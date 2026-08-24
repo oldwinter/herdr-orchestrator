@@ -650,10 +650,24 @@ def _replay_verification_fixture(
         != register.verification_policy.to_dict()
     ):
         raise ExecutorStoreError("verification_fixture_policy_integrity_mismatch")
+    checkpoint_outcome_code = (
+        str(checkpoint.payload.get("outcome_code"))
+        if checkpoint is not None
+        and isinstance(checkpoint.payload, dict)
+        and checkpoint.payload.get("outcome_code") is not None
+        else None
+    )
+    checkpoint_reason = (
+        str(checkpoint.payload.get("reason"))
+        if checkpoint is not None
+        and isinstance(checkpoint.payload, dict)
+        and checkpoint.payload.get("reason") is not None
+        else None
+    )
     outcome_code = (
         str(event.payload.get("outcome_code", "unknown"))
         if event is not None and isinstance(event.payload, dict)
-        else _verification_outcome(register)
+        else checkpoint_outcome_code or _verification_outcome(register)
     )
     run = store.require_run(run_id)
     if event is None:
@@ -696,7 +710,7 @@ def _replay_verification_fixture(
             payload={
                 "fixture_case_id": requested_case_id,
                 "outcome_code": outcome_code,
-                "reason": outcome_code,
+                "reason": checkpoint_reason or outcome_code,
                 "verification_policy": register.verification_policy.to_dict(),
                 "verification": register.claim_status(register.claims[0].claim_id),
                 "verification_assignment": current_assignment,
@@ -1699,7 +1713,7 @@ def _research_verification_fixture_in_state(
         # A producer attempting to downgrade the derived criticality cannot
         # create a verified disposition or gate credit.
         try:
-            register.admit_verification_disposition(
+            disposition = register.admit_verification_disposition(
                 VerificationDisposition(
                     disposition_id="disposition-downgrade",
                     claim_id=claim.claim_id,
@@ -1737,28 +1751,7 @@ def _research_verification_fixture_in_state(
             rejection_code = str(exc).split(":", 1)[0]
 
     verification = register.claim_status(claim.claim_id)
-    checkpoint_evidence = register.to_dict()
-    kernel.append_event(
-        run_id,
-        event_key=f"research-verification-checkpoint:{requested_case_id}",
-        event_type="research_verification_checkpoint",
-        payload={
-            "fixture_case_id": requested_case_id,
-            "verification_policy": research_config.verification.to_dict(),
-            "evidence": checkpoint_evidence,
-        },
-    )
-    register_claims = kernel.claim_ready(run_id, limit=1)
-    if len(register_claims) != 1:
-        raise ExecutorStoreError("verification_fixture_register_not_ready")
-    register_claim = register_claims[0]
-    _settle_verification_fixture_work(
-        kernel,
-        register_claim,
-        artifact_type="research-verification-register",
-        payload={"evidence": register.to_dict()},
-    )
-    if case_id == "contradiction-pack" or case_id == "contested":
+    if case_id in {"contradiction-pack", "contested"}:
         outcome_code = "claim_contested"
         reason = "opposing admitted evidence remains contested"
         success = True
@@ -1779,6 +1772,29 @@ def _research_verification_fixture_in_state(
         outcome_code = "critical_claim_unverified"
         reason = rejection_code or "critical_claim_requires_independent_verification"
         success = False
+    checkpoint_evidence = register.to_dict()
+    kernel.append_event(
+        run_id,
+        event_key=f"research-verification-checkpoint:{requested_case_id}",
+        event_type="research_verification_checkpoint",
+        payload={
+            "fixture_case_id": requested_case_id,
+            "verification_policy": research_config.verification.to_dict(),
+            "outcome_code": outcome_code,
+            "reason": reason,
+            "evidence": checkpoint_evidence,
+        },
+    )
+    register_claims = kernel.claim_ready(run_id, limit=1)
+    if len(register_claims) != 1:
+        raise ExecutorStoreError("verification_fixture_register_not_ready")
+    register_claim = register_claims[0]
+    _settle_verification_fixture_work(
+        kernel,
+        register_claim,
+        artifact_type="research-verification-register",
+        payload={"evidence": register.to_dict()},
+    )
     evidence = register.to_dict()
     kernel.transition_run(run_id, "succeeded" if success else "failed")
     kernel.append_event(
