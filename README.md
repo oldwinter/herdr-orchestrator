@@ -133,10 +133,14 @@ Canonical cases include `contradiction-pack`, `critical-unverified`,
 `disposition-history`, `source-reuse`, `unaccounted-contradiction`, and
 `stale-assignment`. Fixture runs retain shared-kernel attempts, typed
 artifacts, evidence receipts, contradiction history, and terminal
-verification state. Repeating a case replays the existing terminal run
-without dispatching another attempt. Export writes a Markdown report and
+verification state. Critical gate credit additionally requires the current
+kernel attempt, semantic receipt, admitted evidence artifact, and complete
+collector/verifier lineage. Repeating a case replays the existing terminal
+run without dispatching another attempt. Export writes a Markdown report and
 source-claim register below the workspace `.orchestrator/exports` boundary;
-contested exports preserve both opposing relations.
+contested exports preserve both opposing relations. The deterministic fixture
+uses scripted public URLs; same-window Grok/Claude public controls are retained
+separately as live attribution evidence.
 
 ## 明确不做
 
