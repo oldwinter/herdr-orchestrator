@@ -9,7 +9,14 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from herdr_orchestrator.model import AgentState, DispatchOutcome, Harness
+from herdr_orchestrator.herdr_layout import HerdrLayout, ProvisionedTerminal
+from herdr_orchestrator.model import (
+    AgentState,
+    DispatchContext,
+    DispatchOutcome,
+    Harness,
+    PlacementTarget,
+)
 from herdr_orchestrator.protocol import (
     Command,
     CommandRunner,
@@ -24,6 +31,9 @@ START_TIMEOUT_MS = 120_000
 START_RECOVERY_TIMEOUT_MS = 120_000
 SHELL_READY_TIMEOUT_SECONDS = 10
 AGENT_POST_START_SETTLE_SECONDS = 3
+AGENT_INTERACTIVE_READY_TIMEOUT_SECONDS = 10
+PROMPT_ACCEPTANCE_TIMEOUT_MS = 5_000
+PROMPT_ENTER_RETRIES = 2
 SETTLED_CONFIRMATION_POLLS = 6
 SETTLED_STATES = {AgentState.IDLE, AgentState.DONE}
 CLAUDE_AUTH_FAILURE = re.compile(
@@ -51,8 +61,13 @@ class HerdrTransport:
         self.settled_confirmation_polls = settled_confirmation_polls
         self.inspect_runtime_errors = inspect_runtime_errors
         self._provision_lock = threading.Lock()
-        self._created_panes: dict[str, str] = {}
-        self._created_tabs: dict[str, str] = {}
+        self._created_terminals: dict[str, ProvisionedTerminal] = {}
+        self._layout = HerdrLayout(
+            workflow_name,
+            self.workspace,
+            self.environ.get("HERDR_WORKSPACE_ID", ""),
+            runner,
+        )
 
     def check_environment(self) -> None:
         if self.environ.get("HERDR_ENV") != "1":
@@ -69,22 +84,54 @@ class HerdrTransport:
         *,
         timeout_seconds: int,
         agent_name: str | None = None,
+        context: DispatchContext | None = None,
     ) -> DispatchOutcome:
+        refresh_visible_label = context is not None
+        dispatch_context = context or DispatchContext(
+            PlacementTarget.TAB,
+            harness.value,
+            agent_name or harness.value,
+        )
         name = agent_name or stable_agent_name(self.workflow_name, self.workspace, harness)
+        pane_id: str | None = None
+        workspace_id: str | None = None
         try:
             self.check_environment()
             with self._provision_lock:
-                pane_id, reused = self._ensure_agent(name, harness)
+                pane_id, reused, workspace_id = self._ensure_agent(
+                    name,
+                    harness,
+                    dispatch_context,
+                    refresh_visible_label=refresh_visible_label,
+                )
             state = self._prompt(name, harness, prompt, timeout_seconds)
         except TransportError as exc:
+            terminal = self._created_terminals.get(name)
             return DispatchOutcome(
                 agent_name=name,
                 state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
-                member_reused=name not in self._created_panes,
-                pane_id=self._created_panes.get(name),
+                member_reused=terminal is None,
+                pane_id=terminal.pane_id if terminal is not None else pane_id,
                 error_code=exc.code,
+                placement=dispatch_context.placement,
+                execution_path=str(
+                    terminal.cwd
+                    if terminal is not None
+                    else self._layout.execution_workspace(dispatch_context)
+                ),
+                herdr_workspace_id=(
+                    terminal.workspace_id if terminal is not None else workspace_id
+                ),
             )
-        return DispatchOutcome(name, state, reused, pane_id)
+        return DispatchOutcome(
+            name,
+            state,
+            reused,
+            pane_id,
+            placement=dispatch_context.placement,
+            execution_path=str(self._layout.execution_workspace(dispatch_context)),
+            herdr_workspace_id=workspace_id,
+        )
 
     def read_agent(self, name: str, *, lines: int = 120) -> str:
         return run_text(
@@ -128,7 +175,29 @@ class HerdrTransport:
             if _agent_state(current) is not AgentState.BLOCKED:
                 raise TransportError("agent_not_blocked")
             pane_id = _non_empty_string(current, "pane_id")
-            state = self._prompt(name, harness, response, timeout_seconds)
+            baseline_sequence = _state_change_sequence(current)
+            run_json(
+                self.runner,
+                Command(
+                    ["herdr", "pane", "send-text", pane_id, response],
+                    self.workspace,
+                    CONTROL_TIMEOUT_SECONDS,
+                ),
+            )
+            run_json(
+                self.runner,
+                Command(
+                    ["herdr", "agent", "send-keys", name, "enter"],
+                    self.workspace,
+                    CONTROL_TIMEOUT_SECONDS,
+                ),
+            )
+            state = self._wait_after_blocked_response(
+                name,
+                harness,
+                baseline_sequence,
+                timeout_seconds,
+            )
         except TransportError as exc:
             return DispatchOutcome(
                 agent_name=name,
@@ -139,21 +208,54 @@ class HerdrTransport:
             )
         return DispatchOutcome(name, state, True, pane_id)
 
-    def close_created_agent(self, name: str) -> None:
-        self._created_panes.pop(name, None)
-        tab_id = self._created_tabs.pop(name, None)
-        if tab_id is None:
-            return
-        run_json(
-            self.runner,
-            Command(
-                ["herdr", "tab", "close", tab_id],
-                self.workspace,
-                CONTROL_TIMEOUT_SECONDS,
-            ),
-        )
+    def _wait_after_blocked_response(
+        self,
+        name: str,
+        harness: Harness,
+        baseline_sequence: int,
+        timeout_seconds: int,
+    ) -> AgentState:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            current = _agent_payload(
+                run_json(
+                    self.runner,
+                    Command(
+                        ["herdr", "agent", "get", name],
+                        self.workspace,
+                        CONTROL_TIMEOUT_SECONDS,
+                    ),
+                )
+            )
+            state = _agent_state(current)
+            sequence = _state_change_sequence(current)
+            if sequence > baseline_sequence and state in {
+                AgentState.IDLE,
+                AgentState.DONE,
+                AgentState.BLOCKED,
+            }:
+                state = self._confirm_stable_settlement(name, state, deadline)
+                self._raise_for_runtime_error(name, harness, state)
+                return state
+            if time.monotonic() >= deadline:
+                raise TransportError("herdr_timeout")
+            self.sleeper(0.5)
 
-    def _ensure_agent(self, name: str, harness: Harness) -> tuple[str | None, bool]:
+    def close_created_agent(self, name: str) -> None:
+        terminal = self._created_terminals.pop(name, None)
+        if terminal is None:
+            return
+        self._layout.close_temporary(terminal)
+
+    def _ensure_agent(
+        self,
+        name: str,
+        harness: Harness,
+        context: DispatchContext,
+        *,
+        refresh_visible_label: bool,
+    ) -> tuple[str | None, bool, str | None]:
+        execution_workspace = self._layout.execution_workspace(context)
         try:
             result = run_json(
                 self.runner,
@@ -168,43 +270,30 @@ class HerdrTransport:
                 raise
         else:
             agent = _agent_payload(result)
-            _validate_reusable_agent(agent, name, harness, self.workspace)
+            _validate_reusable_agent(agent, name, harness, execution_workspace)
+            if refresh_visible_label:
+                self._layout.refresh_visible_label(agent, context)
             pane_id = _non_empty_string(agent, "pane_id")
-            return pane_id, True
+            raw_workspace_id = agent.get("workspace_id")
+            workspace_id = (
+                raw_workspace_id.strip()
+                if isinstance(raw_workspace_id, str) and raw_workspace_id.strip()
+                else (
+                    self._layout.workspace_id
+                    if context.placement is not PlacementTarget.WORKTREE
+                    else None
+                )
+            )
+            return pane_id, True, workspace_id
 
-        created = run_json(
-            self.runner,
-            Command(
-                [
-                    "herdr",
-                    "tab",
-                    "create",
-                    "--workspace",
-                    self.environ["HERDR_WORKSPACE_ID"],
-                    "--cwd",
-                    str(self.workspace),
-                    "--label",
-                    name,
-                    "--no-focus",
-                ],
-                self.workspace,
-                CONTROL_TIMEOUT_SECONDS,
-            ),
-        )
-        pane = created.get("root_pane")
-        tab = created.get("tab")
-        if not isinstance(pane, dict) or not isinstance(tab, dict):
-            raise TransportError("herdr_invalid_response")
-        pane_id = _non_empty_string(pane, "pane_id")
-        tab_id = _non_empty_string(tab, "tab_id")
+        terminal = self._layout.provision(context)
+        pane_id = terminal.pane_id
         try:
             self._wait_for_shell(pane_id)
             started = self._start_agent(name, harness, pane_id)
             started_agent = _agent_payload(started)
             started_state = _agent_state(started_agent)
-            if started_state is AgentState.BLOCKED:
-                raise TransportError("agent_blocked")
-            if started_state not in SETTLED_STATES:
+            if started_state not in SETTLED_STATES | {AgentState.BLOCKED}:
                 started = run_json(
                     self.runner,
                     Command(
@@ -220,18 +309,51 @@ class HerdrTransport:
                         START_RECOVERY_TIMEOUT_MS // 1000 + 10,
                     ),
                 )
-            _validate_started_agent(_agent_payload(started), name, harness, pane_id)
             self.sleeper(AGENT_POST_START_SETTLE_SECONDS)
+            started_agent = self._wait_for_interactive_agent(name, harness, pane_id)
+            _validate_started_agent(started_agent, name, harness, pane_id)
         except TransportError as cause:
             if cause.code == "agent_blocked":
-                self._created_panes[name] = pane_id
-                self._created_tabs[name] = tab_id
+                self._created_terminals[name] = terminal
                 raise
-            self._close_failed_tab(tab_id, cause)
+            try:
+                self._layout.cleanup_failed(terminal)
+            except TransportError as cleanup_error:
+                raise TransportError("layout_cleanup_failed") from cause
             raise
-        self._created_panes[name] = pane_id
-        self._created_tabs[name] = tab_id
-        return pane_id, False
+        self._created_terminals[name] = terminal
+        return pane_id, False, terminal.workspace_id
+
+    def _wait_for_interactive_agent(
+        self,
+        name: str,
+        harness: Harness,
+        pane_id: str,
+    ) -> Mapping[str, Any]:
+        deadline = time.monotonic() + AGENT_INTERACTIVE_READY_TIMEOUT_SECONDS
+        while True:
+            current = _agent_payload(
+                run_json(
+                    self.runner,
+                    Command(
+                        ["herdr", "agent", "get", name],
+                        self.workspace,
+                        CONTROL_TIMEOUT_SECONDS,
+                    ),
+                )
+            )
+            _validate_agent_identity(current, name, harness, pane_id)
+            state = _agent_state(current)
+            if _interactive_ready(current):
+                if state is AgentState.BLOCKED:
+                    raise TransportError("agent_blocked")
+                if state in SETTLED_STATES:
+                    return current
+            if time.monotonic() >= deadline:
+                if state is AgentState.BLOCKED:
+                    raise TransportError("agent_blocked")
+                raise TransportError("agent_not_ready")
+            self.sleeper(0.5)
 
     def _wait_for_shell(self, pane_id: str) -> None:
         deadline = time.monotonic() + SHELL_READY_TIMEOUT_SECONDS
@@ -323,6 +445,7 @@ class HerdrTransport:
         )
         baseline_sequence = _state_change_sequence(before)
         deadline = time.monotonic() + timeout_seconds
+        acceptance_timeout_ms = min(timeout_seconds * 1000, PROMPT_ACCEPTANCE_TIMEOUT_MS)
         try:
             prompted = _agent_payload(
                 run_json(
@@ -335,11 +458,19 @@ class HerdrTransport:
                             name,
                             prompt,
                             "--wait",
+                            "--until",
+                            AgentState.WORKING.value,
+                            "--until",
+                            AgentState.IDLE.value,
+                            "--until",
+                            AgentState.DONE.value,
+                            "--until",
+                            AgentState.BLOCKED.value,
                             "--timeout",
-                            str(timeout_seconds * 1000),
+                            str(acceptance_timeout_ms),
                         ],
                         self.workspace,
-                        timeout_seconds + 10,
+                        acceptance_timeout_ms // 1000 + 10,
                     ),
                 )
             )
@@ -356,27 +487,14 @@ class HerdrTransport:
                     ),
                 )
             )
-            stalled_state = _agent_state(stalled)
-            stalled_sequence = _state_change_sequence(stalled)
-            if stalled_sequence > baseline_sequence and stalled_state in {
-                AgentState.IDLE,
-                AgentState.DONE,
-                AgentState.BLOCKED,
-            }:
-                state = self._confirm_stable_settlement(name, stalled_state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
-            if stalled_sequence == baseline_sequence and stalled_state is AgentState.IDLE:
-                run_json(
-                    self.runner,
-                    Command(
-                        ["herdr", "agent", "send-keys", name, "enter"],
-                        self.workspace,
-                        CONTROL_TIMEOUT_SECONDS,
-                    ),
-                )
-        else:
-            state = _agent_state(prompted)
+            state = _agent_state(stalled)
+            sequence = _state_change_sequence(stalled)
+            if sequence == baseline_sequence and state is AgentState.IDLE:
+                stalled = self._resubmit_enter_until_turn(name, baseline_sequence)
+                state = _agent_state(stalled)
+                sequence = _state_change_sequence(stalled)
+            if sequence <= baseline_sequence:
+                raise TransportError("agent_turn_not_observed")
             if state in {
                 AgentState.IDLE,
                 AgentState.DONE,
@@ -385,7 +503,23 @@ class HerdrTransport:
                 state = self._confirm_stable_settlement(name, state, deadline)
                 self._raise_for_runtime_error(name, harness, state)
                 return state
-            raise TransportError("agent_not_settled")
+            if state is not AgentState.WORKING:
+                raise TransportError("agent_not_settled")
+        else:
+            state = _agent_state(prompted)
+            sequence = _state_change_sequence(prompted)
+            if sequence <= baseline_sequence:
+                raise TransportError("agent_turn_not_observed")
+            if state in {
+                AgentState.IDLE,
+                AgentState.DONE,
+                AgentState.BLOCKED,
+            }:
+                state = self._confirm_stable_settlement(name, state, deadline)
+                self._raise_for_runtime_error(name, harness, state)
+                return state
+            if state is not AgentState.WORKING:
+                raise TransportError("agent_not_settled")
 
         while True:
             if time.monotonic() >= deadline:
@@ -411,6 +545,35 @@ class HerdrTransport:
                 self._raise_for_runtime_error(name, harness, state)
                 return state
             self.sleeper(0.5)
+
+    def _resubmit_enter_until_turn(
+        self,
+        name: str,
+        baseline_sequence: int,
+    ) -> Mapping[str, Any]:
+        for _ in range(PROMPT_ENTER_RETRIES):
+            run_json(
+                self.runner,
+                Command(
+                    ["herdr", "agent", "send-keys", name, "enter"],
+                    self.workspace,
+                    CONTROL_TIMEOUT_SECONDS,
+                ),
+            )
+            self.sleeper(0.5)
+            current = _agent_payload(
+                run_json(
+                    self.runner,
+                    Command(
+                        ["herdr", "agent", "get", name],
+                        self.workspace,
+                        CONTROL_TIMEOUT_SECONDS,
+                    ),
+                )
+            )
+            if _state_change_sequence(current) > baseline_sequence:
+                return current
+        raise TransportError("agent_turn_not_observed")
 
     def _confirm_stable_settlement(
         self,
@@ -473,20 +636,6 @@ class HerdrTransport:
         if harness is Harness.CLAUDE and CLAUDE_AUTH_FAILURE.search(output):
             raise TransportError("agent_auth_failed")
 
-    def _close_failed_tab(self, tab_id: str, cause: TransportError) -> None:
-        try:
-            run_json(
-                self.runner,
-                Command(
-                    ["herdr", "tab", "close", tab_id],
-                    self.workspace,
-                    CONTROL_TIMEOUT_SECONDS,
-                ),
-            )
-        except TransportError as cleanup_error:
-            raise TransportError("tab_cleanup_failed") from cause
-
-
 def stable_agent_name(workflow_name: str, workspace: Path, harness: Harness) -> str:
     seed = f"{workflow_name}\0{workspace.resolve()}\0{harness.value}"
     digest = hashlib.sha256(seed.encode()).hexdigest()[:8]
@@ -498,16 +647,40 @@ def replica_slot_names(
     workspace: Path,
     harness: Harness,
     replicas: int,
+    placement: PlacementTarget = PlacementTarget.TAB,
 ) -> tuple[str, ...]:
     if replicas < 1:
         raise ValueError("replicas_must_be_positive")
+    if placement is PlacementTarget.WORKTREE:
+        raise ValueError("worktree_slots_are_task_scoped")
+    target = "" if placement is PlacementTarget.TAB else f"-{placement.value}"
     if replicas == 1:
-        return (stable_agent_name(workflow_name, workspace, harness),)
-    seed = f"{workflow_name}\0{workspace.resolve()}\0{harness.value}"
+        if placement is PlacementTarget.TAB:
+            return (stable_agent_name(workflow_name, workspace, harness),)
+        seed = (
+            f"{workflow_name}\0{workspace.resolve()}\0{harness.value}"
+            f"\0{placement.value}"
+        )
+        digest = hashlib.sha256(seed.encode()).hexdigest()[:6]
+        return (f"ho-{harness.value}{target}-{digest}"[:32],)
+    seed = (
+        f"{workflow_name}\0{workspace.resolve()}\0{harness.value}"
+        f"\0{placement.value}"
+    )
     digest = hashlib.sha256(seed.encode()).hexdigest()[:6]
     return tuple(
-        f"ho-{harness.value}-{index:02d}-{digest}" for index in range(1, replicas + 1)
+        f"ho-{harness.value}{target}-{index:02d}-{digest}"[:32]
+        for index in range(1, replicas + 1)
     )
+
+
+def worktree_agent_name(
+    workflow_name: str,
+    harness: Harness,
+    job_id: int,
+) -> str:
+    digest = hashlib.sha256(f"{workflow_name}\0worktree\0{job_id}".encode()).hexdigest()[:6]
+    return f"ho-{harness.value}-wt-{job_id}-{digest}"[:32].rstrip("-")
 
 
 def smoke_agent_name(workflow_name: str, harness: Harness) -> str:
@@ -539,6 +712,13 @@ def _state_change_sequence(agent: Mapping[str, Any]) -> int:
     return value
 
 
+def _interactive_ready(agent: Mapping[str, Any]) -> bool:
+    value = agent.get("interactive_ready")
+    if not isinstance(value, bool):
+        raise TransportError("herdr_invalid_response")
+    return value
+
+
 def _non_empty_string(data: Mapping[str, Any], key: str) -> str:
     value = data.get(key)
     if not isinstance(value, str) or not value:
@@ -561,6 +741,8 @@ def _validate_reusable_agent(
         value = agent.get(key)
         if not isinstance(value, str) or Path(value).resolve() != workspace:
             raise TransportError("agent_workspace_mismatch")
+    if not _interactive_ready(agent):
+        raise TransportError("agent_not_ready")
     state = _agent_state(agent)
     if state is AgentState.BLOCKED:
         raise TransportError("agent_blocked")
@@ -574,13 +756,24 @@ def _validate_started_agent(
     harness: Harness,
     pane_id: str,
 ) -> None:
-    live_name = agent.get("name")
-    if live_name is not None and live_name != name:
-        raise TransportError("agent_identity_mismatch")
-    if agent.get("agent") != harness.value or agent.get("pane_id") != pane_id:
-        raise TransportError("agent_identity_mismatch")
+    _validate_agent_identity(agent, name, harness, pane_id)
+    if not _interactive_ready(agent):
+        raise TransportError("agent_not_ready")
     state = _agent_state(agent)
     if state is AgentState.BLOCKED:
         raise TransportError("agent_blocked")
     if state not in SETTLED_STATES:
         raise TransportError("agent_not_settled")
+
+
+def _validate_agent_identity(
+    agent: Mapping[str, Any],
+    name: str,
+    harness: Harness,
+    pane_id: str,
+) -> None:
+    live_name = agent.get("name")
+    if live_name is not None and live_name != name:
+        raise TransportError("agent_identity_mismatch")
+    if agent.get("agent") != harness.value or agent.get("pane_id") != pane_id:
+        raise TransportError("agent_identity_mismatch")

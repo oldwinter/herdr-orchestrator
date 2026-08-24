@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -12,6 +13,7 @@ from herdr_orchestrator.model import (
     Harness,
     JobState,
     NewJob,
+    PlacementTarget,
 )
 from herdr_orchestrator.store import Store
 
@@ -88,11 +90,40 @@ class StoreTests(unittest.TestCase):
 
         state = self.store.record_outcome(
             claimed,
-            DispatchOutcome("worker", AgentState.DONE, False, "w1:p2"),
+            DispatchOutcome(
+                "worker",
+                AgentState.DONE,
+                False,
+                "w2:p2",
+                placement=PlacementTarget.WORKTREE,
+                execution_path="/repo/.orchestrator/worktrees/task",
+                herdr_workspace_id="w2",
+            ),
         )
+        job = self.store.jobs("example")[0]
+        with sqlite3.connect(self.store.path) as connection:
+            receipt = connection.execute(
+                """
+                SELECT placement, execution_path, herdr_workspace_id
+                FROM receipts
+                """
+            ).fetchone()
 
         self.assertEqual(state, JobState.SUCCEEDED)
         self.assertEqual(self.store.status_counts("example")["succeeded"], 1)
+        self.assertEqual(
+            job["execution_path"],
+            "/repo/.orchestrator/worktrees/task",
+        )
+        self.assertEqual(job["herdr_workspace_id"], "w2")
+        self.assertEqual(
+            receipt,
+            (
+                PlacementTarget.WORKTREE.value,
+                "/repo/.orchestrator/worktrees/task",
+                "w2",
+            ),
+        )
 
     def test_agent_blocked_error_is_terminal_blocked_state(self) -> None:
         self.store.enqueue(_job("one"))
@@ -152,6 +183,84 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(first.job_id, second.job_id)
         self.assertEqual(second.attempt, 2)
+
+    def test_migrates_v1_jobs_and_receipts_to_tab_placement(self) -> None:
+        path = Path(self.temporary.name) / "v1.db"
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (version INTEGER NOT NULL);
+            INSERT INTO schema_meta(version) VALUES (1);
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow TEXT NOT NULL,
+                title TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL,
+                available_at REAL NOT NULL,
+                lease_until REAL,
+                agent_name TEXT,
+                error_code TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(workflow, dedupe_key)
+            );
+            CREATE TABLE receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES jobs(id),
+                attempt INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                agent_state TEXT NOT NULL,
+                member_reused INTEGER NOT NULL,
+                pane_id TEXT,
+                error_code TEXT,
+                observed_at REAL NOT NULL
+            );
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            INSERT INTO jobs(
+                workflow, title, harness, prompt, dedupe_key, state,
+                attempts, max_attempts, available_at, created_at, updated_at
+            ) VALUES (
+                'example', 'old', 'codex', 'inspect', 'old-v1', 'pending',
+                0, 2, 1, 1, 1
+            );
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        store = Store(path)
+        store.initialize()
+
+        migrated = store.jobs("example")
+        with sqlite3.connect(path) as migrated_connection:
+            version = migrated_connection.execute(
+                "SELECT version FROM schema_meta"
+            ).fetchone()[0]
+            job_columns = {
+                row[1]
+                for row in migrated_connection.execute("PRAGMA table_info(jobs)")
+            }
+            receipt_columns = {
+                row[1]
+                for row in migrated_connection.execute("PRAGMA table_info(receipts)")
+            }
+
+        self.assertEqual(version, 2)
+        self.assertEqual(migrated[0]["placement"], PlacementTarget.TAB.value)
+        self.assertIn("execution_path", job_columns)
+        self.assertIn("herdr_workspace_id", job_columns)
+        self.assertIn("execution_path", receipt_columns)
+        self.assertIn("herdr_workspace_id", receipt_columns)
 
 
 def _job(

@@ -29,6 +29,7 @@ from herdr_orchestrator.model import (
     AgentState,
     Harness,
     HarnessProfile,
+    PlacementTarget,
     TrackerBackend,
     WayfinderMode,
     WorkflowConfig,
@@ -78,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--title", required=True)
     enqueue.add_argument("--prompt-file", required=True)
     enqueue.add_argument("--dedupe-key", required=True)
+    enqueue.add_argument(
+        "--placement",
+        choices=["auto", *(item.value for item in PlacementTarget)],
+        default="auto",
+        help="Override topology selection for this task.",
+    )
     _add_selection_arguments(enqueue)
 
     deliver = subparsers.add_parser("deliver")
@@ -120,6 +127,11 @@ def main(argv: list[str] | None = None) -> int:
                     title=args.title,
                     prompt_file=prompt_file,
                     dedupe_key=args.dedupe_key,
+                    placement=(
+                        None
+                        if args.placement == "auto"
+                        else PlacementTarget(args.placement)
+                    ),
                 )
                 print(
                     json.dumps(

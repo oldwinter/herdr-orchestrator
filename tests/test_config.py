@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 
 from herdr_orchestrator.config import ConfigError, load_workflow
-from herdr_orchestrator.model import Harness, TrackerBackend, WayfinderMode
+from herdr_orchestrator.model import (
+    Harness,
+    PlacementMode,
+    PlacementTarget,
+    TrackerBackend,
+    WayfinderMode,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -17,6 +23,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.name, "multi-harness")
         self.assertEqual(config.workspace, REPO_ROOT)
         self.assertEqual(config.state_db, REPO_ROOT / ".orchestrator/state.db")
+        self.assertEqual(config.placement.mode, PlacementMode.HYBRID)
+        self.assertEqual(
+            config.placement.worktree_root,
+            REPO_ROOT / ".orchestrator/worktrees",
+        )
         self.assertEqual(config.profiles_dir, REPO_ROOT / "profiles/harnesses")
         self.assertEqual({profile.harness for profile in config.profiles}, set(Harness))
         self.assertEqual(
@@ -53,6 +64,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual({job.harness for job in config.seed_jobs}, {Harness.GROK})
         self.assertEqual(config.coordinator.max_parallel, 10)
         self.assertEqual(config.workers[0].replicas, 10)
+        self.assertEqual(config.workers[0].placement, PlacementTarget.PANE)
 
     def test_rejects_unknown_harness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

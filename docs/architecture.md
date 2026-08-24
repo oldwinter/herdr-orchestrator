@@ -11,6 +11,7 @@ Harness TOML metadata ─> compact catalog ─> Planner
                                               │ selected harness
 Planner JSON / CLI enqueue ─> Controller router ─> Validator ─> SQLite queue
                                               │ claim
+                             Topology policy ───┤ tab | pane | worktree
 Selected Markdown profile ── dynamic load ────┤
                                               ▼
                                      Herdr transport adapter
@@ -49,6 +50,32 @@ claim 在 `BEGIN IMMEDIATE` 事务内完成。`running` 任务持有 `lease_unti
 - 对必须写 strict JSON 的 turn，settled 后目标 artifact 缺失会在同一已 ready agent 上仅重发
   一次；artifact handshake 防止 startup lifecycle 变化被误认成任务完成。
 
+### Execution topology
+
+普通 queue 在 harness selection 之外有独立 topology decision seam。harness 决定“谁做”，
+topology 决定“在哪里做”，两者不耦合：
+
+```text
+explicit task override
+  -> worker default
+  -> deterministic read/write rules
+  -> bounded controller JSON for ambiguous tasks
+  -> validated PlacementTarget
+```
+
+- `tab`：独立 full-size tab，共享 workflow checkout；
+- `pane`：同一 `run_once` 批次共享一个 tab，每个任务有独立 pane 和 agent；
+- `worktree`：Herdr 原生 `worktree create/open` 创建独立 workspace、branch 和 checkout。
+
+内部 agent name 仍带短 digest，用于跨 workspace、replica 与重启保持唯一；用户可见的 tab
+或 worktree label 使用截断任务标题，不暴露 digest。Pane 布局每次选择当前面积最大的
+pane，并根据宽高决定向右或向下 split，避免机械地连续切窄。
+
+Worktree path 与 branch 从 workflow 和 task key 稳定派生，retry 可恢复同一 checkout。
+普通 queue 不自动 merge、关闭 workspace、删除 checkout 或删除 branch；保留状态供人工
+审查。Standardized delivery 仍使用自己的 integration/ticket worktree DAG 和收据协议，
+不与普通 queue topology 混用。
+
 ### Harness catalog 与按需 profile
 
 - `profiles/harnesses/*.toml` 是紧凑 catalog 真源，只包含主控做选择所需的元数据；
@@ -67,9 +94,21 @@ claim 在 `BEGIN IMMEDIATE` 事务内完成。`running` 任务持有 `lease_unti
 - 只复用 kind 与 cwd 都匹配、且处于 settled state 的 agent；
 - `agent start` 无论返回 `agent_not_ready`，还是成功 payload 暂时为 `working/unknown`，
   都进入有界 recovery wait 后再验证；
+- 新 agent 在固定 settle 窗口后必须重新读取并确认 `interactive_ready=true`；startup
+  瞬态 `blocked` 会在 settle 后复查，只有持续 blocked 才成为任务阻塞；
+- prompt submission 使用 5 秒 acceptance handshake，必须观察到
+  `state_change_seq` 前进；进入 `working` 后由 coordinator 独立等待 settled；
+- `agent_prompt_stalled` 且仍停在原 idle sequence 时最多重发两次 Enter；仍没有 lifecycle
+  变化则快速返回 `agent_turn_not_observed`，不占满整个 agent timeout；
 - 每个 harness 使用独立后台 tab 和 full-size root pane，始终 `--no-focus`，避免多 agent 连续 split 后 TUI 过窄；
+- transport 通过独立 Herdr layout adapter provision tab、批次 pane 或原生 worktree，
+  并从 JSON response 读取 workspace/tab/pane ID；
 - 所有 CLI 结果按 JSON schema 读取，不预测 pane ID；
 - runtime output 只用于诊断摘要和少量确定性 fatal signal，不作为完整 transcript 或一般正确性证明。
+
+结构化 receipt 证明的是 prompt 后发生了真实 lifecycle change 并稳定 settled，不是任务内容
+质量证明。运行诊断与本仓库真实演练形成的经验见
+[`runtime-troubleshooting.md`](runtime-troubleshooting.md)。
 
 ### Planner
 
@@ -122,7 +161,9 @@ route -> wayfinder? -> spec + ticket DAG -> frontier worktrees
 
 标准交付中的 `blocked` 会读取有限 worker detection output，让独立 proxy controller
 输出严格 decision JSON，再把回答交回原 worker。最多 8 轮。deterministic guard 与
-schema 都要求 secret/production 升级，response 本身不进入 decision ledger。
+schema 都要求 secret/production 升级。由于 Herdr 拒绝向已 blocked agent 提交普通
+`agent prompt`，response 通过受控的 pane literal text 加 agent Enter 输入，再按新的
+lifecycle sequence 等待结果；response 本身不进入 decision ledger。
 
 每次运行的状态、map、plan、routes、receipts、reviews、ledger 和 worktrees 保存在
 `.orchestrator/deliveries/<run-id>/`。最终产物是隔离 integration branch 与 commit，

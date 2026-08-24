@@ -56,6 +56,18 @@ class HerdrTransportTests(unittest.TestCase):
                             "agent": {
                                 "agent": "codex",
                                 "agent_status": "idle",
+                                "interactive_ready": True,
+                                "pane_id": "w1:p2",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "idle",
+                                "interactive_ready": True,
                                 "pane_id": "w1:p2",
                                 "state_change_seq": 1,
                             }
@@ -104,8 +116,8 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(outcome.pane_id, "w1:p2")
         self.assertIn("--no-focus", runner.calls[1])
         self.assertEqual(runner.calls[3][0:4], ["herdr", "agent", "start", outcome.agent_name])
-        self.assertEqual(runner.calls[5][0:4], ["herdr", "agent", "prompt", outcome.agent_name])
-        self.assertIn("--wait", runner.calls[5])
+        self.assertEqual(runner.calls[6][0:4], ["herdr", "agent", "prompt", outcome.agent_name])
+        self.assertIn("--wait", runner.calls[6])
         self.assertIn(3, sleeps)
 
     def test_reuses_matching_settled_agent(self) -> None:
@@ -120,6 +132,7 @@ class HerdrTransportTests(unittest.TestCase):
                                 "agent_status": "idle",
                                 "cwd": str(workspace),
                                 "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
                                 "pane_id": "w1:p9",
                                 "state_change_seq": 1,
                             }
@@ -167,6 +180,250 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(len(runner.calls), 3)
         self.assertIn("--wait", runner.calls[2])
 
+    def test_rejects_settled_prompt_without_state_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 10,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 10,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 10,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.GROK, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+        self.assertEqual(outcome.error_code, "agent_turn_not_observed")
+
+    def test_waits_for_interactive_ready_before_prompting_new_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _error("agent_not_found"),
+                    _result(
+                        {
+                            "root_pane": {"pane_id": "w1:p7"},
+                            "tab": {"tab_id": "w1:t7"},
+                        }
+                    ),
+                    _result(
+                        {
+                            "process_info": {
+                                "shell_pid": 42,
+                                "foreground_processes": [{"pid": 42, "name": "zsh"}],
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "interactive_ready": False,
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "interactive_ready": True,
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "done",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 3,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.GROK, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.state, AgentState.DONE)
+        prompt_call = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[0:3] == ["herdr", "agent", "prompt"]
+        )
+        readiness_gets = [
+            call
+            for call in runner.calls[:prompt_call]
+            if call[0:3] == ["herdr", "agent", "get"]
+        ]
+        self.assertEqual(len(readiness_gets), 4)
+
+    def test_rechecks_transient_startup_block_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _error("agent_not_found"),
+                    _result(
+                        {
+                            "root_pane": {"pane_id": "w1:p7"},
+                            "tab": {"tab_id": "w1:t7"},
+                        }
+                    ),
+                    _result(
+                        {
+                            "process_info": {
+                                "shell_pid": 42,
+                                "foreground_processes": [{"pid": 42, "name": "zsh"}],
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "blocked",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "idle",
+                                "interactive_ready": True,
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "done",
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 4,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.CLAUDE, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.state, AgentState.DONE)
+        self.assertIsNone(outcome.error_code)
+
     def test_requires_herdr_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             transport = HerdrTransport(
@@ -209,6 +466,18 @@ class HerdrTransportTests(unittest.TestCase):
                             "agent": {
                                 "agent": "hermes",
                                 "agent_status": "idle",
+                                "interactive_ready": True,
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "hermes",
+                                "agent_status": "idle",
+                                "interactive_ready": True,
                                 "pane_id": "w1:p7",
                                 "state_change_seq": 1,
                             }
@@ -293,6 +562,18 @@ class HerdrTransportTests(unittest.TestCase):
                             "agent": {
                                 "agent": "codex",
                                 "agent_status": "idle",
+                                "interactive_ready": True,
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "idle",
+                                "interactive_ready": True,
                                 "pane_id": "w1:p7",
                                 "state_change_seq": 2,
                             }
@@ -372,6 +653,17 @@ class HerdrTransportTests(unittest.TestCase):
                             }
                         }
                     ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "codex",
+                                "agent_status": "blocked",
+                                "interactive_ready": True,
+                                "pane_id": "w1:p7",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
                 ]
             )
             transport = HerdrTransport(
@@ -410,6 +702,7 @@ class HerdrTransportTests(unittest.TestCase):
                                 "agent_status": "idle",
                                 "cwd": str(workspace),
                                 "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
                                 "pane_id": "w1:p9",
                                 "state_change_seq": 10,
                             }
@@ -457,6 +750,167 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(outcome.state, AgentState.DONE)
         self.assertEqual(runner.calls[-1][0:4], ["herdr", "agent", "get", outcome.agent_name])
 
+    def test_prompt_acceptance_returns_working_then_polls_to_done(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 20,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 20,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "working",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 21,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 22,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.GROK, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.state, AgentState.DONE)
+        prompt_call = runner.calls[2]
+        self.assertEqual(prompt_call[0:3], ["herdr", "agent", "prompt"])
+        self.assertIn("working", prompt_call)
+        self.assertIn("blocked", prompt_call)
+        self.assertIn("done", prompt_call)
+        self.assertIn("idle", prompt_call)
+        self.assertEqual(prompt_call[prompt_call.index("--timeout") + 1], "5000")
+
+    def test_stalled_prompt_fails_fast_when_enter_never_starts_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 30,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 30,
+                            }
+                        }
+                    ),
+                    _error("agent_prompt_stalled"),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 30,
+                            }
+                        }
+                    ),
+                    _result({"type": "ok"}),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 30,
+                            }
+                        }
+                    ),
+                    _result({"type": "ok"}),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "grok",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 30,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.GROK, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+        self.assertEqual(outcome.error_code, "agent_turn_not_observed")
+        self.assertEqual(
+            sum(call[0:3] == ["herdr", "agent", "send-keys"] for call in runner.calls),
+            2,
+        )
+
     def test_resubmits_enter_when_stalled_prompt_is_still_pending(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -469,6 +923,7 @@ class HerdrTransportTests(unittest.TestCase):
                                 "agent_status": "idle",
                                 "cwd": str(workspace),
                                 "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
                                 "pane_id": "w1:p9",
                                 "state_change_seq": 10,
                             }
@@ -542,6 +997,7 @@ class HerdrTransportTests(unittest.TestCase):
                                 "agent_status": "idle",
                                 "cwd": str(workspace),
                                 "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
                                 "pane_id": "w1:p9",
                                 "state_change_seq": 1,
                             }
@@ -633,6 +1089,7 @@ class HerdrTransportTests(unittest.TestCase):
                                 "agent_status": "idle",
                                 "cwd": str(workspace),
                                 "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
                                 "pane_id": "w1:p9",
                                 "state_change_seq": 1,
                             }
@@ -696,7 +1153,8 @@ class HerdrTransportTests(unittest.TestCase):
             runner = FakeRunner(
                 [
                     _result({"agent": blocked}),
-                    _result({"agent": blocked}),
+                    _result({"type": "ok"}),
+                    _result({"type": "ok"}),
                     _result(
                         {
                             "agent": {
@@ -733,8 +1191,21 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(outcome.state, AgentState.DONE)
         self.assertEqual(outcome.pane_id, "w1:p9")
         self.assertEqual(
-            runner.calls[-1][0:4],
-            ["herdr", "agent", "prompt", "blocked-worker"],
+            runner.calls[1],
+            [
+                "herdr",
+                "pane",
+                "send-text",
+                "w1:p9",
+                "Approve this local action.",
+            ],
+        )
+        self.assertEqual(
+            runner.calls[2],
+            ["herdr", "agent", "send-keys", "blocked-worker", "enter"],
+        )
+        self.assertFalse(
+            any(call[0:3] == ["herdr", "agent", "prompt"] for call in runner.calls)
         )
 
     def test_stable_name_is_deterministic(self) -> None:

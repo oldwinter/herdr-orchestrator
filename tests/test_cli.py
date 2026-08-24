@@ -22,6 +22,7 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(args.harness, "auto")
+        self.assertEqual(args.placement, "auto")
         self.assertIsNone(args.controller_harness)
         self.assertIsNone(args.worker_harness)
 

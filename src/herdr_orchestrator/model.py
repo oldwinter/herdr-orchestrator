@@ -30,6 +30,19 @@ class AgentState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class PlacementMode(StrEnum):
+    HYBRID = "hybrid"
+    TAB = "tab"
+    PANE = "pane"
+    WORKTREE = "worktree"
+
+
+class PlacementTarget(StrEnum):
+    TAB = "tab"
+    PANE = "pane"
+    WORKTREE = "worktree"
+
+
 class TrackerBackend(StrEnum):
     LOCAL_MARKDOWN = "local-markdown"
     GITHUB = "github"
@@ -48,6 +61,12 @@ class CoordinatorConfig:
     lease_seconds: int
     max_attempts: int
     agent_timeout_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlacementConfig:
+    mode: PlacementMode
+    worktree_root: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +110,7 @@ class WorkerConfig:
     harness: Harness
     capabilities: tuple[str, ...]
     replicas: int = 1
+    placement: PlacementTarget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +119,7 @@ class SeedJobConfig:
     harness: Harness
     prompt_file: Path
     dedupe_key: str
+    placement: PlacementTarget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +130,7 @@ class WorkflowConfig:
     workspace: Path
     state_db: Path
     coordinator: CoordinatorConfig
+    placement: PlacementConfig
     standardized_delivery: StandardizedDeliveryConfig
     planner: PlannerConfig
     profiles_dir: Path
@@ -125,6 +147,7 @@ class NewJob:
     prompt: str
     dedupe_key: str
     max_attempts: int
+    placement: PlacementTarget | None = PlacementTarget.TAB
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +161,7 @@ class ClaimedJob:
     attempt: int
     max_attempts: int
     agent_name: str
+    placement: PlacementTarget
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +171,18 @@ class DispatchOutcome:
     member_reused: bool
     pane_id: str | None
     error_code: str | None = None
+    placement: PlacementTarget | None = None
+    execution_path: str | None = None
+    herdr_workspace_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchContext:
+    placement: PlacementTarget
+    title: str
+    task_key: str
+    batch_key: str | None = None
+    worktree_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)

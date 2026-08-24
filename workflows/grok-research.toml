@@ -10,6 +10,10 @@ lease_seconds = 3690
 max_attempts = 2
 agent_timeout_seconds = 3600
 
+[placement]
+mode = "hybrid"
+worktree_root = ".orchestrator/worktrees"
+
 [planner]
 enabled = true
 harness = "grok"
@@ -23,6 +27,7 @@ name = "research"
 harness = "grok"
 replicas = 10
 capabilities = ["research", "synthesis", "decision-support"]
+placement = "pane"
 
 [[seed_jobs]]
 title = "Harness taxonomy and market map"

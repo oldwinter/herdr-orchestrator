@@ -12,15 +12,21 @@ from herdr_orchestrator.catalog import (
     profile_for_harness,
     render_compact_catalog,
 )
-from herdr_orchestrator.herdr import HerdrTransport, replica_slot_names
+from herdr_orchestrator.herdr import (
+    HerdrTransport,
+    replica_slot_names,
+    worktree_agent_name,
+)
 from herdr_orchestrator.model import (
     AgentState,
     ClaimedJob,
+    DispatchContext,
     DispatchOutcome,
     Harness,
     HarnessProfile,
     JobState,
     NewJob,
+    PlacementTarget,
     WorkflowConfig,
 )
 from herdr_orchestrator.planner import (
@@ -35,6 +41,12 @@ from herdr_orchestrator.selection import (
     select_controller_harness,
 )
 from herdr_orchestrator.store import Store
+from herdr_orchestrator.topology import (
+    TopologyDecisionError,
+    load_topology_decision,
+    static_placement,
+    topology_decision_prompt,
+)
 
 
 class Dispatcher(Protocol):
@@ -45,6 +57,7 @@ class Dispatcher(Protocol):
         *,
         timeout_seconds: int,
         agent_name: str | None = None,
+        context: DispatchContext | None = None,
     ) -> DispatchOutcome: ...
 
 
@@ -74,14 +87,21 @@ class Coordinator:
         added = 0
         existing = 0
         for seed in self.config.seed_jobs:
+            prompt = seed.prompt_file.read_text(encoding="utf-8").strip()
             _, created = self.store.enqueue(
                 NewJob(
                     workflow=self.config.name,
                     title=seed.title,
                     harness=seed.harness,
-                    prompt=seed.prompt_file.read_text(encoding="utf-8").strip(),
+                    prompt=prompt,
                     dedupe_key=seed.dedupe_key,
                     max_attempts=self.config.coordinator.max_attempts,
+                    placement=self._static_placement(
+                        seed.title,
+                        prompt,
+                        seed.harness,
+                        seed.placement,
+                    ),
                 )
             )
             added += int(created)
@@ -95,6 +115,7 @@ class Coordinator:
         title: str,
         prompt_file: Path,
         dedupe_key: str,
+        placement: PlacementTarget | None = None,
     ) -> tuple[int, bool, Harness]:
         self.initialize()
         if not prompt_file.is_file():
@@ -117,6 +138,12 @@ class Coordinator:
                 prompt=prompt,
                 dedupe_key=dedupe_key,
                 max_attempts=self.config.coordinator.max_attempts,
+                placement=self._static_placement(
+                    title,
+                    prompt,
+                    selected,
+                    placement,
+                ),
             )
         )
         if not created:
@@ -129,17 +156,16 @@ class Coordinator:
     def run_once(self) -> dict[str, int]:
         self.initialize()
         self._run_planner_if_due()
+        self._assign_pending_placements()
+        batch_key = f"run-{time.time_ns()}"
+        slot_names = self._slot_names()
         jobs = self.store.claim(
             self.config.name,
             limit=self.config.coordinator.max_parallel,
             lease_seconds=self.config.coordinator.lease_seconds,
-            slot_names={
-                worker.harness.value: replica_slot_names(
-                    self.config.name,
-                    self.config.workspace,
-                    worker.harness,
-                    worker.replicas,
-                )
+            slot_names=slot_names,
+            slot_limits={
+                worker.harness.value: worker.replicas
                 for worker in self.config.workers
             },
             allowed_harnesses=self.worker_harnesses,
@@ -148,7 +174,10 @@ class Coordinator:
         if not jobs:
             return results
         with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="harness") as executor:
-            futures = {executor.submit(self._dispatch_job, job): job for job in jobs}
+            futures = {
+                executor.submit(self._dispatch_job, job, batch_key): job
+                for job in jobs
+            }
             for future in as_completed(futures):
                 job = futures[future]
                 try:
@@ -171,14 +200,136 @@ class Coordinator:
             self.run_once()
             time.sleep(self.config.coordinator.poll_seconds)
 
-    def _dispatch_job(self, job: ClaimedJob) -> DispatchOutcome:
+    def _dispatch_job(self, job: ClaimedJob, batch_key: str) -> DispatchOutcome:
         profile = profile_for_harness(self.config.profiles, job.harness)
         return self.dispatcher.dispatch(
             job.harness,
             execution_prompt(profile, job.prompt),
             timeout_seconds=self.config.coordinator.agent_timeout_seconds,
             agent_name=job.agent_name,
+            context=DispatchContext(
+                placement=job.placement,
+                title=job.title,
+                task_key=job.dedupe_key,
+                batch_key=batch_key,
+                worktree_root=self.config.placement.worktree_root,
+            ),
         )
+
+    def _slot_names(self) -> dict[str, tuple[str, ...]]:
+        names: dict[str, tuple[str, ...]] = {}
+        for worker in self.config.workers:
+            for placement in (PlacementTarget.TAB, PlacementTarget.PANE):
+                names[f"{worker.harness.value}:{placement.value}"] = replica_slot_names(
+                    self.config.name,
+                    self.config.workspace,
+                    worker.harness,
+                    worker.replicas,
+                    placement,
+                )
+        for row in self.store.jobs(self.config.name):
+            if row["placement"] != PlacementTarget.WORKTREE.value:
+                continue
+            job_id = int(row["id"])
+            harness = Harness(str(row["harness"]))
+            names[f"{harness.value}:worktree:{job_id}"] = (
+                worktree_agent_name(self.config.name, harness, job_id),
+            )
+        return names
+
+    def _assign_pending_placements(self) -> None:
+        for row in self.store.unplaced_jobs(
+            self.config.name,
+            allowed_harnesses=self.worker_harnesses,
+        ):
+            harness = Harness(str(row["harness"]))
+            placement = self._static_placement(
+                str(row["title"]),
+                str(row["prompt"]),
+                harness,
+                None,
+            )
+            if placement is None:
+                placement = self._select_topology(
+                    int(row["id"]),
+                    str(row["title"]),
+                    str(row["prompt"]),
+                    str(row["dedupe_key"]),
+                )
+            self.store.set_placement(int(row["id"]), placement)
+
+    def _static_placement(
+        self,
+        title: str,
+        prompt: str,
+        harness: Harness,
+        override: PlacementTarget | None,
+    ) -> PlacementTarget | None:
+        worker = next(
+            worker for worker in self.config.workers if worker.harness is harness
+        )
+        return static_placement(
+            self.config.placement.mode,
+            title,
+            prompt,
+            override=override,
+            worker_default=worker.placement,
+            supports_worktree=self._supports_worktree(),
+        )
+
+    def _select_topology(
+        self,
+        job_id: int,
+        title: str,
+        prompt: str,
+        dedupe_key: str,
+    ) -> PlacementTarget:
+        controller = self._controller_harness()
+        digest = hashlib.sha256(
+            f"{self.config.name}\0topology\0{dedupe_key}".encode()
+        ).hexdigest()[:12]
+        output_file = self.config.planner.output_file.parent / f"topology-{digest}.json"
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.unlink(missing_ok=True)
+        try:
+            outcome = self.dispatcher.dispatch(
+                controller,
+                topology_decision_prompt(
+                    title,
+                    prompt,
+                    output_file,
+                    supports_worktree=self._supports_worktree(),
+                ),
+                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                agent_name=_controller_agent_name(
+                    self.config.name,
+                    self.config.workspace,
+                    controller,
+                ),
+                context=DispatchContext(
+                    PlacementTarget.TAB,
+                    "Topology decision",
+                    f"topology:{job_id}",
+                ),
+            )
+            if outcome.error_code is not None or outcome.state not in {
+                AgentState.IDLE,
+                AgentState.DONE,
+            }:
+                raise ValueError(
+                    f"topology_selection_failed:{outcome.error_code or outcome.state.value}"
+                )
+            return load_topology_decision(
+                output_file,
+                supports_worktree=self._supports_worktree(),
+            )
+        except TopologyDecisionError as exc:
+            raise ValueError(str(exc)) from exc
+        finally:
+            output_file.unlink(missing_ok=True)
+
+    def _supports_worktree(self) -> bool:
+        return (self.config.workspace / ".git").exists()
 
     def _select_worker_harness(
         self,
@@ -208,6 +359,11 @@ class Coordinator:
                     self.config.name,
                     self.config.workspace,
                     controller,
+                ),
+                context=DispatchContext(
+                    PlacementTarget.TAB,
+                    "Worker routing",
+                    f"route:{dedupe_key}",
                 ),
             )
             if outcome.error_code is not None or outcome.state not in {
@@ -269,6 +425,11 @@ class Coordinator:
                 self.config.workspace,
                 controller,
             ),
+            context=DispatchContext(
+                PlacementTarget.TAB,
+                "Planner",
+                f"planner:{self.config.name}",
+            ),
         )
         if outcome.error_code is not None or outcome.state not in {
             AgentState.IDLE,
@@ -291,6 +452,12 @@ class Coordinator:
                     prompt=task.prompt,
                     dedupe_key=task.dedupe_key,
                     max_attempts=self.config.coordinator.max_attempts,
+                    placement=self._static_placement(
+                        task.title,
+                        task.prompt,
+                        task.harness,
+                        None,
+                    ),
                 )
             )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from dataclasses import replace
@@ -9,9 +10,11 @@ from pathlib import Path
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.model import (
     AgentState,
+    DispatchContext,
     DispatchOutcome,
     Harness,
     NewJob,
+    PlacementTarget,
 )
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.store import Store
@@ -26,12 +29,15 @@ class FakeDispatcher:
         *,
         route_output: Path | None = None,
         routed_harness: Harness | None = None,
+        topology_placement: str | None = None,
     ) -> None:
         self.outcomes = outcomes
         self.route_output = route_output
         self.routed_harness = routed_harness
+        self.topology_placement = topology_placement
         self.calls: list[Harness] = []
         self.prompts: dict[Harness, str] = {}
+        self.contexts: list[DispatchContext | None] = []
 
     def dispatch(
         self,
@@ -40,12 +46,35 @@ class FakeDispatcher:
         *,
         timeout_seconds: int,
         agent_name: str | None = None,
+        context: DispatchContext | None = None,
     ) -> DispatchOutcome:
         self.calls.append(harness)
         self.prompts[harness] = prompt
+        self.contexts.append(context)
         if self.route_output is not None and self.routed_harness is not None:
             self.route_output.write_text(
                 json.dumps({"harness": self.routed_harness.value}),
+                encoding="utf-8",
+            )
+        if (
+            self.topology_placement is not None
+            and "Choose the Herdr execution topology" in prompt
+        ):
+            match = re.search(
+                r"Write only this UTF-8 JSON file:\n([^\n]+)",
+                prompt,
+            )
+            if match is None:
+                raise AssertionError("topology output path missing")
+            output = Path(match.group(1).strip())
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                json.dumps(
+                    {
+                        "placement": self.topology_placement,
+                        "rationale": "Use the requested test topology.",
+                    }
+                ),
                 encoding="utf-8",
             )
         return self.outcomes[harness]
@@ -187,6 +216,62 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual(selected, Harness.GROK)
         self.assertEqual(dispatcher.calls, [])
+
+    def test_ambiguous_task_uses_controller_topology_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(
+                    base.planner,
+                    output_file=root / "plans/planner.json",
+                ),
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text(
+                "Determine the best execution approach.",
+                encoding="utf-8",
+            )
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "controller",
+                        AgentState.DONE,
+                        True,
+                        "w1:p1",
+                    ),
+                    Harness.GROK: DispatchOutcome(
+                        "worker",
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                    ),
+                },
+                topology_placement="pane",
+            )
+            coordinator = Coordinator(
+                config,
+                dispatcher=dispatcher,
+                controller_harness=Harness.DROID,
+            )
+            coordinator.enqueue_prompt_file(
+                harness=Harness.GROK,
+                title="Determine next step",
+                prompt_file=prompt_file,
+                dedupe_key="ambiguous-topology",
+            )
+
+            result = coordinator.run_once()
+            job = coordinator.store.jobs(config.name)[0]
+
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(dispatcher.calls, [Harness.DROID, Harness.GROK])
+        self.assertEqual(job["placement"], "pane")
+        self.assertEqual(dispatcher.contexts[0].placement, PlacementTarget.TAB)
+        self.assertEqual(dispatcher.contexts[1].placement, PlacementTarget.PANE)
+        self.assertIsNotNone(dispatcher.contexts[1].batch_key)
 
 
 def _job(workflow: str, harness: Harness) -> NewJob:
