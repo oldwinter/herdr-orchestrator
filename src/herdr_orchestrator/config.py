@@ -23,6 +23,7 @@ from herdr_orchestrator.model import (
     WorkerConfig,
     WorkflowConfig,
 )
+from herdr_orchestrator.research_executor import ResearchConfig, ResearchInputError
 
 WORKFLOW_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 WORKER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
@@ -371,6 +372,11 @@ def _validate_executor_settings(
         if key not in allowed:
             raise ConfigError(f"executor_unknown_field: {key}")
         _validate_setting_value(key, value)
+    if kind is ExecutorKind.RESEARCH_SYNTHESIS:
+        try:
+            ResearchConfig.from_mapping(settings)
+        except ResearchInputError as exc:
+            raise ConfigError(str(exc)) from exc
     _validate_role_references(settings, worker_capabilities)
 
 

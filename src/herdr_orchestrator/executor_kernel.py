@@ -3548,7 +3548,7 @@ class ExecutionKernel:
                 "running": {"paused", "cancelled", "succeeded", "blocked", "failed"},
                 "paused": {"running", "cancelled", "failed"},
                 "succeeded": set(),
-                "blocked": set(),
+                "blocked": {"running"},
                 "failed": set(),
                 "cancelled": set(),
             }

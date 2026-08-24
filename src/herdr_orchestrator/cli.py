@@ -58,6 +58,30 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--dedupe-key", required=True)
     start_parser.add_argument("--input", default="")
 
+    research_parser = subparsers.add_parser("research")
+    research_subparsers = research_parser.add_subparsers(
+        dest="research_command",
+        required=True,
+    )
+    research_start = research_subparsers.add_parser("start")
+    research_start.add_argument("--workflow", required=True)
+    research_start.add_argument("--dedupe-key", required=True)
+    research_start.add_argument("--question", "--input", dest="question")
+    research_start.add_argument("--input-json")
+    research_status = research_subparsers.add_parser("status")
+    research_status.add_argument("--workflow", required=True)
+    research_status.add_argument("--run-id")
+    research_inspect = research_subparsers.add_parser("inspect")
+    research_inspect.add_argument("--workflow", required=True)
+    research_selector = research_inspect.add_mutually_exclusive_group()
+    research_selector.add_argument("--run-id", "--run")
+    research_selector.add_argument("--dedupe-key")
+    research_resume = research_subparsers.add_parser("resume")
+    research_resume.add_argument("--workflow", required=True)
+    research_resume.add_argument("--run-id", required=True)
+    research_resume.add_argument("--input-id", required=True)
+    research_resume.add_argument("--input", required=True)
+
     smoke_parser = subparsers.add_parser("smoke")
     smoke_parser.add_argument("--workflow", required=True)
     smoke_parser.add_argument(
@@ -167,6 +191,11 @@ def main(argv: list[str] | None = None) -> int:
                     dedupe_key=args.dedupe_key,
                     input_value=args.input,
                 )
+            case "research":
+                _require_schema_v2(config, "research")
+                if config.executor is None or config.executor.kind.value != "research-synthesis":
+                    raise ConfigError("executor_mismatch: research_requires_research_synthesis")
+                return _research_command(config, args)
             case "artifact-fixture":
                 _require_schema_v2(config, args.command)
                 return _run_artifact_fixture(
@@ -193,9 +222,23 @@ def main(argv: list[str] | None = None) -> int:
                 "inspect",
                 "run",
                 "artifact-fixture",
+                "research",
             }
         ):
             _print_v2_error(exc)
+            return 64
+        if config is None and getattr(args, "command", None) == "research":
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "success": False,
+                        "code": _error_code(exc),
+                        "reason": str(exc),
+                    },
+                    sort_keys=True,
+                )
+            )
             return 64
         print(str(exc), file=sys.stderr)
         return 2
@@ -384,6 +427,12 @@ def _v2_start(
         )
     )
     return 0
+
+
+def _research_command(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    from herdr_orchestrator.research_cli import research_command
+
+    return research_command(config, args)
 
 
 def _v2_status(config: WorkflowConfig, *, run_id: str | None) -> int:
