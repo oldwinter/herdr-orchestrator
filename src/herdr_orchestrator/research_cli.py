@@ -690,6 +690,19 @@ def _replay_verification_fixture(
             ),
             None,
         )
+        if current_assignment is None and isinstance(checkpoint.payload, dict):
+            historical_assignment = checkpoint.payload.get(
+                "verification_assignment"
+            )
+            if historical_assignment is not None:
+                if historical_assignment not in [
+                    item.to_dict()
+                    for item in register.verification_assignments
+                ]:
+                    raise ExecutorStoreError(
+                        "verification_fixture_checkpoint_assignment_mismatch"
+                    )
+                current_assignment = historical_assignment
         current_disposition = next(
             (
                 item.to_dict()
@@ -1782,6 +1795,12 @@ def _research_verification_fixture_in_state(
             "verification_policy": research_config.verification.to_dict(),
             "outcome_code": outcome_code,
             "reason": reason,
+            "verification_assignment": (
+                None if assignment is None else assignment.to_dict()
+            ),
+            "verification_disposition": (
+                None if disposition is None else disposition.to_dict()
+            ),
             "evidence": checkpoint_evidence,
         },
     )
