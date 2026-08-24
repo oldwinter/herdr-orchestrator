@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
                     prompt_file=prompt_file,
                     dedupe_key=args.dedupe_key,
                 )
-                print(json.dumps({"created": created, "job_id": job_id}, sort_keys=True))
+                print(json.dumps({"created": created, "job_id": str(job_id)}, sort_keys=True))
                 return 0
             case "run":
                 coordinator = Coordinator(config)

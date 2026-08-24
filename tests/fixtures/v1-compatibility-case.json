@@ -1,0 +1,113 @@
+{
+  "schema": "herdr-orchestrator.v1-compatibility-case/v1",
+  "case_id": "v1-cli-and-durable-queue",
+  "live": false,
+  "bound_seconds": 120,
+  "workflow": "workflows/multi-harness.toml",
+  "commands": [
+    {
+      "id": "doctor",
+      "argv": [
+        "python3",
+        "-m",
+        "herdr_orchestrator",
+        "doctor",
+        "--workflow",
+        "workflows/multi-harness.toml"
+      ],
+      "canonical_fields": [
+        "checks",
+        "ok"
+      ]
+    },
+    {
+      "id": "seed",
+      "argv": [
+        "python3",
+        "-m",
+        "herdr_orchestrator",
+        "seed",
+        "--workflow",
+        "workflows/multi-harness.toml"
+      ],
+      "canonical_fields": [
+        "added",
+        "existing"
+      ]
+    },
+    {
+      "id": "enqueue",
+      "argv": [
+        "python3",
+        "-m",
+        "herdr_orchestrator",
+        "enqueue",
+        "--workflow",
+        "workflows/multi-harness.toml",
+        "--harness",
+        "droid",
+        "--title",
+        "v1 compatibility probe",
+        "--prompt-file",
+        "workflows/prompts/droid-inventory.md",
+        "--dedupe-key",
+        "v1-compatibility-probe"
+      ],
+      "canonical_fields": [
+        "created",
+        "job_id"
+      ]
+    },
+    {
+      "id": "run-once",
+      "argv": [
+        "python3",
+        "-m",
+        "herdr_orchestrator",
+        "run",
+        "--workflow",
+        "workflows/multi-harness.toml",
+        "--once"
+      ],
+      "canonical_fields": [
+        "pending",
+        "running",
+        "succeeded",
+        "blocked",
+        "failed"
+      ]
+    },
+    {
+      "id": "status",
+      "argv": [
+        "python3",
+        "-m",
+        "herdr_orchestrator",
+        "status",
+        "--workflow",
+        "workflows/multi-harness.toml"
+      ],
+      "canonical_fields": [
+        "workflow",
+        "counts",
+        "jobs"
+      ]
+    },
+    {
+      "id": "smoke",
+      "argv": [
+        "python3",
+        "-m",
+        "herdr_orchestrator",
+        "smoke",
+        "--workflow",
+        "workflows/multi-harness.toml"
+      ],
+      "canonical_fields": [
+        "failures",
+        "results"
+      ],
+      "live_evidence": "foundation-six-harness"
+    }
+  ]
+}
