@@ -87,7 +87,10 @@ Herdr whitelist observer ──┘
 ```
 
 `RuntimeProjector.snapshot()` 是页面和测试共用的 interface。实现内部关联
-`job → named agent → pane → tab → workspace`，并计算 durable/runtime drift。
+`job → named agent → pane → tab → workspace`，并计算 durable/runtime drift。面向浏览器的
+topology 另外以 additive projection 组织为
+`project → worktree/workspace → tab → pane`，供 Canvas compound graph 使用；旧 workspace
+projection 保留。
 Dashboard monitor 独立运行；它失败、退出或断线不改变 coordinator、lease 或 receipt。
 
 SQLite observer 不读取 `jobs.prompt`。Herdr observer 不读取 pane output，只投影

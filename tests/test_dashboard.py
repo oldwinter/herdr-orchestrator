@@ -134,7 +134,15 @@ class DashboardTests(unittest.TestCase):
                     "cwd": "/repo",
                 },
             ),
-            (),
+            (
+                {
+                    "path": "/repo/.orchestrator/worktrees/task-2",
+                    "branch": "orchestrator/task-2",
+                    "label": "Task 2",
+                    "open_workspace_id": "w1",
+                    "is_linked_worktree": True,
+                },
+            ),
         )
         projector = RuntimeProjector(
             "example",
@@ -159,6 +167,13 @@ class DashboardTests(unittest.TestCase):
             ],
             "worker-two",
         )
+        project = snapshot["topology"]["projects"][0]
+        worktree = project["worktrees"][0]
+        self.assertEqual(project["label"], "example")
+        self.assertEqual(worktree["workspace_id"], "w1")
+        self.assertEqual(worktree["branch"], "orchestrator/task-2")
+        self.assertTrue(worktree["is_linked_worktree"])
+        self.assertEqual(worktree["tabs"][0]["panes"][0]["pane_id"], "w1:p2")
         self.assertEqual(snapshot["timeline"][0]["type"], "receipt")
         self.assertGreaterEqual(snapshot["summary"]["needs_attention"], 3)
 
@@ -322,6 +337,9 @@ class DashboardTests(unittest.TestCase):
                 snapshot = _wait_for_json(f"{base_url}/api/snapshot")
                 with urlopen(f"{base_url}/assets/dashboard.css", timeout=2) as response:
                     content_type = response.headers["Content-Type"]
+                with urlopen(f"{base_url}/assets/cytoscape.min.js", timeout=2) as response:
+                    cytoscape_content_type = response.headers["Content-Type"]
+                    cytoscape_data = response.read()
                 connection = HTTPConnection(host, port, timeout=2)
                 connection.request(
                     "GET",
@@ -339,6 +357,10 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("default-src 'self'", policy)
         self.assertEqual(snapshot["snapshot"]["workflow"], "example")
         self.assertEqual(content_type, "text/css; charset=utf-8")
+        self.assertEqual(cytoscape_content_type, "text/javascript; charset=utf-8")
+        self.assertGreater(len(cytoscape_data), 400_000)
+        self.assertIn("The Cytoscape Consortium", cytoscape_data[:180].decode())
+        self.assertIn("/assets/cytoscape.min.js", index)
         self.assertEqual(rejected_host, 421)
         self.assertFalse(thread.is_alive())
 

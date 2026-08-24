@@ -6,6 +6,7 @@
     <meta name="color-scheme" content="dark">
     <title>Herdr Operations</title>
     <link rel="stylesheet" href="/assets/dashboard.css">
+    <script src="/assets/cytoscape.min.js" defer></script>
     <script src="/assets/dashboard.js" defer></script>
   </head>
   <body>
@@ -65,6 +66,41 @@
           </article>
         </section>
 
+        <section class="panel topology-panel">
+          <div class="panel-heading topology-heading">
+            <div>
+              <p class="eyebrow">Observed runtime</p>
+              <h2>Herdr topology</h2>
+            </div>
+            <div class="topology-heading-actions">
+              <span id="topology-count" class="quiet-badge">0 nodes</span>
+              <div class="topology-controls" role="group" aria-label="Topology viewport controls">
+                <button id="topology-zoom-out" class="icon-button" type="button" aria-label="Zoom out" title="Zoom out">−</button>
+                <button id="topology-fit" class="icon-button" type="button" aria-label="Fit topology" title="Fit topology">⌂</button>
+                <button id="topology-zoom-in" class="icon-button" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+              </div>
+            </div>
+          </div>
+          <div class="topology-legend" aria-hidden="true">
+            <span><i class="legend-swatch kind-project"></i>Project</span>
+            <span><i class="legend-swatch kind-worktree"></i>Worktree</span>
+            <span><i class="legend-swatch kind-tab"></i>Tab</span>
+            <span><i class="legend-swatch kind-pane"></i>Pane</span>
+          </div>
+          <div class="topology-stage">
+            <div
+              id="topology"
+              class="topology-canvas"
+              tabindex="0"
+              role="application"
+              aria-label="Interactive Herdr topology"
+            ></div>
+            <div id="topology-empty" class="topology-empty">Waiting for Herdr…</div>
+            <div id="topology-inspector" class="topology-inspector is-hidden" aria-live="polite"></div>
+          </div>
+          <div id="topology-a11y" class="sr-only" aria-live="polite"></div>
+        </section>
+
         <section class="main-grid">
           <article class="panel board-panel">
             <div class="panel-heading">
@@ -74,7 +110,7 @@
               </div>
               <span id="job-total" class="quiet-badge">0 jobs</span>
             </div>
-            <div id="kanban" class="kanban">
+            <div id="kanban" class="kanban" role="region" tabindex="0" aria-label="Work in flight board">
               <div class="empty-state">Loading queue state…</div>
             </div>
           </article>
@@ -93,18 +129,6 @@
               </div>
             </article>
 
-            <article class="panel topology-panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Observed runtime</p>
-                  <h2>Herdr topology</h2>
-                </div>
-                <span id="topology-count" class="quiet-badge">0 workspaces</span>
-              </div>
-              <div id="topology" class="topology">
-                <div class="empty-state compact">Waiting for Herdr…</div>
-              </div>
-            </article>
           </aside>
         </section>
 

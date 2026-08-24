@@ -405,16 +405,12 @@ h2 {
   font: 600 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-.attention-list,
-.topology {
-  max-height: 440px;
-  overflow-y: auto;
-  padding: var(--space-3);
-}
-
 .attention-list {
   display: grid;
   gap: var(--space-2);
+  max-height: 440px;
+  overflow-y: auto;
+  padding: var(--space-3);
 }
 
 .attention-item {
@@ -444,74 +440,185 @@ h2 {
   font: 500 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-.workspace-node {
-  position: relative;
-  margin-bottom: var(--space-3);
-  padding: var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--surface-muted);
+.topology-panel {
+  margin-bottom: var(--space-4);
+  overflow: hidden;
 }
 
-.workspace-node:last-child {
-  margin-bottom: 0;
-}
-
-.node-heading,
-.tab-heading,
-.pane-row {
+.topology-heading-actions,
+.topology-controls,
+.topology-legend {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+}
+
+.topology-heading-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: var(--space-2);
 }
 
-.node-heading strong {
-  font-size: 13px;
+.topology-controls {
+  gap: 6px;
 }
 
-.node-id {
-  color: var(--muted);
-  font: 500 9px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-.worktree-line {
-  margin: var(--space-2) 0 0;
-  color: var(--signal);
-  font: 500 9px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  overflow-wrap: anywhere;
-}
-
-.tab-node {
-  margin-top: var(--space-2);
-  padding: var(--space-2) 0 0 var(--space-3);
-  border-top: 1px solid var(--line-soft);
-  border-left: 1px solid var(--line);
-}
-
-.tab-heading {
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
   color: var(--muted-strong);
-  font-size: 11px;
+  background: var(--surface-muted);
+  font: 650 17px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  cursor: pointer;
 }
 
-.pane-row {
-  margin-top: 6px;
-  padding-left: var(--space-3);
-  color: var(--muted);
-  font: 500 9px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-.agent-chip {
-  padding: 3px 6px;
-  border-radius: 999px;
-  color: var(--muted-strong);
+.icon-button:hover,
+.icon-button:focus-visible {
+  border-color: #59636c;
+  color: var(--text);
   background: var(--surface-raised);
 }
 
-.agent-chip.status-working { color: var(--blue); }
-.agent-chip.status-blocked { color: var(--red); }
-.agent-chip.status-done,
-.agent-chip.status-idle { color: var(--green); }
+.icon-button:focus-visible,
+.topology-canvas:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: -2px;
+}
+
+.topology-legend {
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  min-height: 42px;
+  padding: 9px var(--space-4);
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--muted);
+  background: rgba(11, 13, 15, 0.38);
+  font: 600 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.topology-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+}
+
+.legend-swatch.kind-project { color: #7e8991; background: #1b2227; }
+.legend-swatch.kind-worktree { color: #9db75b; background: #202b1d; }
+.legend-swatch.kind-tab { color: #639ac1; background: #172733; }
+.legend-swatch.kind-pane { color: #69747c; background: #262d32; }
+
+.topology-stage {
+  position: relative;
+  height: 520px;
+  min-height: 420px;
+  overflow: hidden;
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    #0d1012;
+  background-size: 24px 24px;
+}
+
+.topology-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+.topology-canvas canvas {
+  display: block;
+}
+
+.topology-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--space-6);
+  color: var(--muted);
+  font: 500 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: center;
+  pointer-events: none;
+}
+
+.topology-inspector {
+  position: absolute;
+  left: var(--space-4);
+  bottom: var(--space-4);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px var(--space-3);
+  width: min(440px, calc(100% - 32px));
+  padding: 10px 12px;
+  border: 1px solid #465159;
+  border-radius: 8px;
+  background: rgba(18, 21, 24, 0.94);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+
+.topology-empty.is-hidden,
+.topology-inspector.is-hidden {
+  display: none;
+}
+
+.topology-inspector strong,
+.topology-inspector span {
+  min-width: 0;
+}
+
+.topology-inspector strong {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topology-inspector > span:last-child {
+  grid-column: 2;
+  color: var(--muted);
+  font: 500 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inspector-kind {
+  grid-row: 1 / span 2;
+  padding-right: var(--space-3);
+  border-right: 1px solid var(--line);
+  color: var(--signal);
+  font: 650 9px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 .timeline-panel {
   margin-top: var(--space-4);
@@ -594,7 +701,7 @@ h2 {
   }
 
   .right-rail {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: 1fr;
   }
 }
 
@@ -622,6 +729,35 @@ h2 {
 
   .right-rail {
     grid-template-columns: 1fr;
+  }
+
+  .topology-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .topology-heading-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .topology-heading-actions .quiet-badge {
+    max-width: none;
+    font-size: 0;
+  }
+
+  .topology-heading-actions .quiet-badge::after {
+    content: attr(data-compact);
+    font-size: 10px;
+  }
+
+  .topology-legend {
+    gap: var(--space-3);
+  }
+
+  .topology-stage {
+    height: 440px;
+    min-height: 360px;
   }
 
   .kanban {
