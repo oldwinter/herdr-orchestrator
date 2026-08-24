@@ -1910,7 +1910,7 @@ class ResearchEvidenceRegister:
             for item in self._verification_dispositions.values()
             if item.claim_id == disposition.claim_id and item.current
         ]
-        if current_for_claim:
+        if disposition.current and current_for_claim:
             # History is retained, but only one disposition is current.  The
             # replacement is deterministic and does not rewrite its payload.
             for previous in current_for_claim:
@@ -2157,7 +2157,10 @@ class ResearchEvidenceRegister:
                     if self._verification_dispositions[key] != item:
                         raise _error("verification_disposition_immutable_conflict")
                 else:
-                    self.admit_verification_disposition(item)
+                    self.admit_verification_disposition(
+                        item,
+                        _allow_historical=not item.current,
+                    )
         except BaseException:
             (
                 self._sources,

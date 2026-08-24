@@ -639,6 +639,9 @@ def _replay_verification_fixture(
     register = _register_from_persisted_evidence(
         raw_evidence,
         kernel=kernel,
+        expected_policy=ResearchConfig.from_mapping(
+            config.executor.settings if config.executor is not None else {}
+        ).verification,
     )
     if (
         event is not None
@@ -665,6 +668,27 @@ def _replay_verification_fixture(
             kernel.transition_run(run_id, target_state)
         elif run.state != target_state:
             raise ExecutorStoreError("verification_fixture_terminal_state_mismatch")
+        current_assignment = next(
+            (
+                item.to_dict()
+                for item in register.verification_assignments
+                if item.current
+            ),
+            None,
+        )
+        current_disposition = next(
+            (
+                item.to_dict()
+                for item in register.verification_dispositions
+                if item.current
+                and any(
+                    assignment.assignment_id == item.assignment_id
+                    and assignment.current
+                    for assignment in register.verification_assignments
+                )
+            ),
+            None,
+        )
         kernel.append_event(
             run_id,
             event_key=f"research-verification-fixture:{requested_case_id}",
@@ -675,12 +699,8 @@ def _replay_verification_fixture(
                 "reason": outcome_code,
                 "verification_policy": register.verification_policy.to_dict(),
                 "verification": register.claim_status(register.claims[0].claim_id),
-                "verification_assignment": (
-                    register.verification_assignments[0].to_dict()
-                    if register.verification_assignments
-                    else None
-                ),
-                "verification_disposition": None,
+                "verification_assignment": current_assignment,
+                "verification_disposition": current_disposition,
                 "evidence": register.to_dict(),
             },
             error_code=None
@@ -760,8 +780,15 @@ def _register_from_persisted_evidence(
     value: dict[str, object],
     *,
     kernel: ExecutionKernel | None = None,
+    expected_policy: CriticalityPolicy | None = None,
 ) -> ResearchEvidenceRegister:
-    policy = CriticalityPolicy.from_mapping(value.get("verification_policy"))
+    policy = (
+        expected_policy
+        if expected_policy is not None
+        else CriticalityPolicy.from_mapping(value.get("verification_policy"))
+    )
+    if value.get("verification_policy") != policy.to_dict():
+        raise ResearchEvidenceError("verification_fixture_policy_integrity_mismatch")
 
     def authorize(assignment: VerificationAssignment) -> None:
         if kernel is None:
@@ -2279,6 +2306,9 @@ def _research_export(
         register = _register_from_persisted_evidence(
             raw_evidence,
             kernel=kernel,
+        expected_policy=ResearchConfig.from_mapping(
+            config.executor.settings if config.executor is not None else {}
+        ).verification,
         )
     except ResearchEvidenceError:
         raise
