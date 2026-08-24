@@ -14,8 +14,10 @@ from herdr_orchestrator.model import (
     JobState,
     NewJob,
     PlacementTarget,
+    ReceiptKind,
+    TaskReceipt,
 )
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import Store, StoreError
 
 
 class StoreTests(unittest.TestCase):
@@ -125,6 +127,70 @@ class StoreTests(unittest.TestCase):
             ),
         )
 
+    def test_declared_task_receipt_is_claimed_and_verification_is_recorded(self) -> None:
+        self.store.enqueue(
+            NewJob(
+                workflow="example",
+                title="verified",
+                harness=Harness.PI,
+                prompt="Inspect the repository",
+                dedupe_key="verified-v1",
+                max_attempts=2,
+                receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, "MOCK-OK harness=pi"),
+            )
+        )
+
+        claimed = self.store.claim("example", limit=1, lease_seconds=60)[0]
+        state = self.store.record_outcome(
+            claimed,
+            DispatchOutcome(
+                "worker",
+                AgentState.DONE,
+                False,
+                "pane",
+                task_verified=True,
+            ),
+        )
+        job = self.store.jobs("example")[0]
+
+        self.assertEqual(
+            claimed.receipt,
+            TaskReceipt(ReceiptKind.OUTPUT_PREFIX, "MOCK-OK harness=pi"),
+        )
+        self.assertEqual(state, JobState.SUCCEEDED)
+        self.assertIs(job["agent_settled"], True)
+        self.assertIs(job["task_verified"], True)
+
+    def test_declared_task_receipt_fails_closed_when_verification_is_unreported(self) -> None:
+        self.store.enqueue(
+            NewJob(
+                workflow="example",
+                title="unverified",
+                harness=Harness.PI,
+                prompt="Inspect the repository",
+                dedupe_key="unverified-v1",
+                max_attempts=1,
+                receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, "MOCK-OK harness=pi"),
+            )
+        )
+        claimed = self.store.claim("example", limit=1, lease_seconds=60)[0]
+
+        state = self.store.record_outcome(
+            claimed,
+            DispatchOutcome(
+                "worker",
+                AgentState.DONE,
+                False,
+                "pane",
+            ),
+        )
+        job = self.store.jobs("example")[0]
+
+        self.assertEqual(state, JobState.FAILED)
+        self.assertEqual(job["error_code"], "task_receipt_missing")
+        self.assertIs(job["agent_settled"], True)
+        self.assertIsNone(job["task_verified"])
+
     def test_agent_blocked_error_is_terminal_blocked_state(self) -> None:
         self.store.enqueue(_job("one"))
         claimed = self.store.claim("example", limit=1, lease_seconds=60)[0]
@@ -154,9 +220,14 @@ class StoreTests(unittest.TestCase):
                 False,
                 None,
                 "herdr_timeout",
+                error_summary="Provider request timed out after 30 seconds",
             ),
         )
         self.assertEqual(state, JobState.PENDING)
+        self.assertEqual(
+            self.store.jobs("example")[0]["error_summary"],
+            "Provider request timed out after 30 seconds",
+        )
 
         with patch("herdr_orchestrator.store.time.time", return_value=time.time() + 120):
             second = self.store.claim("example", limit=1, lease_seconds=60)[0]
@@ -173,6 +244,33 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(state, JobState.FAILED)
 
+    def test_failed_job_can_be_retried_with_additional_attempt_budget(self) -> None:
+        job_id, _ = self.store.enqueue(_job("retry", max_attempts=1))
+        failed = self.store.claim("example", limit=1, lease_seconds=60)[0]
+        self.store.record_outcome(
+            failed,
+            DispatchOutcome(
+                "worker",
+                AgentState.UNKNOWN,
+                False,
+                None,
+                "agent_provider_failed",
+            ),
+        )
+
+        retried = self.store.retry_failed(
+            "example",
+            job_id,
+            extra_attempts=2,
+        )
+        claimed = self.store.claim("example", limit=1, lease_seconds=60)[0]
+
+        self.assertEqual(retried["state"], JobState.PENDING.value)
+        self.assertEqual(claimed.attempt, 2)
+        self.assertEqual(claimed.max_attempts, 3)
+        with self.assertRaisesRegex(StoreError, "job_not_retryable"):
+            self.store.retry_failed("example", job_id, extra_attempts=1)
+
     def test_expired_lease_is_reclaimed(self) -> None:
         self.store.enqueue(_job("one"))
         baseline = time.time() + 1
@@ -184,7 +282,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(first.job_id, second.job_id)
         self.assertEqual(second.attempt, 2)
 
-    def test_migrates_v1_jobs_and_receipts_to_tab_placement(self) -> None:
+    def test_migrates_v1_jobs_and_receipts_to_current_schema(self) -> None:
         path = Path(self.temporary.name) / "v1.db"
         connection = sqlite3.connect(path)
         connection.executescript(
@@ -255,12 +353,22 @@ class StoreTests(unittest.TestCase):
                 for row in migrated_connection.execute("PRAGMA table_info(receipts)")
             }
 
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
         self.assertEqual(migrated[0]["placement"], PlacementTarget.TAB.value)
+        self.assertIsNone(migrated[0]["task_verified"])
+        self.assertIsNone(migrated[0]["agent_settled"])
         self.assertIn("execution_path", job_columns)
         self.assertIn("herdr_workspace_id", job_columns)
+        self.assertIn("receipt_kind", job_columns)
+        self.assertIn("receipt_value", job_columns)
+        self.assertIn("agent_settled", job_columns)
+        self.assertIn("task_verified", job_columns)
+        self.assertIn("error_summary", job_columns)
         self.assertIn("execution_path", receipt_columns)
         self.assertIn("herdr_workspace_id", receipt_columns)
+        self.assertIn("agent_settled", receipt_columns)
+        self.assertIn("task_verified", receipt_columns)
+        self.assertIn("error_summary", receipt_columns)
 
 
 def _job(

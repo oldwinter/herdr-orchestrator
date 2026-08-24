@@ -11,8 +11,8 @@
 3. **Turn observed**：提交 prompt 后 `state_change_seq` 前进，通常先进入 `working`。
 4. **Settled**：同一 turn 最终稳定返回 `idle`、`done` 或 `blocked`。
 
-只有第 3、4 层都成立，普通 queue 才能写成功 receipt。`done` 证明 lifecycle 完成，不证明
-输出内容正确；需要内容证明的任务应写结构化 artifact、测试结果或 acceptance receipt。
+第 3、4 层成立只证明 `agent_settled=true`。`done` 不证明输出内容正确；需要机器验收的任务
+应 enqueue `--receipt-prefix` 或 `--receipt-file`，并要求 `task_verified=true`。
 
 ## Topology 证据
 
@@ -58,6 +58,9 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 - principal proxy 使用 pane literal text 加 agent Enter 回答 blocked worker，再等待新的
   lifecycle sequence；普通 queue 不自动回答。
 - `unknown`、timeout、未观察到 turn 和协议错误都不会记成功。
+- settled output 命中登录墙、device login、provider retry exhaustion 或 invalid model 时，
+  不会记成功，并保留稳定错误码与有界摘要。
+- 声明的 output/file receipt 缺失返回 `task_receipt_missing`，即使 agent 已 idle/done。
 
 ## 诊断顺序
 
@@ -99,6 +102,10 @@ herdr integration status
 | `herdr_timeout` | 已观察到 turn，但未在执行 deadline 内 settled，或控制命令超时 | 按 attempt 重试，耗尽后 failed |
 | `agent_blocked` | settle 后仍有真实交互阻塞 | 普通 queue terminal blocked |
 | `agent_auth_failed` | settled output 命中明确认证失败信号 | 按 attempt 失败处理 |
+| `agent_auth_required` | settled output 命中登录或 device-code 等待 | 按 attempt 失败处理 |
+| `agent_model_invalid` | provider 拒绝默认 model identifier | 按 attempt 失败处理 |
+| `agent_provider_failed` | provider 请求重试耗尽 | 按 attempt 失败处理 |
+| `task_receipt_missing` | 声明的输出前缀或非空文件不存在 | 按 attempt 失败处理 |
 
 ## 收口检查
 

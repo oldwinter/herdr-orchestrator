@@ -17,7 +17,7 @@ class CommandRunner(Protocol):
         argv: list[str],
         *,
         cwd: str,
-        timeout: int | None,
+        timeout: float | None,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -25,13 +25,22 @@ class CommandRunner(Protocol):
 class Command:
     argv: list[str]
     cwd: Path
-    timeout_seconds: int | None
+    timeout_seconds: float | None
 
 
 class TransportError(RuntimeError):
-    def __init__(self, code: str, *, exit_code: int | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        exit_code: int | None = None,
+        summary: str | None = None,
+        agent_settled: bool = False,
+    ) -> None:
         self.code = code
         self.exit_code = exit_code
+        self.summary = summary
+        self.agent_settled = agent_settled
         super().__init__(code)
 
 
@@ -39,7 +48,7 @@ def subprocess_runner(
     argv: list[str],
     *,
     cwd: str,
-    timeout: int | None,
+    timeout: float | None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         argv,

@@ -43,6 +43,11 @@ class PlacementTarget(StrEnum):
     WORKTREE = "worktree"
 
 
+class ReceiptKind(StrEnum):
+    OUTPUT_PREFIX = "output-prefix"
+    FILE = "file"
+
+
 class TrackerBackend(StrEnum):
     LOCAL_MARKDOWN = "local-markdown"
     GITHUB = "github"
@@ -148,6 +153,13 @@ class NewJob:
     dedupe_key: str
     max_attempts: int
     placement: PlacementTarget | None = PlacementTarget.TAB
+    receipt: TaskReceipt | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskReceipt:
+    kind: ReceiptKind
+    value: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +174,7 @@ class ClaimedJob:
     max_attempts: int
     agent_name: str
     placement: PlacementTarget
+    receipt: TaskReceipt | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +187,9 @@ class DispatchOutcome:
     placement: PlacementTarget | None = None
     execution_path: str | None = None
     herdr_workspace_id: str | None = None
+    task_verified: bool | None = None
+    error_summary: str | None = None
+    agent_settled: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +199,7 @@ class DispatchContext:
     task_key: str
     batch_key: str | None = None
     worktree_root: Path | None = None
+    receipt: TaskReceipt | None = None
 
 
 @dataclass(frozen=True, slots=True)

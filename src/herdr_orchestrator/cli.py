@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,27 +26,45 @@ from herdr_orchestrator.delivery import (
 )
 from herdr_orchestrator.delivery_protocol import DeliveryArtifactError
 from herdr_orchestrator.git_workspace import GitWorkspaceError
-from herdr_orchestrator.herdr import HerdrTransport, smoke_agent_name
+from herdr_orchestrator.herdr import HerdrTransport, doctor_agent_name, smoke_agent_name
 from herdr_orchestrator.model import (
     AgentState,
+    DispatchContext,
     Harness,
     HarnessProfile,
     PlacementTarget,
+    ReceiptKind,
+    TaskReceipt,
     TrackerBackend,
     WayfinderMode,
     WorkflowConfig,
 )
+from herdr_orchestrator.protocol import TransportError
 from herdr_orchestrator.runner import Coordinator
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import Store, StoreError
 from herdr_orchestrator.tracker import TrackerError
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Durable multi-harness orchestration over Herdr.")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("doctor", "seed", "status"):
+    for name in ("seed", "status"):
         command = subparsers.add_parser(name)
         command.add_argument("--workflow", required=True)
+
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--workflow", required=True)
+    doctor_parser.add_argument("--probe-timeout-seconds", type=int, default=30)
+
+    retry_parser = subparsers.add_parser("retry")
+    retry_parser.add_argument("--workflow", required=True)
+    retry_parser.add_argument("--job-id", type=int, required=True)
+    retry_parser.add_argument("--extra-attempts", type=int, choices=range(1, 11), default=1)
+
+    gc_parser = subparsers.add_parser("gc")
+    gc_parser.add_argument("--workflow", required=True)
+    gc_parser.add_argument("--succeeded-agents", action="store_true", required=True)
+    gc_parser.add_argument("--apply", action="store_true")
 
     smoke_parser = subparsers.add_parser("smoke")
     smoke_parser.add_argument("--workflow", required=True)
@@ -73,7 +92,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run")
     run.add_argument("--workflow", required=True)
-    run.add_argument("--once", action="store_true")
+    run_mode = run.add_mutually_exclusive_group()
+    run_mode.add_argument("--once", action="store_true")
+    run_mode.add_argument(
+        "--until-idle",
+        "--drain",
+        dest="until_idle",
+        action="store_true",
+    )
+    run.add_argument("--drain-timeout-seconds", type=int, default=3600)
     _add_selection_arguments(run)
 
     enqueue = subparsers.add_parser("enqueue")
@@ -91,6 +118,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", *(item.value for item in PlacementTarget)],
         default="auto",
         help="Override topology selection for this task.",
+    )
+    receipt = enqueue.add_mutually_exclusive_group()
+    receipt.add_argument(
+        "--receipt-prefix",
+        help="Require this exact prefix in bounded agent output before success.",
+    )
+    receipt.add_argument(
+        "--receipt-file",
+        help="Require this non-empty path relative to the task execution root.",
     )
     _add_selection_arguments(enqueue)
 
@@ -119,10 +155,29 @@ def main(argv: list[str] | None = None) -> int:
         config = load_workflow(args.workflow)
         match args.command:
             case "doctor":
-                return doctor(config)
+                if not 5 <= args.probe_timeout_seconds <= 300:
+                    raise ValueError("doctor_probe_timeout_out_of_range")
+                return doctor(
+                    config,
+                    probe_timeout_seconds=args.probe_timeout_seconds,
+                )
             case "seed":
                 added, existing = Coordinator(config).seed()
                 print(json.dumps({"added": added, "existing": existing}, sort_keys=True))
+                return 0
+            case "retry":
+                store = Store(config.state_db)
+                store.initialize()
+                result = store.retry_failed(
+                    config.name,
+                    args.job_id,
+                    extra_attempts=args.extra_attempts,
+                )
+                print(json.dumps(result, sort_keys=True))
+                return 0
+            case "gc":
+                result = Coordinator(config).gc_succeeded_agents(dry_run=not args.apply)
+                print(json.dumps(result, indent=2, sort_keys=True))
                 return 0
             case "enqueue":
                 prompt_file = Path(args.prompt_file).expanduser().resolve()
@@ -139,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
                         if args.placement == "auto"
                         else PlacementTarget(args.placement)
                     ),
+                    receipt=_task_receipt_from_args(args),
                 )
                 print(
                     json.dumps(
@@ -215,6 +271,14 @@ def main(argv: list[str] | None = None) -> int:
                 if args.once:
                     print(json.dumps(coordinator.run_once(), sort_keys=True))
                     return 0
+                if args.until_idle:
+                    if not 1 <= args.drain_timeout_seconds <= 86_400:
+                        raise ValueError("drain_timeout_out_of_range")
+                    result = coordinator.run_until_idle(
+                        timeout_seconds=args.drain_timeout_seconds,
+                    )
+                    print(json.dumps(result, sort_keys=True))
+                    return 0 if result["idle"] else 1
                 try:
                     coordinator.run_forever()
                 except KeyboardInterrupt:
@@ -289,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         DeliveryArtifactError,
         DeliveryError,
         GitWorkspaceError,
+        StoreError,
+        TransportError,
         TrackerError,
         ValueError,
     ) as exc:
@@ -297,39 +363,76 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def doctor(workflow: WorkflowConfig) -> int:
+def _task_receipt_from_args(args: argparse.Namespace) -> TaskReceipt | None:
+    if args.receipt_prefix is not None:
+        value = str(args.receipt_prefix).strip()
+        if not value or len(value) > 256 or "\n" in value or "\r" in value:
+            raise ValueError("receipt_prefix_invalid")
+        return TaskReceipt(ReceiptKind.OUTPUT_PREFIX, value)
+    if args.receipt_file is not None:
+        value = str(args.receipt_file).strip()
+        path = Path(value)
+        if (
+            not value
+            or len(value) > 500
+            or path.is_absolute()
+            or not path.parts
+            or ".." in path.parts
+        ):
+            raise ValueError("receipt_file_invalid")
+        return TaskReceipt(ReceiptKind.FILE, path.as_posix())
+    return None
+
+
+ReadinessProbe = Callable[[WorkflowConfig, Harness, int], Mapping[str, object]]
+
+
+def doctor(
+    workflow: WorkflowConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    version_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    readiness_probe: ReadinessProbe | None = None,
+    probe_timeout_seconds: int = 30,
+) -> int:
+    current_environ = os.environ if environ is None else environ
+    probe = readiness_probe or probe_harness_readiness
     checks: list[dict[str, object]] = []
     checks.append(
         {
             "check": "HERDR_ENV",
-            "ok": os.environ.get("HERDR_ENV") == "1",
-            "value": os.environ.get("HERDR_ENV"),
+            "ok": current_environ.get("HERDR_ENV") == "1",
+            "value": current_environ.get("HERDR_ENV"),
         }
     )
     checks.append(
         {
             "check": "HERDR_PANE_ID",
-            "ok": bool(os.environ.get("HERDR_PANE_ID")),
-            "value": os.environ.get("HERDR_PANE_ID"),
+            "ok": bool(current_environ.get("HERDR_PANE_ID")),
+            "value": current_environ.get("HERDR_PANE_ID"),
         }
     )
     checks.append(
         {
             "check": "HERDR_WORKSPACE_ID",
-            "ok": bool(os.environ.get("HERDR_WORKSPACE_ID")),
-            "value": os.environ.get("HERDR_WORKSPACE_ID"),
+            "ok": bool(current_environ.get("HERDR_WORKSPACE_ID")),
+            "value": current_environ.get("HERDR_WORKSPACE_ID"),
         }
     )
-    herdr_path = shutil.which("herdr")
+    herdr_path = which("herdr")
     checks.append({"check": "herdr", "ok": herdr_path is not None, "value": herdr_path})
     if herdr_path is not None:
-        version = subprocess.run(
-            ["herdr", "--version"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
+        try:
+            version = version_runner(
+                ["herdr", "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            version = subprocess.CompletedProcess(["herdr", "--version"], 1, "", "")
         checks.append(
             {
                 "check": "herdr_version",
@@ -337,10 +440,10 @@ def doctor(workflow: WorkflowConfig) -> int:
                 "value": version.stdout.strip(),
             }
         )
-    git_path = shutil.which("git")
+    git_path = which("git")
     checks.append({"check": "git", "ok": git_path is not None, "value": git_path})
     if workflow.standardized_delivery.tracker_backend is TrackerBackend.GITHUB:
-        github_path = shutil.which("gh")
+        github_path = which("gh")
         checks.append(
             {
                 "check": "tracker:github",
@@ -352,7 +455,7 @@ def doctor(workflow: WorkflowConfig) -> int:
     if workflow.planner.harness is not None and workflow.planner.harness not in harnesses:
         harnesses.append(workflow.planner.harness)
     for harness in harnesses:
-        executable = shutil.which(harness.value)
+        executable = which(harness.value)
         checks.append(
             {
                 "check": f"harness:{harness.value}",
@@ -361,16 +464,102 @@ def doctor(workflow: WorkflowConfig) -> int:
             }
         )
         profile = profile_for_harness(workflow.profiles, harness)
+        profile_ok = profile.context_file.is_file()
         checks.append(
             {
                 "check": f"profile:{harness.value}",
-                "ok": profile.context_file.is_file(),
+                "ok": profile_ok,
                 "value": str(profile.context_file),
+            }
+        )
+        environment_ready = (
+            current_environ.get("HERDR_ENV") == "1"
+            and bool(current_environ.get("HERDR_PANE_ID"))
+            and bool(current_environ.get("HERDR_WORKSPACE_ID"))
+            and herdr_path is not None
+        )
+        if executable is None or not profile_ok or not environment_ready:
+            readiness: Mapping[str, object] = {
+                "status": "unavailable",
+                "error_code": (
+                    "harness_unavailable"
+                    if executable is None
+                    else "profile_unavailable"
+                    if not profile_ok
+                    else "not_in_herdr"
+                ),
+                "error_summary": None,
+            }
+        else:
+            try:
+                readiness = probe(workflow, harness, probe_timeout_seconds)
+            except Exception as exc:
+                readiness = {
+                    "status": "error",
+                    "error_code": "readiness_probe_failed",
+                    "error_summary": " ".join(str(exc).split())[:300] or None,
+                }
+        status = str(readiness.get("status", "error"))
+        checks.append(
+            {
+                "check": f"readiness:{harness.value}",
+                "ok": status == "ready",
+                "status": status,
+                "error_code": readiness.get("error_code"),
+                "error_summary": readiness.get("error_summary"),
             }
         )
     ok = all(bool(check["ok"]) for check in checks)
     print(json.dumps({"checks": checks, "ok": ok}, indent=2, sort_keys=True))
     return 0 if ok else 1
+
+
+def probe_harness_readiness(
+    workflow: WorkflowConfig,
+    harness: Harness,
+    timeout_seconds: int,
+    *,
+    transport: HerdrTransport | None = None,
+) -> Mapping[str, object]:
+    active_transport = transport or HerdrTransport(workflow.name, workflow.workspace)
+    name = doctor_agent_name(workflow.name, harness)
+    prefix = f"HERDR-DOCTOR-OK harness={harness.value}"
+    try:
+        outcome = active_transport.dispatch(
+            harness,
+            (
+                "Read-only readiness probe. Do not modify files or external state. "
+                f"Reply with exactly this line: {prefix}"
+            ),
+            timeout_seconds=timeout_seconds,
+            agent_name=name,
+            context=DispatchContext(
+                placement=PlacementTarget.TAB,
+                title=f"doctor-{harness.value}",
+                task_key=f"doctor-{harness.value}",
+                receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, prefix),
+            ),
+        )
+    finally:
+        active_transport.close_created_agent(name)
+    status_by_error = {
+        "agent_auth_failed": "auth_required",
+        "agent_auth_required": "auth_required",
+        "agent_model_invalid": "model_invalid",
+        "herdr_timeout": "timeout",
+        "agent_provider_failed": "error",
+        "herdr_unavailable": "unavailable",
+        "not_in_herdr": "unavailable",
+    }
+    if outcome.state in {AgentState.IDLE, AgentState.DONE} and outcome.task_verified is True:
+        status = "ready"
+    else:
+        status = status_by_error.get(outcome.error_code or "", "error")
+    return {
+        "status": status,
+        "error_code": outcome.error_code,
+        "error_summary": outcome.error_summary,
+    }
 
 
 def smoke(
@@ -380,7 +569,7 @@ def smoke(
 ) -> int:
     transport = HerdrTransport(workflow.name, workflow.workspace)
     failures: list[dict[str, str]] = []
-    results: list[dict[str, str]] = []
+    results: list[dict[str, object]] = []
     created_names: list[str] = []
     selected = set(selected_harnesses or ())
     workers = [
@@ -391,10 +580,13 @@ def smoke(
     try:
         for worker in workers:
             harness = worker.harness
+            targets = _smoke_targets(workflow)
+            prefix = f"HERDR-SMOKE-OK harness={harness.value}"
             prompt = (
-                "这是只读连通性测试。必须使用本地只读工具检查 pyproject.toml 和 "
-                "workflows/multi-harness.toml；不得修改或创建文件，不得联网，不得执行任何"
-                "外部动作。完成后简短回复 project.name、schema_version 和 workers 数量。"
+                "This is a read-only connectivity check. Use local read-only tools to "
+                f"inspect {', '.join(targets)}. Do not modify or create files, access the "
+                "network, or perform external actions. Finish with one line that starts "
+                f"exactly with: {prefix}"
             )
             name = smoke_agent_name(workflow.name, harness)
             outcome = transport.dispatch(
@@ -402,13 +594,19 @@ def smoke(
                 prompt,
                 timeout_seconds=workflow.coordinator.agent_timeout_seconds,
                 agent_name=name,
+                context=DispatchContext(
+                    placement=PlacementTarget.TAB,
+                    title=f"smoke-{harness.value}",
+                    task_key=f"smoke-{harness.value}",
+                    receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, prefix),
+                ),
             )
             if not outcome.member_reused:
                 created_names.append(name)
             if outcome.error_code is not None or outcome.state not in {
                 AgentState.IDLE,
                 AgentState.DONE,
-            }:
+            } or outcome.task_verified is not True:
                 failures.append(
                     {
                         "harness": harness.value,
@@ -416,7 +614,13 @@ def smoke(
                     }
                 )
                 continue
-            results.append({"harness": harness.value, "state": outcome.state.value})
+            results.append(
+                {
+                    "harness": harness.value,
+                    "state": outcome.state.value,
+                    "task_verified": True,
+                }
+            )
     finally:
         for name in reversed(created_names):
             try:
@@ -425,6 +629,22 @@ def smoke(
                 failures.append({"harness": name, "error": f"cleanup:{type(exc).__name__}"})
     print(json.dumps({"failures": failures, "results": results}, indent=2, sort_keys=True))
     return 0 if not failures and len(results) == len(workers) else 1
+
+
+def _smoke_targets(workflow: WorkflowConfig) -> tuple[str, ...]:
+    candidates = (workflow.workspace / "README.md", workflow.path)
+    targets: list[str] = []
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            rendered = candidate.relative_to(workflow.workspace).as_posix()
+        except ValueError:
+            rendered = str(candidate)
+        targets.append(rendered)
+    if not targets:
+        raise ValueError("smoke_target_not_found")
+    return tuple(targets)
 
 
 def _catalog_text(profiles: tuple[HarnessProfile, ...]) -> str:

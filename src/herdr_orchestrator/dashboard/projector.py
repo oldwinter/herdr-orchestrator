@@ -126,6 +126,10 @@ class RuntimeProjector:
             "lease_until": lease_until,
             "agent_name": agent_name,
             "error_code": row.get("error_code"),
+            "error_summary": row.get("error_summary"),
+            "agent_settled": _nullable_bool(row.get("agent_settled")),
+            "task_verified": _nullable_bool(row.get("task_verified")),
+            "receipt_kind": row.get("receipt_kind"),
             "execution_path": row.get("execution_path"),
             "herdr_workspace_id": row.get("herdr_workspace_id"),
             "created_at": float(row["created_at"]),
@@ -195,6 +199,12 @@ def _attention(
                 )
             )
     return items
+
+
+def _nullable_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
 
 
 def _job_attention(

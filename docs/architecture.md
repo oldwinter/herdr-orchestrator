@@ -37,18 +37,30 @@ pending -> running -> succeeded
 
 claim 在 `BEGIN IMMEDIATE` 事务内完成。`running` 任务持有 `lease_until`；coordinator 崩溃后，lease 过期任务可再次 claim。每次 claim 增加 attempt。
 
+耗尽 attempt 的 `failed` job 可用显式 `retry` 在原 job id 和 `dedupe_key` 上追加有界 attempt
+budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。
+
 ### Coordinator
 
 - 一次最多 claim `max_parallel` 个任务；
 - 每个 harness 最多同时占用 `replicas` 个 slot；默认 1，因此同 harness 任务默认串行；
 - provisioning 后台 tab 与启动 agent 串行，避免布局竞争；
 - agent prompt 可并发等待；
-- `idle` / `done` 必须连续稳定 3 秒才成功；若期间重新进入 `working`，继续等待同一 deadline；
+- `idle` / `done` 必须连续稳定 3 秒才算 agent settled；若期间重新进入 `working`，继续等待同一 deadline；
 - 普通 queue 的 `blocked` 单独落 terminal 状态；
-- settled 后检测少量、明确的 fatal runtime 信号（例如 Claude `/login` 加 401/403），避免把认证失败记成成功；
+- settled 后跨 harness 检测有界 fatal runtime 信号，包括登录墙、device login、provider
+  retry exhaustion 与 invalid model，命中后保留稳定错误码和截断摘要；
+- enqueue 可声明 output-prefix 或 execution-root file receipt；声明后必须验证通过才能成功，
+  并分别记录 `agent_settled` 与 `task_verified`；
 - `unknown`、timeout 和协议错误按失败与重试策略处理。
 - 对必须写 strict JSON 的 turn，settled 后目标 artifact 缺失会在同一已 ready agent 上仅重发
   一次；artifact handshake 防止 startup lifecycle 变化被误认成任务完成。
+
+`run_once` 输出保留兼容的顶层本波计数，并新增 `claimed`、`batch` 和结束时全局 `queue`。
+`run_until_idle` 在有界 timeout 内重复 replica-limited wave，且把剩余 deadline 传给每个
+dispatch，直到当前 worker pool 没有 pending/running。结果用 `worker_pool_idle` 与
+`queue_idle` 明确区分所选 pool 和全局 queue；pool 外任务不会造成假死，也不会被误报为
+全局排空。
 
 ### Execution topology
 
@@ -75,6 +87,10 @@ Worktree path 与 branch 从 workflow 和 task key 稳定派生，retry 可恢�
 普通 queue 不自动 merge、关闭 workspace、删除 checkout 或删除 branch；保留状态供人工
 审查。Standardized delivery 仍使用自己的 integration/ticket worktree DAG 和收据协议，
 不与普通 queue topology 混用。
+
+显式 GC 默认 dry-run，只回收名称、workspace、cwd、placement 和 settled state 均能证明由
+当前 workflow 拥有的 succeeded agent pane；即使任务原 placement 为 tab，也不会关闭整个
+tab。worktree 与 active/foreign agent 始终跳过。
 
 ### Local operations dashboard
 
@@ -126,10 +142,12 @@ workspace、tab、pane、agent lifecycle 和 worktree 的白名单字段。浏�
 - transport 通过独立 Herdr layout adapter provision tab、批次 pane 或原生 worktree，
   并从 JSON response 读取 workspace/tab/pane ID；
 - 所有 CLI 结果按 JSON schema 读取，不预测 pane ID；
-- runtime output 只用于诊断摘要和少量确定性 fatal signal，不作为完整 transcript 或一般正确性证明。
+- runtime output 只用于诊断摘要、确定性 fatal signal 和显式 output-prefix receipt，不作为
+  完整 transcript 或一般正确性证明。
 
-结构化 receipt 证明的是 prompt 后发生了真实 lifecycle change 并稳定 settled，不是任务内容
-质量证明。运行诊断与本仓库真实演练形成的经验见
+未声明 task receipt 的兼容任务在 settled 且无 fatal signal 时仍可成功，但
+`task_verified = null`。声明 task receipt 后，`task_verified = true` 证明指定前缀或文件
+存在；它仍只证明该机器契约，不代替更广泛的质量审查。运行诊断与本仓库真实演练形成的经验见
 [`runtime-troubleshooting.md`](runtime-troubleshooting.md)。
 
 ### Planner

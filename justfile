@@ -43,8 +43,20 @@ enqueue harness title prompt_file dedupe_key *args:
 run-once *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} --once "$@"
 
+[positional-arguments]
+run-until-idle *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} --until-idle "$@"
+
 run *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} "$@"
+
+[positional-arguments]
+retry job_id *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{workflow}} --job-id {{quote(job_id)}} "$@"
+
+[positional-arguments]
+gc *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{workflow}} --succeeded-agents "$@"
 
 enqueue-auto title prompt_file dedupe_key *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} "$@"
