@@ -7,6 +7,38 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from herdr_orchestrator.research_evidence import (
+    Claim,
+    ClaimRecord,
+    EVIDENCE_NORMALIZATION_VERSION,
+    EvidenceRelation,
+    EvidenceRelationRecord,
+    ExcerptReceipt,
+    MAX_CLAIM_BYTES,
+    MAX_EXCERPT_BYTES,
+    MAX_SOURCE_URL_BYTES,
+    RESEARCH_EVIDENCE_SCHEMA_VERSION,
+    ResearchEvidenceError,
+    ResearchEvidenceRegister,
+    SUPPORTED_CLAIM_TYPES,
+    SUPPORTED_EVIDENCE_RELATIONS,
+    SUPPORTED_SOURCE_OUTCOMES,
+    SourceExcerpt,
+    SourceExcerptReceipt,
+    SourceReceipt,
+    TypedClaim,
+    parse_evidence_relation,
+    parse_evidence_register,
+    parse_excerpt_receipt,
+    parse_source_receipt,
+    parse_typed_claim,
+    validate_claim,
+    validate_evidence_relation,
+    validate_evidence_register,
+    validate_excerpt_receipt,
+    validate_source_receipt,
+)
+
 
 RESEARCH_INPUT_VERSION = 1
 MAX_QUESTION_BYTES = 16_384

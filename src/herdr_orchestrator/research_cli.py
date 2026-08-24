@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 from herdr_orchestrator.config import ConfigError
@@ -12,7 +15,13 @@ from herdr_orchestrator.executor_store import ExecutorStore, ExecutorStoreError
 from herdr_orchestrator.model import WorkflowConfig
 from herdr_orchestrator.research_executor import (
     ResearchConfig,
+    ResearchEvidenceError,
+    ResearchEvidenceRegister,
     ResearchInputError,
+    EvidenceRelation,
+    ExcerptReceipt,
+    SourceReceipt,
+    TypedClaim,
     build_research_view,
     classify_input,
     decompose_question,
@@ -68,6 +77,8 @@ def _research_select_run(
 
 def research_command(config: WorkflowConfig, args: argparse.Namespace) -> int:
     command = args.research_command
+    if command == "evidence-fixture":
+        return _research_evidence_fixture(config, args.case)
     if command == "start":
         if args.input_json is not None and args.question is not None:
             raise ResearchInputError("research_input_duplicate_payload")
@@ -116,6 +127,423 @@ def research_command(config: WorkflowConfig, args: argparse.Namespace) -> int:
             material=args.input,
         )
     raise ConfigError(f"research_route_unknown: {command}")
+
+
+_RESEARCH_EVIDENCE_FIXTURE_CASES = frozenset(
+    {
+        "valid",
+        "changed-retrieval",
+        "snippet-only",
+        "bare-url",
+        "offset-out-of-bounds",
+        "malformed-excerpt",
+        "unknown-source-key",
+        "unknown-excerpt-key",
+        "unknown-claim-key",
+        "unknown-relation-key",
+        "missing-excerpt",
+        "oversize-excerpt",
+        "digest-mismatch",
+        "malformed-claim",
+        "unknown-claim-type",
+        "unknown-relation",
+        "unadmitted-source",
+        "unadmitted-excerpt",
+        "unadmitted-premise",
+        "unadmitted-evidence",
+    }
+)
+_RESEARCH_EVIDENCE_FIXTURE_ALIASES = {
+    "search-snippet": "snippet-only",
+    "snippet": "snippet-only",
+    "search-snippet-only": "snippet-only",
+    "bare-url-excerpt": "bare-url",
+    "oversized-excerpt": "oversize-excerpt",
+    "malformed-excerpt-receipt": "malformed-excerpt",
+    "offsets-out-of-bounds": "offset-out-of-bounds",
+    "changed-source": "changed-retrieval",
+    "bad-excerpt-digest": "digest-mismatch",
+    "bad-claim-type": "unknown-claim-type",
+    "bad-relation": "unknown-relation",
+}
+
+
+def _research_evidence_fixture(config: WorkflowConfig, case_id: str) -> int:
+    requested_case_id = case_id
+    case_id = _RESEARCH_EVIDENCE_FIXTURE_ALIASES.get(case_id, case_id)
+    if case_id not in _RESEARCH_EVIDENCE_FIXTURE_CASES:
+        raise ConfigError(
+            f"research_evidence_fixture_unknown_case:{requested_case_id}"
+        )
+    fixture_workspace = Path(
+        tempfile.mkdtemp(
+            prefix=".research-evidence-fixture-",
+            dir=config.workspace,
+        )
+    )
+    isolated = replace(
+        config,
+        workspace=fixture_workspace,
+        state_db=fixture_workspace / "state.db",
+        runtime_dir=fixture_workspace / "runtime",
+    )
+    try:
+        return _research_evidence_fixture_in_state(
+            isolated,
+            requested_case_id=requested_case_id,
+            case_id=case_id,
+        )
+    finally:
+        shutil.rmtree(fixture_workspace, ignore_errors=True)
+
+
+def _research_evidence_fixture_in_state(
+    config: WorkflowConfig,
+    *,
+    requested_case_id: str,
+    case_id: str,
+) -> int:
+    if config.executor is None:
+        raise ConfigError("executor_missing")
+    store = ExecutorStore(config.state_db)
+    kernel = _research_kernel(config, store)
+    worker = config.workers[0]
+    run_id, _ = store.create_run(
+        config.name,
+        "research-synthesis",
+        f"research-evidence-fixture-{requested_case_id}",
+        state="pending",
+        workflow_definition={
+            "name": config.name,
+            "schema_version": 2,
+            "fixture_case_id": requested_case_id,
+        },
+        config_definition={"fixture": requested_case_id},
+        input_value={"question": "evidence fixture"},
+        route_definition={
+            "worker": worker.name,
+            "harness": worker.harness.value,
+        },
+        contract_definition={"version": "research-evidence-v1"},
+        executor_definition={"kind": "research-synthesis", "version": 1},
+        artifact_contract_definition={
+            "version": ARTIFACT_CONTRACT_VERSION,
+            "schema_version": 1,
+        },
+    )
+    ledger = ResearchEvidenceRegister()
+    source = SourceReceipt.from_retrieval(
+        requested_url="https://example.test/research",
+        final_url="https://example.test/research",
+        redirect_chain=(),
+        retrieved_content=b'{"answer":"bounded"}',
+        retrieval_order=1,
+        retrieved_at=1_700_000_000,
+        content_type="application/json",
+        role="collector",
+        run_id=run_id,
+        work_id="collect-scope-operator",
+        attempt_id="attempt-1",
+        fencing_token="fixture-fence-1",
+        harness=worker.harness.value,
+        worker=worker.name,
+        agent="research-grok-1",
+        pane="pane:research-grok-1",
+        source_id="source-research-page",
+    )
+    if case_id == "changed-retrieval":
+        ledger.admit_source(source)
+        later = SourceReceipt.from_retrieval(
+            requested_url=source.requested_url,
+            final_url=source.final_url,
+            redirect_chain=source.redirect_chain,
+            retrieved_content=b'{"answer":"changed"}',
+            retrieval_order=2,
+            retrieved_at=1_700_000_001,
+            content_type=source.content_type,
+            role=source.role,
+            run_id=run_id,
+            work_id=source.work_id,
+            attempt_id="attempt-2",
+            fencing_token="fixture-fence-2",
+            harness=worker.harness.value,
+            worker=worker.name,
+            agent="research-grok-1",
+            pane="pane:research-grok-1",
+        )
+        ledger.admit_source(later)
+        outcome_code = "new_source_observation"
+        reason = "later_retrieval_created_new_immutable_receipt"
+    else:
+        ledger.admit_source(source)
+        outcome_code = "evidence_rejected"
+        reason = "typed_evidence_required"
+        try:
+            if case_id in {
+                "snippet-only",
+                "bare-url",
+                "offset-out-of-bounds",
+                "malformed-excerpt",
+                "unknown-excerpt-key",
+                "unknown-claim-key",
+                "oversize-excerpt",
+                "digest-mismatch",
+                "malformed-claim",
+                "unknown-claim-type",
+            }:
+                _raise_fixture_case(
+                    case_id,
+                    source=source,
+                    ledger=ledger,
+                )
+            else:
+                excerpt = ExcerptReceipt.from_text(
+                    source,
+                    text='{"answer":"bounded"}',
+                    selector="$.answer",
+                )
+                ledger.admit_excerpt(excerpt)
+                factual = TypedClaim(
+                    claim_id="claim-bounded",
+                    claim_type="factual",
+                    text="The answer is bounded.",
+                )
+                ledger.admit_claim(factual)
+                if case_id == "valid":
+                    relation = EvidenceRelation(
+                        relation_id="relation-support",
+                        claim_id=factual.claim_id,
+                        relation="support",
+                        source_id=source.source_id,
+                        excerpt_id=excerpt.excerpt_id,
+                    )
+                    ledger.admit_relation(relation)
+                    outcome_code = "evidence_admitted"
+                    reason = "source_excerpt_claim_relation_admitted"
+                else:
+                    _raise_fixture_case(
+                        case_id,
+                        source=source,
+                        excerpt=excerpt,
+                        ledger=ledger,
+                    )
+        except ResearchEvidenceError as exc:
+            outcome_code = str(exc).split(":", 1)[0]
+            reason = str(exc)
+
+    evidence = ledger.to_dict()
+    kernel.append_event(
+        run_id,
+        event_key=f"research-evidence-fixture:{requested_case_id}",
+        event_type="research_evidence_fixture",
+        payload={
+            "fixture_case_id": requested_case_id,
+            "outcome_code": outcome_code,
+            "evidence": evidence,
+        },
+        error_code=None if outcome_code in {
+            "evidence_admitted",
+            "new_source_observation",
+        } else outcome_code,
+    )
+    inspected = kernel.inspect_run(run_id)
+    print(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "executor": "research-synthesis",
+                "route": "research.evidence-fixture",
+                "success": outcome_code in {
+                    "evidence_admitted",
+                    "new_source_observation",
+                },
+                "fixture_case_id": requested_case_id,
+                "bound": {
+                    "max_source_url_bytes": 4096,
+                    "max_excerpt_bytes": 16_384,
+                    "max_claim_bytes": 16_384,
+                    "one_submission": True,
+                },
+                "run_id": run_id,
+                "code": outcome_code,
+                "reason": reason,
+                "coverage_credit": len(evidence["creditable_relation_ids"]),
+                "evidence": evidence,
+                "events": len(inspected["events"]),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _raise_fixture_case(
+    case_id: str,
+    *,
+    source: SourceReceipt,
+    excerpt: ExcerptReceipt | None = None,
+    ledger: ResearchEvidenceRegister,
+) -> None:
+    if case_id == "snippet-only":
+        excerpt = excerpt or _fixture_excerpt(source)
+        value = excerpt.to_dict()
+        value["capture_kind"] = "search_snippet"
+        ledger.admit_excerpt(value)
+    elif case_id == "unknown-source-key":
+        value = source.to_dict()
+        value["unexpected"] = True
+        SourceReceipt.from_mapping(value)
+    elif case_id == "bare-url":
+        ledger.admit_excerpt(
+            ExcerptReceipt.from_text(
+                source,
+                text=source.final_url,
+                selector="body",
+            )
+        )
+    elif case_id == "offset-out-of-bounds":
+        ledger.admit_excerpt(
+            ExcerptReceipt.from_text(
+                source,
+                text="bounded",
+                offset_start=0,
+                offset_end=100,
+            )
+        )
+    elif case_id == "malformed-excerpt":
+        excerpt = excerpt or _fixture_excerpt(source)
+        value = excerpt.to_dict()
+        value["selector"] = None
+        value["offset_start"] = None
+        value["offset_end"] = None
+        ledger.admit_excerpt(value)
+    elif case_id == "unknown-excerpt-key":
+        excerpt = excerpt or _fixture_excerpt(source)
+        value = excerpt.to_dict()
+        value["unexpected"] = True
+        ExcerptReceipt.from_mapping(value)
+    elif case_id == "missing-excerpt":
+        ledger.admit_relation(
+            {
+                "schema_version": 1,
+                "relation_id": "relation-missing-excerpt",
+                "claim_id": "claim-bounded",
+                "relation": "support",
+                "source_id": source.source_id,
+                "excerpt_id": "excerpt-missing",
+            }
+        )
+    elif case_id == "oversize-excerpt":
+        excerpt = excerpt or _fixture_excerpt(source)
+        value = excerpt.to_dict()
+        value["text"] = "x" * 16_385
+        value["excerpt_digest"] = digest_bytes(value["text"].encode("utf-8"))
+        ledger.admit_excerpt(value)
+    elif case_id == "digest-mismatch":
+        excerpt = excerpt or _fixture_excerpt(source)
+        value = excerpt.to_dict()
+        value["excerpt_digest"] = "sha256:" + "0" * 64
+        ledger.admit_excerpt(value)
+    elif case_id == "malformed-claim":
+        ledger.admit_claim(
+            {
+                "schema_version": 1,
+                "claim_id": "claim-malformed",
+                "text": "Missing claim type.",
+            }
+        )
+    elif case_id == "unknown-claim-key":
+        ledger.admit_claim(
+            {
+                "schema_version": 1,
+                "claim_id": "claim-unknown-key",
+                "claim_type": "factual",
+                "text": "Unknown claim key.",
+                "unexpected": True,
+            }
+        )
+    elif case_id == "unknown-claim-type":
+        ledger.admit_claim(
+            {
+                "schema_version": 1,
+                "claim_id": "claim-unknown",
+                "claim_type": "opinion",
+                "text": "Unsupported claim type.",
+            }
+        )
+    elif case_id == "unknown-relation":
+        ledger.admit_relation(
+            {
+                "schema_version": 1,
+                "relation_id": "relation-unknown",
+                "claim_id": "claim-bounded",
+                "relation": "depends_on",
+                "source_id": source.source_id,
+                "excerpt_id": excerpt.excerpt_id,
+            }
+        )
+    elif case_id == "unknown-relation-key":
+        ledger.admit_relation(
+            {
+                "schema_version": 1,
+                "relation_id": "relation-unknown-key",
+                "claim_id": "claim-bounded",
+                "relation": "support",
+                "source_id": source.source_id,
+                "excerpt_id": excerpt.excerpt_id,
+                "unexpected": True,
+            }
+        )
+    elif case_id == "unadmitted-source":
+        ledger.admit_relation(
+            {
+                "schema_version": 1,
+                "relation_id": "relation-source-missing",
+                "claim_id": "claim-bounded",
+                "relation": "support",
+                "source_id": "source-missing",
+                "excerpt_id": excerpt.excerpt_id,
+            }
+        )
+    elif case_id == "unadmitted-excerpt":
+        ledger.admit_relation(
+            {
+                "schema_version": 1,
+                "relation_id": "relation-excerpt-missing",
+                "claim_id": "claim-bounded",
+                "relation": "support",
+                "source_id": source.source_id,
+                "excerpt_id": "excerpt-missing",
+            }
+        )
+    elif case_id == "unadmitted-premise":
+        ledger.admit_claim(
+            TypedClaim(
+                claim_id="claim-inference",
+                claim_type="inference",
+                text="Unadmitted premise.",
+                premise_ids=("claim-missing",),
+                evidence_ids=("relation-support",),
+            )
+        )
+    elif case_id == "unadmitted-evidence":
+        ledger.admit_claim(
+            TypedClaim(
+                claim_id="claim-inference",
+                claim_type="inference",
+                text="Unadmitted evidence.",
+                premise_ids=("claim-bounded",),
+                evidence_ids=("relation-missing",),
+            )
+        )
+
+
+def _fixture_excerpt(source: SourceReceipt) -> ExcerptReceipt:
+    return ExcerptReceipt.from_text(
+        source,
+        text='{"answer":"bounded"}',
+        selector="$.answer",
+    )
 
 
 def _research_start(

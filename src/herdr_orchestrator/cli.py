@@ -81,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
     research_resume.add_argument("--run-id", required=True)
     research_resume.add_argument("--input-id", required=True)
     research_resume.add_argument("--input", required=True)
+    research_evidence_fixture = research_subparsers.add_parser("evidence-fixture")
+    research_evidence_fixture.add_argument("--workflow", required=True)
+    research_evidence_fixture.add_argument(
+        "--case",
+        "--fixture-case",
+        dest="case",
+        required=True,
+    )
 
     smoke_parser = subparsers.add_parser("smoke")
     smoke_parser.add_argument("--workflow", required=True)
