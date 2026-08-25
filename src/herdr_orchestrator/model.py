@@ -190,6 +190,7 @@ class DispatchOutcome:
     task_verified: bool | None = None
     error_summary: str | None = None
     agent_settled: bool | None = None
+    phase_timings_ms: dict[str, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)

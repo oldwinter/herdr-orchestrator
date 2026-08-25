@@ -106,6 +106,36 @@ class DistributionCliTests(unittest.TestCase):
             "doctor_probe_timeout_out_of_range",
         )
 
+    def test_doctor_reports_wrapper_manifest_version_skew(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            manifest_path = project / ".herdr-orchestrator/manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = "0.0.0"
+            manifest_path.write_text(
+                f"{json.dumps(manifest, indent=2)}\n",
+                encoding="utf-8",
+            )
+
+            doctor = self._run("doctor", "--project", str(project))
+
+        self.assertEqual(doctor.returncode, 1, doctor.stderr)
+        payload = json.loads(doctor.stdout)
+        installation = payload["installation"]
+        self.assertFalse(installation["ok"])
+        self.assertTrue(installation["version_skew"])
+        self.assertEqual(installation["installed_version"], "0.0.0")
+        self.assertEqual(installation["runtime_version"], __version__)
+
     def test_install_keeps_a_real_git_worktree_status_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

@@ -6,8 +6,9 @@ python := "python3"
 default:
     @just --list
 
-doctor:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}}
+[positional-arguments]
+doctor *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}} "$@"
 
 test:
     @PYTHONPATH=src {{python}} -m unittest discover -s tests -p 'test_*.py' -v
@@ -55,8 +56,16 @@ retry job_id *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{workflow}} --job-id {{quote(job_id)}} "$@"
 
 [positional-arguments]
+resume job_id response_file:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator resume --workflow {{workflow}} --job-id {{quote(job_id)}} --response-file {{quote(response_file)}}
+
+[positional-arguments]
 gc *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{workflow}} --succeeded-agents "$@"
+
+[positional-arguments]
+gc-failed *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{workflow}} --failed-agents "$@"
 
 enqueue-auto title prompt_file dedupe_key *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} "$@"

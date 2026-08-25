@@ -104,6 +104,54 @@ class CliTests(unittest.TestCase):
         self.assertEqual(droid["status"], "auth_required")
         self.assertFalse(droid["ok"])
 
+    def test_doctor_can_filter_harnesses_and_reports_probe_timing(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        output = io.StringIO()
+        probed: list[Harness] = []
+
+        def readiness_probe(
+            workflow: object,
+            harness: Harness,
+            timeout_seconds: int,
+        ) -> dict[str, object]:
+            probed.append(harness)
+            return {
+                "status": "ready",
+                "error_code": None,
+                "error_summary": None,
+                "duration_ms": 7,
+            }
+
+        with redirect_stdout(output):
+            code = doctor(
+                config,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                which=lambda name: f"/bin/{name}",
+                version_runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                    ["herdr", "--version"],
+                    0,
+                    "herdr 0.8.2\n",
+                    "",
+                ),
+                readiness_probe=readiness_probe,
+                selected_harnesses=["droid"],
+            )
+
+        report = json.loads(output.getvalue())
+        readiness = [
+            check for check in report["checks"] if check["check"].startswith("readiness:")
+        ]
+        self.assertEqual(code, 0)
+        self.assertEqual(probed, [Harness.DROID])
+        self.assertEqual([check["check"] for check in readiness], ["readiness:droid"])
+        self.assertEqual(readiness[0]["duration_ms"], 7)
+        self.assertEqual(report["summary"]["harnesses"], ["droid"])
+        self.assertEqual(report["summary"]["readiness_ms"], 7)
+
     def test_dashboard_defaults_to_loopback_live_view(self) -> None:
         args = build_parser().parse_args(
             [
@@ -116,6 +164,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.host, "127.0.0.1")
         self.assertEqual(args.port, 8765)
         self.assertEqual(args.poll_seconds, 2.0)
+
+    def test_doctor_accepts_repeatable_harness_filter(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "doctor",
+                "--workflow",
+                "workflow.toml",
+                "--harness",
+                "droid",
+                "--harness",
+                "codex",
+            ]
+        )
+
+        self.assertEqual(args.harness, ["droid", "codex"])
 
     def test_enqueue_defaults_to_automatic_selection(self) -> None:
         args = build_parser().parse_args(
@@ -208,6 +271,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.job_id, 42)
         self.assertEqual(args.extra_attempts, 2)
 
+    def test_resume_accepts_job_and_response_file(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "resume",
+                "--workflow",
+                "workflow.toml",
+                "--job-id",
+                "42",
+                "--response-file",
+                "approval.txt",
+            ]
+        )
+
+        self.assertEqual(args.job_id, 42)
+        self.assertEqual(args.response_file, "approval.txt")
+
     def test_gc_defaults_to_dry_run_for_succeeded_agents(self) -> None:
         args = build_parser().parse_args(
             [
@@ -219,6 +298,21 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertTrue(args.succeeded_agents)
+        self.assertFalse(args.failed_agents)
+        self.assertFalse(args.apply)
+
+    def test_gc_accepts_owned_failed_agents_scope(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "gc",
+                "--workflow",
+                "workflow.toml",
+                "--failed-agents",
+            ]
+        )
+
+        self.assertFalse(args.succeeded_agents)
+        self.assertTrue(args.failed_agents)
         self.assertFalse(args.apply)
 
     def test_smoke_uses_target_files_and_requires_an_output_receipt(self) -> None:

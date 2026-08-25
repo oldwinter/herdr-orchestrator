@@ -61,6 +61,17 @@ class Dispatcher(Protocol):
         context: DispatchContext | None = None,
     ) -> DispatchOutcome: ...
 
+    def respond(
+        self,
+        name: str,
+        harness: Harness,
+        response: str,
+        *,
+        timeout_seconds: int,
+        expected_pane_id: str,
+        context: DispatchContext | None,
+    ) -> DispatchOutcome: ...
+
 
 class _DispatchDeadlineExceeded(RuntimeError):
     pass
@@ -261,10 +272,12 @@ class Coordinator:
                     worker_pool_idle=(
                         active[JobState.PENDING.value] == 0
                         and active[JobState.RUNNING.value] == 0
+                        and active[JobState.BLOCKED.value] == 0
                     ),
                     queue_idle=(
                         last_queue[JobState.PENDING.value] == 0
                         and last_queue[JobState.RUNNING.value] == 0
+                        and last_queue[JobState.BLOCKED.value] == 0
                     ),
                 )
             waves += 1
@@ -284,11 +297,24 @@ class Coordinator:
             worker_pool_idle = (
                 active[JobState.PENDING.value] == 0
                 and active[JobState.RUNNING.value] == 0
+                and active[JobState.BLOCKED.value] == 0
             )
             queue_idle = (
                 last_queue[JobState.PENDING.value] == 0
                 and last_queue[JobState.RUNNING.value] == 0
+                and last_queue[JobState.BLOCKED.value] == 0
             )
+            if active[JobState.BLOCKED.value] > 0:
+                return self._drain_report(
+                    aggregate,
+                    idle=False,
+                    reason="blocked",
+                    waves=waves,
+                    claimed=total_claimed,
+                    queue=last_queue,
+                    worker_pool_idle=False,
+                    queue_idle=queue_idle,
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return self._drain_report(
@@ -314,6 +340,62 @@ class Coordinator:
                 )
             if claimed == 0:
                 time.sleep(min(self.config.coordinator.poll_seconds, remaining))
+
+    def resume_blocked(
+        self,
+        job_id: int,
+        response: str,
+    ) -> dict[str, object]:
+        if not response.strip():
+            raise ValueError("blocked_response_empty")
+        responder = getattr(self.dispatcher, "respond", None)
+        if not callable(responder):
+            raise ValueError("dispatcher_resume_unsupported")
+        self.initialize()
+        job, expected_pane_id = self.store.claim_blocked_for_resume(
+            self.config.name,
+            job_id,
+            lease_seconds=self.config.coordinator.lease_seconds,
+        )
+        context = DispatchContext(
+            placement=job.placement,
+            title=job.title,
+            task_key=job.dedupe_key,
+            batch_key=f"resume-{job.job_id}-{job.attempt}",
+            worktree_root=self.config.placement.worktree_root,
+            receipt=job.receipt,
+        )
+        try:
+            outcome = responder(
+                job.agent_name,
+                job.harness,
+                response,
+                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                expected_pane_id=expected_pane_id,
+                context=context,
+            )
+        except Exception:
+            outcome = DispatchOutcome(
+                agent_name=job.agent_name,
+                state=AgentState.UNKNOWN,
+                member_reused=True,
+                pane_id=expected_pane_id,
+                error_code="resume_unhandled_error",
+                placement=job.placement,
+            )
+        state = self.store.record_resume_outcome(job, outcome)
+        return {
+            "job_id": job.job_id,
+            "state": state.value,
+            "attempt": job.attempt,
+            "agent_name": job.agent_name,
+            "pane_id": expected_pane_id,
+            "agent_state": outcome.state.value,
+            "error_code": outcome.error_code,
+            "agent_settled": outcome.agent_settled,
+            "task_verified": outcome.task_verified,
+            "queue": self.store.status_counts(self.config.name),
+        }
 
     def _drain_report(
         self,
@@ -342,8 +424,25 @@ class Coordinator:
         }
 
     def gc_succeeded_agents(self, *, dry_run: bool = True) -> dict[str, object]:
+        return self._gc_agents({JobState.SUCCEEDED}, dry_run=dry_run)
+
+    def gc_failed_agents(self, *, dry_run: bool = True) -> dict[str, object]:
+        return self._gc_agents({JobState.FAILED}, dry_run=dry_run)
+
+    def _gc_agents(
+        self,
+        target_states: set[JobState],
+        *,
+        dry_run: bool,
+    ) -> dict[str, object]:
+        if not target_states or not target_states <= {
+            JobState.SUCCEEDED,
+            JobState.FAILED,
+        }:
+            raise ValueError("gc_states_invalid")
         self.initialize()
         rows = self.store.jobs(self.config.name)
+        target_values = {state.value for state in target_states}
         created_panes = self.store.created_agent_panes(self.config.name)
         owned_names = {
             name
@@ -360,14 +459,17 @@ class Coordinator:
         active_names = {
             str(row["agent_name"])
             for row in rows
-            if row["state"] != JobState.SUCCEEDED.value and row["agent_name"]
+            if row["state"] not in target_values and row["agent_name"]
         }
         candidates_by_name: dict[str, dict[str, object]] = {}
         skipped_worktrees = 0
         skipped_unowned = 0
         skipped_active = 0
+        skipped_blocked = 0
         for row in rows:
-            if row["state"] != JobState.SUCCEEDED.value:
+            if row["state"] == JobState.BLOCKED.value:
+                skipped_blocked += 1
+            if row["state"] not in target_values:
                 continue
             if row["placement"] == PlacementTarget.WORKTREE.value:
                 skipped_worktrees += 1
@@ -388,6 +490,7 @@ class Coordinator:
                 "agent_name": name,
                 "placement": str(row["placement"]),
                 "pane_id": created_panes[name],
+                "state": str(row["state"]),
             }
         closer = getattr(self.dispatcher, "close_agent_terminal", None)
         if not callable(closer):
@@ -407,6 +510,8 @@ class Coordinator:
             "candidate_count": len(candidates),
             "candidates": candidates,
             "actions": actions,
+            "states": sorted(target_values),
+            "skipped_blocked": skipped_blocked,
             "skipped_worktrees": skipped_worktrees,
             "skipped_unowned": skipped_unowned,
             "skipped_active": skipped_active,
@@ -577,6 +682,11 @@ class Coordinator:
         dedupe_key: str,
     ) -> Harness:
         controller = self._controller_harness()
+        controller_name = _controller_agent_name(
+            self.config.name,
+            self.config.workspace,
+            controller,
+        )
         profiles = self._worker_profiles()
         digest = hashlib.sha256(
             f"{self.config.name}\0{dedupe_key}".encode()
@@ -584,6 +694,7 @@ class Coordinator:
         output_file = self.config.planner.output_file.parent / f"route-{digest}.json"
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.unlink(missing_ok=True)
+        outcome: DispatchOutcome | None = None
         try:
             outcome = self.dispatcher.dispatch(
                 controller,
@@ -594,11 +705,7 @@ class Coordinator:
                     self.worker_harnesses,
                 ),
                 timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-                agent_name=_controller_agent_name(
-                    self.config.name,
-                    self.config.workspace,
-                    controller,
-                ),
+                agent_name=controller_name,
                 context=DispatchContext(
                     PlacementTarget.TAB,
                     "Worker routing",
@@ -620,6 +727,19 @@ class Coordinator:
             raise ValueError(str(exc)) from exc
         finally:
             output_file.unlink(missing_ok=True)
+            self._close_ephemeral_controller(controller_name, outcome)
+
+    def _close_ephemeral_controller(
+        self,
+        controller_name: str,
+        outcome: DispatchOutcome | None,
+    ) -> None:
+        if outcome is None or outcome.member_reused:
+            return
+        closer = getattr(self.dispatcher, "close_created_agent", None)
+        if not callable(closer):
+            raise ValueError("dispatcher_controller_cleanup_unsupported")
+        closer(controller_name)
 
     def _controller_harness(self) -> Harness:
         return select_controller_harness(

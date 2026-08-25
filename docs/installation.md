@@ -112,7 +112,9 @@ npx --yes herdr-orchestrator status --project .
 npx --yes herdr-orchestrator run --project . --once
 npx --yes herdr-orchestrator run --project . --until-idle
 npx --yes herdr-orchestrator retry --project . --job-id 42
+npx --yes herdr-orchestrator resume --project . --job-id 43 --response-file approval.txt
 npx --yes herdr-orchestrator gc --project . --succeeded-agents
+npx --yes herdr-orchestrator gc --project . --failed-agents
 npx --yes herdr-orchestrator dashboard --project .
 ```
 
@@ -128,10 +130,14 @@ npx --yes herdr-orchestrator enqueue --project . \
 ```
 
 `run --once` reports the claimed wave in `batch` and the ending global counts in `queue`.
-`--until-idle` repeats waves until the selected worker pool has no pending/running work or the
-bounded drain timeout expires. Read `worker_pool_idle` and `queue_idle` separately when the
-worker pool is narrowed. Retry retains job identity and adds attempt budget only to a failed
-job. GC is dry-run unless `--apply` is present and never removes worktrees; cleanup requires a
+`--until-idle` repeats waves until the selected worker pool has no pending/running/blocked work or
+the bounded drain timeout expires. A blocked job returns `idle=false`, `reason=blocked`. Read
+`worker_pool_idle` and `queue_idle` separately when the worker pool is narrowed. Retry retains job
+identity and adds attempt budget only to a failed job. After human review, `resume` sends the
+response file to the exact recorded blocked agent and pane without incrementing the attempt or
+repeating the task prompt. GC is dry-run unless `--apply` is present. Succeeded and failed agents
+use separate explicit scopes; blocked agents are never regular GC candidates. GC never removes
+worktrees; cleanup requires a
 persisted creation receipt and an unchanged current pane ID. It closes only that pane, including
 for tab-placed jobs, and never closes the containing tab.
 

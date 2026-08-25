@@ -81,7 +81,8 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - `idle` / `done` 只表示 agent settled；声明 task receipt 时必须 `task_verified=true`。
 - 所有 Herdr wait 必须有 timeout。
 - 不关闭非本运行创建的 pane 或 agent。
-- 普通 queue 的 `blocked` 是 terminal；只有 opt-in 标准交付执行有界 controller response loop。
+- 普通 queue 的 `blocked` 是 terminal，不自动回答；只有人工显式 `resume --response-file`
+  可恢复原 agent/pane/attempt。仅 opt-in 标准交付执行自动的有界 controller response loop。
 - runtime state、完整终端输出和原始 prompt 不进入 Git。
 - npm Trusted Publishing 不支持 self-hosted runner；只有测试和版本 gate 使用专属 runner，
   `publish` 必须保持 GitHub-hosted 且不得引入长期 npm token。

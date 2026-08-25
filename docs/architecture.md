@@ -33,12 +33,15 @@ pending -> running -> succeeded
                    -> blocked
                    -> pending  (仍可重试)
                    -> failed   (耗尽重试)
+blocked --显式 resume response--> succeeded | blocked
 ```
 
 claim 在 `BEGIN IMMEDIATE` 事务内完成。`running` 任务持有 `lease_until`；coordinator 崩溃后，lease 过期任务可再次 claim。每次 claim 增加 attempt。
 
 耗尽 attempt 的 `failed` job 可用显式 `retry` 在原 job id 和 `dedupe_key` 上追加有界 attempt
-budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。
+budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。普通 queue 不自动回答
+`blocked`；人工审查后可用显式 `resume --response-file` 回答原 agent。resume 必须匹配已记录的
+agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提问仍保持 blocked。
 
 ### Coordinator
 
@@ -50,15 +53,17 @@ budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。
 - 普通 queue 的 `blocked` 单独落 terminal 状态；
 - settled 后跨 harness 检测有界 fatal runtime 信号，包括登录墙、device login、provider
   retry exhaustion 与 invalid model，命中后保留稳定错误码和截断摘要；
-- enqueue 可声明 output-prefix 或 execution-root file receipt；声明后必须验证通过才能成功，
-  并分别记录 `agent_settled` 与 `task_verified`；
+- enqueue 可声明 output-prefix 或 execution-root file receipt；声明后必须验证通过才能成功。
+  output-prefix 只接受当前 turn 新增且不与 prompt 独立行歧义的输出，file receipt 必须在当前
+  turn 新建或改变；分别记录 `agent_settled` 与 `task_verified`；
 - `unknown`、timeout 和协议错误按失败与重试策略处理。
 - 对必须写 strict JSON 的 turn，settled 后目标 artifact 缺失会在同一已 ready agent 上仅重发
   一次；artifact handshake 防止 startup lifecycle 变化被误认成任务完成。
 
 `run_once` 输出保留兼容的顶层本波计数，并新增 `claimed`、`batch` 和结束时全局 `queue`。
 `run_until_idle` 在有界 timeout 内重复 replica-limited wave，且把剩余 deadline 传给每个
-dispatch，直到当前 worker pool 没有 pending/running。结果用 `worker_pool_idle` 与
+dispatch，直到当前 worker pool 没有 pending/running/blocked。blocked 会立即返回
+`idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
 `queue_idle` 明确区分所选 pool 和全局 queue；pool 外任务不会造成假死，也不会被误报为
 全局排空。
 
@@ -88,9 +93,9 @@ Worktree path 与 branch 从 workflow 和 task key 稳定派生，retry 可恢�
 审查。Standardized delivery 仍使用自己的 integration/ticket worktree DAG 和收据协议，
 不与普通 queue topology 混用。
 
-显式 GC 默认 dry-run，只回收名称、workspace、cwd、placement 和 settled state 均能证明由
-当前 workflow 拥有的 succeeded agent pane；即使任务原 placement 为 tab，也不会关闭整个
-tab。worktree 与 active/foreign agent 始终跳过。
+显式 GC 默认 dry-run。succeeded 与 failed 使用独立 scope，只回收名称、workspace、cwd、
+placement 和 settled state 均能证明由当前 workflow 拥有的 agent pane；即使任务原
+placement 为 tab，也不会关闭整个 tab。blocked、worktree 与 active/foreign agent 始终跳过。
 
 ### Local operations dashboard
 
@@ -134,8 +139,9 @@ workspace、tab、pane、agent lifecycle 和 worktree 的白名单字段。浏�
   都进入有界 recovery wait 后再验证；
 - 新 agent 在固定 settle 窗口后必须重新读取并确认 `interactive_ready=true`；startup
   瞬态 `blocked` 会在 settle 后复查，只有持续 blocked 才成为任务阻塞；
-- prompt submission 使用 5 秒 acceptance handshake，必须观察到
-  `state_change_seq` 前进；进入 `working` 后由 coordinator 独立等待 settled；
+- prompt submission 使用 Herdr 默认 `agent prompt --wait`，其内部 acceptance handshake
+  仍必须观察到 `state_change_seq` 前进；command timeout 后先复查 sequence，已进入
+  `working` 就继续等待，未前进则返回 phase-specific `prompt_acceptance_timeout`；
 - `agent_prompt_stalled` 且仍停在原 idle sequence 时最多重发两次 Enter；仍没有 lifecycle
   变化则快速返回 `agent_turn_not_observed`，不占满整个 agent timeout；
 - 每个 harness 使用独立后台 tab 和 full-size root pane，始终 `--no-focus`，避免多 agent 连续 split 后 TUI 过窄；

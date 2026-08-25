@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -32,6 +33,7 @@ from herdr_orchestrator.model import (
     DispatchContext,
     Harness,
     HarnessProfile,
+    JobState,
     PlacementTarget,
     ReceiptKind,
     TaskReceipt,
@@ -55,15 +57,28 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("--workflow", required=True)
     doctor_parser.add_argument("--probe-timeout-seconds", type=int, default=30)
+    doctor_parser.add_argument(
+        "--harness",
+        action="append",
+        choices=[item.value for item in Harness],
+        help="Limit readiness probes to one enabled harness; repeat for more than one.",
+    )
 
     retry_parser = subparsers.add_parser("retry")
     retry_parser.add_argument("--workflow", required=True)
     retry_parser.add_argument("--job-id", type=int, required=True)
     retry_parser.add_argument("--extra-attempts", type=int, choices=range(1, 11), default=1)
 
+    resume_parser = subparsers.add_parser("resume")
+    resume_parser.add_argument("--workflow", required=True)
+    resume_parser.add_argument("--job-id", type=int, required=True)
+    resume_parser.add_argument("--response-file", required=True)
+
     gc_parser = subparsers.add_parser("gc")
     gc_parser.add_argument("--workflow", required=True)
-    gc_parser.add_argument("--succeeded-agents", action="store_true", required=True)
+    gc_scope = gc_parser.add_mutually_exclusive_group(required=True)
+    gc_scope.add_argument("--succeeded-agents", action="store_true")
+    gc_scope.add_argument("--failed-agents", action="store_true")
     gc_parser.add_argument("--apply", action="store_true")
 
     smoke_parser = subparsers.add_parser("smoke")
@@ -160,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 return doctor(
                     config,
                     probe_timeout_seconds=args.probe_timeout_seconds,
+                    selected_harnesses=args.harness,
                 )
             case "seed":
                 added, existing = Coordinator(config).seed()
@@ -175,8 +191,23 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(json.dumps(result, sort_keys=True))
                 return 0
+            case "resume":
+                response_file = Path(args.response_file).expanduser().resolve()
+                if not response_file.is_file():
+                    raise ValueError(f"response_file_not_found: {response_file}")
+                result = Coordinator(config).resume_blocked(
+                    args.job_id,
+                    response_file.read_text(encoding="utf-8").strip(),
+                )
+                print(json.dumps(result, sort_keys=True))
+                return 0 if result["state"] == JobState.SUCCEEDED.value else 1
             case "gc":
-                result = Coordinator(config).gc_succeeded_agents(dry_run=not args.apply)
+                coordinator = Coordinator(config)
+                result = (
+                    coordinator.gc_succeeded_agents(dry_run=not args.apply)
+                    if args.succeeded_agents
+                    else coordinator.gc_failed_agents(dry_run=not args.apply)
+                )
                 print(json.dumps(result, indent=2, sort_keys=True))
                 return 0
             case "enqueue":
@@ -395,6 +426,7 @@ def doctor(
     version_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     readiness_probe: ReadinessProbe | None = None,
     probe_timeout_seconds: int = 30,
+    selected_harnesses: list[str] | None = None,
 ) -> int:
     current_environ = os.environ if environ is None else environ
     probe = readiness_probe or probe_harness_readiness
@@ -454,6 +486,14 @@ def doctor(
     harnesses = [worker.harness for worker in workflow.workers]
     if workflow.planner.harness is not None and workflow.planner.harness not in harnesses:
         harnesses.append(workflow.planner.harness)
+    if selected_harnesses:
+        enabled = set(harnesses)
+        selected = list(dict.fromkeys(Harness(value) for value in selected_harnesses))
+        unavailable = [harness.value for harness in selected if harness not in enabled]
+        if unavailable:
+            raise ValueError(f"doctor_harness_not_enabled: {','.join(unavailable)}")
+        harnesses = selected
+    readiness_ms = 0
     for harness in harnesses:
         executable = which(harness.value)
         checks.append(
@@ -490,7 +530,9 @@ def doctor(
                 ),
                 "error_summary": None,
             }
+            duration_ms = 0
         else:
+            probe_started = time.monotonic()
             try:
                 readiness = probe(workflow, harness, probe_timeout_seconds)
             except Exception as exc:
@@ -499,6 +541,14 @@ def doctor(
                     "error_code": "readiness_probe_failed",
                     "error_summary": " ".join(str(exc).split())[:300] or None,
                 }
+            measured_ms = max(0, int((time.monotonic() - probe_started) * 1000))
+            reported_ms = readiness.get("duration_ms")
+            duration_ms = (
+                int(reported_ms)
+                if isinstance(reported_ms, int) and not isinstance(reported_ms, bool)
+                else measured_ms
+            )
+        readiness_ms += duration_ms
         status = str(readiness.get("status", "error"))
         checks.append(
             {
@@ -507,10 +557,29 @@ def doctor(
                 "status": status,
                 "error_code": readiness.get("error_code"),
                 "error_summary": readiness.get("error_summary"),
+                "duration_ms": duration_ms,
+                "phase_timings_ms": readiness.get("phase_timings_ms", {}),
             }
         )
     ok = all(bool(check["ok"]) for check in checks)
-    print(json.dumps({"checks": checks, "ok": ok}, indent=2, sort_keys=True))
+    passed = sum(bool(check["ok"]) for check in checks)
+    print(
+        json.dumps(
+            {
+                "checks": checks,
+                "ok": ok,
+                "summary": {
+                    "checks": len(checks),
+                    "failed": len(checks) - passed,
+                    "harnesses": [harness.value for harness in harnesses],
+                    "passed": passed,
+                    "readiness_ms": readiness_ms,
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0 if ok else 1
 
 
@@ -524,6 +593,7 @@ def probe_harness_readiness(
     active_transport = transport or HerdrTransport(workflow.name, workflow.workspace)
     name = doctor_agent_name(workflow.name, harness)
     prefix = f"HERDR-DOCTOR-OK harness={harness.value}"
+    started = time.monotonic()
     try:
         outcome = active_transport.dispatch(
             harness,
@@ -547,6 +617,8 @@ def probe_harness_readiness(
         "agent_auth_required": "auth_required",
         "agent_model_invalid": "model_invalid",
         "herdr_timeout": "timeout",
+        "timeout": "timeout",
+        "prompt_acceptance_timeout": "timeout",
         "agent_provider_failed": "error",
         "herdr_unavailable": "unavailable",
         "not_in_herdr": "unavailable",
@@ -559,6 +631,8 @@ def probe_harness_readiness(
         "status": status,
         "error_code": outcome.error_code,
         "error_summary": outcome.error_summary,
+        "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
+        "phase_timings_ms": outcome.phase_timings_ms or {},
     }
 
 

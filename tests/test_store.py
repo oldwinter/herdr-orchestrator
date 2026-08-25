@@ -209,6 +209,47 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(state, JobState.BLOCKED)
         self.assertEqual(self.store.status_counts("example")["blocked"], 1)
 
+    def test_blocked_job_can_resume_same_attempt_and_record_success(self) -> None:
+        job_id, _ = self.store.enqueue(_job("resume", max_attempts=1))
+        claimed = self.store.claim("example", limit=1, lease_seconds=60)[0]
+        self.store.record_outcome(
+            claimed,
+            DispatchOutcome(
+                "worker",
+                AgentState.BLOCKED,
+                False,
+                "w1:p2",
+                "agent_blocked",
+            ),
+        )
+
+        blocked, pane_id = self.store.claim_blocked_for_resume(
+            "example",
+            job_id,
+            lease_seconds=60,
+        )
+        state = self.store.record_resume_outcome(
+            blocked,
+            DispatchOutcome(
+                "worker",
+                AgentState.DONE,
+                True,
+                "w1:p2",
+            ),
+        )
+        job = self.store.jobs("example")[0]
+        with sqlite3.connect(self.store.path) as connection:
+            receipt_count = connection.execute(
+                "SELECT COUNT(*) FROM receipts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+
+        self.assertEqual(pane_id, "w1:p2")
+        self.assertEqual(blocked.attempt, 1)
+        self.assertEqual(state, JobState.SUCCEEDED)
+        self.assertEqual(job["attempts"], 1)
+        self.assertEqual(receipt_count, 2)
+
     def test_failure_retries_then_exhausts_attempts(self) -> None:
         self.store.enqueue(_job("one", max_attempts=2))
         first = self.store.claim("example", limit=1, lease_seconds=60)[0]

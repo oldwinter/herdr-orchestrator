@@ -45,6 +45,7 @@ class FakeDispatcher:
         self.timeouts: list[float] = []
         self.prompts: dict[Harness, str] = {}
         self.contexts: list[DispatchContext | None] = []
+        self.closed_created_agents: list[str] = []
 
     def dispatch(
         self,
@@ -89,6 +90,9 @@ class FakeDispatcher:
             )
         return self.outcomes[harness]
 
+    def close_created_agent(self, name: str) -> None:
+        self.closed_created_agents.append(name)
+
 
 class CleanupDispatcher(FakeDispatcher):
     def __init__(self) -> None:
@@ -111,6 +115,41 @@ class CleanupDispatcher(FakeDispatcher):
             "pane_id": expected_pane_id,
             "action": "would_close" if dry_run else "closed",
         }
+
+
+class ResumeDispatcher(FakeDispatcher):
+    def __init__(
+        self,
+        outcomes: dict[Harness, DispatchOutcome],
+        resume_outcome: DispatchOutcome,
+    ) -> None:
+        super().__init__(outcomes)
+        self.resume_outcome = resume_outcome
+        self.responses: list[
+            tuple[str, Harness, str, int, str, DispatchContext | None]
+        ] = []
+
+    def respond(
+        self,
+        name: str,
+        harness: Harness,
+        response: str,
+        *,
+        timeout_seconds: int,
+        expected_pane_id: str,
+        context: DispatchContext | None,
+    ) -> DispatchOutcome:
+        self.responses.append(
+            (
+                name,
+                harness,
+                response,
+                timeout_seconds,
+                expected_pane_id,
+                context,
+            )
+        )
+        return self.resume_outcome
 
 
 class CoordinatorTests(unittest.TestCase):
@@ -189,6 +228,80 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(result["queue_idle"])
         self.assertTrue(result["worker_pool_idle"])
         self.assertTrue(all(0 < timeout <= 10 for timeout in dispatcher.timeouts))
+
+    def test_run_until_idle_reports_blocked_instead_of_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "worker",
+                        AgentState.BLOCKED,
+                        False,
+                        "w1:p2",
+                        "agent_blocked",
+                    )
+                }
+            )
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+            ).run_until_idle(timeout_seconds=10)
+
+        self.assertFalse(result["idle"])
+        self.assertEqual(result["reason"], "blocked")
+        self.assertFalse(result["worker_pool_idle"])
+        self.assertFalse(result["queue_idle"])
+        self.assertEqual(result["queue"]["blocked"], 1)
+
+    def test_resume_blocked_uses_same_agent_pane_and_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            dispatcher = ResumeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "droid-worker",
+                        AgentState.BLOCKED,
+                        False,
+                        "w1:p2",
+                        "agent_blocked",
+                    )
+                },
+                DispatchOutcome(
+                    "droid-worker",
+                    AgentState.DONE,
+                    True,
+                    "w1:p2",
+                ),
+            )
+            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+            job_id, _ = store.enqueue(_job(config.name, Harness.DROID))
+            coordinator.run_once()
+
+            result = coordinator.resume_blocked(job_id, "Approve this local action.")
+            job = store.jobs(config.name)[0]
+
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual(job["attempts"], 1)
+        self.assertEqual(dispatcher.calls, [Harness.DROID])
+        self.assertEqual(len(dispatcher.responses), 1)
+        response = dispatcher.responses[0]
+        self.assertEqual(response[0], "droid-worker")
+        self.assertEqual(response[2], "Approve this local action.")
+        self.assertEqual(response[4], "w1:p2")
 
     def test_run_until_idle_does_not_report_idle_after_the_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -494,6 +607,71 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result["candidate_count"], 0)
         self.assertEqual(result["skipped_unowned"], 1)
 
+    def test_gc_can_preview_owned_failed_agents_but_excludes_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(
+                replace(
+                    _job(config.name, Harness.DROID, suffix="failed"),
+                    max_attempts=1,
+                )
+            )
+            store.enqueue(_job(config.name, Harness.CLAUDE, suffix="blocked"))
+            droid_name = replica_slot_names(
+                config.name,
+                config.workspace,
+                Harness.DROID,
+                1,
+            )[0]
+            claude_name = replica_slot_names(
+                config.name,
+                config.workspace,
+                Harness.CLAUDE,
+                1,
+            )[0]
+            claimed = store.claim(
+                config.name,
+                limit=2,
+                lease_seconds=60,
+                slot_names={
+                    Harness.DROID.value: (droid_name,),
+                    Harness.CLAUDE.value: (claude_name,),
+                },
+            )
+            for job in claimed:
+                if job.harness is Harness.DROID:
+                    outcome = DispatchOutcome(
+                        job.agent_name,
+                        AgentState.UNKNOWN,
+                        False,
+                        "w1:p2",
+                        "agent_provider_failed",
+                    )
+                else:
+                    outcome = DispatchOutcome(
+                        job.agent_name,
+                        AgentState.BLOCKED,
+                        False,
+                        "w1:p3",
+                        "agent_blocked",
+                    )
+                store.record_outcome(job, outcome)
+            dispatcher = CleanupDispatcher()
+            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+
+            result = coordinator.gc_failed_agents(dry_run=True)
+
+        self.assertEqual(result["candidate_count"], 1)
+        self.assertEqual(result["candidates"][0]["state"], "failed")
+        self.assertEqual(result["candidates"][0]["agent_name"], droid_name)
+        self.assertEqual(result["skipped_blocked"], 1)
+        self.assertEqual(dispatcher.closed, [])
+
     def test_enqueue_carries_declared_receipt_through_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -605,6 +783,52 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIn('"harness": "codex"', dispatcher.prompts[Harness.DROID])
         self.assertNotIn('"harness": "claude"', dispatcher.prompts[Harness.DROID])
         self.assertIn("Title: Build", dispatcher.prompts[Harness.DROID])
+        self.assertEqual(len(dispatcher.closed_created_agents), 1)
+
+    def test_auto_router_timeout_closes_controller_created_for_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(
+                    base.planner,
+                    output_file=root / "plans/planner.json",
+                ),
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Implement a focused change.", encoding="utf-8")
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "router",
+                        AgentState.UNKNOWN,
+                        False,
+                        "w1:p2",
+                        "prompt_acceptance_timeout",
+                    )
+                }
+            )
+            coordinator = Coordinator(
+                config,
+                dispatcher=dispatcher,
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.GROK, Harness.CODEX),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "worker_selection_failed:prompt_acceptance_timeout",
+            ):
+                coordinator.enqueue_prompt_file(
+                    harness=None,
+                    title="Build",
+                    prompt_file=prompt_file,
+                    dedupe_key="auto-route-timeout",
+                )
+
+        self.assertEqual(len(dispatcher.closed_created_agents), 1)
 
     def test_explicit_enqueue_does_not_start_router(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

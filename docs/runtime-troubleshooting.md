@@ -51,16 +51,22 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 ## 当前防回归行为
 
 - 新 agent 固定 settle 后，有界等待 `interactive_ready=true`。
-- startup 瞬态 blocked 会复查；普通 turn 中的 persistent blocked 仍是 terminal。
-- prompt acceptance 最多等待 5 秒，要求观察到新的 lifecycle sequence。
+- startup 瞬态 blocked 会复查；普通 turn 中的 persistent blocked 仍是 terminal，且
+  `run --until-idle` 返回 `idle=false`、`reason=blocked`。
+- prompt 使用 Herdr 默认 `--wait`；内部 acceptance 仍要求新的 lifecycle sequence。command
+  timeout 后先复查 sequence，已前进则继续，未前进返回 `prompt_acceptance_timeout`。
 - stalled prompt 最多重发两次 Enter；仍无变化返回 `agent_turn_not_observed`。
 - 进入 `working` 后继续使用 workflow 的 `agent_timeout_seconds` 等待 settled。
 - principal proxy 使用 pane literal text 加 agent Enter 回答 blocked worker，再等待新的
   lifecycle sequence；普通 queue 不自动回答。
+- 人工审查后，普通 queue 可用显式 `resume --job-id ... --response-file ...` 回答；命令验证
+  原 agent、pane 与 execution workspace，保持原 attempt 且不重发任务 prompt。
 - `unknown`、timeout、未观察到 turn 和协议错误都不会记成功。
 - settled output 命中登录墙、device login、provider retry exhaustion 或 invalid model 时，
   不会记成功，并保留稳定错误码与有界摘要。
 - 声明的 output/file receipt 缺失返回 `task_receipt_missing`，即使 agent 已 idle/done。
+  output-prefix 必须来自当前 turn 的新增输出，独立 prompt echo 返回
+  `task_receipt_ambiguous`；未改变的既有 file receipt 返回 `task_receipt_stale`。
 
 ## 诊断顺序
 
@@ -68,6 +74,14 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 
 ```bash
 just status
+```
+
+用 doctor 的 repeatable filter 收窄单一 harness；JSON 包含 compact summary、readiness 总耗时
+和 provision/turn/receipt phase timings：
+
+```bash
+just doctor --harness droid
+just doctor --harness droid --harness codex
 ```
 
 再读取结构化 agent 状态：
@@ -105,7 +119,10 @@ herdr integration status
 | `agent_auth_required` | settled output 命中登录或 device-code 等待 | 按 attempt 失败处理 |
 | `agent_model_invalid` | provider 拒绝默认 model identifier | 按 attempt 失败处理 |
 | `agent_provider_failed` | provider 请求重试耗尽 | 按 attempt 失败处理 |
+| `prompt_acceptance_timeout` | prompt command 超时且复查未观察到新 sequence | 按 attempt 重试；摘要含 phase/state/sequence |
 | `task_receipt_missing` | 声明的输出前缀或非空文件不存在 | 按 attempt 失败处理 |
+| `task_receipt_ambiguous` | output-prefix 与 prompt 独立行重合，无法证明 authorship | 按 attempt 失败处理 |
+| `task_receipt_stale` | file receipt 在当前 turn 前后未改变 | 按 attempt 失败处理 |
 
 ## 收口检查
 
