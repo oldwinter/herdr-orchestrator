@@ -728,7 +728,7 @@ class HerdrTransport:
                 start_timeout_ms / 1000,
             )
             try:
-                return run_json(self.runner, command)
+                started = run_json(self.runner, command)
             except TransportError as exc:
                 if exc.code == "agent_pane_busy" and attempt < 2:
                     self._sleep_until(
@@ -759,6 +759,30 @@ class HerdrTransport:
                         ),
                     )
                 raise
+            started_agent = _agent_payload(started)
+            startup_blocked = started_agent.get("agent_status") == AgentState.BLOCKED.value
+            if startup_blocked and self._accept_claude_workspace_trust(
+                name,
+                harness,
+                execution_workspace,
+            ):
+                recovery_timeout_ms = self._remaining_milliseconds(START_RECOVERY_TIMEOUT_MS)
+                return run_json(
+                    self.runner,
+                    Command(
+                        [
+                            "herdr",
+                            "agent",
+                            "wait",
+                            name,
+                            "--timeout",
+                            str(recovery_timeout_ms),
+                        ],
+                        self.workspace,
+                        recovery_timeout_ms / 1000,
+                    ),
+                )
+            return started
         raise TransportError("agent_start_failed")
 
     def _accept_claude_workspace_trust(

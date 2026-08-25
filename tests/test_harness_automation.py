@@ -141,6 +141,80 @@ class HarnessAutomationTests(unittest.TestCase):
             ["herdr", "agent", "send-keys", "test-claude", "enter"],
         )
 
+    def test_accepts_claude_trust_when_start_returns_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "blocked",
+                                "name": "test-claude",
+                                "pane_id": "w1:p2",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        (
+                            "Accessing workspace:\n"
+                            f"{workspace}\n"
+                            "Quick safety check:\n"
+                            "1. Yes, I trust this folder\n"
+                            "2. No, exit\n"
+                        ),
+                        "",
+                    ),
+                    _result({"type": "ok"}),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "claude",
+                                "agent_status": "idle",
+                                "interactive_ready": True,
+                                "name": "test-claude",
+                                "pane_id": "w1:p2",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                ]
+            )
+
+            result = _transport(workspace, runner)._start_agent(
+                "test-claude",
+                Harness.CLAUDE,
+                "w1:p2",
+                workspace,
+            )
+
+        self.assertEqual(result["agent"]["agent_status"], "idle")
+        self.assertEqual(
+            runner.calls[1],
+            [
+                "herdr",
+                "agent",
+                "read",
+                "test-claude",
+                "--source",
+                "detection",
+                "--lines",
+                "160",
+            ],
+        )
+        self.assertEqual(
+            runner.calls[2],
+            ["herdr", "agent", "send-keys", "test-claude", "enter"],
+        )
+        self.assertEqual(
+            runner.calls[3][:4],
+            ["herdr", "agent", "wait", "test-claude"],
+        )
+
     def test_does_not_answer_a_different_claude_startup_block(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
