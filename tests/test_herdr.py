@@ -512,6 +512,12 @@ class HerdrTransportTests(unittest.TestCase):
                             }
                         }
                     ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        "Startup still settling.\n",
+                        "",
+                    ),
                     _result(
                         {
                             "agent": {

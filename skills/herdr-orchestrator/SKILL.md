@@ -39,6 +39,21 @@ Stable harness names are `droid`, `grok`, `codex`, `pi`, `claude`, and `hermes`.
 support additional kinds such as `cursor`, but they are outside this workflow's validated
 catalog and cannot be passed to `--harness`.
 
+New agents start with the packaged maximum-automation policy: Droid `--auto high`, Grok
+`--always-approve --permission-mode bypassPermissions`, Codex
+`--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust`, pi
+`--approve`, Claude `--dangerously-skip-permissions`, and Hermes `--yolo --accept-hooks`.
+Do not rely on a harness approval dialog as a safety boundary. The control plane fixes these
+arguments; planner output and task prompts cannot replace them. External or destructive
+actions still require the user's separate exact authorization.
+
+Claude's first workspace-trust dialog has no native bypass flag. The adapter verifies the
+expected execution root and sends one Enter only when a newly created Claude agent exposes all
+three exact built-in markers:
+`Accessing workspace:`, `Quick safety check:`, and `Yes, I trust this folder`. Treat every
+other startup block, login, approval, or task question as unresolved; do not answer it
+automatically.
+
 ## 2. Write and enqueue the task packet
 
 Write the complete task contract to a UTF-8 file in the target repository before enqueueing.

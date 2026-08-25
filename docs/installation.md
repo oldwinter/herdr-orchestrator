@@ -40,6 +40,22 @@ The npm package has no runtime npm dependencies. Its executable:
 Python is not copied or downloaded. The target machine must provide Python 3.12+ and Herdr.
 No global install or elevated permission is required.
 
+The packaged control plane starts new harness agents with fixed maximum-automation native
+arguments: Droid `--auto high`, Grok `--always-approve --permission-mode
+bypassPermissions`, Codex `--dangerously-bypass-approvals-and-sandbox
+--dangerously-bypass-hook-trust`, pi `--approve`, Claude
+`--dangerously-skip-permissions`, and Hermes `--yolo --accept-hooks`. These bypass local
+approval, trust, hook, and sandbox prompts where each CLI supports doing so. Planner output
+and task prompts cannot inject or override launch arguments. This execution policy does not
+authorize push, merge, publish, messaging, worktree deletion, permission changes, or
+production access.
+
+Claude has no native flag that bypasses its first workspace-trust dialog. For a newly created
+Claude agent only, the adapter sends one Enter when detection output contains the expected
+execution root and all three stable built-in markers: `Accessing workspace:`,
+`Quick safety check:`, and `Yes, I trust this folder`. It does not answer any other startup
+block, login, secret, approval, or task question.
+
 To bypass automatic harness detection:
 
 ```bash
