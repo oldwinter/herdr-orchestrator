@@ -26,7 +26,9 @@
       "idor",
       "symlink_traversal",
       "terminal_ownership",
-      "receipt_confusion"
+      "receipt_confusion",
+      "secret_disclosure",
+      "untrusted_ci_execution"
     ],
     "custom_patterns_path": null
   }

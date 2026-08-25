@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import subprocess
 import threading
 import time
 from collections import Counter
@@ -42,9 +43,7 @@ SETTLED_CONFIRMATION_POLLS = 6
 SETTLED_STATES = {AgentState.IDLE, AgentState.DONE}
 PROMPT_TIMEOUT_ERRORS = {"herdr_timeout", "timeout"}
 OUTPUT_RECEIPT_UI_MARKERS = {"\u26ec", "⧬", "⏺", "•", "●", "◆", "◇", "✦"}
-CLAUDE_AUTH_FAILURE = re.compile(
-    r"(?im)^\s*⏺\s+Please run /login\b.*\bAPI Error:\s*(?:401|403)\b"
-)
+CLAUDE_AUTH_FAILURE = re.compile(r"(?im)^\s*⏺\s+Please run /login\b.*\bAPI Error:\s*(?:401|403)\b")
 INVALID_MODEL_FAILURE = re.compile(
     r"(?is)(?:"
     r"ValidationException\b.{0,240}\bmodel\s+identifier\b.{0,120}\binvalid\b"
@@ -195,15 +194,14 @@ class HerdrTransport:
                 dispatch_context.receipt,
                 self._layout.execution_workspace(dispatch_context),
             )
-            phase_timings_ms["receipt_baseline"] = _elapsed_ms(
-                receipt_baseline_started
-            )
+            phase_timings_ms["receipt_baseline"] = _elapsed_ms(receipt_baseline_started)
             turn_started = time.monotonic()
             try:
                 state = self._prompt(name, harness, prompt, timeout_seconds)
             finally:
                 phase_timings_ms["turn_settlement"] = _elapsed_ms(turn_started)
             receipt_verification_started = time.monotonic()
+            task_verified: bool | None
             try:
                 if dispatch_context.receipt is not None and state not in SETTLED_STATES:
                     task_verified = False
@@ -217,9 +215,7 @@ class HerdrTransport:
                         file_before=receipt_file_before,
                     )
             finally:
-                phase_timings_ms["receipt_verification"] = _elapsed_ms(
-                    receipt_verification_started
-                )
+                phase_timings_ms["receipt_verification"] = _elapsed_ms(receipt_verification_started)
         except TransportError as exc:
             phase_timings_ms["total"] = _elapsed_ms(dispatch_started)
             terminal = self._created_terminals.get(name)
@@ -240,10 +236,7 @@ class HerdrTransport:
                 ),
                 task_verified=(False if dispatch_context.receipt is not None else None),
                 error_summary=exc.summary,
-                agent_settled=(
-                    exc.agent_settled
-                    or state in SETTLED_STATES
-                ),
+                agent_settled=(exc.agent_settled or state in SETTLED_STATES),
                 phase_timings_ms=phase_timings_ms,
             )
         phase_timings_ms["total"] = _elapsed_ms(dispatch_started)
@@ -293,53 +286,13 @@ class HerdrTransport:
         workspace_id: str | None = None
         try:
             self.check_environment()
-            current = _agent_payload(
-                run_json(
-                    self.runner,
-                    Command(
-                        ["herdr", "agent", "get", name],
-                        self.workspace,
-                        CONTROL_TIMEOUT_SECONDS,
-                    ),
-                )
+            current, pane_id, workspace_id, execution_workspace = self._blocked_response_context(
+                name,
+                harness,
+                expected_pane_id=expected_pane_id,
+                context=context,
             )
-            if _agent_state(current) is not AgentState.BLOCKED:
-                raise TransportError("agent_not_blocked")
-            pane_id = _non_empty_string(current, "pane_id")
-            workspace_id = current.get("workspace_id")
-            if not isinstance(workspace_id, str):
-                workspace_id = None
-            if expected_pane_id is not None:
-                if current.get("name") != name:
-                    raise TransportError("agent_identity_mismatch")
-                if pane_id != expected_pane_id:
-                    raise TransportError("agent_pane_mismatch")
-                execution_workspace = self._layout.execution_workspace(
-                    context
-                    or DispatchContext(
-                        PlacementTarget.TAB,
-                        harness.value,
-                        name,
-                    )
-                )
-                for key in ("cwd", "foreground_cwd"):
-                    value = current.get(key)
-                    if (
-                        not isinstance(value, str)
-                        or not Path(value).resolve().is_relative_to(
-                            execution_workspace.resolve()
-                        )
-                    ):
-                        raise TransportError("agent_workspace_mismatch")
             receipt = context.receipt if context is not None else None
-            execution_workspace = self._layout.execution_workspace(
-                context
-                or DispatchContext(
-                    PlacementTarget.TAB,
-                    harness.value,
-                    name,
-                )
-            )
             output_before = self._snapshot_output_receipt(name, receipt)
             file_before = self._snapshot_file_receipt(receipt, execution_workspace)
             baseline_sequence = _state_change_sequence(current)
@@ -365,6 +318,7 @@ class HerdrTransport:
                 baseline_sequence,
                 timeout_seconds,
             )
+            task_verified: bool | None
             if receipt is not None and state not in SETTLED_STATES:
                 task_verified = False
             else:
@@ -385,9 +339,7 @@ class HerdrTransport:
                 error_code=exc.code,
                 placement=context.placement if context is not None else None,
                 execution_path=(
-                    str(self._layout.execution_workspace(context))
-                    if context is not None
-                    else None
+                    str(self._layout.execution_workspace(context)) if context is not None else None
                 ),
                 herdr_workspace_id=workspace_id,
                 task_verified=(False if context is not None and context.receipt else None),
@@ -405,6 +357,48 @@ class HerdrTransport:
             task_verified=task_verified,
             agent_settled=state in SETTLED_STATES,
         )
+
+    def _blocked_response_context(
+        self,
+        name: str,
+        harness: Harness,
+        *,
+        expected_pane_id: str | None,
+        context: DispatchContext | None,
+    ) -> tuple[Mapping[str, Any], str, str | None, Path]:
+        current = _agent_payload(
+            run_json(
+                self.runner,
+                Command(
+                    ["herdr", "agent", "get", name],
+                    self.workspace,
+                    CONTROL_TIMEOUT_SECONDS,
+                ),
+            )
+        )
+        if _agent_state(current) is not AgentState.BLOCKED:
+            raise TransportError("agent_not_blocked")
+        pane_id = _non_empty_string(current, "pane_id")
+        workspace_id = current.get("workspace_id")
+        if not isinstance(workspace_id, str):
+            workspace_id = None
+        execution_workspace = self._layout.execution_workspace(
+            context
+            or DispatchContext(
+                PlacementTarget.TAB,
+                harness.value,
+                name,
+            )
+        )
+        if expected_pane_id is not None:
+            _validate_blocked_agent(
+                current,
+                name=name,
+                pane_id=pane_id,
+                expected_pane_id=expected_pane_id,
+                execution_workspace=execution_workspace,
+            )
+        return current, pane_id, workspace_id, execution_workspace
 
     def _wait_after_blocked_response(
         self,
@@ -483,9 +477,8 @@ class HerdrTransport:
             raise TransportError("agent_workspace_mismatch")
         for key in ("cwd", "foreground_cwd"):
             value = agent.get(key)
-            if (
-                not isinstance(value, str)
-                or not Path(value).resolve().is_relative_to(self.workspace)
+            if not isinstance(value, str) or not Path(value).resolve().is_relative_to(
+                self.workspace
             ):
                 raise TransportError("agent_workspace_mismatch")
         if _agent_state(agent) not in SETTLED_STATES:
@@ -514,7 +507,7 @@ class HerdrTransport:
         *,
         cwd: str,
         timeout: float | None,
-    ) -> Any:
+    ) -> subprocess.CompletedProcess[str]:
         deadline = getattr(self._dispatch_deadline, "value", None)
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -525,9 +518,9 @@ class HerdrTransport:
 
     def _remaining_seconds(self, maximum: float) -> float:
         deadline = getattr(self._dispatch_deadline, "value", None)
-        if deadline is None:
+        if not isinstance(deadline, (int, float)):
             return maximum
-        remaining = deadline - time.monotonic()
+        remaining = float(deadline) - time.monotonic()
         if remaining <= 0:
             raise TransportError("herdr_timeout")
         return min(maximum, remaining)
@@ -590,9 +583,7 @@ class HerdrTransport:
             started_agent = _agent_payload(started)
             started_state = _agent_state(started_agent)
             if started_state not in SETTLED_STATES | {AgentState.BLOCKED}:
-                recovery_timeout_ms = self._remaining_milliseconds(
-                    START_RECOVERY_TIMEOUT_MS
-                )
+                recovery_timeout_ms = self._remaining_milliseconds(START_RECOVERY_TIMEOUT_MS)
                 started = run_json(
                     self.runner,
                     Command(
@@ -720,9 +711,7 @@ class HerdrTransport:
                     )
                     continue
                 if exc.code == "agent_not_ready":
-                    recovery_timeout_ms = self._remaining_milliseconds(
-                        START_RECOVERY_TIMEOUT_MS
-                    )
+                    recovery_timeout_ms = self._remaining_milliseconds(START_RECOVERY_TIMEOUT_MS)
                     return run_json(
                         self.runner,
                         Command(
@@ -1018,10 +1007,7 @@ class HerdrTransport:
         if receipt is None:
             return None
         if receipt.kind is ReceiptKind.OUTPUT_PREFIX:
-            if any(
-                _line_starts_with_receipt(line, receipt.value)
-                for line in prompt.splitlines()
-            ):
+            if any(_line_starts_with_receipt(line, receipt.value) for line in prompt.splitlines()):
                 raise TransportError("task_receipt_ambiguous")
             output = self._read_receipt_output(name)
             if not any(
@@ -1192,20 +1178,13 @@ def replica_slot_names(
     if replicas == 1:
         if placement is PlacementTarget.TAB:
             return (stable_agent_name(workflow_name, workspace, harness),)
-        seed = (
-            f"{workflow_name}\0{workspace.resolve()}\0{harness.value}"
-            f"\0{placement.value}"
-        )
+        seed = f"{workflow_name}\0{workspace.resolve()}\0{harness.value}" f"\0{placement.value}"
         digest = hashlib.sha256(seed.encode()).hexdigest()[:6]
         return (f"ho-{harness.value}{target}-{digest}"[:32],)
-    seed = (
-        f"{workflow_name}\0{workspace.resolve()}\0{harness.value}"
-        f"\0{placement.value}"
-    )
+    seed = f"{workflow_name}\0{workspace.resolve()}\0{harness.value}" f"\0{placement.value}"
     digest = hashlib.sha256(seed.encode()).hexdigest()[:6]
     return tuple(
-        f"ho-{harness.value}{target}-{index:02d}-{digest}"[:32]
-        for index in range(1, replicas + 1)
+        f"ho-{harness.value}{target}-{index:02d}-{digest}"[:32] for index in range(1, replicas + 1)
     )
 
 
@@ -1312,3 +1291,23 @@ def _validate_agent_identity(
         raise TransportError("agent_identity_mismatch")
     if agent.get("agent") != harness.value or agent.get("pane_id") != pane_id:
         raise TransportError("agent_identity_mismatch")
+
+
+def _validate_blocked_agent(
+    current: Mapping[str, Any],
+    *,
+    name: str,
+    pane_id: str,
+    expected_pane_id: str,
+    execution_workspace: Path,
+) -> None:
+    if current.get("name") != name:
+        raise TransportError("agent_identity_mismatch")
+    if pane_id != expected_pane_id:
+        raise TransportError("agent_pane_mismatch")
+    for key in ("cwd", "foreground_cwd"):
+        value = current.get(key)
+        if not isinstance(value, str) or not Path(value).resolve().is_relative_to(
+            execution_workspace.resolve()
+        ):
+            raise TransportError("agent_workspace_mismatch")

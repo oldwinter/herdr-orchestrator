@@ -27,9 +27,7 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
                 TicketReceipt(
                     ticket_id="01",
                     commit="abcdef1234567890",
-                    acceptance=(
-                        AcceptanceResult("The behavior works.", True, "test passes"),
-                    ),
+                    acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
                     checks=("python -m unittest: passed",),
                     summary="Implemented the slice.",
                 ),
@@ -121,9 +119,7 @@ class GithubTrackerTests(unittest.TestCase):
             TicketReceipt(
                 ticket_id="01",
                 commit="abcdef1234567890",
-                acceptance=(
-                    AcceptanceResult("The behavior works.", True, "test passes"),
-                ),
+                acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
                 checks=("python -m unittest: passed",),
                 summary="Implemented the slice.",
             ),

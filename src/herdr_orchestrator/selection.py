@@ -23,9 +23,7 @@ def effective_worker_harnesses(
 ) -> tuple[Harness, ...]:
     configured = tuple(worker.harness for worker in config.workers)
     requested = tuple(
-        override
-        if override is not None
-        else (config.planner.worker_harnesses or configured)
+        override if override is not None else (config.planner.worker_harnesses or configured)
     )
     if not requested:
         raise ValueError("worker_harnesses_empty")

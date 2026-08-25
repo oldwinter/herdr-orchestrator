@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -31,3 +31,65 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.black]
 target-version = ["py312"]
 line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--strict-config --strict-markers"
+
+[tool.coverage.run]
+branch = true
+source = ["herdr_orchestrator"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
+
+[tool.pylint.main]
+py-version = "3.12"
+jobs = 1
+
+[tool.pylint.basic]
+function-naming-style = "snake_case"
+method-naming-style = "snake_case"
+class-naming-style = "PascalCase"
+const-naming-style = "UPPER_CASE"
+good-names = ["do_GET"]
+
+[tool.pylint.similarities]
+min-similarity-lines = 8
+ignore-comments = true
+ignore-docstrings = true
+ignore-imports = true
+ignore-signatures = true
+
+[tool.deptry]
+known_first_party = ["herdr_orchestrator"]
+
+[dependency-groups]
+dev = [
+    "bandit==1.9.4",
+    "black==26.5.1",
+    "coverage==7.15.4",
+    "deptry==0.25.1",
+    "detect-secrets==1.5.0",
+    "import-linter==2.13",
+    "mypy==2.3.1",
+    "pip-audit==2.10.1",
+    "pre-commit==4.6.2",
+    "pylint==4.0.7",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "pytest-json-report==1.5.0",
+    "radon==6.0.1",
+    "ruff==0.16.4",
+    "vulture==2.16",
+    "xenon==0.9.3",
+]

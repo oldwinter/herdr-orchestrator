@@ -85,7 +85,9 @@ def run_json(
         raise TransportError("herdr_invalid_response") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
         raise TransportError("herdr_invalid_response")
-    return payload["result"]
+    result = payload["result"]
+    assert isinstance(result, dict)
+    return result
 
 
 def run_text(

@@ -164,217 +164,236 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _command_doctor(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    if not 5 <= args.probe_timeout_seconds <= 300:
+        raise ValueError("doctor_probe_timeout_out_of_range")
+    return doctor(
+        config,
+        probe_timeout_seconds=args.probe_timeout_seconds,
+        selected_harnesses=getattr(args, "harness", None),
+    )
+
+
+def _command_seed(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    del args
+    added, existing = Coordinator(config).seed()
+    print(json.dumps({"added": added, "existing": existing}, sort_keys=True))
+    return 0
+
+
+def _command_retry(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    store = Store(config.state_db)
+    store.initialize()
+    result = store.retry_failed(
+        config.name,
+        args.job_id,
+        extra_attempts=args.extra_attempts,
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _command_resume(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    response_file = Path(args.response_file).expanduser().resolve()
+    if not response_file.is_file():
+        raise ValueError(f"response_file_not_found: {response_file}")
+    result = Coordinator(config).resume_blocked(
+        args.job_id,
+        response_file.read_text(encoding="utf-8").strip(),
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["state"] == JobState.SUCCEEDED.value else 1
+
+
+def _command_gc(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    coordinator = Coordinator(config)
+    result = (
+        coordinator.gc_succeeded_agents(dry_run=not args.apply)
+        if getattr(args, "succeeded_agents", True)
+        else coordinator.gc_failed_agents(dry_run=not args.apply)
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _command_enqueue(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    job_id, created, selected = _coordinator_from_args(config, args).enqueue_prompt_file(
+        harness=None if args.harness == "auto" else Harness(args.harness),
+        title=args.title,
+        prompt_file=Path(args.prompt_file).expanduser().resolve(),
+        dedupe_key=args.dedupe_key,
+        placement=None if args.placement == "auto" else PlacementTarget(args.placement),
+        receipt=_task_receipt_from_args(args),
+    )
+    print(
+        json.dumps(
+            {"created": created, "harness": selected.value, "job_id": job_id},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _delivery_config(config: WorkflowConfig, args: argparse.Namespace) -> WorkflowConfig:
+    delivery = config.standardized_delivery
+    if args.tracker_backend is not None:
+        delivery = replace(delivery, tracker_backend=TrackerBackend(args.tracker_backend))
+    if args.tracker_root is not None:
+        delivery = replace(
+            delivery,
+            tracker_root=Path(args.tracker_root).expanduser().resolve(),
+        )
+    if args.github_repository is not None:
+        delivery = replace(delivery, github_repository=str(args.github_repository))
+    if args.wayfinder is not None:
+        delivery = replace(delivery, wayfinder=WayfinderMode(args.wayfinder))
+    if args.max_parallel is not None:
+        delivery = replace(delivery, max_parallel=int(args.max_parallel))
+    if args.review_repair_rounds is not None:
+        delivery = replace(
+            delivery,
+            review_repair_rounds=int(args.review_repair_rounds),
+        )
+    if delivery.tracker_backend is TrackerBackend.GITHUB and delivery.github_repository is None:
+        raise ValueError("github_repository_required")
+    return replace(config, standardized_delivery=delivery)
+
+
+def _command_deliver(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    controller_harness, controller_auto, worker_harnesses = _selection(args)
+    delivery = StandardizedDelivery(
+        _delivery_config(config, args),
+        controller_harness=controller_harness,
+        controller_auto=controller_auto,
+        worker_harnesses=worker_harnesses,
+    )
+    result = delivery.run(Path(args.goal_file))
+    print(
+        json.dumps(
+            {
+                "artifact_root": str(result.artifact_root),
+                "integration_branch": result.integration_branch,
+                "integration_commit": result.integration_commit,
+                "review_rounds": result.review_rounds,
+                "run_id": result.run_id,
+                "status": result.status,
+                "tickets_completed": result.tickets_completed,
+                "tracker_references": result.tracker_references,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _command_run(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    coordinator = _coordinator_from_args(config, args)
+    if args.once:
+        print(json.dumps(coordinator.run_once(), sort_keys=True))
+        return 0
+    if args.until_idle:
+        if not 1 <= args.drain_timeout_seconds <= 86_400:
+            raise ValueError("drain_timeout_out_of_range")
+        result = coordinator.run_until_idle(timeout_seconds=args.drain_timeout_seconds)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["idle"] else 1
+    try:
+        coordinator.run_forever()
+    except KeyboardInterrupt:
+        print("coordinator_stopped", file=sys.stderr)
+    return 0
+
+
+def _command_status(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    del args
+    store = Store(config.state_db)
+    store.initialize()
+    print(
+        json.dumps(
+            {
+                "counts": store.status_counts(config.name),
+                "jobs": store.jobs(config.name),
+                "workflow": config.name,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _command_smoke(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    return smoke(config, selected_harnesses=args.harness)
+
+
+def _command_catalog(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    profiles = profiles_for_workers(config.profiles, config.workers)
+    print(render_compact_catalog(profiles) if args.format == "json" else _catalog_text(profiles))
+    return 0
+
+
+def _command_dashboard(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    dashboard = DashboardServer(
+        config,
+        host=args.host,
+        port=args.port,
+        poll_seconds=args.poll_seconds,
+    )
+    host, port = dashboard.address
+    print(
+        json.dumps(
+            {"status": "dashboard_started", "url": f"http://{host}:{port}"},
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    try:
+        dashboard.serve_forever()
+    except KeyboardInterrupt:
+        print("dashboard_stopped", file=sys.stderr)
+    return 0
+
+
+def _command_profile(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    profile = profile_for_harness(
+        profiles_for_workers(config.profiles, config.workers),
+        Harness(args.harness),
+    )
+    payload = full_profile_payload(profile)
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        profile_payload = payload["profile"]
+        assert isinstance(profile_payload, dict)
+        print(profile_payload["context"])
+    return 0
+
+
+CommandHandler = Callable[[WorkflowConfig, argparse.Namespace], int]
+COMMAND_HANDLERS: Mapping[str, CommandHandler] = {
+    "catalog": _command_catalog,
+    "dashboard": _command_dashboard,
+    "deliver": _command_deliver,
+    "doctor": _command_doctor,
+    "enqueue": _command_enqueue,
+    "gc": _command_gc,
+    "profile": _command_profile,
+    "resume": _command_resume,
+    "retry": _command_retry,
+    "run": _command_run,
+    "seed": _command_seed,
+    "smoke": _command_smoke,
+    "status": _command_status,
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = load_workflow(args.workflow)
-        match args.command:
-            case "doctor":
-                if not 5 <= args.probe_timeout_seconds <= 300:
-                    raise ValueError("doctor_probe_timeout_out_of_range")
-                return doctor(
-                    config,
-                    probe_timeout_seconds=args.probe_timeout_seconds,
-                    selected_harnesses=args.harness,
-                )
-            case "seed":
-                added, existing = Coordinator(config).seed()
-                print(json.dumps({"added": added, "existing": existing}, sort_keys=True))
-                return 0
-            case "retry":
-                store = Store(config.state_db)
-                store.initialize()
-                result = store.retry_failed(
-                    config.name,
-                    args.job_id,
-                    extra_attempts=args.extra_attempts,
-                )
-                print(json.dumps(result, sort_keys=True))
-                return 0
-            case "resume":
-                response_file = Path(args.response_file).expanduser().resolve()
-                if not response_file.is_file():
-                    raise ValueError(f"response_file_not_found: {response_file}")
-                result = Coordinator(config).resume_blocked(
-                    args.job_id,
-                    response_file.read_text(encoding="utf-8").strip(),
-                )
-                print(json.dumps(result, sort_keys=True))
-                return 0 if result["state"] == JobState.SUCCEEDED.value else 1
-            case "gc":
-                coordinator = Coordinator(config)
-                result = (
-                    coordinator.gc_succeeded_agents(dry_run=not args.apply)
-                    if args.succeeded_agents
-                    else coordinator.gc_failed_agents(dry_run=not args.apply)
-                )
-                print(json.dumps(result, indent=2, sort_keys=True))
-                return 0
-            case "enqueue":
-                prompt_file = Path(args.prompt_file).expanduser().resolve()
-                job_id, created, selected = _coordinator_from_args(
-                    config,
-                    args,
-                ).enqueue_prompt_file(
-                    harness=None if args.harness == "auto" else Harness(args.harness),
-                    title=args.title,
-                    prompt_file=prompt_file,
-                    dedupe_key=args.dedupe_key,
-                    placement=(
-                        None
-                        if args.placement == "auto"
-                        else PlacementTarget(args.placement)
-                    ),
-                    receipt=_task_receipt_from_args(args),
-                )
-                print(
-                    json.dumps(
-                        {
-                            "created": created,
-                            "harness": selected.value,
-                            "job_id": job_id,
-                        },
-                        sort_keys=True,
-                    )
-                )
-                return 0
-            case "deliver":
-                delivery_config = config.standardized_delivery
-                if args.tracker_backend is not None:
-                    delivery_config = replace(
-                        delivery_config,
-                        tracker_backend=TrackerBackend(args.tracker_backend),
-                    )
-                if args.tracker_root is not None:
-                    delivery_config = replace(
-                        delivery_config,
-                        tracker_root=Path(args.tracker_root).expanduser().resolve(),
-                    )
-                if args.github_repository is not None:
-                    delivery_config = replace(
-                        delivery_config,
-                        github_repository=args.github_repository,
-                    )
-                if args.wayfinder is not None:
-                    delivery_config = replace(
-                        delivery_config,
-                        wayfinder=WayfinderMode(args.wayfinder),
-                    )
-                if args.max_parallel is not None:
-                    delivery_config = replace(
-                        delivery_config,
-                        max_parallel=args.max_parallel,
-                    )
-                if args.review_repair_rounds is not None:
-                    delivery_config = replace(
-                        delivery_config,
-                        review_repair_rounds=args.review_repair_rounds,
-                    )
-                if (
-                    delivery_config.tracker_backend is TrackerBackend.GITHUB
-                    and delivery_config.github_repository is None
-                ):
-                    raise ValueError("github_repository_required")
-                delivery = StandardizedDelivery(
-                    replace(config, standardized_delivery=delivery_config),
-                    **_selection_kwargs(args),
-                )
-                result = delivery.run(Path(args.goal_file))
-                print(
-                    json.dumps(
-                        {
-                            "artifact_root": str(result.artifact_root),
-                            "integration_branch": result.integration_branch,
-                            "integration_commit": result.integration_commit,
-                            "review_rounds": result.review_rounds,
-                            "run_id": result.run_id,
-                            "status": result.status,
-                            "tickets_completed": result.tickets_completed,
-                            "tracker_references": result.tracker_references,
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    )
-                )
-                return 0
-            case "run":
-                coordinator = _coordinator_from_args(config, args)
-                if args.once:
-                    print(json.dumps(coordinator.run_once(), sort_keys=True))
-                    return 0
-                if args.until_idle:
-                    if not 1 <= args.drain_timeout_seconds <= 86_400:
-                        raise ValueError("drain_timeout_out_of_range")
-                    result = coordinator.run_until_idle(
-                        timeout_seconds=args.drain_timeout_seconds,
-                    )
-                    print(json.dumps(result, sort_keys=True))
-                    return 0 if result["idle"] else 1
-                try:
-                    coordinator.run_forever()
-                except KeyboardInterrupt:
-                    print("coordinator_stopped", file=sys.stderr)
-                return 0
-            case "status":
-                store = Store(config.state_db)
-                store.initialize()
-                print(
-                    json.dumps(
-                        {
-                            "counts": store.status_counts(config.name),
-                            "jobs": store.jobs(config.name),
-                            "workflow": config.name,
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    )
-                )
-                return 0
-            case "smoke":
-                return smoke(config, selected_harnesses=args.harness)
-            case "catalog":
-                profiles = profiles_for_workers(config.profiles, config.workers)
-                if args.format == "json":
-                    print(render_compact_catalog(profiles))
-                else:
-                    print(_catalog_text(profiles))
-                return 0
-            case "dashboard":
-                dashboard = DashboardServer(
-                    config,
-                    host=args.host,
-                    port=args.port,
-                    poll_seconds=args.poll_seconds,
-                )
-                host, port = dashboard.address
-                print(
-                    json.dumps(
-                        {
-                            "status": "dashboard_started",
-                            "url": f"http://{host}:{port}",
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-                try:
-                    dashboard.serve_forever()
-                except KeyboardInterrupt:
-                    print("dashboard_stopped", file=sys.stderr)
-                return 0
-            case "profile":
-                profile = profile_for_harness(
-                    profiles_for_workers(config.profiles, config.workers),
-                    Harness(args.harness),
-                )
-                payload = full_profile_payload(profile)
-                if args.format == "json":
-                    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-                else:
-                    profile_payload = payload["profile"]
-                    assert isinstance(profile_payload, dict)
-                    print(profile_payload["context"])
-                return 0
+        handler = COMMAND_HANDLERS.get(args.command)
+        return 2 if handler is None else handler(config, args)
     except DeliveryEscalation as exc:
         print(str(exc), file=sys.stderr)
         return 3
@@ -391,7 +410,6 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    return 2
 
 
 def _task_receipt_from_args(args: argparse.Namespace) -> TaskReceipt | None:
@@ -430,59 +448,8 @@ def doctor(
 ) -> int:
     current_environ = os.environ if environ is None else environ
     probe = readiness_probe or probe_harness_readiness
-    checks: list[dict[str, object]] = []
-    checks.append(
-        {
-            "check": "HERDR_ENV",
-            "ok": current_environ.get("HERDR_ENV") == "1",
-            "value": current_environ.get("HERDR_ENV"),
-        }
-    )
-    checks.append(
-        {
-            "check": "HERDR_PANE_ID",
-            "ok": bool(current_environ.get("HERDR_PANE_ID")),
-            "value": current_environ.get("HERDR_PANE_ID"),
-        }
-    )
-    checks.append(
-        {
-            "check": "HERDR_WORKSPACE_ID",
-            "ok": bool(current_environ.get("HERDR_WORKSPACE_ID")),
-            "value": current_environ.get("HERDR_WORKSPACE_ID"),
-        }
-    )
+    checks = _doctor_system_checks(workflow, current_environ, which, version_runner)
     herdr_path = which("herdr")
-    checks.append({"check": "herdr", "ok": herdr_path is not None, "value": herdr_path})
-    if herdr_path is not None:
-        try:
-            version = version_runner(
-                ["herdr", "--version"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            version = subprocess.CompletedProcess(["herdr", "--version"], 1, "", "")
-        checks.append(
-            {
-                "check": "herdr_version",
-                "ok": version.returncode == 0,
-                "value": version.stdout.strip(),
-            }
-        )
-    git_path = which("git")
-    checks.append({"check": "git", "ok": git_path is not None, "value": git_path})
-    if workflow.standardized_delivery.tracker_backend is TrackerBackend.GITHUB:
-        github_path = which("gh")
-        checks.append(
-            {
-                "check": "tracker:github",
-                "ok": github_path is not None,
-                "value": github_path,
-            }
-        )
     harnesses = [worker.harness for worker in workflow.workers]
     if workflow.planner.harness is not None and workflow.planner.harness not in harnesses:
         harnesses.append(workflow.planner.harness)
@@ -495,72 +462,19 @@ def doctor(
         harnesses = selected
     readiness_ms = 0
     for harness in harnesses:
-        executable = which(harness.value)
-        checks.append(
-            {
-                "check": f"harness:{harness.value}",
-                "ok": executable is not None,
-                "value": executable,
-            }
+        harness_checks = _doctor_harness_checks(
+            workflow,
+            harness,
+            current_environ,
+            which,
+            herdr_path,
+            probe,
+            probe_timeout_seconds,
         )
-        profile = profile_for_harness(workflow.profiles, harness)
-        profile_ok = profile.context_file.is_file()
-        checks.append(
-            {
-                "check": f"profile:{harness.value}",
-                "ok": profile_ok,
-                "value": str(profile.context_file),
-            }
-        )
-        environment_ready = (
-            current_environ.get("HERDR_ENV") == "1"
-            and bool(current_environ.get("HERDR_PANE_ID"))
-            and bool(current_environ.get("HERDR_WORKSPACE_ID"))
-            and herdr_path is not None
-        )
-        if executable is None or not profile_ok or not environment_ready:
-            readiness: Mapping[str, object] = {
-                "status": "unavailable",
-                "error_code": (
-                    "harness_unavailable"
-                    if executable is None
-                    else "profile_unavailable"
-                    if not profile_ok
-                    else "not_in_herdr"
-                ),
-                "error_summary": None,
-            }
-            duration_ms = 0
-        else:
-            probe_started = time.monotonic()
-            try:
-                readiness = probe(workflow, harness, probe_timeout_seconds)
-            except Exception as exc:
-                readiness = {
-                    "status": "error",
-                    "error_code": "readiness_probe_failed",
-                    "error_summary": " ".join(str(exc).split())[:300] or None,
-                }
-            measured_ms = max(0, int((time.monotonic() - probe_started) * 1000))
-            reported_ms = readiness.get("duration_ms")
-            duration_ms = (
-                int(reported_ms)
-                if isinstance(reported_ms, int) and not isinstance(reported_ms, bool)
-                else measured_ms
-            )
-        readiness_ms += duration_ms
-        status = str(readiness.get("status", "error"))
-        checks.append(
-            {
-                "check": f"readiness:{harness.value}",
-                "ok": status == "ready",
-                "status": status,
-                "error_code": readiness.get("error_code"),
-                "error_summary": readiness.get("error_summary"),
-                "duration_ms": duration_ms,
-                "phase_timings_ms": readiness.get("phase_timings_ms", {}),
-            }
-        )
+        checks.extend(harness_checks)
+        duration_ms = harness_checks[-1].get("duration_ms")
+        if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
+            readiness_ms += duration_ms
     ok = all(bool(check["ok"]) for check in checks)
     passed = sum(bool(check["ok"]) for check in checks)
     print(
@@ -581,6 +495,156 @@ def doctor(
         )
     )
     return 0 if ok else 1
+
+
+def _doctor_system_checks(
+    workflow: WorkflowConfig,
+    environ: Mapping[str, str],
+    which: Callable[[str], str | None],
+    version_runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> list[dict[str, object]]:
+    checks = [
+        {
+            "check": "HERDR_ENV",
+            "ok": environ.get("HERDR_ENV") == "1",
+            "value": environ.get("HERDR_ENV"),
+        },
+        {
+            "check": "HERDR_PANE_ID",
+            "ok": bool(environ.get("HERDR_PANE_ID")),
+            "value": environ.get("HERDR_PANE_ID"),
+        },
+        {
+            "check": "HERDR_WORKSPACE_ID",
+            "ok": bool(environ.get("HERDR_WORKSPACE_ID")),
+            "value": environ.get("HERDR_WORKSPACE_ID"),
+        },
+    ]
+    herdr_path = which("herdr")
+    checks.append({"check": "herdr", "ok": herdr_path is not None, "value": herdr_path})
+    if herdr_path is not None:
+        checks.append(_herdr_version_check(version_runner))
+    git_path = which("git")
+    checks.append({"check": "git", "ok": git_path is not None, "value": git_path})
+    if workflow.standardized_delivery.tracker_backend is TrackerBackend.GITHUB:
+        github_path = which("gh")
+        checks.append(
+            {
+                "check": "tracker:github",
+                "ok": github_path is not None,
+                "value": github_path,
+            }
+        )
+    return checks
+
+
+def _herdr_version_check(
+    version_runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, object]:
+    try:
+        version = version_runner(
+            ["herdr", "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        version = subprocess.CompletedProcess(["herdr", "--version"], 1, "", "")
+    return {
+        "check": "herdr_version",
+        "ok": version.returncode == 0,
+        "value": version.stdout.strip(),
+    }
+
+
+def _doctor_harness_checks(
+    workflow: WorkflowConfig,
+    harness: Harness,
+    environ: Mapping[str, str],
+    which: Callable[[str], str | None],
+    herdr_path: str | None,
+    probe: ReadinessProbe,
+    probe_timeout_seconds: int,
+) -> list[dict[str, object]]:
+    executable = which(harness.value)
+    profile = profile_for_harness(workflow.profiles, harness)
+    profile_ok = profile.context_file.is_file()
+    probe_started = time.monotonic()
+    readiness = _harness_readiness(
+        workflow,
+        harness,
+        environ,
+        executable,
+        profile_ok,
+        herdr_path,
+        probe,
+        probe_timeout_seconds,
+    )
+    measured_ms = max(0, int((time.monotonic() - probe_started) * 1000))
+    reported_ms = readiness.get("duration_ms")
+    duration_ms = (
+        int(reported_ms)
+        if isinstance(reported_ms, int) and not isinstance(reported_ms, bool)
+        else measured_ms
+    )
+    status = str(readiness.get("status", "error"))
+    return [
+        {
+            "check": f"harness:{harness.value}",
+            "ok": executable is not None,
+            "value": executable,
+        },
+        {
+            "check": f"profile:{harness.value}",
+            "ok": profile_ok,
+            "value": str(profile.context_file),
+        },
+        {
+            "check": f"readiness:{harness.value}",
+            "ok": status == "ready",
+            "status": status,
+            "error_code": readiness.get("error_code"),
+            "error_summary": readiness.get("error_summary"),
+            "duration_ms": duration_ms,
+            "phase_timings_ms": readiness.get("phase_timings_ms", {}),
+        },
+    ]
+
+
+def _harness_readiness(
+    workflow: WorkflowConfig,
+    harness: Harness,
+    environ: Mapping[str, str],
+    executable: str | None,
+    profile_ok: bool,
+    herdr_path: str | None,
+    probe: ReadinessProbe,
+    probe_timeout_seconds: int,
+) -> Mapping[str, object]:
+    environment_ready = (
+        environ.get("HERDR_ENV") == "1"
+        and bool(environ.get("HERDR_PANE_ID"))
+        and bool(environ.get("HERDR_WORKSPACE_ID"))
+        and herdr_path is not None
+    )
+    if executable is None or not profile_ok or not environment_ready:
+        error_code = "harness_unavailable"
+        if executable is not None:
+            error_code = "profile_unavailable" if not profile_ok else "not_in_herdr"
+        return {
+            "status": "unavailable",
+            "error_code": error_code,
+            "error_summary": None,
+        }
+    try:
+        return probe(workflow, harness, probe_timeout_seconds)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error_code": "readiness_probe_failed",
+            "error_summary": " ".join(str(exc).split())[:300] or None,
+        }
 
 
 def probe_harness_readiness(
@@ -647,9 +711,7 @@ def smoke(
     created_names: list[str] = []
     selected = set(selected_harnesses or ())
     workers = [
-        worker
-        for worker in workflow.workers
-        if not selected or worker.harness.value in selected
+        worker for worker in workflow.workers if not selected or worker.harness.value in selected
     ]
     try:
         for worker in workers:
@@ -677,10 +739,15 @@ def smoke(
             )
             if not outcome.member_reused:
                 created_names.append(name)
-            if outcome.error_code is not None or outcome.state not in {
-                AgentState.IDLE,
-                AgentState.DONE,
-            } or outcome.task_verified is not True:
+            if (
+                outcome.error_code is not None
+                or outcome.state
+                not in {
+                    AgentState.IDLE,
+                    AgentState.DONE,
+                }
+                or outcome.task_verified is not True
+            ):
                 failures.append(
                     {
                         "harness": harness.value,
@@ -757,27 +824,20 @@ def _coordinator_from_args(
     config: WorkflowConfig,
     args: argparse.Namespace,
 ) -> Coordinator:
+    controller_harness, controller_auto, worker_harnesses = _selection(args)
     return Coordinator(
         config,
-        **_selection_kwargs(args),
+        controller_harness=controller_harness,
+        controller_auto=controller_auto,
+        worker_harnesses=worker_harnesses,
     )
 
 
-def _selection_kwargs(args: argparse.Namespace) -> dict[str, object]:
+def _selection(
+    args: argparse.Namespace,
+) -> tuple[Harness | None, bool, tuple[Harness, ...] | None]:
     controller_value = getattr(args, "controller_harness", None)
-    controller = (
-        None
-        if controller_value in {None, "auto"}
-        else Harness(controller_value)
-    )
+    controller = None if controller_value in {None, "auto"} else Harness(controller_value)
     worker_values = getattr(args, "worker_harness", None)
-    workers = (
-        None
-        if worker_values is None
-        else tuple(Harness(value) for value in worker_values)
-    )
-    return {
-        "controller_harness": controller,
-        "controller_auto": controller_value == "auto",
-        "worker_harnesses": workers,
-    }
+    workers = None if worker_values is None else tuple(Harness(value) for value in worker_values)
+    return controller, controller_value == "auto", workers

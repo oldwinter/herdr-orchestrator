@@ -1,0 +1,6 @@
+# Repository-wide ownership and security-sensitive automation.
+* @oldwinter
+/.github/ @oldwinter
+/scripts/ @oldwinter
+/src/herdr_orchestrator/ @oldwinter
+/workflows/ @oldwinter

@@ -133,7 +133,8 @@ def plan_prompt(
     wayfinder_context = (
         "No Wayfinder map was needed."
         if wayfinder is None
-        else "Resolved Wayfinder map:\n" + json.dumps(
+        else "Resolved Wayfinder map:\n"
+        + json.dumps(
             _wayfinder_payload(wayfinder),
             ensure_ascii=False,
             indent=2,
@@ -229,6 +230,10 @@ def standards_review_prompt(
     base_commit: str,
     output_file: Path,
 ) -> str:
+    schema = (
+        '{{"standards":[{{"severity":"must-fix|advisory","summary":"...",'
+        '"evidence":"file/hunk","source":"documented rule or named smell"}}]}}'
+    )
     return f"""
 Review the committed diff `{base_commit}...HEAD` along the Standards axis only.
 Read this repository's documented instructions and standards. Report violations with a
@@ -244,7 +249,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{"standards":[{{"severity":"must-fix|advisory","summary":"...","evidence":"file/hunk","source":"documented rule or named smell"}}]}}
+{schema}
 """.strip()
 
 
@@ -253,6 +258,10 @@ def spec_review_prompt(
     plan: DeliveryPlan,
     output_file: Path,
 ) -> str:
+    schema = (
+        '{{"spec":[{{"severity":"must-fix|advisory","summary":"...",'
+        '"evidence":"file/hunk","source":"quoted spec text"}}]}}'
+    )
     return f"""
 Review the committed diff `{base_commit}...HEAD` along the Spec axis only. Report missing or
 partial requirements, unrequested scope, and implementations that contradict the accepted
@@ -268,7 +277,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{"spec":[{{"severity":"must-fix|advisory","summary":"...","evidence":"file/hunk","source":"quoted spec text"}}]}}
+{schema}
 """.strip()
 
 

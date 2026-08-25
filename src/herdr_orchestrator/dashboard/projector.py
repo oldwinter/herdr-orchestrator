@@ -34,14 +34,9 @@ class RuntimeProjector:
         herdr = self.herdr_observer.observe()
         generated_at = self.clock()
         agents_by_name = {
-            str(row["name"]): row
-            for row in herdr.agents
-            if isinstance(row.get("name"), str)
+            str(row["name"]): row for row in herdr.agents if isinstance(row.get("name"), str)
         }
-        jobs = [
-            self._project_job(row, agents_by_name, generated_at)
-            for row in queue.jobs
-        ]
+        jobs = [self._project_job(row, agents_by_name, generated_at) for row in queue.jobs]
         attention = _attention(jobs, herdr, generated_at)
         counts = Counter(str(job["state"]) for job in jobs)
         summary = {
@@ -52,13 +47,9 @@ class RuntimeProjector:
             "failed": counts["failed"],
             "succeeded": counts["succeeded"],
             "active_agents": sum(
-                str(agent.get("agent_status")) in ACTIVE_AGENT_STATES
-                for agent in herdr.agents
+                str(agent.get("agent_status")) in ACTIVE_AGENT_STATES for agent in herdr.agents
             ),
-            "worktrees": sum(
-                row.get("is_linked_worktree") is True
-                for row in herdr.worktrees
-            ),
+            "worktrees": sum(row.get("is_linked_worktree") is True for row in herdr.worktrees),
             "needs_attention": len(attention),
         }
         return {
@@ -84,11 +75,7 @@ class RuntimeProjector:
         generated_at: float,
     ) -> dict[str, object]:
         agent_name = row.get("agent_name")
-        agent = (
-            agents_by_name.get(agent_name)
-            if isinstance(agent_name, str)
-            else None
-        )
+        agent = agents_by_name.get(agent_name) if isinstance(agent_name, str) else None
         runtime = dict(agent) if agent is not None else None
         state = str(row["state"])
         drift: list[str] = []
@@ -114,26 +101,27 @@ class RuntimeProjector:
         ):
             drift.append("lease_expired")
         return {
-            "id": int(row["id"]),
+            "id": _integer(row["id"]),
             "title": str(row["title"]),
             "harness": str(row["harness"]),
             "dedupe_key": str(row["dedupe_key"]),
             "placement": row.get("placement"),
             "state": state,
-            "attempts": int(row["attempts"]),
-            "max_attempts": int(row["max_attempts"]),
+            "attempts": _integer(row["attempts"]),
+            "max_attempts": _integer(row["max_attempts"]),
             "available_at": row.get("available_at"),
             "lease_until": lease_until,
             "agent_name": agent_name,
             "error_code": row.get("error_code"),
             "error_summary": row.get("error_summary"),
+            "correlation_id": row.get("correlation_id"),
             "agent_settled": _nullable_bool(row.get("agent_settled")),
             "task_verified": _nullable_bool(row.get("task_verified")),
             "receipt_kind": row.get("receipt_kind"),
             "execution_path": row.get("execution_path"),
             "herdr_workspace_id": row.get("herdr_workspace_id"),
-            "created_at": float(row["created_at"]),
-            "updated_at": float(row["updated_at"]),
+            "created_at": _number(row["created_at"]),
+            "updated_at": _number(row["updated_at"]),
             "runtime": runtime,
             "drift": drift,
         }
@@ -175,7 +163,8 @@ def _attention(
                     job.get("error_code") or "Attempts exhausted",
                 )
             )
-        for code in job["drift"]:
+        drift = job.get("drift")
+        for code in drift if isinstance(drift, list) else []:
             items.append(
                 _job_attention(
                     job,
@@ -185,11 +174,7 @@ def _attention(
                 )
             )
         updated_at = job.get("updated_at")
-        if (
-            state == "running"
-            and isinstance(updated_at, (int, float))
-            and now - updated_at > 300
-        ):
+        if state == "running" and isinstance(updated_at, (int, float)) and now - updated_at > 300:
             items.append(
                 _job_attention(
                     job,
@@ -224,9 +209,7 @@ def _job_attention(
 
 def _topology(herdr: HerdrObservation, project_label: str) -> dict[str, object]:
     agents_by_pane = {
-        str(row["pane_id"]): row
-        for row in herdr.agents
-        if isinstance(row.get("pane_id"), str)
+        str(row["pane_id"]): row for row in herdr.agents if isinstance(row.get("pane_id"), str)
     }
     panes_by_tab: dict[str, list[dict[str, object]]] = {}
     for pane in herdr.panes:
@@ -270,21 +253,15 @@ def _topology(herdr: HerdrObservation, project_label: str) -> dict[str, object]:
                 "worktree_id": workspace_id,
                 "workspace_id": workspace_id,
                 "label": (
-                    linked_worktree.get("label")
-                    if isinstance(linked_worktree, dict)
-                    else None
+                    linked_worktree.get("label") if isinstance(linked_worktree, dict) else None
                 )
                 or projected.get("label")
                 or workspace_id,
                 "path": (
-                    linked_worktree.get("path")
-                    if isinstance(linked_worktree, dict)
-                    else None
+                    linked_worktree.get("path") if isinstance(linked_worktree, dict) else None
                 ),
                 "branch": (
-                    linked_worktree.get("branch")
-                    if isinstance(linked_worktree, dict)
-                    else None
+                    linked_worktree.get("branch") if isinstance(linked_worktree, dict) else None
                 ),
                 "is_linked_worktree": bool(
                     isinstance(linked_worktree, dict)
@@ -311,7 +288,7 @@ def _timeline(
     queue: QueueObservation,
     jobs: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    jobs_by_id = {int(job["id"]): job for job in jobs}
+    jobs_by_id = {_integer(job["id"]): job for job in jobs}
     events: list[dict[str, object]] = []
     for job in jobs:
         events.append(
@@ -329,26 +306,39 @@ def _timeline(
             }
         )
     for receipt in queue.receipts:
-        job_id = int(receipt["job_id"])
-        job = jobs_by_id.get(job_id)
-        if job is None:
+        job_id = _integer(receipt["job_id"])
+        matching_job = jobs_by_id.get(job_id)
+        if matching_job is None:
             continue
         events.append(
             {
                 "id": f"receipt:{receipt['id']}",
                 "type": "receipt",
-                "at": float(receipt["observed_at"]),
+                "at": _number(receipt["observed_at"]),
                 "job_id": job_id,
-                "title": job["title"],
+                "title": matching_job["title"],
                 "state": receipt["state"],
-                "attempt": int(receipt["attempt"]),
+                "attempt": _integer(receipt["attempt"]),
                 "agent_state": receipt["agent_state"],
                 "error_code": receipt["error_code"],
+                "correlation_id": receipt.get("correlation_id"),
                 "detail": (
                     f"{receipt['agent_name']} · "
-                    f"{receipt.get('placement') or job.get('placement') or 'tab'}"
+                    f"{receipt.get('placement') or matching_job.get('placement') or 'tab'}"
                 ),
             }
         )
-    events.sort(key=lambda event: (float(event["at"]), str(event["id"])), reverse=True)
+    events.sort(key=lambda event: (_number(event["at"]), str(event["id"])), reverse=True)
     return events[:100]
+
+
+def _integer(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("dashboard_integer_invalid")
+    return int(value)
+
+
+def _number(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("dashboard_number_invalid")
+    return float(value)

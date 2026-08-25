@@ -1,8 +1,8 @@
 {
-  "scan_id": "scan-2026-08-25-001",
-  "scan_date": "2026-08-25T07:21:04Z",
-  "scan_type": "working",
-  "commit_range": "HEAD..working-tree",
+  "scan_id": "scan-2026-08-25-readiness-rebased",
+  "scan_date": "2026-08-25T08:34:33.235336+00:00",
+  "scan_type": "commit",
+  "commit_range": "origin/main..HEAD",
   "pr_number": null,
   "threat_model_version": "1.0.0",
   "findings": [],
@@ -22,6 +22,6 @@
       "DoS": 0,
       "ElevationOfPrivilege": 0
     },
-    "files_analyzed": 19
+    "files_analyzed": 71
   }
 }

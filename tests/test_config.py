@@ -160,8 +160,7 @@ class ConfigTests(unittest.TestCase):
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
-                _minimal_workflow()
-                + """
+                _minimal_workflow() + """
 [standardized_delivery]
 tracker_backend = "github"
 github_repository = "owner/project"
@@ -191,9 +190,7 @@ def _minimal_workflow(
     planner_harness: str | None = "droid",
     planner_worker_harnesses: list[str] | None = None,
 ) -> str:
-    planner_harness_line = (
-        "" if planner_harness is None else f'harness = "{planner_harness}"'
-    )
+    planner_harness_line = "" if planner_harness is None else f'harness = "{planner_harness}"'
     planner_workers_line = (
         ""
         if planner_worker_harnesses is None

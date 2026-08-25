@@ -103,6 +103,7 @@ npx --yes herdr-orchestrator uninstall --project .
 ## 源码 checkout 快速开始
 
 ```bash
+uv sync --locked
 just doctor
 just test
 
@@ -122,6 +123,10 @@ just run
 just status
 ```
 
+开发环境、devcontainer、质量门禁与 Git hooks 见
+[`docs/development.md`](docs/development.md)。机器生成的完整 CLI 参数参考见
+[`docs/generated/cli.md`](docs/generated/cli.md)。
+
 ## 实时 Dashboard
 
 ```bash
@@ -135,6 +140,10 @@ just dashboard --port 9000 --poll-seconds 1
 workspace/tab/pane/agent 拓扑、原生 worktree 和 receipt 时间线。Dashboard 是只读投影，
 默认只监听 `127.0.0.1:8765`，不读取 prompt、环境变量或 terminal output。详细行为见
 [`docs/dashboard.md`](docs/dashboard.md)。
+
+Coordinator 为每次 dispatch 生成 correlation ID，并在本机记录经过脱敏的结构化事件、
+指标与告警。Sentry、PostHog 和 HTTPS webhook exporter 全部默认关闭，配置、隐私边界和
+告警 runbook 见 [`docs/observability.md`](docs/observability.md)。
 
 ## 六 harness 真实只读 smoke
 

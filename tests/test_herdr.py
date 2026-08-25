@@ -259,9 +259,7 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertLessEqual(int(start_timeout), 30_000)
         self.assertEqual(runner.calls[6][0:4], ["herdr", "agent", "prompt", outcome.agent_name])
         self.assertIn("--wait", runner.calls[6])
-        self.assertTrue(
-            all(timeout is None or timeout <= 30 for timeout in runner.timeouts)
-        )
+        self.assertTrue(all(timeout is None or timeout <= 30 for timeout in runner.timeouts))
         self.assertIn(3, sleeps)
 
     def test_reuses_matching_settled_agent(self) -> None:
@@ -480,9 +478,7 @@ class HerdrTransportTests(unittest.TestCase):
             if call[0:3] == ["herdr", "agent", "prompt"]
         )
         readiness_gets = [
-            call
-            for call in runner.calls[:prompt_call]
-            if call[0:3] == ["herdr", "agent", "get"]
+            call for call in runner.calls[:prompt_call] if call[0:3] == ["herdr", "agent", "get"]
         ]
         self.assertEqual(len(readiness_gets), 4)
 
@@ -834,9 +830,7 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(outcome.error_code, "agent_blocked")
         self.assertEqual(outcome.pane_id, "w1:p7")
         self.assertFalse(outcome.member_reused)
-        self.assertFalse(
-            any(call[0:3] == ["herdr", "tab", "close"] for call in runner.calls)
-        )
+        self.assertFalse(any(call[0:3] == ["herdr", "tab", "close"] for call in runner.calls))
 
     def test_polls_after_prompt_stalled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1504,17 +1498,10 @@ class HerdrTransportTests(unittest.TestCase):
 
         self.assertTrue(outcome.task_verified)
         self.assertEqual(outcome.state, AgentState.DONE)
-        receipt_reads = [
-            call
-            for call in runner.calls
-            if call[0:3] == ["herdr", "agent", "read"]
-        ]
+        receipt_reads = [call for call in runner.calls if call[0:3] == ["herdr", "agent", "read"]]
         self.assertTrue(receipt_reads)
         self.assertTrue(
-            all(
-                call[call.index("--source") + 1] == "recent-unwrapped"
-                for call in receipt_reads
-            )
+            all(call[call.index("--source") + 1] == "recent-unwrapped" for call in receipt_reads)
         )
 
     def test_does_not_verify_receipt_prefix_mentioned_only_in_prompt(self) -> None:
@@ -1627,8 +1614,7 @@ class HerdrTransportTests(unittest.TestCase):
                     subprocess.CompletedProcess(
                         ["herdr"],
                         0,
-                        "› Do the task and emit MOCK-OK harness=codex\n"
-                        "• MOCK-OK harness=codex",
+                        "› Do the task and emit MOCK-OK harness=codex\n" "• MOCK-OK harness=codex",
                         "",
                     )
                 ]
@@ -1705,6 +1691,7 @@ class HerdrTransportTests(unittest.TestCase):
                         }
                     )
                 raise AssertionError(f"unexpected call: {argv}")
+
             transport = HerdrTransport(
                 "example",
                 workspace,
@@ -2300,9 +2287,7 @@ class HerdrTransportTests(unittest.TestCase):
             runner.calls[2],
             ["herdr", "agent", "send-keys", "blocked-worker", "enter"],
         )
-        self.assertFalse(
-            any(call[0:3] == ["herdr", "agent", "prompt"] for call in runner.calls)
-        )
+        self.assertFalse(any(call[0:3] == ["herdr", "agent", "prompt"] for call in runner.calls))
 
     def test_refuses_blocked_response_when_owned_pane_changed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

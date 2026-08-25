@@ -61,11 +61,7 @@ def static_placement(
     if any(signal in content for signal in HARD_READ_ONLY_SIGNALS):
         return PlacementTarget.PANE
     if any(signal in content for signal in WRITE_SIGNALS):
-        return (
-            PlacementTarget.WORKTREE
-            if supports_worktree
-            else PlacementTarget.TAB
-        )
+        return PlacementTarget.WORKTREE if supports_worktree else PlacementTarget.TAB
     if any(signal in content for signal in READ_SIGNALS):
         return PlacementTarget.PANE
     return None
@@ -126,8 +122,11 @@ def load_topology_decision(
     rationale = payload.get("rationale")
     if not isinstance(rationale, str) or not rationale.strip() or len(rationale) > 2_000:
         raise TopologyDecisionError("topology_rationale_invalid")
+    placement = payload.get("placement")
+    if not isinstance(placement, str):
+        raise TopologyDecisionError("topology_placement_invalid")
     try:
-        target = PlacementTarget(payload.get("placement"))
+        target = PlacementTarget(placement)
     except (TypeError, ValueError) as exc:
         raise TopologyDecisionError("topology_placement_invalid") from exc
     return _validate_worktree(target, supports_worktree)

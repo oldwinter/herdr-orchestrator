@@ -80,6 +80,13 @@ queue execution does not authorize push, merge, publication, messaging, producti
 permission changes. The GitHub tracker backend is limited to explicitly selected issue
 operations for standardized delivery.
 
+### 2.8 Continuous integration
+
+Pull-request code is untrusted and runs only on ephemeral GitHub-hosted runners without write or
+OIDC permissions. Persistent self-hosted runners are reserved for trusted `main` release planning.
+Publishing remains GitHub-hosted because npm Trusted Publishing does not support self-hosted
+runners. Actions are pinned to immutable commit SHAs and credentials are not persisted.
+
 ## 3. Attack Surface Inventory
 
 | Surface | Untrusted inputs | Sensitive sinks | Primary controls |
@@ -254,6 +261,18 @@ Required: snapshot before dispatch, verify only after settled success states, re
 transcript evidence or changed file hash/size, and fail closed when prompt and receipt are
 indistinguishable.
 
+### 6.8 Secret disclosure
+
+Never log environment mappings or raw exceptions containing prompts. Pass structured telemetry
+through centralized sanitization, keep `.env` files ignored, maintain the reviewed secret
+baseline, and require HTTPS for optional exporters.
+
+### 6.9 Untrusted CI execution
+
+Never run `pull_request` code on a persistent self-hosted runner. Jobs with `issues: write`,
+`pull-requests: write`, `contents: write`, or `id-token: write` must not execute contributor code.
+Keep trusted release planning and GitHub-hosted publishing separate.
+
 ## 7. Security Testing Strategy
 
 - Unit-test path escape, symlink, schema, SQL state, lease, attempt, and ownership failures.
@@ -262,6 +281,8 @@ indistinguishable.
 - Run `just check` for every change and real read-only Herdr probes for lifecycle changes.
 - Scan npm tarballs for unintended files and compare wrapper/manifest versions.
 - Test dashboard loopback and Host rejection, field whitelists, and absence of prompts.
+- Assert that untrusted pull-request jobs remain GitHub-hosted and external-write jobs do not
+  execute contributor code.
 - Scan uncommitted and release diffs against this model before commit or publication.
 - Never include real secrets or full terminal transcripts in test fixtures or findings.
 

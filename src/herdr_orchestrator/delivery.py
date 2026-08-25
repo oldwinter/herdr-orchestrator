@@ -230,9 +230,9 @@ class StandardizedDelivery:
             ).encode()
         ).hexdigest()[:12]
         self._run_root = self.config.standardized_delivery.artifact_root / run_id
-        completed = _load_completed_result(self._run_root / "result.json", run_id)
-        if completed is not None:
-            return completed
+        completed_result = _load_completed_result(self._run_root / "result.json", run_id)
+        if completed_result is not None:
+            return completed_result
         self._run_root.mkdir(parents=True, exist_ok=True)
         self._write_state("running", stage="wayfinder")
         try:
@@ -244,13 +244,11 @@ class StandardizedDelivery:
                 "tracker_published",
                 {
                     "backend": self.config.standardized_delivery.tracker_backend.value,
-                    "tickets": {
-                        key: value.reference for key, value in references.items()
-                    },
+                    "tickets": {key: value.reference for key, value in references.items()},
                 },
             )
             self._write_state("running", stage="implementation")
-            integration, completed = self._implement_plan(plan)
+            integration, tickets_completed = self._implement_plan(plan)
             self._write_state("running", stage="final-review")
             review_rounds = self._review_and_repair(plan, integration)
             commit = GitWorkspace(
@@ -262,12 +260,10 @@ class StandardizedDelivery:
                 run_id=run_id,
                 status="succeeded",
                 artifact_root=self._run_root,
-                tracker_references={
-                    key: value.reference for key, value in references.items()
-                },
+                tracker_references={key: value.reference for key, value in references.items()},
                 integration_branch=integration.branch,
                 integration_commit=commit,
-                tickets_completed=completed,
+                tickets_completed=tickets_completed,
                 review_rounds=review_rounds,
             )
             _write_json(
@@ -340,11 +336,7 @@ class StandardizedDelivery:
             if iterations >= MAX_WAYFINDER_DECISIONS:
                 raise DeliveryError("wayfinder_decision_limit")
             selected = _first_decision_frontier(map_)
-            resolution_path = (
-                self._run_root
-                / "wayfinder"
-                / f"resolution-{selected.ticket_id}.json"
-            )
+            resolution_path = self._run_root / "wayfinder" / f"resolution-{selected.ticket_id}.json"
             resolution_path.parent.mkdir(parents=True, exist_ok=True)
             self._dispatch_artifact(
                 self.config.workspace,
@@ -363,12 +355,17 @@ class StandardizedDelivery:
                 selected=selected,
                 known_ids=tuple(ticket.ticket_id for ticket in map_.decisions),
             )
-            decisions = tuple(
-                replace(ticket, resolution=resolution.resolution)
-                if ticket.ticket_id == selected.ticket_id
-                else ticket
-                for ticket in map_.decisions
-            ) + resolution.new_decisions
+            decisions = (
+                tuple(
+                    (
+                        replace(ticket, resolution=resolution.resolution)
+                        if ticket.ticket_id == selected.ticket_id
+                        else ticket
+                    )
+                    for ticket in map_.decisions
+                )
+                + resolution.new_decisions
+            )
             map_ = WayfinderMap(
                 destination=map_.destination,
                 notes=map_.notes,
@@ -382,9 +379,7 @@ class StandardizedDelivery:
                 {
                     "ticket_id": selected.ticket_id,
                     "title": selected.title,
-                    "new_decisions": [
-                        ticket.ticket_id for ticket in resolution.new_decisions
-                    ],
+                    "new_decisions": [ticket.ticket_id for ticket in resolution.new_decisions],
                 },
             )
             iterations += 1
@@ -423,8 +418,7 @@ class StandardizedDelivery:
             frontier = [
                 ticket
                 for ticket in plan.tickets
-                if ticket.ticket_id not in completed
-                and set(ticket.blocked_by).issubset(completed)
+                if ticket.ticket_id not in completed and set(ticket.blocked_by).issubset(completed)
             ]
             if not frontier:
                 raise DeliveryError("ticket_dag_stalled")
@@ -495,9 +489,7 @@ class StandardizedDelivery:
             receipt = load_ticket_receipt(receipt_file, ticket)
             commit = git.validate_commit(worktree)
             if receipt.commit != commit:
-                raise DeliveryError(
-                    f"ticket_receipt_commit_mismatch: {ticket.ticket_id}"
-                )
+                raise DeliveryError(f"ticket_receipt_commit_mismatch: {ticket.ticket_id}")
             return _ImplementedTicket(ticket, worktree, receipt)
         profile = profile_for_harness(self.config.profiles, harness)
         prompt = execution_prompt(
@@ -529,12 +521,12 @@ class StandardizedDelivery:
 
     def _review_and_repair(self, plan: DeliveryPlan, integration: Worktree) -> int:
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
-        review_rounds = 0
-        for round_number in range(
-            self.config.standardized_delivery.review_repair_rounds + 1
+        rounds = range(self.config.standardized_delivery.review_repair_rounds + 1)
+        for review_rounds, round_number in enumerate(
+            rounds,
+            start=1,
         ):
             report = self._review(plan, integration, round_number)
-            review_rounds += 1
             findings = _finding_map(report)
             if not findings:
                 self._record(
@@ -542,9 +534,7 @@ class StandardizedDelivery:
                     {"round": round_number, "findings": 0, "accepted": []},
                 )
                 return review_rounds
-            verdict_file = (
-                self._run_root / "reviews" / f"round-{round_number}" / "verdict.json"
-            )
+            verdict_file = self._run_root / "reviews" / f"round-{round_number}" / "verdict.json"
             self._dispatch_artifact(
                 self.config.workspace,
                 self.controller,
@@ -556,10 +546,7 @@ class StandardizedDelivery:
                 verdict_file,
                 candidates=tuple(findings),
             )
-            accepted = {
-                finding_id: findings[finding_id]
-                for finding_id in verdict.accepted
-            }
+            accepted = {finding_id: findings[finding_id] for finding_id in verdict.accepted}
             must_fix = {
                 finding_id: finding
                 for finding_id, finding in accepted.items()
@@ -599,9 +586,7 @@ class StandardizedDelivery:
                 role=f"repair-{round_number + 1}",
             )
             _require_success(outcome, f"repair_{round_number + 1}")
-            after = git.validate_commit(
-                Worktree(integration.path, integration.branch, before)
-            )
+            after = git.validate_commit(Worktree(integration.path, integration.branch, before))
             self._record(
                 "review_repaired",
                 {"round": round_number + 1, "commit": after},
@@ -669,9 +654,9 @@ class StandardizedDelivery:
 
     def _select_worker(self, title: str, prompt: str, dedupe_key: str) -> Harness:
         profiles = self._worker_profiles()
-        digest = hashlib.sha256(
-            f"{self.config.name}\0delivery\0{dedupe_key}".encode()
-        ).hexdigest()[:12]
+        digest = hashlib.sha256(f"{self.config.name}\0delivery\0{dedupe_key}".encode()).hexdigest()[
+            :12
+        ]
         output = self._run_root / "routes" / f"{digest}.json"
         output.parent.mkdir(parents=True, exist_ok=True)
         if not output.is_file():
@@ -735,10 +720,7 @@ class StandardizedDelivery:
         *,
         role: str,
     ) -> DispatchOutcome:
-        if (
-            workspace.resolve() == self.config.workspace.resolve()
-            and harness is self.controller
-        ):
+        if workspace.resolve() == self.config.workspace.resolve() and harness is self.controller:
             agent_name = _controller_agent_name(
                 self.config.name,
                 workspace,
@@ -763,9 +745,7 @@ class StandardizedDelivery:
                     lines=120,
                 )
             except TransportError as exc:
-                raise DeliveryError(
-                    f"principal_proxy_read_failed:{exc.code}"
-                ) from exc
+                raise DeliveryError(f"principal_proxy_read_failed:{exc.code}") from exc
             question_hash = hashlib.sha256(question.encode()).hexdigest()[:12]
             if SENSITIVE_QUESTION.search(question):
                 self._record(
@@ -777,11 +757,7 @@ class StandardizedDelivery:
                     },
                 )
                 raise DeliveryEscalation("principal_proxy_sensitive_escalation")
-            decision_file = (
-                self._run_root
-                / "proxy"
-                / f"{agent_name}-{proxy_round + 1}.json"
-            )
+            decision_file = self._run_root / "proxy" / f"{agent_name}-{proxy_round + 1}.json"
             self._run_proxy_decision(
                 question,
                 decision_file,
@@ -848,8 +824,7 @@ class StandardizedDelivery:
 
     def _worker_profiles(self) -> tuple[HarnessProfile, ...]:
         return tuple(
-            profile_for_harness(self.config.profiles, harness)
-            for harness in self.worker_harnesses
+            profile_for_harness(self.config.profiles, harness) for harness in self.worker_harnesses
         )
 
     def _record(self, event: str, details: dict[str, object]) -> None:
@@ -876,9 +851,7 @@ class StandardizedDelivery:
 
 
 def _first_decision_frontier(map_: WayfinderMap) -> DecisionTicket:
-    resolved = {
-        ticket.ticket_id for ticket in map_.decisions if ticket.resolution
-    }
+    resolved = {ticket.ticket_id for ticket in map_.decisions if ticket.resolution}
     for ticket in map_.decisions:
         if not ticket.resolution and set(ticket.blocked_by).issubset(resolved):
             return ticket
@@ -899,16 +872,15 @@ def _require_success(outcome: DispatchOutcome, role: str) -> None:
         AgentState.DONE,
     }:
         raise DeliveryError(
-            f"delivery_dispatch_failed:{role}:"
-            f"{outcome.error_code or outcome.state.value}"
+            f"delivery_dispatch_failed:{role}:" f"{outcome.error_code or outcome.state.value}"
         )
 
 
 def _agent_name(role: str, workspace: Path, harness: Harness) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "agent"
-    digest = hashlib.sha256(
-        f"{role}\0{workspace.resolve()}\0{harness.value}".encode()
-    ).hexdigest()[:7]
+    digest = hashlib.sha256(f"{role}\0{workspace.resolve()}\0{harness.value}".encode()).hexdigest()[
+        :7
+    ]
     prefix = f"hd-{normalized[:17].rstrip('-')}"
     return f"{prefix}-{digest}"[:32].rstrip("-")
 
@@ -980,8 +952,7 @@ def _load_completed_result(path: Path, run_id: str) -> DeliveryResult | None:
         or payload["status"] != "succeeded"
         or not isinstance(references, dict)
         or not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in references.items()
+            isinstance(key, str) and isinstance(value, str) for key, value in references.items()
         )
         or not isinstance(artifact_root, str)
         or Path(artifact_root).resolve() != path.parent.resolve()

@@ -40,6 +40,23 @@ class ProcessRunner(Protocol):
     ) -> subprocess.CompletedProcess[str]: ...
 
 
+def _subprocess_process_runner(
+    argv: list[str],
+    *,
+    capture_output: bool,
+    text: bool,
+    check: bool,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        capture_output=capture_output,
+        text=text,
+        check=check,
+        timeout=timeout,
+    )
+
+
 class LocalMarkdownTracker:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -85,7 +102,7 @@ class GithubTracker:
         self,
         repository: str,
         *,
-        runner: ProcessRunner = subprocess.run,
+        runner: ProcessRunner = _subprocess_process_runner,
     ) -> None:
         if not GITHUB_REPOSITORY.fullmatch(repository):
             raise TrackerError("github_repository_invalid")
@@ -99,8 +116,7 @@ class GithubTracker:
         self.spec_url = spec_url
         for ticket in plan.tickets:
             blocker_references = {
-                blocker: self.references[blocker].reference
-                for blocker in ticket.blocked_by
+                blocker: self.references[blocker].reference for blocker in ticket.blocked_by
             }
             body = (
                 f"## Parent\n\n{spec_url}\n\n"
@@ -117,10 +133,7 @@ class GithubTracker:
         if self.spec_url is None:
             raise TrackerError("github_spec_unknown")
         issue_number = reference.reference.rstrip("/").rsplit("/", 1)[-1]
-        body = (
-            f"## Parent\n\n{self.spec_url}\n\n"
-            f"{render_ticket(ticket, receipt=receipt)}"
-        )
+        body = f"## Parent\n\n{self.spec_url}\n\n" f"{render_ticket(ticket, receipt=receipt)}"
         self._run(
             [
                 "gh",
@@ -262,8 +275,7 @@ def render_ticket(
         "",
     ]
     lines.extend(
-        f"- [{'x' if accepted else ' '}] {criterion}"
-        for criterion in ticket.acceptance_criteria
+        f"- [{'x' if accepted else ' '}] {criterion}" for criterion in ticket.acceptance_criteria
     )
     if receipt is not None:
         lines.extend(
@@ -289,11 +301,7 @@ def _write_once_or_match(path: Path, content: str) -> None:
 
 
 def _completed_ticket_matches(content: str, ticket: DeliveryTicket) -> bool:
-    blockers = (
-        ", ".join(ticket.blocked_by)
-        if ticket.blocked_by
-        else "None — can start immediately"
-    )
+    blockers = ", ".join(ticket.blocked_by) if ticket.blocked_by else "None — can start immediately"
     required = {
         f"# {ticket.ticket_id} — {ticket.title}",
         f"**What to build:** {ticket.what_to_build}",

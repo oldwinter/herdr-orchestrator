@@ -1,7 +1,7 @@
 set positional-arguments
 
 workflow := "workflows/multi-harness.toml"
-python := "python3"
+python := "uv run python"
 
 default:
     @just --list
@@ -11,11 +11,63 @@ doctor *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}} "$@"
 
 test:
-    @PYTHONPATH=src {{python}} -m unittest discover -s tests -p 'test_*.py' -v
+    @mkdir -p .orchestrator/quality
+    @PYTHONPATH=src uv run pytest tests --durations=0 --json-report --json-report-file=.orchestrator/quality/tests.json
+
+test-coverage:
+    @mkdir -p .orchestrator/quality
+    @PYTHONPATH=src uv run pytest tests --durations=0 --cov=herdr_orchestrator --cov-branch --cov-report=term-missing --cov-report=json:.orchestrator/quality/coverage.json --cov-fail-under=80 --json-report --json-report-file=.orchestrator/quality/tests.json
+
+test-stability:
+    @PYTHONPATH=src uv run python scripts/test_stability.py --runs 3 --output .orchestrator/quality/stability.json
+
+lint:
+    @uv run ruff check src tests scripts
+    @uv run black --check src tests scripts
+    @uv run mypy
+    @uv run pylint src/herdr_orchestrator --disable=all --enable=invalid-name,duplicate-code
+    @uv run vulture src tests scripts --min-confidence 90
+    @uv run xenon --max-absolute C --max-modules B --max-average A src
+    @uv run lint-imports
+    @uv run deptry src
+    @uv run python scripts/check_repository.py
+    @uv run python scripts/check_feature_flags.py
+    @uv run python scripts/check_docs.py
+    @uv run python scripts/generate_reference.py --check
+
+security:
+    @mkdir -p .orchestrator/quality
+    @uv run detect-secrets-hook --baseline .secrets.baseline $(git ls-files --cached --others --exclude-standard)
+    @uv run bandit -q -r src -ll -f json -o .orchestrator/quality/bandit.json
+    @uv run pip-audit --local --format json --output .orchestrator/quality/pip-audit.json
+
+build-metrics:
+    @uv run python scripts/build_metrics.py --output .orchestrator/quality/build.json
+
+profile-tests:
+    @mkdir -p .orchestrator/quality
+    @PYTHONPATH=src uv run python -m cProfile -o .orchestrator/quality/tests.pstats -m pytest tests/test_protocol.py -q
+
+quality-summary:
+    @uv run python scripts/quality_summary.py --output .orchestrator/quality/summary.md
+
+docs-generate:
+    @uv run python scripts/generate_reference.py
+
+docs-check:
+    @uv run python scripts/check_docs.py
+    @uv run python scripts/generate_reference.py --check
 
 check:
-    @PYTHONPATH=src {{python}} -m compileall -q src tests
-    @just test
+    @uv sync --locked
+    @PYTHONPATH=src {{python}} -m compileall -q src tests scripts
+    @just lint
+    @just test-coverage
+    @just test-stability
+    @just security
+    @just build-metrics
+    @just profile-tests
+    @just quality-summary
 
 seed:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator seed --workflow {{workflow}}

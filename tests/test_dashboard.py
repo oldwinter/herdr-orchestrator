@@ -164,9 +164,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIs(snapshot["jobs"][1]["agent_settled"], True)
         self.assertIs(snapshot["jobs"][1]["task_verified"], True)
         self.assertEqual(
-            snapshot["topology"]["workspaces"][0]["tabs"][0]["panes"][0]["agent"][
-                "name"
-            ],
+            snapshot["topology"]["workspaces"][0]["tabs"][0]["panes"][0]["agent"]["name"],
             "worker-two",
         )
         project = snapshot["topology"]["projects"][0]
@@ -274,13 +272,17 @@ class DashboardTests(unittest.TestCase):
             )
 
         observation = HerdrObserver(workspace, runner=runner).observe()
-        serialized = json.dumps(observation.__dict__ if hasattr(observation, "__dict__") else {
-            "workspaces": observation.workspaces,
-            "tabs": observation.tabs,
-            "panes": observation.panes,
-            "agents": observation.agents,
-            "worktrees": observation.worktrees,
-        })
+        serialized = json.dumps(
+            observation.__dict__
+            if hasattr(observation, "__dict__")
+            else {
+                "workspaces": observation.workspaces,
+                "tabs": observation.tabs,
+                "panes": observation.panes,
+                "agents": observation.agents,
+                "worktrees": observation.worktrees,
+            }
+        )
 
         self.assertEqual(observation.health, "ok")
         self.assertEqual([row["workspace_id"] for row in observation.workspaces], ["w1"])

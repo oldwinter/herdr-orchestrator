@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from herdr_orchestrator.model import DispatchContext, PlacementTarget
 from herdr_orchestrator.protocol import Command, CommandRunner, TransportError, run_json
@@ -353,11 +354,7 @@ class HerdrLayout:
         if not isinstance(panes, list):
             raise TransportError("herdr_invalid_response")
         pane = next(
-            (
-                row
-                for row in panes
-                if isinstance(row, dict) and row.get("cwd") == str(path)
-            ),
+            (row for row in panes if isinstance(row, dict) and row.get("cwd") == str(path)),
             None,
         )
         if not isinstance(pane, dict):
@@ -375,9 +372,9 @@ class HerdrLayout:
     def _worktree_coordinates(self, context: DispatchContext) -> tuple[Path, str]:
         if context.worktree_root is None:
             raise TransportError("placement_worktree_root_missing")
-        digest = hashlib.sha256(
-            f"{self.workflow_name}\0{context.task_key}".encode()
-        ).hexdigest()[:7]
+        digest = hashlib.sha256(f"{self.workflow_name}\0{context.task_key}".encode()).hexdigest()[
+            :7
+        ]
         slug = stable_slug(context.title, maximum=32)
         identifier = f"{slug}-{digest}"
         path = (

@@ -1,0 +1,42 @@
+- name: priority:critical
+  color: b60205
+  description: Immediate attention required
+- name: priority:high
+  color: d93f0b
+  description: Important near-term work
+- name: priority:normal
+  color: fbca04
+  description: Normal backlog priority
+- name: priority:triage
+  color: cfd3d7
+  description: Priority has not been assigned
+- name: type:bug
+  color: d73a4a
+  description: Incorrect behavior
+- name: type:feature
+  color: 0e8a16
+  description: New or improved behavior
+- name: type:maintenance
+  color: 5319e7
+  description: Repository maintenance
+- name: security
+  color: ee0701
+  description: Security or dependency risk
+- name: area:ci
+  color: 1d76db
+  description: CI and release automation
+- name: area:coordinator
+  color: 1d76db
+  description: Queue and dispatch coordinator
+- name: area:dashboard
+  color: 1d76db
+  description: Read-only dashboard
+- name: area:delivery
+  color: 1d76db
+  description: Standardized delivery
+- name: area:distribution
+  color: 1d76db
+  description: npm packaging and installation
+- name: area:docs
+  color: 1d76db
+  description: Documentation
