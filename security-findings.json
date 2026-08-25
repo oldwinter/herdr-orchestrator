@@ -1,9 +1,9 @@
 {
-  "scan_id": "scan-2026-08-25-readiness-rebased",
-  "scan_date": "2026-08-25T08:34:33.235336+00:00",
-  "scan_type": "commit",
-  "commit_range": "origin/main..HEAD",
-  "pr_number": null,
+  "scan_id": "scan-2026-08-25-pr18-v2",
+  "scan_date": "2026-08-25T08:49:30.914565+00:00",
+  "scan_type": "range",
+  "commit_range": "origin/main..worktree/lucky-cloud-e44c",
+  "pr_number": 18,
   "threat_model_version": "1.0.0",
   "findings": [],
   "summary": {

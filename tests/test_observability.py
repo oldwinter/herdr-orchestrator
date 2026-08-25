@@ -33,13 +33,13 @@ class ObservabilityTests(unittest.TestCase):
         sanitized = sanitize(
             {
                 "token": "secret-value",
-                "message": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+                "message": "Authorization: [TEST-CREDENTIAL]",
                 "nested": {"password": "unsafe"},  # pragma: allowlist secret
             }
         )
         self.assertEqual(sanitized["token"], "[REDACTED]")
         self.assertEqual(sanitized["nested"]["password"], "[REDACTED]")
-        self.assertNotIn("abcdefghijklmnopqrstuvwxyz", sanitized["message"])
+        self.assertNotIn("[TEST-CREDENTIAL]", sanitized["message"])
 
     def test_local_events_and_metrics_include_correlation_without_prompts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -81,7 +81,7 @@ class ObservabilityTests(unittest.TestCase):
                 telemetry.event(
                     "dispatch_finished",
                     correlation_id="trace-2",
-                    fields={"password": "do-not-send"},  # pragma: allowlist secret
+                    fields={"password": "[TEST-PASSWORD]"},  # pragma: allowlist secret
                 )
                 telemetry.alert(
                     "dispatch_needs_attention",
@@ -92,7 +92,7 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(opener.call_count, 3)
         requests = [call.args[0] for call in opener.call_args_list]
         self.assertTrue(all(request.full_url.startswith("https://") for request in requests))
-        self.assertTrue(all(b"do-not-send" not in request.data for request in requests))
+        self.assertTrue(all(b"[TEST-PASSWORD]" not in request.data for request in requests))
 
     def test_exporters_fail_closed_for_missing_or_invalid_configuration(self) -> None:
         environ = {

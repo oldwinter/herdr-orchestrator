@@ -177,6 +177,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
             workflow,
         )
+        self.assertIn("npm install --global rust-just@1.57.0", workflow)
         self.assertNotIn("actions/checkout@v4", workflow)
         self.assertNotIn("actions/setup-node@v4", workflow)
         self.assertNotIn("actions/setup-python@v5", workflow)
