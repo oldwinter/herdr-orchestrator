@@ -64,7 +64,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - `bin/herdr-orchestrator.mjs`：npm 安装、诊断、升级、卸载和 runtime 包装入口
 - `package.json`：`herdr-orchestrator` npm 分发清单
 - `scripts/npm-release-plan.mjs`：main 发布前的 registry 版本 gate
-- `.github/workflows/ci.yml`：测试与 npm OIDC Trusted Publishing 编排
+- `.github/workflows/ci.yml`：专属 self-hosted 测试/版本 gate 与 GitHub-hosted npm OIDC 发布编排
 
 ## 安全边界
 
@@ -83,6 +83,8 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - 不关闭非本运行创建的 pane 或 agent。
 - 普通 queue 的 `blocked` 是 terminal；只有 opt-in 标准交付执行有界 controller response loop。
 - runtime state、完整终端输出和原始 prompt 不进入 Git。
+- npm Trusted Publishing 不支持 self-hosted runner；只有测试和版本 gate 使用专属 runner，
+  `publish` 必须保持 GitHub-hosted 且不得引入长期 npm token。
 
 ## 修改约定
 

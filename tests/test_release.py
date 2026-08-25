@@ -139,6 +139,27 @@ class NpmReleasePlanTests(unittest.TestCase):
 
 
 class NpmReleaseWorkflowTests(unittest.TestCase):
+    def test_test_and_release_plan_use_the_dedicated_self_hosted_runner(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            workflow.count(
+                "runs-on: [self-hosted, Linux, X64, herdr-orchestrator]"
+            ),
+            2,
+        )
+        self.assertEqual(workflow.count("runs-on: ubuntu-latest"), 1)
+        self.assertIn("release-plan:", workflow)
+        self.assertIn(
+            "publish: ${{ steps.plan.outputs.publish }}",
+            workflow,
+        )
+        self.assertIn(
+            "needs.release-plan.outputs.publish == 'true'",
+            workflow,
+        )
+        self.assertEqual(workflow.count("persist-credentials: false"), 3)
+
     def test_main_publish_uses_test_gate_oidc_and_version_plan(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 
@@ -152,8 +173,9 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             "node scripts/npm-release-plan.mjs --package-json package.json",
             workflow,
         )
-        self.assertIn("steps.plan.outputs.publish == 'true'", workflow)
-        self.assertIn("npm publish --access public --provenance", workflow)
+        self.assertIn("needs.release-plan.outputs.publish == 'true'", workflow)
+        self.assertIn("npm publish --access public", workflow)
+        self.assertNotIn("--provenance", workflow)
         self.assertNotIn("NODE_AUTH_TOKEN", workflow)
         self.assertIn("actions/checkout@11d5960a326750d5838078e36cf38b85af677262", workflow)
         self.assertIn("actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020", workflow)

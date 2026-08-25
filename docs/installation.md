@@ -151,16 +151,33 @@ place and are listed in the JSON result; they are no longer managed after that p
 
 ## Automated npm releases
 
-The `ci` GitHub Actions workflow publishes from `main` without an npm token:
+The `ci` GitHub Actions workflow uses a dedicated runner for routine validation and publishes
+from `main` without an npm token:
 
-1. the Python compile and test job must pass;
-2. the publish job runs only for a push to `main`;
-3. `npm run release:plan` compares `package.json` with public registry versions;
-4. an existing version is a successful no-op;
-5. a missing version is published with npm Trusted Publishing and provenance.
+1. Python compile and test run on
+   `[self-hosted, Linux, X64, herdr-orchestrator]`;
+2. after a successful `main` test, the same runner compares `package.json` with public
+   registry versions;
+3. an existing version is a successful no-op and allocates no GitHub-hosted runner;
+4. a missing version enables the GitHub-hosted publish job;
+5. that job publishes through npm Trusted Publishing.
 
 Registry lookup failures stop the job. The workflow never guesses that a failed lookup means
-a new package version.
+a new package version. npm does not support Trusted Publishing from self-hosted runners, so
+the OIDC publish job must remain on `ubuntu-latest`. The repository is private, so npm
+provenance is not supported even though tokenless Trusted Publishing is.
+
+### Dedicated runner
+
+The repository-specific runner is `herdr-orchestrator-185` on `remote-185`. It runs under a
+dedicated operating-system account and advertises these labels:
+
+```yaml
+runs-on: [self-hosted, Linux, X64, herdr-orchestrator]
+```
+
+Both self-hosted jobs disable checkout credential persistence. Keep this runner scoped to
+this private repository, and do not run untrusted pull request code on it.
 
 ### One-time trusted publisher setup
 
@@ -178,11 +195,12 @@ a new package version.
      -y
    ```
 
-3. Ensure GitHub Actions can start hosted runners. Account billing or spending-limit failures
-   prevent both CI and publishing before any step executes.
+3. Before releasing a new version, ensure GitHub Actions can start hosted runners. Account
+   billing or spending-limit failures block only the missing-version publish job; routine
+   test and no-op release-plan jobs continue on the dedicated runner.
 
 The publish job grants only `contents: read` and `id-token: write`. Do not add
-`NODE_AUTH_TOKEN` or an npm token secret.
+`NODE_AUTH_TOKEN` or an npm token secret, and do not move this job to a self-hosted runner.
 
 ### Releasing a new version
 
