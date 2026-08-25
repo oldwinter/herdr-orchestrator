@@ -175,6 +175,7 @@ class ClaimedJob:
     agent_name: str
     placement: PlacementTarget
     receipt: TaskReceipt | None = None
+    correlation_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +192,7 @@ class DispatchOutcome:
     error_summary: str | None = None
     agent_settled: bool | None = None
     phase_timings_ms: dict[str, int] | None = None
+    correlation_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +203,7 @@ class DispatchContext:
     batch_key: str | None = None
     worktree_root: Path | None = None
     receipt: TaskReceipt | None = None
+    correlation_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

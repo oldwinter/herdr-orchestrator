@@ -26,6 +26,25 @@ class GitRunner(Protocol):
     ) -> subprocess.CompletedProcess[str]: ...
 
 
+def _subprocess_git_runner(
+    argv: list[str],
+    *,
+    cwd: str,
+    capture_output: bool,
+    text: bool,
+    check: bool,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        capture_output=capture_output,
+        text=text,
+        check=check,
+        timeout=timeout,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Worktree:
     path: Path
@@ -40,7 +59,7 @@ class GitWorkspace:
         runtime_root: Path,
         slug: str,
         *,
-        runner: GitRunner = subprocess.run,
+        runner: GitRunner = _subprocess_git_runner,
     ) -> None:
         self.repository = repository.resolve()
         self.runtime_root = runtime_root.resolve()

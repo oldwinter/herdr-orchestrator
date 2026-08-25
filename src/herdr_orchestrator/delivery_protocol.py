@@ -488,9 +488,11 @@ def load_proxy_decision(path: Path) -> ProxyDecision:
     response = _optional_text(payload, "response", 10_000, "proxy_decision")
     if action is not ProxyAction.ESCALATE and not response:
         raise DeliveryArtifactError("proxy_decision_response_required")
-    if category in {AuthorityCategory.SECRET, AuthorityCategory.PRODUCTION}:
-        if action is not ProxyAction.ESCALATE:
-            raise DeliveryArtifactError("proxy_decision_must_escalate")
+    if (
+        category in {AuthorityCategory.SECRET, AuthorityCategory.PRODUCTION}
+        and action is not ProxyAction.ESCALATE
+    ):
+        raise DeliveryArtifactError("proxy_decision_must_escalate")
     return ProxyDecision(
         action=action,
         category=category,
@@ -505,9 +507,7 @@ def _review_findings(payload: dict[str, Any], key: str) -> tuple[ReviewFinding, 
     for row in rows:
         _exact_keys(row, {"severity", "summary", "evidence", "source"}, "review_finding")
         try:
-            severity = FindingSeverity(
-                _text(row, "severity", 20, "review_finding")
-            )
+            severity = FindingSeverity(_text(row, "severity", 20, "review_finding"))
         except ValueError as exc:
             raise DeliveryArtifactError("review_finding_severity_invalid") from exc
         findings.append(

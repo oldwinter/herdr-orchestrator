@@ -1,0 +1,33 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+      include: ["*"]
+    groups:
+      python-development:
+        dependency-type: development
+        patterns: ["*"]
+    labels: ["type:maintenance", "area:ci", "priority:normal"]
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+      include: ["*"]
+    labels: ["type:maintenance", "area:distribution", "priority:normal"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+      include: ["*"]
+    labels: ["type:maintenance", "area:ci", "priority:normal"]

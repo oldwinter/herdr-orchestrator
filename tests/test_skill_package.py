@@ -13,9 +13,7 @@ SKILLS = REPO_ROOT / ".agents/skills"
 
 class StandardizedDeliverySkillTests(unittest.TestCase):
     def test_portable_skill_uses_the_npm_runtime(self) -> None:
-        skill = (REPO_ROOT / "skills/herdr-orchestrator/SKILL.md").read_text(
-            encoding="utf-8"
-        )
+        skill = (REPO_ROOT / "skills/herdr-orchestrator/SKILL.md").read_text(encoding="utf-8")
         frontmatter = skill.split("---", 2)[1]
 
         self.assertIn("name: herdr-orchestrator", frontmatter)
@@ -25,9 +23,7 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
         self.assertNotIn("workflows/multi-harness.toml", skill)
 
     def test_portable_skill_covers_the_full_queue_operating_contract(self) -> None:
-        skill = (REPO_ROOT / "skills/herdr-orchestrator/SKILL.md").read_text(
-            encoding="utf-8"
-        )
+        skill = (REPO_ROOT / "skills/herdr-orchestrator/SKILL.md").read_text(encoding="utf-8")
 
         for required in (
             "--harness auto",
@@ -51,9 +47,7 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             self.assertIn(required, skill)
 
     def test_portable_skill_runtime_examples_parse_against_the_cli_contract(self) -> None:
-        skill = (REPO_ROOT / "skills/herdr-orchestrator/SKILL.md").read_text(
-            encoding="utf-8"
-        )
+        skill = (REPO_ROOT / "skills/herdr-orchestrator/SKILL.md").read_text(encoding="utf-8")
         commands: list[list[str]] = []
         for block in re.findall(r"```bash\n(.*?)```", skill, flags=re.DOTALL):
             normalized = block.replace("\\\n", " ")
@@ -87,9 +81,7 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             self.assertEqual(parsed.command, command[0])
 
     def test_canonical_skill_has_only_exact_opt_in_keyword_triggers(self) -> None:
-        skill = (SKILLS / "standardized-delivery/SKILL.md").read_text(
-            encoding="utf-8"
-        )
+        skill = (SKILLS / "standardized-delivery/SKILL.md").read_text(encoding="utf-8")
         frontmatter = skill.split("---", 2)[1]
 
         for trigger in (
@@ -111,19 +103,13 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             self.assertIn("../standardized-delivery/SKILL.md", skill)
 
     def test_progressive_references_cover_authority_and_recovery_branches(self) -> None:
-        canonical = (SKILLS / "standardized-delivery/SKILL.md").read_text(
-            encoding="utf-8"
-        )
+        canonical = (SKILLS / "standardized-delivery/SKILL.md").read_text(encoding="utf-8")
 
         self.assertIn("references/workflow-contract.md", canonical)
         self.assertIn("references/authority.md", canonical)
         self.assertIn("references/recovery.md", canonical)
-        self.assertTrue(
-            (SKILLS / "standardized-delivery/references/authority.md").is_file()
-        )
-        self.assertTrue(
-            (SKILLS / "standardized-delivery/references/recovery.md").is_file()
-        )
+        self.assertTrue((SKILLS / "standardized-delivery/references/authority.md").is_file())
+        self.assertTrue((SKILLS / "standardized-delivery/references/recovery.md").is_file())
 
     def test_cross_harness_skill_paths_share_the_canonical_tree(self) -> None:
         for link in (REPO_ROOT / ".agent/skills", REPO_ROOT / ".claude/skills"):

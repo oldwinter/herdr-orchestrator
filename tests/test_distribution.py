@@ -39,9 +39,9 @@ class DistributionCliTests(unittest.TestCase):
         version = self._run("--version")
 
         self.assertEqual(version.returncode, 0, version.stderr)
-        python_version = tomllib.loads(
-            (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        )["project"]["version"]
+        python_version = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+            "project"
+        ]["version"]
         self.assertEqual(version.stdout.strip(), python_version)
         self.assertEqual(__version__, python_version)
 
@@ -65,9 +65,7 @@ class DistributionCliTests(unittest.TestCase):
             self.assertTrue(
                 (project / ".herdr-orchestrator/workflows/multi-harness.toml").is_file()
             )
-            self.assertTrue(
-                (project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file()
-            )
+            self.assertTrue((project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file())
 
             catalog = self._run("catalog", "--project", str(project))
 
@@ -446,9 +444,7 @@ class DistributionCliTests(unittest.TestCase):
             self.assertFalse(
                 (project / ".herdr-orchestrator/workflows/multi-harness.toml").exists()
             )
-            self.assertFalse(
-                (project / ".herdr-orchestrator/manifest.json").exists()
-            )
+            self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
 
     def test_install_rejects_symlinked_managed_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -571,9 +567,7 @@ class DistributionCliTests(unittest.TestCase):
             self.assertTrue(
                 (project / ".herdr-orchestrator/profiles/harnesses/droid.toml").is_file()
             )
-            self.assertTrue(
-                (project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file()
-            )
+            self.assertTrue((project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file())
 
     def test_uninstall_rejects_manifest_paths_outside_managed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -617,9 +611,7 @@ class DistributionCliTests(unittest.TestCase):
             skill = project / ".agents/skills/herdr-orchestrator/SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text(
-                (
-                    REPO_ROOT / "skills/herdr-orchestrator/SKILL.md"
-                ).read_text(encoding="utf-8"),
+                (REPO_ROOT / "skills/herdr-orchestrator/SKILL.md").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
 
@@ -637,9 +629,7 @@ class DistributionCliTests(unittest.TestCase):
                 [".agents/skills/herdr-orchestrator/SKILL.md"],
             )
             manifest = json.loads(
-                (project / ".herdr-orchestrator/manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (project / ".herdr-orchestrator/manifest.json").read_text(encoding="utf-8")
             )
             self.assertNotIn(
                 ".agents/skills/herdr-orchestrator/SKILL.md",

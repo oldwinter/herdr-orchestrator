@@ -5,7 +5,7 @@ import tomllib
 from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from herdr_orchestrator.catalog import (
     CatalogError,
@@ -31,7 +31,6 @@ from herdr_orchestrator.model import (
 WORKFLOW_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 WORKER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 DEDUPE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
-EnumValue = TypeVar("EnumValue", bound=StrEnum)
 
 
 class ConfigError(ValueError):
@@ -99,6 +98,66 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     ):
         raise ConfigError("placement_worktree_root_must_be_in_workspace_runtime")
 
+    standardized_delivery = _load_standardized_delivery(workspace, raw)
+
+    planner_raw = _table(raw, "planner")
+    planner_output = _resolve_path(
+        base,
+        _string(planner_raw, "output_file", maximum=4096),
+    )
+    if not planner_output.is_relative_to(workspace) or ".orchestrator" not in planner_output.parts:
+        raise ConfigError("planner_output_must_be_in_workspace_runtime")
+    workers, harnesses = _load_workers(raw)
+
+    planner_worker_harnesses = _optional_harness_list(planner_raw, "worker_harnesses")
+    if any(harness not in harnesses for harness in planner_worker_harnesses):
+        raise ConfigError("planner_worker_harness_has_no_worker")
+    planner = PlannerConfig(
+        enabled=_boolean(planner_raw, "enabled"),
+        harness=_optional_harness(planner_raw, "harness"),
+        worker_harnesses=planner_worker_harnesses,
+        interval_seconds=_integer(
+            planner_raw,
+            "interval_seconds",
+            minimum=60,
+            maximum=86400,
+        ),
+        prompt_file=_existing_file(base, planner_raw, "prompt_file"),
+        output_file=planner_output,
+        max_tasks=_integer(planner_raw, "max_tasks", minimum=1, maximum=100),
+    )
+
+    try:
+        profiles = load_harness_profiles(profiles_dir)
+        profiles_for_workers(profiles, workers)
+        if planner.harness is not None:
+            profile_for_harness(profiles, planner.harness)
+    except CatalogError as exc:
+        raise ConfigError(str(exc)) from exc
+
+    seed_jobs = _load_seed_jobs(raw, base, harnesses)
+
+    return WorkflowConfig(
+        schema_version=schema_version,
+        name=name,
+        path=workflow_path,
+        workspace=workspace,
+        state_db=state_db,
+        coordinator=coordinator,
+        placement=placement,
+        standardized_delivery=standardized_delivery,
+        planner=planner,
+        profiles_dir=profiles_dir,
+        profiles=profiles,
+        workers=tuple(workers),
+        seed_jobs=tuple(seed_jobs),
+    )
+
+
+def _load_standardized_delivery(
+    workspace: Path,
+    raw: Mapping[str, Any],
+) -> StandardizedDeliveryConfig:
     delivery_raw = _optional_table(raw, "standardized_delivery")
     tracker_backend = _enum_value(
         delivery_raw,
@@ -127,7 +186,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     )
     if tracker_backend is TrackerBackend.GITHUB and github_repository is None:
         raise ConfigError("github_repository_required")
-    standardized_delivery = StandardizedDeliveryConfig(
+    return StandardizedDeliveryConfig(
         tracker_backend=tracker_backend,
         tracker_root=tracker_root,
         artifact_root=artifact_root,
@@ -154,13 +213,8 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         ),
     )
 
-    planner_raw = _table(raw, "planner")
-    planner_output = _resolve_path(
-        base,
-        _string(planner_raw, "output_file", maximum=4096),
-    )
-    if not planner_output.is_relative_to(workspace) or ".orchestrator" not in planner_output.parts:
-        raise ConfigError("planner_output_must_be_in_workspace_runtime")
+
+def _load_workers(raw: Mapping[str, Any]) -> tuple[list[WorkerConfig], set[Harness]]:
     worker_rows = _table_list(raw, "workers")
     if not worker_rows:
         raise ConfigError("workers_empty")
@@ -176,46 +230,25 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             raise ConfigError(f"worker_name_duplicate: {worker_name}")
         if harness in harnesses:
             raise ConfigError(f"worker_harness_duplicate: {harness.value}")
-        capabilities = _string_list(row, "capabilities", maximum_items=32)
-        replicas = _optional_integer(row, "replicas", minimum=1, maximum=16, default=1)
         workers.append(
             WorkerConfig(
                 worker_name,
                 harness,
-                capabilities,
-                replicas,
+                _string_list(row, "capabilities", maximum_items=32),
+                _optional_integer(row, "replicas", minimum=1, maximum=16, default=1),
                 _optional_placement(row, "placement"),
             )
         )
         worker_names.add(worker_name)
         harnesses.add(harness)
+    return workers, harnesses
 
-    planner_worker_harnesses = _optional_harness_list(planner_raw, "worker_harnesses")
-    if any(harness not in harnesses for harness in planner_worker_harnesses):
-        raise ConfigError("planner_worker_harness_has_no_worker")
-    planner = PlannerConfig(
-        enabled=_boolean(planner_raw, "enabled"),
-        harness=_optional_harness(planner_raw, "harness"),
-        worker_harnesses=planner_worker_harnesses,
-        interval_seconds=_integer(
-            planner_raw,
-            "interval_seconds",
-            minimum=60,
-            maximum=86400,
-        ),
-        prompt_file=_existing_file(base, planner_raw, "prompt_file"),
-        output_file=planner_output,
-        max_tasks=_integer(planner_raw, "max_tasks", minimum=1, maximum=100),
-    )
 
-    try:
-        profiles = load_harness_profiles(profiles_dir)
-        profiles_for_workers(profiles, workers)
-        if planner.harness is not None:
-            profile_for_harness(profiles, planner.harness)
-    except CatalogError as exc:
-        raise ConfigError(str(exc)) from exc
-
+def _load_seed_jobs(
+    raw: Mapping[str, Any],
+    base: Path,
+    harnesses: set[Harness],
+) -> list[SeedJobConfig]:
     seed_jobs: list[SeedJobConfig] = []
     seed_keys: set[str] = set()
     for row in _table_list(raw, "seed_jobs"):
@@ -237,22 +270,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             )
         )
         seed_keys.add(dedupe_key)
-
-    return WorkflowConfig(
-        schema_version=schema_version,
-        name=name,
-        path=workflow_path,
-        workspace=workspace,
-        state_db=state_db,
-        coordinator=coordinator,
-        placement=placement,
-        standardized_delivery=standardized_delivery,
-        planner=planner,
-        profiles_dir=profiles_dir,
-        profiles=profiles,
-        workers=tuple(workers),
-        seed_jobs=tuple(seed_jobs),
-    )
+    return seed_jobs
 
 
 def _resolve_path(base: Path, value: str) -> Path:
@@ -439,7 +457,7 @@ def _optional_path(
     return (workspace / candidate).resolve()
 
 
-def _enum_value(
+def _enum_value[EnumValue: StrEnum](
     data: Mapping[str, Any],
     key: str,
     enum_type: type[EnumValue],

@@ -170,15 +170,9 @@ class HerdrLayoutTests(unittest.TestCase):
         retried = layout.provision(context)
 
         self.assertEqual(retried.tab_id, "w1:t3")
-        creates = [
-            call
-            for call in runner.calls
-            if call[:3] == ["herdr", "tab", "create"]
-        ]
+        creates = [call for call in runner.calls if call[:3] == ["herdr", "tab", "create"]]
         self.assertEqual(len(creates), 2)
-        self.assertFalse(
-            any(call[:3] == ["herdr", "pane", "layout"] for call in runner.calls)
-        )
+        self.assertFalse(any(call[:3] == ["herdr", "pane", "layout"] for call in runner.calls))
 
     def test_worktree_uses_native_create_and_is_retained(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

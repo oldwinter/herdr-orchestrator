@@ -180,8 +180,7 @@ def _string_list(
         or not value
         or len(value) > maximum_items
         or not all(
-            isinstance(item, str) and item.strip() and len(item) <= maximum_length
-            for item in value
+            isinstance(item, str) and item.strip() and len(item) <= maximum_length for item in value
         )
     ):
         raise CatalogError(f"profile_{key}_invalid")

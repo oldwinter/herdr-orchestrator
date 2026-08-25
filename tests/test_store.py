@@ -104,12 +104,10 @@ class StoreTests(unittest.TestCase):
         )
         job = self.store.jobs("example")[0]
         with sqlite3.connect(self.store.path) as connection:
-            receipt = connection.execute(
-                """
-                SELECT placement, execution_path, herdr_workspace_id
+            receipt = connection.execute("""
+                SELECT placement, execution_path, herdr_workspace_id, correlation_id
                 FROM receipts
-                """
-            ).fetchone()
+                """).fetchone()
 
         self.assertEqual(state, JobState.SUCCEEDED)
         self.assertEqual(self.store.status_counts("example")["succeeded"], 1)
@@ -118,12 +116,14 @@ class StoreTests(unittest.TestCase):
             "/repo/.orchestrator/worktrees/task",
         )
         self.assertEqual(job["herdr_workspace_id"], "w2")
+        self.assertEqual(job["correlation_id"], claimed.correlation_id)
         self.assertEqual(
             receipt,
             (
                 PlacementTarget.WORKTREE.value,
                 "/repo/.orchestrator/worktrees/task",
                 "w2",
+                claimed.correlation_id,
             ),
         )
 
@@ -326,8 +326,7 @@ class StoreTests(unittest.TestCase):
     def test_migrates_v1_jobs_and_receipts_to_current_schema(self) -> None:
         path = Path(self.temporary.name) / "v1.db"
         connection = sqlite3.connect(path)
-        connection.executescript(
-            """
+        connection.executescript("""
             CREATE TABLE schema_meta (version INTEGER NOT NULL);
             INSERT INTO schema_meta(version) VALUES (1);
             CREATE TABLE jobs (
@@ -372,8 +371,7 @@ class StoreTests(unittest.TestCase):
                 'example', 'old', 'codex', 'inspect', 'old-v1', 'pending',
                 0, 2, 1, 1, 1
             );
-            """
-        )
+            """)
         connection.commit()
         connection.close()
 
@@ -382,19 +380,13 @@ class StoreTests(unittest.TestCase):
 
         migrated = store.jobs("example")
         with sqlite3.connect(path) as migrated_connection:
-            version = migrated_connection.execute(
-                "SELECT version FROM schema_meta"
-            ).fetchone()[0]
-            job_columns = {
-                row[1]
-                for row in migrated_connection.execute("PRAGMA table_info(jobs)")
-            }
+            version = migrated_connection.execute("SELECT version FROM schema_meta").fetchone()[0]
+            job_columns = {row[1] for row in migrated_connection.execute("PRAGMA table_info(jobs)")}
             receipt_columns = {
-                row[1]
-                for row in migrated_connection.execute("PRAGMA table_info(receipts)")
+                row[1] for row in migrated_connection.execute("PRAGMA table_info(receipts)")
             }
 
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertEqual(migrated[0]["placement"], PlacementTarget.TAB.value)
         self.assertIsNone(migrated[0]["task_verified"])
         self.assertIsNone(migrated[0]["agent_settled"])
@@ -405,11 +397,13 @@ class StoreTests(unittest.TestCase):
         self.assertIn("agent_settled", job_columns)
         self.assertIn("task_verified", job_columns)
         self.assertIn("error_summary", job_columns)
+        self.assertIn("correlation_id", job_columns)
         self.assertIn("execution_path", receipt_columns)
         self.assertIn("herdr_workspace_id", receipt_columns)
         self.assertIn("agent_settled", receipt_columns)
         self.assertIn("task_verified", receipt_columns)
         self.assertIn("error_summary", receipt_columns)
+        self.assertIn("correlation_id", receipt_columns)
 
 
 def _job(

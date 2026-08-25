@@ -1,0 +1,30 @@
+[importlinter]
+root_package = herdr_orchestrator
+
+[importlinter:contract:model-is-a-leaf]
+name = Domain model must not depend on orchestration modules
+type = forbidden
+source_modules =
+    herdr_orchestrator.model
+forbidden_modules =
+    herdr_orchestrator.catalog
+    herdr_orchestrator.cli
+    herdr_orchestrator.config
+    herdr_orchestrator.delivery
+    herdr_orchestrator.herdr
+    herdr_orchestrator.runner
+    herdr_orchestrator.store
+
+[importlinter:contract:protocol-is-a-leaf]
+name = Process protocol must not depend on orchestration modules
+type = forbidden
+source_modules =
+    herdr_orchestrator.protocol
+forbidden_modules =
+    herdr_orchestrator.catalog
+    herdr_orchestrator.cli
+    herdr_orchestrator.config
+    herdr_orchestrator.delivery
+    herdr_orchestrator.herdr
+    herdr_orchestrator.runner
+    herdr_orchestrator.store

@@ -5,13 +5,17 @@ import json
 import subprocess
 import tempfile
 import unittest
+from argparse import Namespace
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import herdr_orchestrator.cli as cli_module
 from herdr_orchestrator.cli import build_parser, doctor, probe_harness_readiness, smoke
 from herdr_orchestrator.config import load_workflow
+from herdr_orchestrator.delivery import DeliveryEscalation
 from herdr_orchestrator.model import (
     AgentState,
     DispatchContext,
@@ -96,9 +100,7 @@ class CliTests(unittest.TestCase):
             )
 
         report = json.loads(output.getvalue())
-        droid = next(
-            check for check in report["checks"] if check["check"] == "readiness:droid"
-        )
+        droid = next(check for check in report["checks"] if check["check"] == "readiness:droid")
         self.assertEqual(code, 1)
         self.assertFalse(report["ok"])
         self.assertEqual(droid["status"], "auth_required")
@@ -142,9 +144,7 @@ class CliTests(unittest.TestCase):
             )
 
         report = json.loads(output.getvalue())
-        readiness = [
-            check for check in report["checks"] if check["check"].startswith("readiness:")
-        ]
+        readiness = [check for check in report["checks"] if check["check"].startswith("readiness:")]
         self.assertEqual(code, 0)
         self.assertEqual(probed, [Harness.DROID])
         self.assertEqual([check["check"] for check in readiness], ["readiness:droid"])
@@ -348,9 +348,7 @@ class CliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
-            workflow_path = (
-                workspace / ".herdr-orchestrator/workflows/multi-harness.toml"
-            )
+            workflow_path = workspace / ".herdr-orchestrator/workflows/multi-harness.toml"
             workflow_path.parent.mkdir(parents=True)
             workflow_path.write_text("schema_version = 1\n", encoding="utf-8")
             (workspace / "README.md").write_text("# Target\n", encoding="utf-8")
@@ -405,6 +403,185 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.review_repair_rounds, 2)
         self.assertEqual(args.controller_harness, "grok")
         self.assertEqual(args.worker_harness, ["codex"])
+
+
+class CliCommandDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+
+    def test_simple_coordinator_and_store_commands_emit_json(self) -> None:
+        args = Namespace(apply=False, extra_attempts=2, job_id=7)
+        coordinator = MagicMock()
+        coordinator.seed.return_value = (2, 1)
+        coordinator.gc_succeeded_agents.return_value = {"candidate_count": 0}
+        store = MagicMock()
+        store.retry_failed.return_value = {"job_id": 7, "state": "pending"}
+        store.status_counts.return_value = {"pending": 0}
+        store.jobs.return_value = []
+        output = io.StringIO()
+        with (
+            patch.object(cli_module, "Coordinator", return_value=coordinator),
+            patch.object(cli_module, "Store", return_value=store),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(cli_module._command_seed(self.config, args), 0)
+            self.assertEqual(cli_module._command_gc(self.config, args), 0)
+            self.assertEqual(cli_module._command_retry(self.config, args), 0)
+            self.assertEqual(cli_module._command_status(self.config, args), 0)
+        self.assertIn('"added": 2', output.getvalue())
+        store.initialize.assert_called()
+
+    def test_enqueue_and_run_modes_forward_typed_arguments(self) -> None:
+        coordinator = MagicMock()
+        coordinator.enqueue_prompt_file.return_value = (9, True, Harness.PI)
+        coordinator.run_once.return_value = {"claimed": 1}
+        coordinator.run_until_idle.return_value = {"idle": False}
+        args = Namespace(
+            controller_harness=None,
+            dedupe_key="task-v1",
+            drain_timeout_seconds=60,
+            harness="pi",
+            once=False,
+            placement="tab",
+            prompt_file="task.md",
+            receipt_file=None,
+            receipt_prefix=None,
+            title="Task",
+            until_idle=False,
+            worker_harness=None,
+        )
+        with (
+            patch.object(cli_module, "_coordinator_from_args", return_value=coordinator),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli_module._command_enqueue(self.config, args), 0)
+            args.once = True
+            self.assertEqual(cli_module._command_run(self.config, args), 0)
+            args.once = False
+            args.until_idle = True
+            self.assertEqual(cli_module._command_run(self.config, args), 1)
+            args.until_idle = False
+            coordinator.run_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(cli_module._command_run(self.config, args), 0)
+        coordinator.enqueue_prompt_file.assert_called_once()
+
+    def test_run_rejects_unbounded_drain(self) -> None:
+        args = Namespace(
+            controller_harness=None,
+            drain_timeout_seconds=0,
+            once=False,
+            until_idle=True,
+            worker_harness=None,
+        )
+        with (
+            patch.object(cli_module, "_coordinator_from_args", return_value=MagicMock()),
+            self.assertRaisesRegex(ValueError, "drain_timeout_out_of_range"),
+        ):
+            cli_module._command_run(self.config, args)
+
+    def test_delivery_overrides_and_command_result(self) -> None:
+        args = Namespace(
+            controller_harness="grok",
+            github_repository="oldwinter/herdr-orchestrator",
+            goal_file="goal.md",
+            max_parallel=2,
+            review_repair_rounds=1,
+            tracker_backend="github",
+            tracker_root=".scratch/tracker",
+            wayfinder="always",
+            worker_harness=["codex"],
+        )
+        delivery = MagicMock()
+        delivery.run.return_value = SimpleNamespace(
+            artifact_root=Path(".orchestrator/deliveries/run"),
+            integration_branch="delivery/run",
+            integration_commit="abc123",
+            review_rounds=1,
+            run_id="run",
+            status="completed",
+            tickets_completed=2,
+            tracker_references={"01": "#1"},
+        )
+        configured = cli_module._delivery_config(self.config, args)
+        self.assertEqual(configured.standardized_delivery.max_parallel, 2)
+        with (
+            patch.object(cli_module, "StandardizedDelivery", return_value=delivery),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli_module._command_deliver(self.config, args), 0)
+
+    def test_catalog_profile_doctor_and_dashboard_commands(self) -> None:
+        dashboard = MagicMock()
+        dashboard.address = ("127.0.0.1", 8765)
+        dashboard.serve_forever.side_effect = KeyboardInterrupt
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(
+                cli_module._command_catalog(self.config, Namespace(format="json")),
+                0,
+            )
+            self.assertEqual(
+                cli_module._command_catalog(self.config, Namespace(format="text")),
+                0,
+            )
+            self.assertEqual(
+                cli_module._command_profile(
+                    self.config,
+                    Namespace(format="json", harness="pi"),
+                ),
+                0,
+            )
+            self.assertEqual(
+                cli_module._command_profile(
+                    self.config,
+                    Namespace(format="text", harness="pi"),
+                ),
+                0,
+            )
+            with patch.object(cli_module, "doctor", return_value=0):
+                self.assertEqual(
+                    cli_module._command_doctor(
+                        self.config,
+                        Namespace(probe_timeout_seconds=30),
+                    ),
+                    0,
+                )
+            with patch.object(cli_module, "DashboardServer", return_value=dashboard):
+                self.assertEqual(
+                    cli_module._command_dashboard(
+                        self.config,
+                        Namespace(host="127.0.0.1", poll_seconds=1.0, port=0),
+                    ),
+                    0,
+                )
+        self.assertIn('"harnesses"', output.getvalue())
+
+    def test_main_dispatches_and_classifies_errors(self) -> None:
+        handler = MagicMock(return_value=7)
+        with (
+            patch.object(cli_module, "load_workflow", return_value=self.config),
+            patch.dict(cli_module.COMMAND_HANDLERS, {"catalog": handler}),
+        ):
+            code = cli_module.main(["catalog", "--workflow", "workflow.toml", "--format", "json"])
+        self.assertEqual(code, 7)
+        with (
+            patch.object(cli_module, "load_workflow", side_effect=ValueError("invalid")),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            self.assertEqual(
+                cli_module.main(["catalog", "--workflow", "workflow.toml"]),
+                2,
+            )
+        handler.side_effect = DeliveryEscalation("account_required")
+        with (
+            patch.object(cli_module, "load_workflow", return_value=self.config),
+            patch.dict(cli_module.COMMAND_HANDLERS, {"catalog": handler}),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            self.assertEqual(
+                cli_module.main(["catalog", "--workflow", "workflow.toml"]),
+                3,
+            )
 
 
 if __name__ == "__main__":

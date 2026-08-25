@@ -56,7 +56,8 @@ class SqliteObserver:
                 SELECT id, title, harness, dedupe_key, placement, state, attempts,
                        max_attempts, available_at, lease_until, agent_name, error_code,
                        execution_path, herdr_workspace_id, receipt_kind, receipt_value,
-                       agent_settled, task_verified, error_summary, created_at, updated_at
+                       agent_settled, task_verified, error_summary, correlation_id,
+                       created_at, updated_at
                 FROM jobs
                 WHERE workflow = ?
                 ORDER BY created_at, id
@@ -70,7 +71,8 @@ class SqliteObserver:
                        receipts.pane_id, receipts.error_code, receipts.placement,
                        receipts.execution_path, receipts.herdr_workspace_id,
                        receipts.agent_settled, receipts.task_verified,
-                       receipts.error_summary, receipts.observed_at
+                       receipts.error_summary, receipts.correlation_id,
+                       receipts.observed_at
                 FROM receipts
                 JOIN jobs ON jobs.id = receipts.job_id
                 WHERE jobs.workflow = ?
@@ -206,17 +208,11 @@ class HerdrObserver:
                 workspace_ids.add(workspace_id)
         for row in worktrees:
             workspace_id = row.get("open_workspace_id")
-            if (
-                isinstance(workspace_id, str)
-                and _path_is_within(row.get("path"), self.workspace)
-            ):
+            if isinstance(workspace_id, str) and _path_is_within(row.get("path"), self.workspace):
                 workspace_ids.add(workspace_id)
         for row in agents:
             workspace_id = row.get("workspace_id")
-            if (
-                isinstance(workspace_id, str)
-                and _path_is_within(row.get("cwd"), self.workspace)
-            ):
+            if isinstance(workspace_id, str) and _path_is_within(row.get("cwd"), self.workspace):
                 workspace_ids.add(workspace_id)
         return workspace_ids
 

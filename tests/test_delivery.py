@@ -319,15 +319,9 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 "log",
                 "--oneline",
             ).stdout
-            issues = list(
-                (delivery_config.tracker_root / "parallel-delivery/issues").glob("*.md")
-            )
-            issue_contents = [
-                path.read_text(encoding="utf-8") for path in issues
-            ]
-            ledger = (
-                result.artifact_root / "decision-ledger.jsonl"
-            ).read_text(encoding="utf-8")
+            issues = list((delivery_config.tracker_root / "parallel-delivery/issues").glob("*.md"))
+            issue_contents = [path.read_text(encoding="utf-8") for path in issues]
+            ledger = (result.artifact_root / "decision-ledger.jsonl").read_text(encoding="utf-8")
 
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(repeated, result)
@@ -378,9 +372,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 role="worker",
             )
 
-            ledger = (
-                delivery._run_root / "decision-ledger.jsonl"
-            ).read_text(encoding="utf-8")
+            ledger = (delivery._run_root / "decision-ledger.jsonl").read_text(encoding="utf-8")
 
         self.assertEqual(outcome.state, AgentState.DONE)
         self.assertEqual(dispatcher.responses, ["Use the accepted default."])
@@ -480,10 +472,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(
-            sum(
-                "Create one accepted specification" in prompt
-                for prompt in dispatcher.prompts
-            ),
+            sum("Create one accepted specification" in prompt for prompt in dispatcher.prompts),
             1,
         )
 
@@ -518,9 +507,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 role="way-route",
             )
 
-            ledger = (
-                delivery._run_root / "decision-ledger.jsonl"
-            ).read_text(encoding="utf-8")
+            ledger = (delivery._run_root / "decision-ledger.jsonl").read_text(encoding="utf-8")
 
         self.assertEqual(dispatcher.calls, 2)
         self.assertIn('"event": "artifact_prompt_retried"', ledger)

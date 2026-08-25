@@ -58,9 +58,7 @@ class SelectionTests(unittest.TestCase):
         config = replace(
             self.config,
             workers=tuple(
-                worker
-                for worker in self.config.workers
-                if worker.harness is not Harness.CLAUDE
+                worker for worker in self.config.workers if worker.harness is not Harness.CLAUDE
             ),
         )
 

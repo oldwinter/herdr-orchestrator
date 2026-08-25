@@ -47,10 +47,7 @@ class SnapshotFeed:
         timeout: float,
     ) -> tuple[int, dict[str, object] | None]:
         with self._condition:
-            if (
-                self._snapshot is not None
-                and event_id > self._event_id
-            ):
+            if self._snapshot is not None and event_id > self._event_id:
                 return self._event_id, self._snapshot
             self._condition.wait_for(
                 lambda: self._event_id > event_id,
@@ -208,10 +205,12 @@ def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
                 request_port = parsed.port
             except ValueError:
                 return False
-            server_port = int(self.server.server_address[1])
-            return (
-                parsed.hostname in {"127.0.0.1", "localhost"}
-                and (request_port is None or request_port == server_port)
+            server_address = self.server.server_address
+            if not isinstance(server_address, tuple) or len(server_address) < 2:
+                return False
+            server_port = int(server_address[1])
+            return parsed.hostname in {"127.0.0.1", "localhost"} and (
+                request_port is None or request_port == server_port
             )
 
         def _snapshot(self) -> None:
@@ -251,9 +250,7 @@ def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
                             separators=(",", ":"),
                         ).encode()
                         self.wfile.write(
-                            f"id: {next_id}\nevent: snapshot\ndata: ".encode()
-                            + payload
-                            + b"\n\n"
+                            f"id: {next_id}\nevent: snapshot\ndata: ".encode() + payload + b"\n\n"
                         )
                         event_id = next_id
                     self.wfile.flush()

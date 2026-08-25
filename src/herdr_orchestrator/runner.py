@@ -4,6 +4,7 @@ import hashlib
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 
@@ -30,6 +31,7 @@ from herdr_orchestrator.model import (
     TaskReceipt,
     WorkflowConfig,
 )
+from herdr_orchestrator.observability import Observability
 from herdr_orchestrator.planner import (
     PlannerOutputError,
     load_planner_tasks,
@@ -87,6 +89,7 @@ class Coordinator:
         controller_harness: Harness | None = None,
         controller_auto: bool = False,
         worker_harnesses: Iterable[Harness] | None = None,
+        observability: Observability | None = None,
     ) -> None:
         self.config = config
         self.store = store or Store(config.state_db)
@@ -94,6 +97,10 @@ class Coordinator:
         self.controller_harness = controller_harness
         self.controller_auto = controller_auto
         self.worker_harnesses = effective_worker_harnesses(config, worker_harnesses)
+        self.observability = observability or Observability(
+            config.state_db.parent / "telemetry",
+            config.name,
+        )
 
     def initialize(self) -> None:
         self.store.initialize()
@@ -186,10 +193,7 @@ class Coordinator:
             limit=self.config.coordinator.max_parallel,
             lease_seconds=self.config.coordinator.lease_seconds,
             slot_names=slot_names,
-            slot_limits={
-                worker.harness.value: worker.replicas
-                for worker in self.config.workers
-            },
+            slot_limits={worker.harness.value: worker.replicas for worker in self.config.workers},
             allowed_harnesses=self.worker_harnesses,
         )
         results = {state.value: 0 for state in JobState}
@@ -269,41 +273,25 @@ class Coordinator:
                     waves=waves,
                     claimed=total_claimed,
                     queue=last_queue,
-                    worker_pool_idle=(
-                        active[JobState.PENDING.value] == 0
-                        and active[JobState.RUNNING.value] == 0
-                        and active[JobState.BLOCKED.value] == 0
-                    ),
-                    queue_idle=(
-                        last_queue[JobState.PENDING.value] == 0
-                        and last_queue[JobState.RUNNING.value] == 0
-                        and last_queue[JobState.BLOCKED.value] == 0
-                    ),
+                    worker_pool_idle=_queue_is_idle(active),
+                    queue_idle=_queue_is_idle(last_queue),
                 )
             waves += 1
-            claimed = int(report["claimed"])
+            claimed = _integer(report["claimed"])
             total_claimed += claimed
             batch = report["batch"]
             assert isinstance(batch, dict)
             for state in JobState:
-                aggregate[state.value] += int(batch[state.value])
+                aggregate[state.value] += _integer(batch[state.value])
             queue = report["queue"]
             assert isinstance(queue, dict)
-            last_queue = {str(key): int(value) for key, value in queue.items()}
+            last_queue = {str(key): _integer(value) for key, value in queue.items()}
             active = self.store.status_counts(
                 self.config.name,
                 allowed_harnesses=self.worker_harnesses,
             )
-            worker_pool_idle = (
-                active[JobState.PENDING.value] == 0
-                and active[JobState.RUNNING.value] == 0
-                and active[JobState.BLOCKED.value] == 0
-            )
-            queue_idle = (
-                last_queue[JobState.PENDING.value] == 0
-                and last_queue[JobState.RUNNING.value] == 0
-                and last_queue[JobState.BLOCKED.value] == 0
-            )
+            worker_pool_idle = _queue_is_idle(active)
+            queue_idle = _queue_is_idle(last_queue)
             if active[JobState.BLOCKED.value] > 0:
                 return self._drain_report(
                     aggregate,
@@ -475,18 +463,14 @@ class Coordinator:
                 skipped_worktrees += 1
                 continue
             name = row["agent_name"]
-            if (
-                not isinstance(name, str)
-                or name not in owned_names
-                or name not in created_panes
-            ):
+            if not isinstance(name, str) or name not in owned_names or name not in created_panes:
                 skipped_unowned += 1
                 continue
             if name in active_names:
                 skipped_active += 1
                 continue
             candidates_by_name[name] = {
-                "job_id": int(row["id"]),
+                "job_id": _integer(row["id"]),
                 "agent_name": name,
                 "placement": str(row["placement"]),
                 "pane_id": created_panes[name],
@@ -529,32 +513,73 @@ class Coordinator:
         batch_key: str,
         dispatch_deadline: float | None = None,
     ) -> DispatchOutcome:
+        started = time.monotonic()
+        self.observability.event(
+            "dispatch_started",
+            correlation_id=job.correlation_id,
+            fields={
+                "attempt": job.attempt,
+                "harness": job.harness.value,
+                "job_id": job.job_id,
+                "placement": job.placement.value,
+            },
+        )
         profile = profile_for_harness(self.config.profiles, job.harness)
         try:
             timeout_seconds = self._dispatch_timeout(dispatch_deadline)
         except _DispatchDeadlineExceeded:
-            return DispatchOutcome(
+            outcome = DispatchOutcome(
                 agent_name=job.agent_name,
                 state=AgentState.UNKNOWN,
                 member_reused=False,
                 pane_id=None,
                 error_code="herdr_timeout",
                 placement=job.placement,
+                correlation_id=job.correlation_id,
             )
-        return self.dispatcher.dispatch(
-            job.harness,
-            execution_prompt(profile, job.prompt),
-            timeout_seconds=timeout_seconds,
-            agent_name=job.agent_name,
-            context=DispatchContext(
-                placement=job.placement,
-                title=job.title,
-                task_key=job.dedupe_key,
-                batch_key=batch_key,
-                worktree_root=self.config.placement.worktree_root,
-                receipt=job.receipt,
-            ),
+        else:
+            outcome = self.dispatcher.dispatch(
+                job.harness,
+                execution_prompt(profile, job.prompt),
+                timeout_seconds=timeout_seconds,
+                agent_name=job.agent_name,
+                context=DispatchContext(
+                    placement=job.placement,
+                    title=job.title,
+                    task_key=job.dedupe_key,
+                    batch_key=batch_key,
+                    worktree_root=self.config.placement.worktree_root,
+                    receipt=job.receipt,
+                    correlation_id=job.correlation_id,
+                ),
+            )
+            outcome = replace(outcome, correlation_id=job.correlation_id)
+        duration = time.monotonic() - started
+        fields = {
+            "attempt": job.attempt,
+            "error_code": outcome.error_code,
+            "harness": job.harness.value,
+            "job_id": job.job_id,
+            "state": outcome.state.value,
+        }
+        self.observability.event(
+            "dispatch_finished",
+            correlation_id=job.correlation_id,
+            fields=fields,
         )
+        self.observability.metric(
+            "dispatch_duration_seconds",
+            duration,
+            correlation_id=job.correlation_id,
+            fields=fields,
+        )
+        if outcome.error_code is not None or outcome.state is AgentState.BLOCKED:
+            self.observability.alert(
+                "dispatch_needs_attention",
+                correlation_id=job.correlation_id,
+                fields=fields,
+            )
+        return outcome
 
     def _slot_names(self) -> dict[str, tuple[str, ...]]:
         names: dict[str, tuple[str, ...]] = {}
@@ -570,7 +595,7 @@ class Coordinator:
         for row in self.store.jobs(self.config.name):
             if row["placement"] != PlacementTarget.WORKTREE.value:
                 continue
-            job_id = int(row["id"])
+            job_id = _integer(row["id"])
             harness = Harness(str(row["harness"]))
             names[f"{harness.value}:worktree:{job_id}"] = (
                 worktree_agent_name(self.config.name, harness, job_id),
@@ -592,13 +617,13 @@ class Coordinator:
             )
             if placement is None:
                 placement = self._select_topology(
-                    int(row["id"]),
+                    _integer(row["id"]),
                     str(row["title"]),
                     str(row["prompt"]),
                     str(row["dedupe_key"]),
                     dispatch_deadline,
                 )
-            self.store.set_placement(int(row["id"]), placement)
+            self.store.set_placement(_integer(row["id"]), placement)
 
     def _static_placement(
         self,
@@ -607,9 +632,7 @@ class Coordinator:
         harness: Harness,
         override: PlacementTarget | None,
     ) -> PlacementTarget | None:
-        worker = next(
-            worker for worker in self.config.workers if worker.harness is harness
-        )
+        worker = next(worker for worker in self.config.workers if worker.harness is harness)
         return static_placement(
             self.config.placement.mode,
             title,
@@ -628,9 +651,9 @@ class Coordinator:
         dispatch_deadline: float | None = None,
     ) -> PlacementTarget:
         controller = self._controller_harness()
-        digest = hashlib.sha256(
-            f"{self.config.name}\0topology\0{dedupe_key}".encode()
-        ).hexdigest()[:12]
+        digest = hashlib.sha256(f"{self.config.name}\0topology\0{dedupe_key}".encode()).hexdigest()[
+            :12
+        ]
         output_file = self.config.planner.output_file.parent / f"topology-{digest}.json"
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.unlink(missing_ok=True)
@@ -688,9 +711,7 @@ class Coordinator:
             controller,
         )
         profiles = self._worker_profiles()
-        digest = hashlib.sha256(
-            f"{self.config.name}\0{dedupe_key}".encode()
-        ).hexdigest()[:12]
+        digest = hashlib.sha256(f"{self.config.name}\0{dedupe_key}".encode()).hexdigest()[:12]
         output_file = self.config.planner.output_file.parent / f"route-{digest}.json"
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.unlink(missing_ok=True)
@@ -751,8 +772,7 @@ class Coordinator:
 
     def _worker_profiles(self) -> tuple[HarnessProfile, ...]:
         return tuple(
-            profile_for_harness(self.config.profiles, harness)
-            for harness in self.worker_harnesses
+            profile_for_harness(self.config.profiles, harness) for harness in self.worker_harnesses
         )
 
     def _run_planner_if_due(self, dispatch_deadline: float | None = None) -> None:
@@ -840,3 +860,15 @@ def _controller_agent_name(
         f"{workflow_name}\0{workspace.resolve()}\0controller\0{harness.value}".encode()
     ).hexdigest()[:8]
     return f"ho-control-{harness.value}-{digest}"
+
+
+def _integer(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("integer_value_invalid")
+    return int(value)
+
+
+def _queue_is_idle(counts: dict[str, int]) -> bool:
+    return all(
+        counts[state.value] == 0 for state in (JobState.PENDING, JobState.RUNNING, JobState.BLOCKED)
+    )

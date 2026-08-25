@@ -130,25 +130,19 @@ class NpmReleasePlanTests(unittest.TestCase):
                 check=False,
                 timeout=30,
             )
-            output = (
-                github_output.read_text(encoding="utf-8")
-                if github_output.is_file()
-                else ""
-            )
+            output = github_output.read_text(encoding="utf-8") if github_output.is_file() else ""
             return result, output
 
 
 class NpmReleaseWorkflowTests(unittest.TestCase):
-    def test_test_and_release_plan_use_the_dedicated_self_hosted_runner(self) -> None:
+    def test_untrusted_pr_code_uses_github_hosted_runner(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertEqual(
-            workflow.count(
-                "runs-on: [self-hosted, Linux, X64, herdr-orchestrator]"
-            ),
-            2,
+            workflow.count("runs-on: [self-hosted, Linux, X64, herdr-orchestrator]"),
+            1,
         )
-        self.assertEqual(workflow.count("runs-on: ubuntu-latest"), 1)
+        self.assertEqual(workflow.count("runs-on: ubuntu-latest"), 4)
         self.assertIn("release-plan:", workflow)
         self.assertIn(
             "publish: ${{ steps.plan.outputs.publish }}",
@@ -183,6 +177,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
             workflow,
         )
+        self.assertIn("npm install --global rust-just@1.57.0", workflow)
         self.assertNotIn("actions/checkout@v4", workflow)
         self.assertNotIn("actions/setup-node@v4", workflow)
         self.assertNotIn("actions/setup-python@v5", workflow)

@@ -67,10 +67,7 @@ class FakeDispatcher:
                 json.dumps({"harness": self.routed_harness.value}),
                 encoding="utf-8",
             )
-        if (
-            self.topology_placement is not None
-            and "Choose the Herdr execution topology" in prompt
-        ):
+        if self.topology_placement is not None and "Choose the Herdr execution topology" in prompt:
             match = re.search(
                 r"Write only this UTF-8 JSON file:\n([^\n]+)",
                 prompt,
@@ -125,9 +122,7 @@ class ResumeDispatcher(FakeDispatcher):
     ) -> None:
         super().__init__(outcomes)
         self.resume_outcome = resume_outcome
-        self.responses: list[
-            tuple[str, Harness, str, int, str, DispatchContext | None]
-        ] = []
+        self.responses: list[tuple[str, Harness, str, int, str, DispatchContext | None]] = []
 
     def respond(
         self,
@@ -359,12 +354,8 @@ class CoordinatorTests(unittest.TestCase):
             )
             dispatcher = FakeDispatcher(
                 {
-                    Harness.DROID: DispatchOutcome(
-                        "controller", AgentState.DONE, True, "w1:p1"
-                    ),
-                    Harness.GROK: DispatchOutcome(
-                        "worker", AgentState.DONE, False, "w1:p2"
-                    ),
+                    Harness.DROID: DispatchOutcome("controller", AgentState.DONE, True, "w1:p1"),
+                    Harness.GROK: DispatchOutcome("worker", AgentState.DONE, False, "w1:p2"),
                 },
                 topology_placement="pane",
                 delay_seconds=1.01,
@@ -407,11 +398,7 @@ class CoordinatorTests(unittest.TestCase):
                 )
             )
             dispatcher = FakeDispatcher(
-                {
-                    Harness.DROID: DispatchOutcome(
-                        "controller", AgentState.DONE, True, "w1:p1"
-                    )
-                },
+                {Harness.DROID: DispatchOutcome("controller", AgentState.DONE, True, "w1:p1")},
                 delay_seconds=1.01,
             )
             coordinator = Coordinator(
@@ -730,9 +717,7 @@ class CoordinatorTests(unittest.TestCase):
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
                 state_db=root / "state.db",
                 planner=replace(
-                    load_workflow(
-                        REPO_ROOT / "workflows/multi-harness.toml"
-                    ).planner,
+                    load_workflow(REPO_ROOT / "workflows/multi-harness.toml").planner,
                     output_file=root / "plans/planner.json",
                 ),
             )
