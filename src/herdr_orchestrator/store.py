@@ -480,6 +480,177 @@ class Store:
             counts[str(row["state"])] = int(row["total"])
         return counts
 
+    def claim_blocked_for_resume(
+        self,
+        workflow: str,
+        job_id: int,
+        *,
+        lease_seconds: int,
+    ) -> tuple[ClaimedJob, str]:
+        now = time.time()
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT jobs.*, receipts.pane_id AS blocked_pane_id
+                FROM jobs
+                JOIN receipts ON receipts.id = (
+                    SELECT id FROM receipts
+                    WHERE receipts.job_id = jobs.id
+                    ORDER BY id DESC LIMIT 1
+                )
+                WHERE jobs.workflow = ? AND jobs.id = ?
+                """,
+                (workflow, job_id),
+            ).fetchone()
+            if row is None:
+                raise StoreError("job_not_found")
+            if row["state"] != JobState.BLOCKED.value:
+                raise StoreError("job_not_resumable")
+            if row["lease_until"] is not None and float(row["lease_until"]) > now:
+                raise StoreError("job_resume_in_progress")
+            agent_name = row["agent_name"]
+            pane_id = row["blocked_pane_id"]
+            if not isinstance(agent_name, str) or not agent_name:
+                raise StoreError("blocked_agent_missing")
+            if not isinstance(pane_id, str) or not pane_id:
+                raise StoreError("blocked_pane_missing")
+            placement = row["placement"]
+            if not isinstance(placement, str) or not placement:
+                raise StoreError("blocked_placement_missing")
+            connection.execute(
+                """
+                UPDATE jobs
+                SET lease_until = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    now + lease_seconds,
+                    now,
+                    job_id,
+                ),
+            )
+            job = ClaimedJob(
+                job_id=int(row["id"]),
+                workflow=str(row["workflow"]),
+                title=str(row["title"]),
+                harness=Harness(str(row["harness"])),
+                prompt=str(row["prompt"]),
+                dedupe_key=str(row["dedupe_key"]),
+                attempt=int(row["attempts"]),
+                max_attempts=int(row["max_attempts"]),
+                agent_name=agent_name,
+                placement=PlacementTarget(placement),
+                receipt=(
+                    TaskReceipt(
+                        ReceiptKind(str(row["receipt_kind"])),
+                        str(row["receipt_value"]),
+                    )
+                    if row["receipt_kind"] is not None
+                    and row["receipt_value"] is not None
+                    else None
+                ),
+            )
+        return job, pane_id
+
+    def record_resume_outcome(
+        self,
+        job: ClaimedJob,
+        outcome: DispatchOutcome,
+    ) -> JobState:
+        now = time.time()
+        error_code = outcome.error_code
+        if job.receipt is not None and outcome.task_verified is not True and error_code is None:
+            error_code = "task_receipt_missing"
+        elif outcome.task_verified is False and error_code is None:
+            error_code = "task_receipt_invalid"
+        if error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
+            state = JobState.SUCCEEDED
+        else:
+            state = JobState.BLOCKED
+        if error_code is None and outcome.state is AgentState.BLOCKED:
+            error_code = "agent_blocked"
+        elif error_code is None and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
+            error_code = "agent_not_settled"
+        agent_settled = (
+            outcome.agent_settled
+            if outcome.agent_settled is not None
+            else outcome.state in {AgentState.IDLE, AgentState.DONE}
+        )
+        error_summary = _bounded_error_summary(outcome.error_summary)
+
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT state, attempts FROM jobs WHERE id = ?",
+                (job.job_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError("job_not_found")
+            if row["state"] != JobState.BLOCKED.value or int(row["attempts"]) != job.attempt:
+                raise StoreError("job_lease_lost")
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = ?, available_at = ?, lease_until = NULL, agent_name = ?,
+                    error_code = ?, execution_path = ?, herdr_workspace_id = ?,
+                    agent_settled = ?, task_verified = ?, error_summary = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state.value,
+                    now,
+                    outcome.agent_name,
+                    error_code,
+                    outcome.execution_path,
+                    outcome.herdr_workspace_id,
+                    int(agent_settled),
+                    (
+                        int(outcome.task_verified)
+                        if outcome.task_verified is not None
+                        else None
+                    ),
+                    error_summary,
+                    now,
+                    job.job_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO receipts(
+                    job_id, attempt, state, agent_name, agent_state,
+                    member_reused, pane_id, error_code, placement,
+                    execution_path, herdr_workspace_id, agent_settled,
+                    task_verified, error_summary, observed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job.job_id,
+                    job.attempt,
+                    state.value,
+                    outcome.agent_name,
+                    outcome.state.value,
+                    int(outcome.member_reused),
+                    outcome.pane_id,
+                    error_code,
+                    (
+                        outcome.placement.value
+                        if outcome.placement is not None
+                        else job.placement.value
+                    ),
+                    outcome.execution_path,
+                    outcome.herdr_workspace_id,
+                    int(agent_settled),
+                    (
+                        int(outcome.task_verified)
+                        if outcome.task_verified is not None
+                        else None
+                    ),
+                    error_summary,
+                    now,
+                ),
+            )
+        return state
+
     def retry_failed(
         self,
         workflow: str,

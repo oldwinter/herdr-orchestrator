@@ -194,12 +194,18 @@ just run-until-idle --drain-timeout-seconds 3600
 # failed job 原 id / dedupe_key 保持不变，只追加一次 attempt budget
 just retry 42 --extra-attempts 1
 
+# blocked job 仅在人工审查后显式回答；复用原 agent/pane/attempt，不重发任务 prompt
+just resume 43 approval.txt
+
 # 默认只预览；--apply 只关闭本 workflow 已成功且 settled 的 agent pane
 just gc
 just gc --apply
+
+# failed 资源使用独立显式 scope；blocked 永不进入常规 GC
+just gc-failed
 ```
 
-GC 永不关闭或删除 worktree workspace、checkout 与 branch，也不碰 foreign/active agent。
+GC 永不关闭或删除 worktree workspace、checkout 与 branch，也不碰 foreign/active/blocked agent。
 回收还必须同时有 `member_reused=false` 的创建收据，且当前 pane ID 与收据一致；tab placement
 也只关闭该 pane，不关闭承载它的整个 tab。
 

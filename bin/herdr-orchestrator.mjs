@@ -486,12 +486,17 @@ function inspectInstallation(project) {
       modified.push(relativePath);
     }
   }
+  const runtimeVersion = packageVersion();
+  const versionSkew = manifest.version !== runtimeVersion;
   return {
     manifest: true,
     missing: missing.sort(),
     modified: modified.sort(),
-    ok: missing.length === 0 && modified.length === 0,
+    ok: missing.length === 0 && modified.length === 0 && !versionSkew,
+    installed_version: manifest.version,
+    runtime_version: runtimeVersion,
     version: manifest.version,
+    version_skew: versionSkew,
   };
 }
 
@@ -700,7 +705,7 @@ Setup:
   uninstall --project <path>
 
 Runtime:
-  doctor | catalog | profile | seed | status | enqueue | run | retry | gc | dashboard | smoke
+  doctor | catalog | profile | seed | status | enqueue | run | retry | resume | gc | dashboard | smoke
 
 Options:
   --project <path>   Target repository (default: current directory)
