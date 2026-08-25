@@ -134,6 +134,16 @@ workspace、tab、pane、agent lifecycle 和 worktree 的白名单字段。浏�
 
 - 强制要求 `HERDR_ENV=1`；
 - agent 名由 workflow、workspace 与 harness 稳定派生；
+- 新 agent 通过 `herdr agent start ... -- <native args>` 使用 control plane 固定的最高
+  自动化参数：Droid `--auto high`、Grok `--always-approve --permission-mode
+  bypassPermissions`、Codex `--dangerously-bypass-approvals-and-sandbox
+  --dangerously-bypass-hook-trust`、pi `--approve`、Claude
+  `--dangerously-skip-permissions`、Hermes `--yolo --accept-hooks`；planner 与 task
+  packet 不能覆盖或注入启动参数；
+- Claude 首次 workspace trust 没有原生 bypass 参数；只有新建 Claude agent 的 detection
+  output 同时包含 `Accessing workspace:`、`Quick safety check:`、
+  `Yes, I trust this folder` 与预期 execution root 时，adapter 才发送一次 Enter，其他
+  startup block、登录、secret、approval 与需求问题都不自动回答；
 - 只复用 kind 与 cwd 都匹配、且处于 settled state 的 agent；
 - `agent start` 无论返回 `agent_not_ready`，还是成功 payload 暂时为 `working/unknown`，
   都进入有界 recovery wait 后再验证；

@@ -43,6 +43,13 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             "idle",
             "done",
             "cursor",
+            "--auto high",
+            "--always-approve",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--approve",
+            "--dangerously-skip-permissions",
+            "--yolo",
+            "Quick safety check:",
         ):
             self.assertIn(required, skill)
 

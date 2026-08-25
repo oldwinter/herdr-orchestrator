@@ -167,6 +167,28 @@ scrollback。验证依据是 agent 成功启动、prompt 被接受、经过 life
 [`docs/runtime-troubleshooting.md`](docs/runtime-troubleshooting.md) 区分 provisioning、
 prompt acceptance、working 与 settled，不要只根据 pane 存在或最终标题判断。
 
+## 最高自动化启动策略
+
+Coordinator 新建 harness agent 时会通过 Herdr 的原生参数分隔符传入固定的最高自动化参数：
+
+| Harness | 原生启动参数 |
+| --- | --- |
+| Droid | `--auto high` |
+| Grok Build | `--always-approve --permission-mode bypassPermissions` |
+| Codex | `--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust` |
+| pi | `--approve` |
+| Claude Code | `--dangerously-skip-permissions` |
+| Hermes | `--yolo --accept-hooks` |
+
+这些参数减少本地工具执行、项目 trust、hook 与 sandbox 的人工确认，也意味着 worker 可在其
+execution root 内直接执行高权限本地动作。参数由 control plane 固定映射，planner 和任务
+prompt 都不能注入或覆盖。Claude 没有跳过首次 workspace trust 的原生参数；新建 Claude
+agent 只有在 detection output 同时匹配内置 workspace trust 提示的三个稳定标记和预期
+execution root 时，才会自动发送一次 Enter，其他 startup block 不会得到输入。它们不扩大
+任务授权范围：push、
+merge、发布、发送、删除 worktree、权限变更和生产操作仍必须由用户单独明确授权。真正的
+需求问题仍可能进入 `blocked`，普通 queue 继续要求显式 `resume`。
+
 ## 添加一个任务
 
 ```bash
@@ -331,7 +353,7 @@ artifact、恢复和退出码见
 ## 明确不做
 
 - 不把 `done` 当成质量证明；
-- 不在普通 queue 模式自动回答 approval 或 question UI；
+- 不在普通 queue 模式自动回答 job approval 或需求 question UI；启动期只自动确认精确匹配的 Claude workspace trust；
 - 不自动 push、merge、发布或删除；
 - 不把 pane terminal output 当完整 transcript；
 - 不让 planner 生成并执行任意 shell command；

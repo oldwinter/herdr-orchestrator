@@ -1,9 +1,9 @@
 {
-  "scan_id": "scan-2026-08-25-pr18-v2",
-  "scan_date": "2026-08-25T08:49:30.914565+00:00",
-  "scan_type": "range",
-  "commit_range": "origin/main..worktree/lucky-cloud-e44c",
-  "pr_number": 18,
+  "scan_id": "scan-2026-08-25-maximum-harness-automation",
+  "scan_date": "2026-08-25T18:18:42+08:00",
+  "scan_type": "pre-commit",
+  "commit_range": "origin/main..worktree",
+  "pr_number": null,
   "threat_model_version": "1.0.0",
   "findings": [],
   "summary": {
@@ -22,6 +22,6 @@
       "DoS": 0,
       "ElevationOfPrivilege": 0
     },
-    "files_analyzed": 71
+    "files_analyzed": 12
   }
 }

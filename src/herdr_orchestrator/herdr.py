@@ -43,6 +43,11 @@ SETTLED_CONFIRMATION_POLLS = 6
 SETTLED_STATES = {AgentState.IDLE, AgentState.DONE}
 PROMPT_TIMEOUT_ERRORS = {"herdr_timeout", "timeout"}
 OUTPUT_RECEIPT_UI_MARKERS = {"\u26ec", "⧬", "⏺", "•", "●", "◆", "◇", "✦"}
+CLAUDE_WORKSPACE_TRUST_MARKERS = (
+    "Accessing workspace:",
+    "Quick safety check:",
+    "Yes, I trust this folder",
+)
 CLAUDE_AUTH_FAILURE = re.compile(r"(?im)^\s*⏺\s+Please run /login\b.*\bAPI Error:\s*(?:401|403)\b")
 INVALID_MODEL_FAILURE = re.compile(
     r"(?is)(?:"
@@ -73,6 +78,18 @@ AUTH_FAILURE = re.compile(
     r"(?:API[ -]?key|access\s+token|credentials?)\b"
     r")"
 )
+
+MAXIMUM_AUTOMATION_ARGUMENTS: dict[Harness, tuple[str, ...]] = {
+    Harness.DROID: ("--auto", "high"),
+    Harness.GROK: ("--always-approve", "--permission-mode", "bypassPermissions"),
+    Harness.CODEX: (
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+    ),
+    Harness.PI: ("--approve",),
+    Harness.CLAUDE: ("--dangerously-skip-permissions",),
+    Harness.HERMES: ("--yolo", "--accept-hooks"),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -579,7 +596,12 @@ class HerdrTransport:
         pane_id = terminal.pane_id
         try:
             self._wait_for_shell(pane_id)
-            started = self._start_agent(name, harness, pane_id)
+            started = self._start_agent(
+                name,
+                harness,
+                pane_id,
+                execution_workspace,
+            )
             started_agent = _agent_payload(started)
             started_state = _agent_state(started_agent)
             if started_state not in SETTLED_STATES | {AgentState.BLOCKED}:
@@ -682,9 +704,11 @@ class HerdrTransport:
         name: str,
         harness: Harness,
         pane_id: str,
+        execution_workspace: Path,
     ) -> Mapping[str, Any]:
         for attempt in range(3):
             start_timeout_ms = self._remaining_milliseconds(START_TIMEOUT_MS)
+            native_arguments = MAXIMUM_AUTOMATION_ARGUMENTS[harness]
             command = Command(
                 [
                     "herdr",
@@ -697,6 +721,8 @@ class HerdrTransport:
                     pane_id,
                     "--timeout",
                     str(start_timeout_ms),
+                    "--",
+                    *native_arguments,
                 ],
                 self.workspace,
                 start_timeout_ms / 1000,
@@ -711,6 +737,11 @@ class HerdrTransport:
                     )
                     continue
                 if exc.code == "agent_not_ready":
+                    self._accept_claude_workspace_trust(
+                        name,
+                        harness,
+                        execution_workspace,
+                    )
                     recovery_timeout_ms = self._remaining_milliseconds(START_RECOVERY_TIMEOUT_MS)
                     return run_json(
                         self.runner,
@@ -729,6 +760,54 @@ class HerdrTransport:
                     )
                 raise
         raise TransportError("agent_start_failed")
+
+    def _accept_claude_workspace_trust(
+        self,
+        name: str,
+        harness: Harness,
+        execution_workspace: Path,
+    ) -> bool:
+        if harness is not Harness.CLAUDE:
+            return False
+        try:
+            output = run_text(
+                self.runner,
+                Command(
+                    [
+                        "herdr",
+                        "agent",
+                        "read",
+                        name,
+                        "--source",
+                        "detection",
+                        "--lines",
+                        "160",
+                    ],
+                    self.workspace,
+                    CONTROL_TIMEOUT_SECONDS,
+                ),
+            )
+        except TransportError:
+            return False
+        expected_path = str(execution_workspace.resolve())
+        if (
+            not all(marker in output for marker in CLAUDE_WORKSPACE_TRUST_MARKERS)
+            or re.search(
+                rf"(?m)^\s*{re.escape(expected_path)}\s*$",
+                output,
+            )
+            is None
+        ):
+            return False
+        run_json(
+            self.runner,
+            Command(
+                ["herdr", "agent", "send-keys", name, "enter"],
+                self.workspace,
+                CONTROL_TIMEOUT_SECONDS,
+            ),
+        )
+        return True
 
     def _prompt(
         self,
