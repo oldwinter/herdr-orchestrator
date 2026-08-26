@@ -537,6 +537,10 @@ class DistributionCliTests(unittest.TestCase):
                 packaged_files,
             )
             self.assertIn(
+                "package/src/herdr_orchestrator/dashboard/static/topology.js",
+                packaged_files,
+            )
+            self.assertIn(
                 "package/src/herdr_orchestrator/dashboard/static/cytoscape.LICENSE.txt",
                 packaged_files,
             )

@@ -68,6 +68,14 @@ pane 上，不形成额外结构层。点击节点只显示白名单详情，不
 当前 viewport。
 Canvas 同时维护一份屏幕阅读器可读的 DOM topology tree。
 
+拓扑图构建是纯函数（无 DOM、无 Cytoscape 依赖），位于独立的
+`static/topology.js`，在 `dashboard.js` 之前加载并暴露全局函数
+（`stateClass`、`normalizedProjects`、`topologyGraph`、`topologyPresetPositions`、
+`topologyId`）。它被 `tests/test_topology_js.py` 用 Node 直接求值并做 fixture
+契约测试：compound 嵌套与状态 class、确定性布局与结构签名稳定性（状态-only
+SSE 更新不移动节点）、v1 workspaces 回退投影、节点身份编码。没有 Node 时该
+测试自动 skip。
+
 Snapshot v1 继续提供原有的 `topology.workspaces`，并以 additive 字段提供
 `topology.projects`，其中嵌套 worktree、tab 与 pane。旧消费者无需修改。
 
