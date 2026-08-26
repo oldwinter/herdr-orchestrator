@@ -62,6 +62,7 @@ class DistributionCliTests(unittest.TestCase):
             payload = json.loads(install.stdout)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["harnesses"], ["droid"])
+            self.assertEqual(payload["manager"], ".herdr-orchestrator/manager")
             self.assertTrue(
                 (project / ".herdr-orchestrator/workflows/multi-harness.toml").is_file()
             )
@@ -719,6 +720,8 @@ class DistributionCliTests(unittest.TestCase):
             self.assertTrue(
                 (project / ".herdr-orchestrator/profiles/harnesses/droid.toml").is_file()
             )
+            self.assertTrue((project / ".herdr-orchestrator/manager/AGENTS.md").is_file())
+            self.assertTrue((project / ".herdr-orchestrator/manager/CLAUDE.md").is_file())
             self.assertTrue((project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file())
 
     def test_uninstall_rejects_manifest_paths_outside_managed_roots(self) -> None:
