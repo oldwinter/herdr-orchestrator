@@ -346,6 +346,8 @@ class DashboardTests(unittest.TestCase):
                     cytoscape_data = response.read()
                 with urlopen(f"{base_url}/assets/dashboard.js", timeout=2) as response:
                     dashboard_script = response.read().decode()
+                with urlopen(f"{base_url}/assets/topology.js", timeout=2) as response:
+                    topology_script = response.read().decode()
                 connection = HTTPConnection(host, port, timeout=2)
                 connection.request(
                     "GET",
@@ -367,6 +369,8 @@ class DashboardTests(unittest.TestCase):
         self.assertGreater(len(cytoscape_data), 400_000)
         self.assertIn("The Cytoscape Consortium", cytoscape_data[:180].decode())
         self.assertIn("/assets/cytoscape.min.js", index)
+        self.assertIn("/assets/topology.js", index)
+        self.assertIn("topologyGraph", topology_script)
         self.assertIn("agent settled", dashboard_script)
         self.assertIn("task verified", dashboard_script)
         self.assertIn("error_summary", dashboard_script)
