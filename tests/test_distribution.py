@@ -62,9 +62,12 @@ class DistributionCliTests(unittest.TestCase):
             payload = json.loads(install.stdout)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["harnesses"], ["droid"])
+            self.assertEqual(payload["manager"], ".herdr-orchestrator/manager")
             self.assertTrue(
                 (project / ".herdr-orchestrator/workflows/multi-harness.toml").is_file()
             )
+            self.assertTrue((project / ".herdr-orchestrator/manager/AGENTS.md").is_file())
+            self.assertTrue((project / ".herdr-orchestrator/manager/CLAUDE.md").is_file())
             self.assertTrue((project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file())
 
             catalog = self._run("catalog", "--project", str(project))
@@ -74,6 +77,150 @@ class DistributionCliTests(unittest.TestCase):
             self.assertEqual(
                 [item["harness"] for item in catalog_payload["harnesses"]],
                 ["droid"],
+            )
+
+    def test_manager_requires_a_herdr_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "claude",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            outside_herdr = os.environ.copy()
+            outside_herdr.pop("HERDR_ENV", None)
+
+            manager = self._run(
+                "manager",
+                "--project",
+                str(project),
+                "--harness",
+                "claude",
+                env=outside_herdr,
+            )
+
+        self.assertEqual(manager.returncode, 2)
+        self.assertEqual(manager.stderr.strip(), "manager_requires_herdr: HERDR_ENV=1")
+
+    def test_manager_rejects_a_harness_not_enabled_by_the_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            environment = os.environ.copy()
+            environment["HERDR_ENV"] = "1"
+
+            manager = self._run(
+                "manager",
+                "--project",
+                str(project),
+                "--harness",
+                "claude",
+                env=environment,
+            )
+
+        self.assertEqual(manager.returncode, 2)
+        self.assertEqual(
+            manager.stderr.strip(),
+            "manager_harness_not_enabled: claude",
+        )
+
+    def test_manager_launches_in_the_installed_workspace_without_extra_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            commands = root / "bin"
+            project.mkdir()
+            commands.mkdir()
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "claude",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            probe = root / "manager-probe"
+            harness = commands / "claude"
+            harness.write_text(
+                "#!/bin/sh\n"
+                'pwd > "$MANAGER_PROBE"\n'
+                'if [ "$#" -gt 0 ]; then\n'
+                '  printf \'%s\\n\' "$@" >> "$MANAGER_PROBE"\n'
+                "fi\n",
+                encoding="utf-8",
+            )
+            harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = self._run(
+                "manager",
+                "--project",
+                str(project),
+                "--harness",
+                "claude",
+                env=environment,
+            )
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            self.assertEqual(
+                probe.read_text(encoding="utf-8").splitlines(),
+                [str(project / ".herdr-orchestrator/manager")],
+            )
+
+    def test_manager_can_launch_from_the_source_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            probe = root / "manager-probe"
+            harness = commands / "grok"
+            harness.write_text(
+                "#!/bin/sh\n" 'pwd > "$MANAGER_PROBE"\n',
+                encoding="utf-8",
+            )
+            harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = self._run(
+                "manager",
+                "--project",
+                str(REPO_ROOT),
+                "--harness",
+                "grok",
+                env=environment,
+            )
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            self.assertEqual(
+                probe.read_text(encoding="utf-8").strip(),
+                str(REPO_ROOT / "manager"),
             )
 
     def test_wrapper_forwards_doctor_probe_timeout(self) -> None:
@@ -544,6 +691,8 @@ class DistributionCliTests(unittest.TestCase):
                 "package/src/herdr_orchestrator/dashboard/static/cytoscape.LICENSE.txt",
                 packaged_files,
             )
+            self.assertIn("package/manager/AGENTS.md", packaged_files)
+            self.assertIn("package/manager/CLAUDE.md", packaged_files)
 
             install = subprocess.run(
                 [
@@ -571,6 +720,8 @@ class DistributionCliTests(unittest.TestCase):
             self.assertTrue(
                 (project / ".herdr-orchestrator/profiles/harnesses/droid.toml").is_file()
             )
+            self.assertTrue((project / ".herdr-orchestrator/manager/AGENTS.md").is_file())
+            self.assertTrue((project / ".herdr-orchestrator/manager/CLAUDE.md").is_file())
             self.assertTrue((project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file())
 
     def test_uninstall_rejects_manifest_paths_outside_managed_roots(self) -> None:
@@ -655,13 +806,18 @@ class DistributionCliTests(unittest.TestCase):
                 exclude.read_text(encoding="utf-8"),
             )
 
-    def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        *arguments: str,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["node", str(CLI), *arguments],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
             check=False,
+            env=env,
             timeout=30,
         )
 

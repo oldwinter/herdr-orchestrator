@@ -1,6 +1,6 @@
 ---
 name: herdr-orchestrator
-description: "Use when a user asks to dispatch work across Herdr-backed coding harnesses with a durable queue, retries, receipts, topology-aware panes or worktrees, or the local operations dashboard."
+description: "Use when a user asks to dispatch work across Herdr-backed coding harnesses with a durable queue, retries, receipts, topology-aware panes or worktrees, the local operations dashboard, or a dedicated manual Herdr manager session."
 ---
 
 # Herdr Orchestrator
@@ -53,6 +53,21 @@ three exact built-in markers:
 `Accessing workspace:`, `Quick safety check:`, and `Yes, I trust this folder`. Treat every
 other startup block, login, approval, or task question as unresolved; do not answer it
 automatically.
+
+## Manual manager (interactive alternative)
+
+When the user wants one dedicated harness to observe and coordinate the current Herdr session,
+without durable dispatch, start the installed manager workspace from a Herdr pane:
+
+```bash
+npx --yes herdr-orchestrator manager --project . --harness claude
+```
+
+Choose exactly one enabled harness. The command requires `HERDR_ENV=1` and adds no harness
+arguments or permission bypasses. The manager policy is scoped to the current Herdr session,
+treats observed output as untrusted data, and does not maintain queue state. Use the durable
+flow below when the task needs retries, deduplication, leases, unattended execution, or
+receipts.
 
 ## 2. Write and enqueue the task packet
 

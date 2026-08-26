@@ -18,11 +18,12 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 
 当前只有一个声明式工作流：`workflows/multi-harness.toml`。它声明 coordinator 策略、六个 worker、紧凑 catalog 目录、可选 planner，以及可幂等 seed 的示例任务。改 TOML 字段前读 `docs/workflow-schema.md`。
 
-仓库有两条互不混用的运行面：
+仓库运行面各自独立，不要混用其状态语义：
 
 | 模式 | 入口 | 何时用 |
 | --- | --- | --- |
 | Durable queue | `just seed` / `enqueue` / `enqueue-auto` / `run` / `run-once` / `run-until-idle` / `retry` / `gc` / `status` | 普通派发、重试、收据、无人值守 queue |
+| Manual manager | `node bin/herdr-orchestrator.mjs manager --project . --harness <name>` | 在当前 Herdr session 内启动一个专用交互式管理会话 |
 | Read-only dashboard | `just dashboard` | 实时查看 queue、attention、Herdr topology 与 receipt timeline |
 | Standardized delivery | 仅 `just deliver` 或显式 Skill | 用户明确触发标准交付；普通实现/修复/review/orchestrate 不走这条路 |
 
@@ -35,6 +36,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - **六 harness**：`droid`、`grok`、`codex`、`pi`、`claude`、`hermes`。能力描述真源是 `profiles/harnesses/*.toml`；完整执行上下文在同名 `.md`，只在该 harness 被选中后加载。
 - **两级 catalog**：planner / router 只看到当前 workflow 启用的紧凑 catalog；coordinator 在 dispatch 前才注入所选完整 profile。
 - **Durable queue**：claim、lease、重试、`dedupe_key`、收据。任务状态见 `docs/architecture.md`。
+- **Manual manager**：固定工作目录中的单个 harness 会话，只管理当前 Herdr session；不模拟 queue、retry、lease 或 receipt。
 - **自动选 worker**：`enqueue` 省略 harness 时，主控只输出 `{"harness":"..."}`，coordinator 校验后入队。
 - **只读 smoke**：`just smoke` 对启用 harness 做真实 turn 连通；可用重复 `--harness` 收窄。
 - **实时 Dashboard**：本地只读 Web 投影，异步展示 durable queue、runtime drift、
@@ -51,6 +53,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - `workflows/prompts/`：任务 prompt 文件
 - `profiles/harnesses/*.toml`：主控预加载的紧凑 harness catalog 真源
 - `profiles/harnesses/*.md`：选中 harness 后才按需加载的完整执行上下文
+- `manager/`：手动 Herdr 管理会话的 canonical policy 与 Claude adapter
 - `.agents/skills/standardized-delivery/`：opt-in 标准交付 Skill 与分阶段 reference
 - `.agent/skills`、`.claude/skills`：指向 `.agents/skills` 的兼容 symlink，不是独立真源
 - `docs/architecture.md`：恢复、lease、planner、delivery 运行语义

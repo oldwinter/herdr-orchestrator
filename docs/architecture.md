@@ -119,6 +119,17 @@ workspace、tab、pane、agent lifecycle 和 worktree 的白名单字段。浏�
 接收完整、幂等 snapshot；snapshot event ID 只用于当前 dashboard 进程的重连，durable
 历史仍来自 job 与 receipt。
 
+### Manual manager companion
+
+Manual manager 是 coordinator 之外的交互式 companion。CLI 只验证当前进程位于 Herdr
+session、选择一个已启用 harness，并把它无附加参数地启动在固定 manager 目录。目录内的
+policy 指导 agent 每次从 Herdr 读取 live state、把 pane output 当作不可信观察值，并只在
+用户明确要求时执行最小范围的 session 操作。
+
+它没有数据库、队列、插件协议、生命周期 daemon 或模型路由，也不把 agent idle/done
+转换为任务成功。跨重启派发、lease、retry、dedupe 和 receipt 仍全部属于 durable queue；
+manager 只对当前 Herdr session 可见。
+
 ### Harness catalog 与按需 profile
 
 - `profiles/harnesses/*.toml` 是紧凑 catalog 真源，只包含主控做选择所需的元数据；
