@@ -1,0 +1,439 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:03.731
+If an agent process disappears, task state
+
+00:00:03.731 --> 00:00:06.928
+should not disappear with it. Herdr
+
+00:00:06.928 --> 00:00:09.060
+Orchestrator places multiple coding
+
+00:00:09.060 --> 00:00:12.258
+harnesses behind one local control plane.
+
+00:00:12.258 --> 00:00:15.455
+Models may propose tasks and select
+
+00:00:15.455 --> 00:00:19.186
+workers. But Python and SQLite always own
+
+00:00:19.186 --> 00:00:22.384
+the queue, leases, retries, and success
+
+00:00:22.384 --> 00:00:25.581
+decisions. Remember it this way: Herdr
+
+00:00:25.581 --> 00:00:28.246
+hosts terminals, while the Coordinator
+
+00:00:28.246 --> 00:00:29.845
+owns the facts.
+
+00:00:30.295 --> 00:00:34.033
+The first step is loading a declarative
+
+00:00:34.033 --> 00:00:37.771
+workflow, not starting a model. TOML fixes
+
+00:00:37.771 --> 00:00:39.908
+concurrency, leases, timeouts, placement,
+
+00:00:39.908 --> 00:00:43.646
+and the allowed workers. The router sees
+
+00:00:43.646 --> 00:00:47.384
+only a compact harness catalog, not six
+
+00:00:47.384 --> 00:00:50.588
+long contexts. After Droid, Grok, Codex,
+
+00:00:50.588 --> 00:00:54.326
+Pi, Claude, or Hermes is selected, its
+
+00:00:54.326 --> 00:00:58.065
+full profile is injected at dispatch. This
+
+00:00:58.065 --> 00:01:01.803
+keeps context small and locks routing to
+
+00:01:01.803 --> 00:01:02.871
+configured candidates.
+
+00:01:03.321 --> 00:01:07.217
+After a task enters SQLite, its dedupe
+
+00:01:07.217 --> 00:01:10.557
+key prevents duplicate work. Claim runs
+
+00:01:10.557 --> 00:01:13.897
+inside an immediate write transaction. It
+
+00:01:13.897 --> 00:01:17.237
+increments the attempt, sets the lease,
+
+00:01:17.237 --> 00:01:21.133
+chooses a replica slot, and creates a
+
+00:01:21.133 --> 00:01:25.030
+correlation ID. Each wave claims only the
+
+00:01:25.030 --> 00:01:27.256
+configured capacity before dispatching
+
+00:01:27.256 --> 00:01:29.483
+through Herdr. Store deterministically
+
+00:01:29.483 --> 00:01:32.266
+folds outcomes into success, blocked,
+
+00:01:32.266 --> 00:01:36.162
+retry, or failure. A stale attempt can
+
+00:01:36.162 --> 00:01:39.502
+never overwrite a newly claimed execution.
+
+00:01:39.952 --> 00:01:43.455
+Herdr runtime does not treat a running
+
+00:01:43.455 --> 00:01:46.958
+process as proof that a task started.
+
+00:01:46.958 --> 00:01:50.461
+It first proves the pane shell is
+
+00:01:50.461 --> 00:01:53.463
+ready, then proves the harness is
+
+00:01:53.463 --> 00:01:55.965
+interactive. Before submitting the prompt,
+
+00:01:55.965 --> 00:01:59.468
+it records the state change sequence. Only
+
+00:01:59.468 --> 00:02:02.971
+a strict sequence advance proves a new
+
+00:02:02.971 --> 00:02:06.474
+turn. The turn must then stabilize in
+
+00:02:06.474 --> 00:02:09.476
+idle or done. Blocked, working, unknown,
+
+00:02:09.476 --> 00:02:12.979
+and timeout are not success. Every wait
+
+00:02:12.979 --> 00:02:14.981
+shares one bounded deadline.
+
+00:02:15.431 --> 00:02:18.487
+After choosing a worker, the system
+
+00:02:18.487 --> 00:02:22.052
+chooses where the task runs. A tab
+
+00:02:22.052 --> 00:02:24.599
+provides a dedicated visible location.
+
+00:02:24.599 --> 00:02:28.164
+Pane placement shares a tab within one
+
+00:02:28.164 --> 00:02:30.711
+wave while preserving separate terminals.
+
+00:02:30.711 --> 00:02:33.767
+Worktree placement creates a task branch,
+
+00:02:33.767 --> 00:02:36.823
+checkout, and Herdr workspace for write
+
+00:02:36.823 --> 00:02:39.370
+work. Explicit overrides and worker
+
+00:02:39.370 --> 00:02:41.916
+defaults come first. Deterministic read
+
+00:02:41.916 --> 00:02:44.972
+and write signals come next. Only
+
+00:02:44.972 --> 00:02:48.028
+ambiguous cases reach a bounded topology
+
+00:02:48.028 --> 00:02:50.575
+controller. A worktree isolates a
+
+00:02:50.575 --> 00:02:52.103
+checkout, not security.
+
+00:02:52.553 --> 00:02:56.328
+Each of the six harnesses receives fixed
+
+00:02:56.328 --> 00:02:59.025
+maximum automation flags that planners
+
+00:02:59.025 --> 00:03:02.261
+cannot override. These flags reduce local
+
+00:03:02.261 --> 00:03:05.497
+confirmations, but they do not authorize
+
+00:03:05.497 --> 00:03:08.194
+pushes, merges, publishing, or production
+
+00:03:08.194 --> 00:03:10.890
+actions. Claude workspace trust has
+
+00:03:10.890 --> 00:03:14.126
+another guard. Three stable markers must
+
+00:03:14.126 --> 00:03:17.362
+appear, and the resolved execution root
+
+00:03:17.362 --> 00:03:21.137
+must match one complete output line. Login
+
+00:03:21.137 --> 00:03:22.755
+prompts, authentication, another
+
+00:03:22.755 --> 00:03:25.452
+directory, or missing markers never
+
+00:03:25.452 --> 00:03:27.070
+trigger automatic input.
+
+00:03:27.520 --> 00:03:31.047
+Settled only means the agent stopped. It
+
+00:03:31.047 --> 00:03:34.574
+does not prove the task is correct.
+
+00:03:34.574 --> 00:03:38.101
+An output receipt must appear in new
+
+00:03:38.101 --> 00:03:41.628
+lines from the current turn. Prompt echoes
+
+00:03:41.628 --> 00:03:45.155
+and old output cannot count. A file
+
+00:03:45.155 --> 00:03:48.178
+receipt must stay inside the execution
+
+00:03:48.178 --> 00:03:50.697
+root, reject absolute paths, parent
+
+00:03:50.697 --> 00:03:53.217
+traversal, and symlinks, and change
+
+00:03:53.217 --> 00:03:56.744
+relative to its baseline. Failed tasks may
+
+00:03:56.744 --> 00:03:59.767
+receive more attempt budget. Blocked tasks
+
+00:03:59.767 --> 00:04:03.294
+continue on the same agent, pane, and
+
+00:04:03.294 --> 00:04:05.813
+attempt after a reviewed response.
+
+00:04:06.263 --> 00:04:08.855
+The Dashboard projects SQLite durable
+
+00:04:08.855 --> 00:04:13.001
+state and Herdr runtime into one read-only
+
+00:04:13.001 --> 00:04:16.111
+snapshot. It shows queue state, attention
+
+00:04:16.111 --> 00:04:19.221
+items, receipt history, and a compound
+
+00:04:19.221 --> 00:04:22.331
+project, worktree, tab, and pane topology.
+
+00:04:22.331 --> 00:04:24.922
+Structural changes trigger layout, while
+
+00:04:24.922 --> 00:04:28.032
+status changes update content only, so
+
+00:04:28.032 --> 00:04:31.142
+live refreshes remain stable. The server
+
+00:04:31.142 --> 00:04:34.770
+binds only to loopback, validates Host and
+
+00:04:34.770 --> 00:04:37.880
+port, applies CSP and field allowlists,
+
+00:04:37.880 --> 00:04:40.471
+and never reads prompts, environment
+
+00:04:40.471 --> 00:04:43.063
+variables, or complete terminal output.
+
+00:04:43.513 --> 00:04:45.575
+Alongside ordinary dispatch, standardized
+
+00:04:45.575 --> 00:04:48.152
+delivery is available only through
+
+00:04:48.152 --> 00:04:50.729
+explicit opt-in. It resolves
+
+00:04:50.729 --> 00:04:52.790
+specification-blocking decisions, then
+
+00:04:52.790 --> 00:04:55.367
+creates an accepted spec and
+
+00:04:55.367 --> 00:04:57.944
+dependency-ordered ticket graph. Each
+
+00:04:57.944 --> 00:05:01.037
+ticket is implemented in an isolated
+
+00:05:01.037 --> 00:05:04.129
+worktree and closed with commit and
+
+00:05:04.129 --> 00:05:06.191
+acceptance evidence. After integration,
+
+00:05:06.191 --> 00:05:09.799
+fresh Standards and Spec reviewers run in
+
+00:05:09.799 --> 00:05:12.376
+parallel, and the controller adjudicates
+
+00:05:12.376 --> 00:05:15.468
+every finding. Repair rounds are bounded.
+
+00:05:15.468 --> 00:05:18.561
+Success stops on an isolated integration
+
+00:05:18.561 --> 00:05:19.076
+branch.
+
+00:05:19.526 --> 00:05:23.136
+This project is not an operating system
+
+00:05:23.136 --> 00:05:25.715
+sandbox. It protects state transitions,
+
+00:05:25.715 --> 00:05:27.778
+evidence, and authorization boundaries.
+
+00:05:27.778 --> 00:05:30.872
+Model artifacts pass exact-key, enum,
+
+00:05:30.872 --> 00:05:33.451
+length, and allowlist checks. Telemetry
+
+00:05:33.451 --> 00:05:37.061
+stays local by default, exporters are off
+
+00:05:37.061 --> 00:05:40.156
+by default, and fields are sanitized
+
+00:05:40.156 --> 00:05:42.734
+before persistence. The installer manages
+
+00:05:42.734 --> 00:05:45.829
+only manifest-owned project paths and
+
+00:05:45.829 --> 00:05:48.923
+stops conservatively on symlinks or user
+
+00:05:48.923 --> 00:05:52.018
+changes. Garbage collection starts as a
+
+00:05:52.018 --> 00:05:55.112
+dry run and requires creation, pane
+
+00:05:55.112 --> 00:05:57.691
+identity, and current ownership evidence.
+
+00:05:58.141 --> 00:06:01.645
+The Python control plane and npm wrapper
+
+00:06:01.645 --> 00:06:04.648
+have no third-party runtime package
+
+00:06:04.648 --> 00:06:06.650
+dependencies. External capabilities come
+
+00:06:06.650 --> 00:06:10.154
+from local command-line tools. The npm
+
+00:06:10.154 --> 00:06:12.657
+installer places workflows, profiles, and
+
+00:06:12.657 --> 00:06:15.660
+an ownership manifest into the target
+
+00:06:15.660 --> 00:06:18.162
+project while preserving user edits.
+
+00:06:18.162 --> 00:06:20.665
+Publishing starts after the complete
+
+00:06:20.665 --> 00:06:24.169
+quality gate on main. A dedicated runner
+
+00:06:24.169 --> 00:06:27.673
+only checks whether the registry lacks the
+
+00:06:27.673 --> 00:06:31.176
+version. The actual npm publish uses OIDC
+
+00:06:31.176 --> 00:06:34.180
+Trusted Publishing on a GitHub-hosted
+
+00:06:34.180 --> 00:06:37.183
+runner, without long-lived tokens or
+
+00:06:37.183 --> 00:06:38.184
+production deployment.
+
+00:06:38.634 --> 00:06:41.235
+The repository currently has nineteen
+
+00:06:41.235 --> 00:06:43.835
+reachable commits, twenty-six package
+
+00:06:43.835 --> 00:06:46.436
+Python modules, and one hundred
+
+00:06:46.436 --> 00:06:49.037
+ninety-eight static test functions.
+
+00:06:49.037 --> 00:06:52.678
+Physical test lines are about zero point
+
+00:06:52.678 --> 00:06:56.319
+eight eight to one compared with Python
+
+00:06:56.319 --> 00:06:58.920
+source. Contributors run focused tests
+
+00:06:58.920 --> 00:07:02.561
+first, then just check, followed by a
+
+00:07:02.561 --> 00:07:06.202
+real doctor or read-only smoke when
+
+00:07:06.202 --> 00:07:08.802
+needed. Remember three invariants: model
+
+00:07:08.802 --> 00:07:11.403
+output is constrained, the Coordinator
+
+00:07:11.403 --> 00:07:14.524
+owns state, and current execution must
+
+00:07:14.524 --> 00:07:17.645
+produce new evidence before success is
+
+00:07:17.645 --> 00:07:18.165
+accepted.
