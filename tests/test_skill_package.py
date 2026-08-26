@@ -78,6 +78,12 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             if command[0] == "install":
                 self.assertEqual(command[1:3], ["--project", "."])
                 continue
+            if command[0] == "manager":
+                self.assertEqual(
+                    command,
+                    ["manager", "--project", ".", "--harness", "claude"],
+                )
+                continue
             arguments = list(command)
             project_index = arguments.index("--project")
             arguments[project_index : project_index + 2] = [

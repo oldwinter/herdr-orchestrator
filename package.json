@@ -17,6 +17,7 @@
   },
   "files": [
     "bin/",
+    "manager/",
     "profiles/",
     "skills/",
     "src/herdr_orchestrator/**/*.py",

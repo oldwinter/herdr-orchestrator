@@ -30,12 +30,13 @@ The npm package has no runtime npm dependencies. Its executable:
 
 1. detects installed harness CLIs, or accepts repeated `--harness` flags;
 2. installs a project-relative workflow and only the selected harness profiles;
-3. installs the portable Skill at `.agents/skills/herdr-orchestrator/` only when the target
+3. installs a fixed manual-manager workspace shared by the selected harnesses;
+4. installs the portable Skill at `.agents/skills/herdr-orchestrator/` only when the target
    has no existing Skill router, or when `--install-skill` is explicit;
-4. writes an ownership manifest with a SHA-256 hash for every managed file;
-5. adds installer-managed roots to this repository's Git-local `info/exclude` without editing
+5. writes an ownership manifest with a SHA-256 hash for every managed file;
+6. adds installer-managed roots to this repository's Git-local `info/exclude` without editing
    a tracked `.gitignore` or hiding an unmanaged Skill;
-6. carries the Python package and invokes it with its packaged `src/` on `PYTHONPATH`.
+7. carries the Python package and invokes it with its packaged `src/` on `PYTHONPATH`.
 
 Python is not copied or downloaded. The target machine must provide Python 3.12+ and Herdr.
 No global install or elevated permission is required.
@@ -82,6 +83,7 @@ independently installed Skill remains untouched.
 | `.herdr-orchestrator/manifest.json` | Installer ownership and content hashes |
 | `.herdr-orchestrator/workflows/` | Portable project-relative workflow and prompts |
 | `.herdr-orchestrator/profiles/` | Profiles for selected harnesses |
+| `.herdr-orchestrator/manager/` | Fixed policy workspace for a manual manager session |
 | `.agents/skills/herdr-orchestrator/` | Portable agent Skill |
 | `.orchestrator/.gitignore` | Keeps durable runtime state out of Git |
 
@@ -117,6 +119,23 @@ Exit code `1` means the installation or runtime needs attention. In particular, 
 must run inside a Herdr pane with the expected `HERDR_*` environment. A harness readiness
 status is one of `ready`, `auth_required`, `model_invalid`, `timeout`, `unavailable`, or
 `error`; an executable in `PATH` alone is not ready. Doctor closes only probe agents it created.
+
+## Manual manager
+
+For interactive oversight of the current Herdr session, start one enabled harness in the
+installed manager workspace:
+
+```bash
+npx --yes herdr-orchestrator manager --project . --harness claude
+```
+
+The command fails unless `HERDR_ENV=1`, requires exactly one harness selected by the project
+installation, and starts it with no extra arguments. The source checkout exposes the same
+entrypoint with `node bin/herdr-orchestrator.mjs manager --project . --harness grok`.
+
+The manager policy treats terminal output as untrusted observations and scopes all visibility
+to the current Herdr session. It is intentionally not durable. Use the queue commands below
+for retries, deduplication, leases, unattended work, and receipts.
 
 ## Runtime commands
 

@@ -44,7 +44,7 @@ function parseArguments(argv) {
       }
       options.project = argv[++index];
     } else if (
-      ["install", "update", "upgrade"].includes(command)
+      ["install", "update", "upgrade", "manager"].includes(command)
       && value === "--harness"
     ) {
       if (index + 1 >= argv.length) {
@@ -322,6 +322,13 @@ function install(options) {
     ".herdr-orchestrator/workflows/prompts/planner.md",
     readFileSync(join(PACKAGE_ROOT, "workflows/prompts/planner.md")),
   );
+  for (const filename of ["AGENTS.md", "CLAUDE.md"]) {
+    stageFile(
+      desiredFiles,
+      `.herdr-orchestrator/manager/${filename}`,
+      readFileSync(join(PACKAGE_ROOT, `manager/${filename}`)),
+    );
+  }
   for (const harness of harnesses) {
     for (const extension of ["toml", "md"]) {
       stageFile(
@@ -434,6 +441,7 @@ function install(options) {
   process.stdout.write(`${JSON.stringify({
     harnesses,
     local_exclude: localExclude,
+    manager: ".herdr-orchestrator/manager",
     manifest: ".herdr-orchestrator/manifest.json",
     ok: preserved.length === 0,
     preserved: preserved.sort(),
@@ -461,6 +469,54 @@ function commandExists(command) {
     timeout: 5_000,
   });
   return result.status === 0;
+}
+
+function manager(options) {
+  if (process.env.HERDR_ENV !== "1") {
+    throw new Error("manager_requires_herdr: HERDR_ENV=1");
+  }
+  if (options.harnesses.length !== 1) {
+    throw new Error("manager_harness_required: pass one --harness <name>");
+  }
+  if (options.rest.length > 0) {
+    throw new Error(`manager_arguments_unsupported: ${options.rest.join(" ")}`);
+  }
+
+  const project = resolve(options.project);
+  const harness = options.harnesses[0];
+  if (!HARNESSES.includes(harness)) {
+    throw new Error(`unsupported_harness: ${harness}`);
+  }
+
+  let directory;
+  if (project === PACKAGE_ROOT) {
+    directory = join(PACKAGE_ROOT, "manager");
+  } else {
+    const manifest = loadManifest(project);
+    if (manifest === null) {
+      throw new Error(`installation_not_found: run herdr-orchestrator install --project ${project}`);
+    }
+    if (!manifest.harnesses.includes(harness)) {
+      throw new Error(`manager_harness_not_enabled: ${harness}`);
+    }
+    directory = join(project, ".herdr-orchestrator/manager");
+  }
+
+  if (!existsSync(join(directory, "AGENTS.md"))) {
+    throw new Error(`manager_workspace_not_found: ${directory}`);
+  }
+  const result = spawnSync(harness, [], {
+    cwd: directory,
+    env: process.env,
+    stdio: "inherit",
+  });
+  if (result.error?.code === "ENOENT") {
+    throw new Error(`manager_harness_not_found: ${harness}`);
+  }
+  if (result.error) {
+    throw result.error;
+  }
+  process.exitCode = result.status ?? 1;
 }
 
 function inspectInstallation(project) {
@@ -577,6 +633,7 @@ function uninstall(options) {
   for (const relativePath of [
     ".herdr-orchestrator/profiles/harnesses",
     ".herdr-orchestrator/profiles",
+    ".herdr-orchestrator/manager",
     ".herdr-orchestrator/workflows/prompts",
     ".herdr-orchestrator/workflows",
     ".herdr-orchestrator",
@@ -689,6 +746,13 @@ Remove only unchanged files owned by the installation manifest.
 `);
     return;
   }
+  if (command === "manager") {
+    process.stdout.write(`Usage: herdr-orchestrator manager --project <path> --harness <name>
+
+Start one enabled harness in the dedicated manual Herdr manager workspace. This command must run inside a Herdr session.
+`);
+    return;
+  }
   if (command && command !== "help") {
     process.stdout.write(`Usage: herdr-orchestrator ${command} --project <path> [command options]
 
@@ -707,9 +771,12 @@ Setup:
 Runtime:
   doctor | catalog | profile | seed | status | enqueue | run | retry | resume | gc | dashboard | smoke
 
+Interactive:
+  manager --project <path> --harness <name>
+
 Options:
   --project <path>   Target repository (default: current directory)
-  --harness <name>   Harness to enable during install; repeat for more
+  --harness <name>   Harness to enable during install, or select for manager
   --install-skill    Install the project Skill even when a Skill router exists
   --skip-skill       Do not install, or remove an unchanged managed project Skill
   --version          Print the package version
@@ -727,6 +794,8 @@ function main() {
     const options = parseArguments(argv);
     if (["install", "update", "upgrade"].includes(options.command)) {
       install(options);
+    } else if (options.command === "manager") {
+      manager(options);
     } else if (options.command === "doctor") {
       doctor(options);
     } else if (options.command === "uninstall") {

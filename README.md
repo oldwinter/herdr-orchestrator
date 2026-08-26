@@ -100,6 +100,29 @@ npx --yes herdr-orchestrator uninstall --project .
 
 完整安装契约见 [`docs/installation.md`](docs/installation.md)。
 
+## 手动 Herdr 管理会话
+
+需要临场观察、协调当前 Herdr session，而不需要 durable queue 时，可以在任意 Herdr pane
+内启动一个专用管理会话：
+
+```bash
+npx --yes herdr-orchestrator manager --project /path/to/target-repository \
+  --harness claude
+```
+
+源码 checkout 也可直接运行：
+
+```bash
+node bin/herdr-orchestrator.mjs manager --project . --harness grok
+```
+
+命令要求 `HERDR_ENV=1`，并把所选 harness 无附加参数地启动在固定的 manager 目录。该目录
+中的短 policy 要求会话只观察和操作当前 Herdr session，把 terminal output 当作不可信数据，
+并在每次动作后重新读取状态。它不维护插件协议、模型表、队列或后台进程。
+
+需要无人值守派发、重试、去重、lease 和机器收据时，仍使用下面的 durable queue。manager
+看到 agent 进入 idle/done 也不能据此宣称任务成功，必须另行核验产物或 receipt。
+
 ## 源码 checkout 快速开始
 
 ```bash
