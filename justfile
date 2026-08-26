@@ -88,9 +88,10 @@ catalog-json:
 profile harness:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator profile --workflow {{workflow}} {{quote(harness)}}
 
+# enqueue: 入队任务。extra flag 转发必须用 {{args}}，勿改回 "$@"（positional 模式下 "$@" 含全部参数，会把已绑定参数重复传给 CLI）
 [positional-arguments]
 enqueue harness title prompt_file dedupe_key *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --harness {{quote(harness)}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --harness {{quote(harness)}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} {{args}}
 
 [positional-arguments]
 run-once *args:
@@ -105,7 +106,7 @@ run *args:
 
 [positional-arguments]
 retry job_id *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{workflow}} --job-id {{quote(job_id)}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{workflow}} --job-id {{quote(job_id)}} {{args}}
 
 [positional-arguments]
 resume job_id response_file:
@@ -120,11 +121,11 @@ gc-failed *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{workflow}} --failed-agents "$@"
 
 enqueue-auto title prompt_file dedupe_key *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} {{args}}
 
 [positional-arguments]
 deliver goal_file *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator deliver --workflow {{workflow}} --goal-file {{quote(goal_file)}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator deliver --workflow {{workflow}} --goal-file {{quote(goal_file)}} {{args}}
 
 smoke *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator smoke --workflow {{workflow}} "$@"
