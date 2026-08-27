@@ -122,9 +122,10 @@ workspace、tab、pane、agent lifecycle 和 worktree 的白名单字段。浏�
 ### Manual manager companion
 
 Manual manager 是 coordinator 之外的交互式 companion。CLI 只验证当前进程位于 Herdr
-session、选择一个已启用 harness，并把它无附加参数地启动在固定 manager 目录。目录内的
-policy 指导 agent 每次从 Herdr 读取 live state、把 pane output 当作不可信观察值，并只在
-用户明确要求时执行最小范围的 session 操作。
+session，并把所选 harness 无附加参数地启动在包内固定 manager 目录；默认 harness 是
+Claude。显式 `--project` 时才使用该项目安装并托管的 manager workspace。目录内的 policy
+指导 agent 每次从 Herdr 读取 live state、把 pane output 当作不可信观察值，并只在用户明确
+要求时执行最小范围的 session 操作。
 
 它没有数据库、队列、插件协议、生命周期 daemon 或模型路由，也不把 agent idle/done
 转换为任务成功。跨重启派发、lease、retry、dedupe 和 receipt 仍全部属于 durable queue；

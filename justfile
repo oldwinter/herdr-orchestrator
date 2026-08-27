@@ -6,6 +6,12 @@ python := "uv run python"
 default:
     @just --list
 
+manager harness="claude":
+    @node bin/herdr-orchestrator.mjs manager {{quote(harness)}}
+
+install-manager:
+    @npm install --global .
+
 [positional-arguments]
 doctor *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}} "$@"

@@ -187,7 +187,7 @@ class DistributionCliTests(unittest.TestCase):
                 [str(project / ".herdr-orchestrator/manager")],
             )
 
-    def test_manager_can_launch_from_the_source_checkout(self) -> None:
+    def test_manager_accepts_a_positional_harness_from_any_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             commands = root / "bin"
@@ -210,17 +210,88 @@ class DistributionCliTests(unittest.TestCase):
 
             manager = self._run(
                 "manager",
-                "--project",
-                str(REPO_ROOT),
-                "--harness",
                 "grok",
                 env=environment,
+                cwd=root,
             )
 
             self.assertEqual(manager.returncode, 0, manager.stderr)
             self.assertEqual(
                 probe.read_text(encoding="utf-8").strip(),
                 str(REPO_ROOT / "manager"),
+            )
+
+    def test_just_manager_defaults_to_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            probe = root / "manager-probe"
+            harness = commands / "claude"
+            harness.write_text(
+                "#!/bin/sh\n" 'pwd > "$MANAGER_PROBE"\n',
+                encoding="utf-8",
+            )
+            harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = subprocess.run(
+                ["just", "manager"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            self.assertEqual(
+                probe.read_text(encoding="utf-8").strip(),
+                str(REPO_ROOT / "manager"),
+            )
+
+    def test_just_install_manager_invokes_the_npm_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            probe = root / "npm-probe"
+            npm = commands / "npm"
+            npm.write_text(
+                "#!/bin/sh\n" 'printf "%s\\n" "$@" > "$NPM_PROBE"\n',
+                encoding="utf-8",
+            )
+            npm.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "NPM_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            install = subprocess.run(
+                ["just", "install-manager"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+
+            self.assertEqual(install.returncode, 0, install.stderr)
+            self.assertEqual(
+                probe.read_text(encoding="utf-8").splitlines(),
+                ["install", "--global", "."],
             )
 
     def test_wrapper_forwards_doctor_probe_timeout(self) -> None:
@@ -694,6 +765,46 @@ class DistributionCliTests(unittest.TestCase):
             self.assertIn("package/manager/AGENTS.md", packaged_files)
             self.assertIn("package/manager/CLAUDE.md", packaged_files)
 
+            commands = root / "bin"
+            commands.mkdir()
+            manager_probe = root / "manager-probe"
+            harness = commands / "grok"
+            harness.write_text(
+                "#!/bin/sh\n" 'pwd > "$MANAGER_PROBE"\n',
+                encoding="utf-8",
+            )
+            harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(manager_probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+            manager = subprocess.run(
+                [
+                    "npm",
+                    "exec",
+                    "--yes",
+                    "--package",
+                    str(tarball),
+                    "--",
+                    "herdr-manager",
+                    "grok",
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=60,
+            )
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            manager_directory = Path(manager_probe.read_text(encoding="utf-8").strip())
+            self.assertEqual(manager_directory.name, "manager")
+            self.assertTrue((manager_directory / "AGENTS.md").is_file())
+
             install = subprocess.run(
                 [
                     "npm",
@@ -810,10 +921,11 @@ class DistributionCliTests(unittest.TestCase):
         self,
         *arguments: str,
         env: dict[str, str] | None = None,
+        cwd: Path = REPO_ROOT,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["node", str(CLI), *arguments],
-            cwd=REPO_ROOT,
+            cwd=cwd,
             capture_output=True,
             text=True,
             check=False,

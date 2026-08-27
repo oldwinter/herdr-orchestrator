@@ -11,7 +11,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -34,6 +34,7 @@ function parseArguments(argv) {
     harnesses: [],
     installSkill: null,
     project: process.cwd(),
+    projectExplicit: false,
     rest: [],
   };
   for (let index = 1; index < argv.length; index += 1) {
@@ -43,6 +44,7 @@ function parseArguments(argv) {
         throw new Error("option_value_required: --project");
       }
       options.project = argv[++index];
+      options.projectExplicit = true;
     } else if (
       ["install", "update", "upgrade", "manager"].includes(command)
       && value === "--harness"
@@ -475,31 +477,31 @@ function manager(options) {
   if (process.env.HERDR_ENV !== "1") {
     throw new Error("manager_requires_herdr: HERDR_ENV=1");
   }
-  if (options.harnesses.length !== 1) {
-    throw new Error("manager_harness_required: pass one --harness <name>");
+  if (options.harnesses.length > 1 || options.rest.length > 1) {
+    throw new Error("manager_harness_ambiguous: pass one harness");
   }
-  if (options.rest.length > 0) {
-    throw new Error(`manager_arguments_unsupported: ${options.rest.join(" ")}`);
+  if (options.harnesses.length === 1 && options.rest.length === 1) {
+    throw new Error("manager_harness_conflict: use a positional harness or --harness, not both");
   }
 
-  const project = resolve(options.project);
-  const harness = options.harnesses[0];
+  const harness = options.harnesses[0] ?? options.rest[0] ?? "claude";
   if (!HARNESSES.includes(harness)) {
     throw new Error(`unsupported_harness: ${harness}`);
   }
 
-  let directory;
-  if (project === PACKAGE_ROOT) {
-    directory = join(PACKAGE_ROOT, "manager");
-  } else {
+  let directory = join(PACKAGE_ROOT, "manager");
+  if (options.projectExplicit) {
+    const project = resolve(options.project);
     const manifest = loadManifest(project);
-    if (manifest === null) {
+    if (project === PACKAGE_ROOT) {
+      directory = join(PACKAGE_ROOT, "manager");
+    } else if (manifest === null) {
       throw new Error(`installation_not_found: run herdr-orchestrator install --project ${project}`);
-    }
-    if (!manifest.harnesses.includes(harness)) {
+    } else if (!manifest.harnesses.includes(harness)) {
       throw new Error(`manager_harness_not_enabled: ${harness}`);
+    } else {
+      directory = join(project, ".herdr-orchestrator/manager");
     }
-    directory = join(project, ".herdr-orchestrator/manager");
   }
 
   if (!existsSync(join(directory, "AGENTS.md"))) {
@@ -747,9 +749,11 @@ Remove only unchanged files owned by the installation manifest.
     return;
   }
   if (command === "manager") {
-    process.stdout.write(`Usage: herdr-orchestrator manager --project <path> --harness <name>
+    process.stdout.write(`Usage:
+  herdr-manager [harness]
+  herdr-orchestrator manager [harness] [--project <path>]
 
-Start one enabled harness in the dedicated manual Herdr manager workspace. This command must run inside a Herdr session.
+Start one harness in the dedicated manual Herdr manager workspace. The default harness is claude. This command must run inside a Herdr session.
 `);
     return;
   }
@@ -772,7 +776,7 @@ Runtime:
   doctor | catalog | profile | seed | status | enqueue | run | retry | resume | gc | dashboard | smoke
 
 Interactive:
-  manager --project <path> --harness <name>
+  manager [harness] [--project <path>]
 
 Options:
   --project <path>   Target repository (default: current directory)
@@ -785,7 +789,10 @@ Options:
 
 function main() {
   try {
-    const argv = process.argv.slice(2);
+    const arguments_ = process.argv.slice(2);
+    const argv = basename(process.argv[1] ?? "") === "herdr-manager"
+      ? ["manager", ...arguments_]
+      : arguments_;
     if (argv.includes("--help") || argv.includes("-h")) {
       const command = argv[0]?.startsWith("-") ? null : argv[0];
       printHelp(command);
