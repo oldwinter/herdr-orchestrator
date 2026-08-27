@@ -102,23 +102,32 @@ npx --yes herdr-orchestrator uninstall --project .
 
 ## 手动 Herdr 管理会话
 
-需要临场观察、协调当前 Herdr session，而不需要 durable queue 时，可以在任意 Herdr pane
-内启动一个专用管理会话：
+需要临场观察、协调当前 Herdr session，而不需要 durable queue 时，在源码 checkout 中运行：
 
 ```bash
-npx --yes herdr-orchestrator manager --project /path/to/target-repository \
-  --harness claude
+just manager       # 默认 Claude
+just manager grok  # 或显式选择 harness
 ```
 
-源码 checkout 也可直接运行：
+高频使用可从源码 checkout 一次性安装全局命令，之后从任意目录启动：
 
 ```bash
-node bin/herdr-orchestrator.mjs manager --project . --harness grok
+just install-manager
+herdr-manager
+herdr-manager grok
 ```
 
-命令要求 `HERDR_ENV=1`，并把所选 harness 无附加参数地启动在固定的 manager 目录。该目录
+`install-manager` 由 `just` 的非交互 shell 调用 npm，因此不会命中把
+`npm install --global .` 重写为 `mise use -g npm:.` 的交互式 wrapper。发布版 `0.1.3`
+及以上也可直接用 `npm install --global herdr-orchestrator` 安装。
+
+一次性使用也可运行 `npx --yes herdr-orchestrator manager grok`。这些入口都要求
+`HERDR_ENV=1`，并把所选 harness 无附加参数地启动在包内固定的 manager 目录。该目录
 中的短 policy 要求会话只观察和操作当前 Herdr session，把 terminal output 当作不可信数据，
 并在每次动作后重新读取状态。它不维护插件协议、模型表、队列或后台进程。
+
+旧的 `manager --project <path> --harness <name>` 形式继续兼容，用于显式采用目标项目中由
+installer 托管的 manager workspace；普通手动管理不需要安装项目 runtime 或传 `--project`。
 
 需要无人值守派发、重试、去重、lease 和机器收据时，仍使用下面的 durable queue。manager
 看到 agent 进入 idle/done 也不能据此宣称任务成功，必须另行核验产物或 receipt。

@@ -23,7 +23,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 | 模式 | 入口 | 何时用 |
 | --- | --- | --- |
 | Durable queue | `just seed` / `enqueue` / `enqueue-auto` / `run` / `run-once` / `run-until-idle` / `retry` / `gc` / `status` | 普通派发、重试、收据、无人值守 queue |
-| Manual manager | `node bin/herdr-orchestrator.mjs manager --project . --harness <name>` | 在当前 Herdr session 内启动一个专用交互式管理会话 |
+| Manual manager | `just manager [harness]` | 在当前 Herdr session 内启动一个专用交互式管理会话 |
 | Read-only dashboard | `just dashboard` | 实时查看 queue、attention、Herdr topology 与 receipt timeline |
 | Standardized delivery | 仅 `just deliver` 或显式 Skill | 用户明确触发标准交付；普通实现/修复/review/orchestrate 不走这条路 |
 
@@ -44,7 +44,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - **Opt-in 标准交付**：Wayfinder（仅在有 decision fog 时）→ spec + ticket DAG → 独立 worktree 实现 → Standards ∥ Spec review → 至多 2 轮 repair。成功停在隔离 integration branch，不自动 push / merge / deploy。
 - **Tracker**：默认 local Markdown；`github` 只授权该次交付的 issue 创建、更新与关闭。
 
-稳定命令入口是 `justfile`。常用：`doctor`、`test`、`check`、`catalog`、`profile`、`seed`、`enqueue`、`enqueue-auto`、`status`、`dashboard`、`run`、`run-once`、`run-until-idle`、`retry`、`gc`、`deliver`、`smoke`。
+稳定命令入口是 `justfile`。常用：`manager`、`install-manager`、`doctor`、`test`、`check`、`catalog`、`profile`、`seed`、`enqueue`、`enqueue-auto`、`status`、`dashboard`、`run`、`run-once`、`run-until-idle`、`retry`、`gc`、`deliver`、`smoke`。
 
 ## Canonical Surface
 

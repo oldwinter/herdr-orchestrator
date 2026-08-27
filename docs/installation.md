@@ -122,16 +122,26 @@ status is one of `ready`, `auth_required`, `model_invalid`, `timeout`, `unavaila
 
 ## Manual manager
 
-For interactive oversight of the current Herdr session, start one enabled harness in the
-installed manager workspace:
+For interactive oversight of the current Herdr session, install the frequent-use command once
+from a source checkout:
 
 ```bash
-npx --yes herdr-orchestrator manager --project . --harness claude
+just install-manager
+herdr-manager       # defaults to Claude
+herdr-manager grok  # selects Grok
 ```
 
-The command fails unless `HERDR_ENV=1`, requires exactly one harness selected by the project
-installation, and starts it with no extra arguments. The source checkout exposes the same
-entrypoint with `node bin/herdr-orchestrator.mjs manager --project . --harness grok`.
+The Just recipe invokes npm from a non-interactive shell, bypassing interactive wrappers that
+rewrite `npm install --global .` as an invalid `mise use -g npm:.` package request. Once version
+`0.1.3` or newer is published, `npm install --global herdr-orchestrator` is also supported.
+
+From a source checkout, use `just manager` or `just manager grok`. For a one-off invocation,
+use `npx --yes herdr-orchestrator manager grok`.
+
+The command fails unless `HERDR_ENV=1` and starts the selected harness with no extra arguments
+in the package's fixed manager workspace. Claude is the default. The backward-compatible
+`herdr-orchestrator manager --project . --harness claude` form explicitly selects the manager
+workspace installed in a target project and validates the harness against that installation.
 
 The manager policy treats terminal output as untrusted observations and scopes all visibility
 to the current Herdr session. It is intentionally not durable. Use the queue commands below

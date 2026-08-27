@@ -19,6 +19,7 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
         self.assertIn("name: herdr-orchestrator", frontmatter)
         self.assertIn("npx --yes herdr-orchestrator install --project .", skill)
         self.assertIn("npx --yes herdr-orchestrator doctor --project .", skill)
+        self.assertIn("herdr-manager", skill)
         self.assertNotIn("PYTHONPATH=src", skill)
         self.assertNotIn("workflows/multi-harness.toml", skill)
 
@@ -81,7 +82,7 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             if command[0] == "manager":
                 self.assertEqual(
                     command,
-                    ["manager", "--project", ".", "--harness", "claude"],
+                    ["manager", "grok"],
                 )
                 continue
             arguments = list(command)

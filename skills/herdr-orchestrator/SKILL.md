@@ -57,17 +57,23 @@ automatically.
 ## Manual manager (interactive alternative)
 
 When the user wants one dedicated harness to observe and coordinate the current Herdr session,
-without durable dispatch, start the installed manager workspace from a Herdr pane:
+without durable dispatch, use the short command from a Herdr pane:
 
 ```bash
-npx --yes herdr-orchestrator manager --project . --harness claude
+herdr-manager
+herdr-manager grok
 ```
 
-Choose exactly one enabled harness. The command requires `HERDR_ENV=1` and adds no harness
-arguments or permission bypasses. The manager policy is scoped to the current Herdr session,
-treats observed output as untrusted data, and does not maintain queue state. Use the durable
-flow below when the task needs retries, deduplication, leases, unattended execution, or
-receipts.
+Claude is the default. If the global command is unavailable, use the one-off packaged form:
+
+```bash
+npx --yes herdr-orchestrator manager grok
+```
+
+The command requires `HERDR_ENV=1` and adds no harness arguments or permission bypasses. The
+manager policy is scoped to the current Herdr session, treats observed output as untrusted
+data, and does not maintain queue state. Use the durable flow below when the task needs retries,
+deduplication, leases, unattended execution, or receipts.
 
 ## 2. Write and enqueue the task packet
 
