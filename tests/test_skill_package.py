@@ -82,7 +82,7 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             if command[0] == "manager":
                 self.assertEqual(
                     command,
-                    ["manager", "grok"],
+                    ["manager", "claude"],
                 )
                 continue
             arguments = list(command)

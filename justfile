@@ -6,7 +6,7 @@ python := "uv run python"
 default:
     @just --list
 
-manager harness="claude":
+manager harness="grok":
     @node bin/herdr-orchestrator.mjs manager {{quote(harness)}}
 
 install-manager:

@@ -484,7 +484,7 @@ function manager(options) {
     throw new Error("manager_harness_conflict: use a positional harness or --harness, not both");
   }
 
-  const harness = options.harnesses[0] ?? options.rest[0] ?? "claude";
+  const harness = options.harnesses[0] ?? options.rest[0] ?? "grok";
   if (!HARNESSES.includes(harness)) {
     throw new Error(`unsupported_harness: ${harness}`);
   }
@@ -753,7 +753,7 @@ Remove only unchanged files owned by the installation manifest.
   herdr-manager [harness]
   herdr-orchestrator manager [harness] [--project <path>]
 
-Start one harness in the dedicated manual Herdr manager workspace. The default harness is claude. This command must run inside a Herdr session.
+Start one harness in the dedicated manual Herdr manager workspace. The default harness is grok. This command must run inside a Herdr session.
 `);
     return;
   }
