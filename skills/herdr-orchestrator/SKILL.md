@@ -61,13 +61,13 @@ without durable dispatch, use the short command from a Herdr pane:
 
 ```bash
 herdr-manager
-herdr-manager grok
+herdr-manager claude
 ```
 
-Claude is the default. If the global command is unavailable, use the one-off packaged form:
+Grok is the default. If the global command is unavailable, use the one-off packaged form:
 
 ```bash
-npx --yes herdr-orchestrator manager grok
+npx --yes herdr-orchestrator manager claude
 ```
 
 The command requires `HERDR_ENV=1` and adds no harness arguments or permission bypasses. The

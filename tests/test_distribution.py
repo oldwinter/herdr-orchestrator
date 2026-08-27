@@ -221,13 +221,13 @@ class DistributionCliTests(unittest.TestCase):
                 str(REPO_ROOT / "manager"),
             )
 
-    def test_just_manager_defaults_to_claude(self) -> None:
+    def test_just_manager_defaults_to_grok(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             commands = root / "bin"
             commands.mkdir()
             probe = root / "manager-probe"
-            harness = commands / "claude"
+            harness = commands / "grok"
             harness.write_text(
                 "#!/bin/sh\n" 'pwd > "$MANAGER_PROBE"\n',
                 encoding="utf-8",
@@ -791,7 +791,6 @@ class DistributionCliTests(unittest.TestCase):
                     str(tarball),
                     "--",
                     "herdr-manager",
-                    "grok",
                 ],
                 cwd=root,
                 capture_output=True,

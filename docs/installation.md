@@ -127,19 +127,19 @@ from a source checkout:
 
 ```bash
 just install-manager
-herdr-manager       # defaults to Claude
-herdr-manager grok  # selects Grok
+herdr-manager         # defaults to Grok
+herdr-manager claude  # selects Claude
 ```
 
 The Just recipe invokes npm from a non-interactive shell, bypassing interactive wrappers that
 rewrite `npm install --global .` as an invalid `mise use -g npm:.` package request. Once version
 `0.1.3` or newer is published, `npm install --global herdr-orchestrator` is also supported.
 
-From a source checkout, use `just manager` or `just manager grok`. For a one-off invocation,
-use `npx --yes herdr-orchestrator manager grok`.
+From a source checkout, use `just manager` or `just manager claude`. For a one-off invocation,
+use `npx --yes herdr-orchestrator manager claude`.
 
 The command fails unless `HERDR_ENV=1` and starts the selected harness with no extra arguments
-in the package's fixed manager workspace. Claude is the default. The backward-compatible
+in the package's fixed manager workspace. Grok is the default. The backward-compatible
 `herdr-orchestrator manager --project . --harness claude` form explicitly selects the manager
 workspace installed in a target project and validates the harness against that installation.
 

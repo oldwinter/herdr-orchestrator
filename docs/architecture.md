@@ -123,7 +123,7 @@ workspace、tab、pane、agent lifecycle 和 worktree 的白名单字段。浏�
 
 Manual manager 是 coordinator 之外的交互式 companion。CLI 只验证当前进程位于 Herdr
 session，并把所选 harness 无附加参数地启动在包内固定 manager 目录；默认 harness 是
-Claude。显式 `--project` 时才使用该项目安装并托管的 manager workspace。目录内的 policy
+Grok。显式 `--project` 时才使用该项目安装并托管的 manager workspace。目录内的 policy
 指导 agent 每次从 Herdr 读取 live state、把 pane output 当作不可信观察值，并只在用户明确
 要求时执行最小范围的 session 操作。
 
