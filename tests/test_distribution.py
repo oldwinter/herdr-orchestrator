@@ -187,6 +187,50 @@ class DistributionCliTests(unittest.TestCase):
                 [str(project / ".herdr-orchestrator/manager")],
             )
 
+    def test_manager_reports_and_clears_a_complete_best_effort_token_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            harness = commands / "grok"
+            harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            harness.chmod(0o755)
+            metadata_probe = root / "metadata.jsonl"
+            herdr = commands / "herdr"
+            herdr.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['METADATA_PROBE'], 'a', encoding='utf-8') as probe:\n"
+                "    probe.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+                encoding="utf-8",
+            )
+            herdr.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_BIN_PATH": str(herdr),
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "manager-pane",
+                    "METADATA_PROBE": str(metadata_probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = self._run("manager", "grok", env=environment)
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            calls = [
+                json.loads(line) for line in metadata_probe.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][:3], ["pane", "report-metadata", "manager-pane"])
+            self.assertIn("hml_role=manager", calls[0])
+            self.assertIn("hml_manager=●", calls[0])
+            self.assertEqual(calls[0].count("--token"), 2)
+            self.assertEqual(calls[0].count("--clear-token"), 4)
+            self.assertEqual(calls[1].count("--token"), 0)
+            self.assertEqual(calls[1].count("--clear-token"), 6)
+
     def test_manager_accepts_a_positional_harness_from_any_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -258,22 +302,30 @@ class DistributionCliTests(unittest.TestCase):
                 str(REPO_ROOT / "manager"),
             )
 
-    def test_just_install_manager_invokes_the_npm_executable(self) -> None:
+    def test_just_install_manager_installs_the_cli_then_manager_light(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             commands = root / "bin"
             commands.mkdir()
             probe = root / "npm-probe"
+            manager_light_probe = root / "manager-light-probe"
             npm = commands / "npm"
             npm.write_text(
                 "#!/bin/sh\n" 'printf "%s\\n" "$@" > "$NPM_PROBE"\n',
                 encoding="utf-8",
             )
             npm.chmod(0o755)
+            manager_light = commands / "herdr-orchestrator"
+            manager_light.write_text(
+                "#!/bin/sh\n" 'printf "%s\\n" "$@" > "$MANAGER_LIGHT_PROBE"\n',
+                encoding="utf-8",
+            )
+            manager_light.chmod(0o755)
             environment = os.environ.copy()
             environment.update(
                 {
                     "NPM_PROBE": str(probe),
+                    "MANAGER_LIGHT_PROBE": str(manager_light_probe),
                     "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
                 }
             )
@@ -292,6 +344,10 @@ class DistributionCliTests(unittest.TestCase):
             self.assertEqual(
                 probe.read_text(encoding="utf-8").splitlines(),
                 ["install", "--global", "."],
+            )
+            self.assertEqual(
+                manager_light_probe.read_text(encoding="utf-8").splitlines(),
+                ["manager-light", "install"],
             )
 
     def test_wrapper_forwards_doctor_probe_timeout(self) -> None:
@@ -764,6 +820,10 @@ class DistributionCliTests(unittest.TestCase):
             )
             self.assertIn("package/manager/AGENTS.md", packaged_files)
             self.assertIn("package/manager/CLAUDE.md", packaged_files)
+            self.assertIn("package/plugins/manager-light/configure.mjs", packaged_files)
+            self.assertIn("package/plugins/manager-light/herdr-plugin.toml", packaged_files)
+            self.assertIn("package/plugins/manager-light/hook.mjs", packaged_files)
+            self.assertIn("package/plugins/manager-light/projection.mjs", packaged_files)
 
             commands = root / "bin"
             commands.mkdir()

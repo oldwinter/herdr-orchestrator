@@ -11,6 +11,7 @@ manager harness="grok":
 
 install-manager:
     @npm install --global .
+    @herdr-orchestrator manager-light install
 
 [positional-arguments]
 doctor *args:

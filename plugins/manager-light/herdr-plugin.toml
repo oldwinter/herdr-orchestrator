@@ -1,0 +1,29 @@
+id = "herdr-manager-light"
+name = "Herdr manager light"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+platforms = ["linux", "macos", "windows"]
+
+[[startup]]
+command = ["node", "hook.mjs"]
+
+[[actions]]
+id = "refresh"
+title = "Refresh manager lights"
+command = ["node", "hook.mjs"]
+
+[[events]]
+on = "pane.created"
+command = ["node", "hook.mjs"]
+
+[[events]]
+on = "pane.moved"
+command = ["node", "hook.mjs"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["node", "hook.mjs"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "hook.mjs"]

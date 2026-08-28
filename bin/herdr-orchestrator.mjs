@@ -14,6 +14,16 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  installManagerLight,
+  managerLightStatus,
+  uninstallManagerLight,
+} from "../plugins/manager-light/configure.mjs";
+import {
+  METADATA_SOURCE,
+  tokenPatchFor,
+} from "../plugins/manager-light/projection.mjs";
+
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HARNESSES = ["droid", "grok", "codex", "pi", "claude", "hermes"];
 const GIT_EXCLUDE_BEGIN = "# BEGIN herdr-orchestrator managed paths";
@@ -473,6 +483,36 @@ function commandExists(command) {
   return result.status === 0;
 }
 
+function reportManagerLight(classification) {
+  const paneId = process.env.HERDR_PANE_ID;
+  if (!paneId) {
+    return;
+  }
+  const args = [
+    "pane",
+    "report-metadata",
+    paneId,
+    "--source",
+    METADATA_SOURCE,
+  ];
+  for (const [name, value] of Object.entries(tokenPatchFor(classification))) {
+    if (value === null) {
+      args.push("--clear-token", name);
+    } else {
+      args.push("--token", `${name}=${value}`);
+    }
+  }
+  try {
+    spawnSync(process.env.HERDR_BIN_PATH || "herdr", args, {
+      env: process.env,
+      stdio: "ignore",
+      timeout: 2_000,
+    });
+  } catch {
+    // Manager metadata is optional and must never prevent the harness launch.
+  }
+}
+
 function manager(options) {
   if (process.env.HERDR_ENV !== "1") {
     throw new Error("manager_requires_herdr: HERDR_ENV=1");
@@ -507,11 +547,17 @@ function manager(options) {
   if (!existsSync(join(directory, "AGENTS.md"))) {
     throw new Error(`manager_workspace_not_found: ${directory}`);
   }
-  const result = spawnSync(harness, [], {
-    cwd: directory,
-    env: process.env,
-    stdio: "inherit",
-  });
+  let result;
+  reportManagerLight("manager");
+  try {
+    result = spawnSync(harness, [], {
+      cwd: directory,
+      env: process.env,
+      stdio: "inherit",
+    });
+  } finally {
+    reportManagerLight("absent");
+  }
   if (result.error?.code === "ENOENT") {
     throw new Error(`manager_harness_not_found: ${harness}`);
   }
@@ -519,6 +565,30 @@ function manager(options) {
     throw result.error;
   }
   process.exitCode = result.status ?? 1;
+}
+
+function managerLight(options) {
+  if (options.projectExplicit || options.harnesses.length > 0 || options.rest.length !== 1) {
+    throw new Error("manager_light_usage: expected install, status, or uninstall");
+  }
+  const action = options.rest[0];
+  const pluginRoot = join(PACKAGE_ROOT, "plugins/manager-light");
+  let payload;
+  if (action === "install") {
+    payload = installManagerLight({
+      pluginRoot,
+    });
+  } else if (action === "status") {
+    payload = managerLightStatus({ pluginRoot });
+  } else if (action === "uninstall") {
+    payload = uninstallManagerLight({ pluginRoot });
+  } else {
+    throw new Error(`manager_light_action_unsupported: ${action}`);
+  }
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  if (!payload.ok) {
+    process.exitCode = 1;
+  }
 }
 
 function inspectInstallation(project) {
@@ -757,6 +827,13 @@ Start one harness in the dedicated manual Herdr manager workspace. The default h
 `);
     return;
   }
+  if (command === "manager-light") {
+    process.stdout.write(`Usage: herdr-orchestrator manager-light <install|status|uninstall>
+
+Install, inspect, or remove the package-owned Herdr manager-light plugin and sidebar row projection.
+`);
+    return;
+  }
   if (command && command !== "help") {
     process.stdout.write(`Usage: herdr-orchestrator ${command} --project <path> [command options]
 
@@ -777,6 +854,7 @@ Runtime:
 
 Interactive:
   manager [harness] [--project <path>]
+  manager-light <install|status|uninstall>
 
 Options:
   --project <path>   Target repository (default: current directory)
@@ -803,6 +881,8 @@ function main() {
       install(options);
     } else if (options.command === "manager") {
       manager(options);
+    } else if (options.command === "manager-light") {
+      managerLight(options);
     } else if (options.command === "doctor") {
       doctor(options);
     } else if (options.command === "uninstall") {
