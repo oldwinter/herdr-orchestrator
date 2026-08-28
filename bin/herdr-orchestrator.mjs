@@ -26,6 +26,7 @@ import {
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HARNESSES = ["droid", "grok", "codex", "pi", "claude", "hermes"];
+const MANAGER_HARNESSES = ["grok", "codex", "claude"];
 const GIT_EXCLUDE_BEGIN = "# BEGIN herdr-orchestrator managed paths";
 const GIT_EXCLUDE_END = "# END herdr-orchestrator managed paths";
 const WORKER_NAMES = {
@@ -524,12 +525,12 @@ function manager(options) {
     throw new Error("manager_harness_conflict: use a positional harness or --harness, not both");
   }
 
-  const harness = options.harnesses[0] ?? options.rest[0] ?? "grok";
-  if (!HARNESSES.includes(harness)) {
-    throw new Error(`unsupported_harness: ${harness}`);
+  const requestedHarness = options.harnesses[0] ?? options.rest[0];
+  if (requestedHarness !== undefined && !HARNESSES.includes(requestedHarness)) {
+    throw new Error(`unsupported_harness: ${requestedHarness}`);
   }
-
   let directory = join(PACKAGE_ROOT, "manager");
+  let enabledHarnesses = HARNESSES;
   if (options.projectExplicit) {
     const project = resolve(options.project);
     const manifest = loadManifest(project);
@@ -537,13 +538,21 @@ function manager(options) {
       directory = join(PACKAGE_ROOT, "manager");
     } else if (manifest === null) {
       throw new Error(`installation_not_found: run herdr-orchestrator install --project ${project}`);
-    } else if (!manifest.harnesses.includes(harness)) {
-      throw new Error(`manager_harness_not_enabled: ${harness}`);
     } else {
+      enabledHarnesses = manifest.harnesses;
       directory = join(project, ".herdr-orchestrator/manager");
     }
   }
 
+  const harness = requestedHarness ?? MANAGER_HARNESSES.find(
+    (candidate) => enabledHarnesses.includes(candidate) && commandExists(candidate),
+  );
+  if (harness === undefined) {
+    throw new Error("manager_default_harness_not_found: install grok, codex, or claude");
+  }
+  if (!enabledHarnesses.includes(harness)) {
+    throw new Error(`manager_harness_not_enabled: ${harness}`);
+  }
   if (!existsSync(join(directory, "AGENTS.md"))) {
     throw new Error(`manager_workspace_not_found: ${directory}`);
   }
@@ -823,7 +832,7 @@ Remove only unchanged files owned by the installation manifest.
   herdr-manager [harness]
   herdr-orchestrator manager [harness] [--project <path>]
 
-Start one harness in the dedicated manual Herdr manager workspace. The default harness is grok. This command must run inside a Herdr session.
+Start one harness in the dedicated manual Herdr manager workspace. Without an explicit harness, try grok, codex, then claude. This command must run inside a Herdr session.
 `);
     return;
   }

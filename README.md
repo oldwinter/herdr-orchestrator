@@ -105,9 +105,20 @@ npx --yes herdr-orchestrator uninstall --project .
 需要临场观察、协调当前 Herdr session，而不需要 durable queue 时，在源码 checkout 中运行：
 
 ```bash
-just manager         # 默认 Grok
+just manager         # 自动选择 Grok、Codex、Claude
 just manager claude  # 或显式选择 harness
 ```
+
+新环境中最短的一次性入口是：
+
+```bash
+npx --yes herdr-manager
+npx --yes herdr-manager claude
+```
+
+未显式指定 harness 时，launcher 按 `grok → codex → claude` 检查本机 CLI，并启动第一个
+可用项；三者都不可用时会给出明确错误。该独立入口只要求 Node.js 20+、Herdr 和所选
+harness，不需要 clone 本仓库、安装项目 runtime 或提供 `--project`。
 
 高频使用可从源码 checkout 一次性安装全局命令，之后从任意目录启动：
 
@@ -135,8 +146,13 @@ herdr-orchestrator manager-light status
 herdr-orchestrator manager-light uninstall
 ```
 
-一次性使用也可运行 `npx --yes herdr-orchestrator manager claude`。这些入口都要求
-`HERDR_ENV=1`，并把所选 harness 无附加参数地启动在包内固定的 manager 目录。该目录
+如果 `herdr-manager` 包暂时不可用，也可用显式 npm package/bin 形式：
+
+```bash
+npm exec --yes --package herdr-orchestrator -- herdr-manager claude
+```
+
+这些入口都要求 `HERDR_ENV=1`，并把所选 harness 无附加参数地启动在包内固定的 manager 目录。该目录
 中的短 policy 要求会话只观察和操作当前 Herdr session，把 terminal output 当作不可信数据，
 并在每次动作后重新读取状态。它不维护插件协议、模型表、队列或后台进程。
 

@@ -1,7 +1,7 @@
 # Herdr Orchestrator Threat Model
 
-Version: 1.0.0
-Updated: 2026-08-25
+Version: 1.1.0
+Updated: 2026-08-28
 
 ## 1. System Overview
 
@@ -9,7 +9,8 @@ Herdr Orchestrator is a local-first Python 3.12+ control plane for interactive c
 agents. A deterministic coordinator loads a TOML workflow, accepts CLI or validated planner
 tasks, stores durable queue state and receipts in SQLite, and controls agent terminals through
 the local `herdr` CLI. An npm wrapper installs owned files into another Git checkout and forwards
-runtime commands to the Python CLI. A loopback-only HTTP/SSE dashboard projects whitelisted
+runtime commands to the Python CLI. A separate `herdr-manager` npm package forwards fixed argv to
+the manual manager entry without a shell. A loopback-only HTTP/SSE dashboard projects whitelisted
 SQLite and Herdr state.
 
 Major components:
@@ -25,6 +26,7 @@ Major components:
 - `dashboard/`: read-only loopback HTTP/SSE projection.
 - `bin/herdr-orchestrator.mjs`: npm installation, ownership manifest, upgrade, uninstall, and
   runtime forwarding.
+- `packages/herdr-manager/`: thin `npx herdr-manager` entry with bounded harness selection.
 
 There is no application login layer. Authority derives from the operating-system user, the
 current Herdr session, harness login state, local filesystem permissions, and explicit CLI
@@ -63,8 +65,10 @@ network services, and credentials according to their own runtime authority.
 ### 2.5 npm wrapper to target project
 
 The wrapper writes only managed roots, records SHA-256 ownership, rejects path escape and symlink
-redirection, and preserves user-modified files. The npm package itself is a supply-chain trust
-boundary. Wrapper and manifest version skew must fail health checks.
+redirection, and preserves user-modified files. Both npm packages are supply-chain trust
+boundaries. The manager package forwards only to the packaged `herdr-orchestrator manager` entry,
+uses no shell, and leaves default selection to a fixed `grok → codex → claude` allowlist.
+Wrapper and manifest version skew must fail health checks.
 
 ### 2.6 Dashboard to browser
 
@@ -84,8 +88,9 @@ operations for standardized delivery.
 
 Pull-request code is untrusted and runs only on ephemeral GitHub-hosted runners without write or
 OIDC permissions. Persistent self-hosted runners are reserved for trusted `main` release planning.
-Publishing remains GitHub-hosted because npm Trusted Publishing does not support self-hosted
-runners. Actions are pinned to immutable commit SHAs and credentials are not persisted.
+Both packages publish from GitHub-hosted runners because npm Trusted Publishing does not support
+self-hosted runners. Actions are pinned to immutable commit SHAs and credentials are not
+persisted.
 
 ## 3. Attack Surface Inventory
 
@@ -99,6 +104,7 @@ runners. Actions are pinned to immutable commit SHAs and credentials are not per
 | File receipts | configured relative path and agent-written bytes | success decision | containment, regular-file check, pre/post hash and size |
 | Output receipts | terminal transcript | success decision | current-turn delta, prompt ambiguity rejection, settled-only verification |
 | Installer | project path, manifest, existing files/symlinks | project filesystem | managed-root allowlist, SHA-256 ownership, symlink fail-closed |
+| Manager launcher | optional harness name, inherited environment | harness process | supported-harness allowlist, fixed fallback order, argv array, no shell |
 | Dashboard | local HTTP requests | state snapshot | loopback bind, host validation, read-only whitelist |
 | Tracker/delivery | goals, specs, model decisions | Git worktrees and GitHub issues | explicit opt-in, schemas, bounded loops, no implicit push/merge |
 
@@ -302,5 +308,7 @@ Keep trusted release planning and GitHub-hosted publishing separate.
 
 ## 9. Changelog
 
+- 1.1.0 (2026-08-28): Added the thin `herdr-manager` package, fixed manager harness fallback,
+  and dual-package Trusted Publishing boundary.
 - 1.0.0 (2026-08-25): Initial STRIDE model covering durable queue, Herdr lifecycle, receipts,
   blocked recovery, topology, installer, dashboard, delivery, tracker, and release boundaries.

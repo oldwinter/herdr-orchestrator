@@ -6,8 +6,8 @@ python := "uv run python"
 default:
     @just --list
 
-manager harness="grok":
-    @node bin/herdr-orchestrator.mjs manager {{quote(harness)}}
+manager harness="":
+    @if test -n {{quote(harness)}}; then node bin/herdr-orchestrator.mjs manager {{quote(harness)}}; else node bin/herdr-orchestrator.mjs manager; fi
 
 install-manager:
     @npm install --global .

@@ -14,6 +14,7 @@ from herdr_orchestrator import __version__
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI = REPO_ROOT / "bin/herdr-orchestrator.mjs"
+MANAGER_PACKAGE = REPO_ROOT / "packages/herdr-manager"
 
 
 class DistributionCliTests(unittest.TestCase):
@@ -135,6 +136,52 @@ class DistributionCliTests(unittest.TestCase):
             manager.stderr.strip(),
             "manager_harness_not_enabled: claude",
         )
+
+    def test_manager_default_respects_project_enabled_harnesses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            commands = root / "bin"
+            project.mkdir()
+            commands.mkdir()
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "codex",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            probe = root / "manager-probe"
+            for name in ("grok", "codex"):
+                harness = commands / name
+                harness.write_text(
+                    "#!/bin/sh\n"
+                    'if [ "${1:-}" = "--version" ]; then exit 0; fi\n'
+                    f'printf "{name}\\n" > "$MANAGER_PROBE"\n',
+                    encoding="utf-8",
+                )
+                harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_BIN_PATH": "/bin/true",
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = self._run(
+                "manager",
+                "--project",
+                str(project),
+                env=environment,
+            )
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            self.assertEqual(probe.read_text(encoding="utf-8").strip(), "codex")
 
     def test_manager_launches_in_the_installed_workspace_without_extra_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -263,6 +310,128 @@ class DistributionCliTests(unittest.TestCase):
             self.assertEqual(
                 probe.read_text(encoding="utf-8").strip(),
                 str(REPO_ROOT / "manager"),
+            )
+
+    def test_manager_defaults_to_codex_when_grok_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            probe = root / "manager-probe"
+            for name in ("grok", "codex", "claude"):
+                harness = commands / name
+                if name == "codex":
+                    harness.write_text(
+                        "#!/bin/sh\n"
+                        'if [ "${1:-}" = "--version" ]; then exit 0; fi\n'
+                        'printf "codex\\n" > "$MANAGER_PROBE"\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    harness.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+                harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_BIN_PATH": "/bin/true",
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = self._run("manager", env=environment, cwd=root)
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            self.assertEqual(probe.read_text(encoding="utf-8").strip(), "codex")
+
+    def test_manager_default_prefers_grok_over_codex_and_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            probe = root / "manager-probe"
+            for name in ("grok", "codex", "claude"):
+                harness = commands / name
+                harness.write_text(
+                    "#!/bin/sh\n"
+                    'if [ "${1:-}" = "--version" ]; then exit 0; fi\n'
+                    f'printf "{name}\\n" > "$MANAGER_PROBE"\n',
+                    encoding="utf-8",
+                )
+                harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_BIN_PATH": "/bin/true",
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = self._run("manager", env=environment, cwd=root)
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            self.assertEqual(probe.read_text(encoding="utf-8").strip(), "grok")
+
+    def test_manager_defaults_to_claude_when_grok_and_codex_are_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            probe = root / "manager-probe"
+            for name in ("grok", "codex", "claude"):
+                harness = commands / name
+                if name == "claude":
+                    harness.write_text(
+                        "#!/bin/sh\n"
+                        'if [ "${1:-}" = "--version" ]; then exit 0; fi\n'
+                        'printf "claude\\n" > "$MANAGER_PROBE"\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    harness.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+                harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_BIN_PATH": "/bin/true",
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = self._run("manager", env=environment, cwd=root)
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            self.assertEqual(probe.read_text(encoding="utf-8").strip(), "claude")
+
+    def test_manager_default_reports_when_no_supported_harness_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            for name in ("grok", "codex", "claude"):
+                harness = commands / name
+                harness.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+                harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_BIN_PATH": "/bin/true",
+                    "HERDR_ENV": "1",
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = self._run("manager", env=environment, cwd=root)
+
+            self.assertEqual(manager.returncode, 2)
+            self.assertEqual(
+                manager.stderr.strip(),
+                "manager_default_harness_not_found: install grok, codex, or claude",
             )
 
     def test_just_manager_defaults_to_grok(self) -> None:
@@ -893,6 +1062,92 @@ class DistributionCliTests(unittest.TestCase):
             self.assertTrue((project / ".herdr-orchestrator/manager/AGENTS.md").is_file())
             self.assertTrue((project / ".herdr-orchestrator/manager/CLAUDE.md").is_file())
             self.assertTrue((project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file())
+
+    def test_packed_herdr_manager_package_runs_outside_the_source_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package_directory = root / "packages"
+            install_directory = root / "install"
+            commands = root / "bin"
+            package_directory.mkdir()
+            install_directory.mkdir()
+            commands.mkdir()
+            tarballs: list[Path] = []
+            for source in (REPO_ROOT, MANAGER_PACKAGE):
+                packed = subprocess.run(
+                    [
+                        "npm",
+                        "pack",
+                        "--silent",
+                        "--pack-destination",
+                        str(package_directory),
+                    ],
+                    cwd=source,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+                self.assertEqual(packed.returncode, 0, packed.stderr)
+                tarballs.append(package_directory / packed.stdout.strip().splitlines()[-1])
+            installed = subprocess.run(
+                [
+                    "npm",
+                    "install",
+                    "--offline",
+                    "--ignore-scripts",
+                    "--no-package-lock",
+                    *map(str, tarballs),
+                ],
+                cwd=install_directory,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            manager_bin = install_directory / "node_modules/.bin/herdr-manager"
+            self.assertEqual(
+                manager_bin.resolve(),
+                install_directory / "node_modules/herdr-manager/bin/herdr-manager.mjs",
+            )
+            probe = root / "manager-probe"
+            for name in ("grok", "codex", "claude"):
+                harness = commands / name
+                if name == "codex":
+                    harness.write_text(
+                        "#!/bin/sh\n"
+                        'if [ "${1:-}" = "--version" ]; then exit 0; fi\n'
+                        'pwd > "$MANAGER_PROBE"\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    harness.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+                harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_BIN_PATH": "/bin/true",
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            manager = subprocess.run(
+                [str(manager_bin)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+
+            self.assertEqual(manager.returncode, 0, manager.stderr)
+            manager_directory = Path(probe.read_text(encoding="utf-8").strip())
+            self.assertEqual(manager_directory.name, "manager")
+            self.assertTrue((manager_directory / "AGENTS.md").is_file())
 
     def test_uninstall_rejects_manifest_paths_outside_managed_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

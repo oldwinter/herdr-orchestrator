@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "herdr-orchestrator"
-version = "0.1.5"
+version = "0.1.6"
 description = "Durable multi-harness workflow orchestration over Herdr"
 readme = "README.md"
 requires-python = ">=3.12"

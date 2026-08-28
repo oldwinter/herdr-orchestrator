@@ -166,8 +166,9 @@ jobs:
     runs-on: [self-hosted, Linux, X64, herdr-orchestrator]
     timeout-minutes: 5
     outputs:
-      publish: ${{ steps.plan.outputs.publish }}
-      version: ${{ steps.plan.outputs.version }}
+      manager_publish: ${{ steps.manager.outputs.publish }}
+      orchestrator_publish: ${{ steps.orchestrator.outputs.publish }}
+      orchestrator_version: ${{ steps.orchestrator.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -175,15 +176,21 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
-      - name: Plan release
-        id: plan
+      - name: Plan orchestrator release
+        id: orchestrator
         run: node scripts/npm-release-plan.mjs --package-json package.json
+      - name: Plan manager release
+        id: manager
+        run: node scripts/npm-release-plan.mjs --package-json packages/herdr-manager/package.json
 
   publish:
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
-      needs.release-plan.outputs.publish == 'true'
+      (
+        needs.release-plan.outputs.orchestrator_publish == 'true' ||
+        needs.release-plan.outputs.manager_publish == 'true'
+      )
     needs: release-plan
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -203,12 +210,17 @@ jobs:
         run: npm install --global npm@12.0.2
       - name: Install package metadata
         run: npm ci --ignore-scripts
-      - name: Publish package
+      - name: Publish orchestrator package
+        if: needs.release-plan.outputs.orchestrator_publish == 'true'
         run: npm publish --access public
+      - name: Publish manager package
+        if: needs.release-plan.outputs.manager_publish == 'true'
+        run: npm publish --access public ./packages/herdr-manager
       - name: Generate GitHub release notes
+        if: needs.release-plan.outputs.orchestrator_publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.release-plan.outputs.version }}
+          VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
         run: >-
           gh release create "v$VERSION"
           --repo "$GITHUB_REPOSITORY"

@@ -71,12 +71,32 @@ class NpmReleasePlanTests(unittest.TestCase):
         self.assertEqual(result.stderr.strip(), "npm_registry_query_failed")
         self.assertEqual(github_output, "")
 
+    def test_missing_registry_package_is_publishable(self) -> None:
+        result, _ = self._run_plan(
+            "0.1.0",
+            "[]",
+            npm_exit=1,
+            npm_stderr="npm error code E404\nnpm error 404 Not Found\n",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "name": "example-package",
+                "publish": True,
+                "reason": "version_missing",
+                "version": "0.1.0",
+            },
+        )
+
     def _run_plan(
         self,
         version: str,
         registry_versions: str,
         *,
         npm_exit: int = 0,
+        npm_stderr: str = "",
         write_github_output: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         with tempfile.TemporaryDirectory() as temporary:
@@ -101,6 +121,7 @@ class NpmReleasePlanTests(unittest.TestCase):
                 "expected = ['view', 'example-package', 'versions', '--json']\n"
                 "if sys.argv[1:] != expected:\n"
                 "    raise SystemExit(9)\n"
+                "sys.stderr.write(os.environ['NPM_STDERR'])\n"
                 "if os.environ['NPM_EXIT'] != '0':\n"
                 "    raise SystemExit(int(os.environ['NPM_EXIT']))\n"
                 "print(os.environ['REGISTRY_VERSIONS'])\n",
@@ -111,6 +132,7 @@ class NpmReleasePlanTests(unittest.TestCase):
                 **os.environ,
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "NPM_EXIT": str(npm_exit),
+                "NPM_STDERR": npm_stderr,
                 "REGISTRY_VERSIONS": registry_versions,
             }
             github_output = root / "github-output.txt"
@@ -145,11 +167,11 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow.count("runs-on: ubuntu-latest"), 4)
         self.assertIn("release-plan:", workflow)
         self.assertIn(
-            "publish: ${{ steps.plan.outputs.publish }}",
+            "orchestrator_publish: ${{ steps.orchestrator.outputs.publish }}",
             workflow,
         )
         self.assertIn(
-            "needs.release-plan.outputs.publish == 'true'",
+            "manager_publish: ${{ steps.manager.outputs.publish }}",
             workflow,
         )
         self.assertEqual(workflow.count("persist-credentials: false"), 3)
@@ -167,8 +189,18 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             "node scripts/npm-release-plan.mjs --package-json package.json",
             workflow,
         )
-        self.assertIn("needs.release-plan.outputs.publish == 'true'", workflow)
+        self.assertIn(
+            "node scripts/npm-release-plan.mjs "
+            "--package-json packages/herdr-manager/package.json",
+            workflow,
+        )
+        self.assertIn("needs.release-plan.outputs.orchestrator_publish == 'true'", workflow)
+        self.assertIn("needs.release-plan.outputs.manager_publish == 'true'", workflow)
         self.assertIn("npm publish --access public", workflow)
+        self.assertIn(
+            "npm publish --access public ./packages/herdr-manager",
+            workflow,
+        )
         self.assertNotIn("--provenance", workflow)
         self.assertNotIn("NODE_AUTH_TOKEN", workflow)
         self.assertIn("actions/checkout@11d5960a326750d5838078e36cf38b85af677262", workflow)
