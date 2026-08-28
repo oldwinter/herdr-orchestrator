@@ -16,7 +16,11 @@ TEXT_SUFFIXES = {".css", ".html", ".js", ".json", ".md", ".mjs", ".py", ".toml",
 DEBT_MARKER = re.compile(r"\b(?:TODO|FIXME|XXX|HACK)\b")
 TRACKED_DEBT = re.compile(r"\b(?:TODO|FIXME|XXX|HACK)\(#[1-9][0-9]* owner=[A-Za-z0-9_.-]+\):")
 EXEMPT_SIZE_PATHS = {
+    ".factory/video/wiki/herdr-orchestrator/out/overview.mp4",
     "src/herdr_orchestrator/dashboard/static/cytoscape.min.js",
+}
+EXEMPT_LINE_PATHS = {
+    ".factory/video/wiki/herdr-orchestrator/package-lock.json",
 }
 EXEMPT_DEBT_PATHS = {"scripts/check_repository.py"}
 
@@ -54,7 +58,7 @@ def main() -> int:
         text = path.read_text(encoding="utf-8")
         lines = text.count("\n") + int(bool(text))
         maximum = line_limit(path)
-        if lines > maximum:
+        if lines > maximum and relative not in EXEMPT_LINE_PATHS:
             failures.append(f"{relative}: {lines} lines exceeds {maximum}")
         if relative in EXEMPT_DEBT_PATHS:
             continue

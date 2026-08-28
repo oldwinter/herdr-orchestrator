@@ -1,0 +1,9 @@
+.venv/
+node_modules/
+__pycache__/
+assets/*.bin
+assets/*.onnx
+assets/*.mp3
+assets/*.wav
+out/*-visual.mp4
+out/preview-*.png
