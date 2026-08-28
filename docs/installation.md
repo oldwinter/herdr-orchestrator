@@ -134,6 +134,24 @@ herdr-manager claude  # selects Claude
 The Just recipe invokes npm from a non-interactive shell, bypassing interactive wrappers that
 rewrite `npm install --global .` as an invalid `mise use -g npm:.` package request. Once version
 `0.1.3` or newer is published, `npm install --global herdr-orchestrator` is also supported.
+Bare npm installation has no Herdr configuration side effects. `just install-manager` follows it
+with the explicit `herdr-orchestrator manager-light install` opt-in.
+
+Manager light requires Herdr 0.8.2 or newer. It links and enables the packaged plugin and owns one
+marked `[ui.sidebar.agents]` block. Installation refuses malformed markers or any external Agent-row
+table, validates a temporary candidate with `herdr config check`, and atomically renames the valid
+candidate. Bytes outside the marker block are preserved. Inspect or remove it with:
+
+```bash
+herdr-orchestrator manager-light status
+herdr-orchestrator manager-light uninstall
+```
+
+Uninstall unlinks the plugin and removes only the intact owned block after validating the candidate.
+The manager's blue token is best-effort metadata around the harness process; ordinary blocked,
+working, idle, and unknown colors remain projections of Herdr's current lifecycle state.
+Custom rows apply only to the expanded desktop Agent sidebar. Collapsed and mobile views retain
+Herdr's built-in indicators.
 
 From a source checkout, use `just manager` or `just manager claude`. For a one-off invocation,
 use `npx --yes herdr-orchestrator manager claude`.

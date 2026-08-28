@@ -117,9 +117,23 @@ herdr-manager
 herdr-manager claude
 ```
 
+`install-manager` 先安装全局命令，再运行 `herdr-orchestrator manager-light install`。
+后者要求 Herdr 0.8.2 或更高版本，安装包内插件，并以原子、候选配置已校验的方式接管一个
+带 marker 的 `[ui.sidebar.agents]` block。它拒绝覆盖已有的 Agent rows；block 之外的配置字节
+保持不变。蓝色实心灯表示 manager，其他 Agent 仍由 Herdr 真实生命周期投影为 blocked、
+working、idle 或 unknown，manager launcher 不会改写 Agent lifecycle。
+自定义 rows 只作用于桌面端展开的 Agent sidebar；折叠 sidebar 和移动端继续使用 Herdr
+内建 indicator。
+
 `install-manager` 由 `just` 的非交互 shell 调用 npm，因此不会命中把
 `npm install --global .` 重写为 `mise use -g npm:.` 的交互式 wrapper。发布版 `0.1.3`
-及以上也可直接用 `npm install --global herdr-orchestrator` 安装。
+及以上也可直接用 `npm install --global herdr-orchestrator` 安装；单独运行 npm 安装不会修改
+Herdr 配置。检查或移除投影时运行：
+
+```bash
+herdr-orchestrator manager-light status
+herdr-orchestrator manager-light uninstall
+```
 
 一次性使用也可运行 `npx --yes herdr-orchestrator manager claude`。这些入口都要求
 `HERDR_ENV=1`，并把所选 harness 无附加参数地启动在包内固定的 manager 目录。该目录

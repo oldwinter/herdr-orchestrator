@@ -1,6 +1,6 @@
 {
   "name": "herdr-orchestrator",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Install and run durable multi-harness orchestration over Herdr",
   "keywords": [
     "agents",
@@ -19,6 +19,7 @@
   "files": [
     "bin/",
     "manager/",
+    "plugins/manager-light/",
     "profiles/",
     "skills/",
     "src/herdr_orchestrator/**/*.py",
@@ -38,7 +39,7 @@
   },
   "scripts": {
     "release:plan": "node scripts/npm-release-plan.mjs --package-json package.json",
-    "test": "python3 -m unittest tests.test_distribution -v"
+    "test": "python3 -m unittest tests.test_distribution tests.test_manager_light -v"
   },
   "repository": {
     "type": "git",
