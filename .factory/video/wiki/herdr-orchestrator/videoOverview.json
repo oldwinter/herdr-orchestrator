@@ -1,0 +1,22 @@
+{
+  "status": "ready",
+  "sizeBytes": 11070753,
+  "contentType": "video/mp4",
+  "generatedAt": "2026-08-26T11:34:29.000Z",
+  "durationSeconds": 438.709,
+  "captionTracks": [
+    {
+      "language": "en",
+      "label": "English",
+      "sizeBytes": 10098,
+      "contentType": "text/vtt"
+    }
+  ],
+  "warnings": [
+    "Prior Factory wiki video history lookup was unavailable (HTTP 403), so this overview was generated fresh.",
+    "The live Factory brand guide and official asset URLs returned HTTP 404; the composition uses the documented fallback palette, local Geist fonts, a white mono Factory label, and the host Noto CJK fallback.",
+    "Live application screenshot capture was skipped because .factory/skills/qa/config.yaml is absent; all visuals are grounded in repository paths, contracts, flows, and measured metrics.",
+    "HyperFrames reported no deterministic alias for the host Noto Sans CJK font during render; local Geist assets are embedded and poster visual QA confirmed the Chinese fallback rendered correctly.",
+    "The Chinese narration has a local Simplified Chinese sidecar at video/captions.zh-CN.vtt, but Droid 0.204.0 exposed only the canonical English caption track in the Factory player."
+  ]
+}
