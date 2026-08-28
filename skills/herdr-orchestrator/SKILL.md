@@ -64,10 +64,13 @@ herdr-manager
 herdr-manager claude
 ```
 
-Grok is the default. If the global command is unavailable, use the one-off packaged form:
+Without an explicit harness, the launcher uses the first available CLI in this order:
+Grok, Codex, Claude. If none is available, it fails with a stable installation hint. For a
+one-off launch from any directory, use:
 
 ```bash
-npx --yes herdr-orchestrator manager claude
+npx --yes herdr-manager
+npx --yes herdr-manager claude
 ```
 
 The command requires `HERDR_ENV=1` and adds no harness arguments or permission bypasses. The

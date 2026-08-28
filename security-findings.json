@@ -1,10 +1,10 @@
 {
-  "scan_id": "scan-2026-08-26-wiki-precommit",
-  "scan_date": "2026-08-26T12:00:47Z",
-  "scan_type": "pre-commit",
+  "scan_id": "scan-2026-08-28-manager-staged",
+  "scan_date": "2026-08-28T08:21:59Z",
+  "scan_type": "staged",
   "commit_range": "origin/main..staged",
   "pr_number": null,
-  "threat_model_version": "1.0.0",
+  "threat_model_version": "1.1.0",
   "findings": [],
   "summary": {
     "total_findings": 0,
@@ -22,6 +22,6 @@
       "DoS": 0,
       "ElevationOfPrivilege": 0
     },
-    "files_analyzed": 52
+    "files_analyzed": 23
   }
 }

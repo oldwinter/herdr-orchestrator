@@ -36,7 +36,13 @@ function registryVersions(name) {
     encoding: "utf8",
     timeout: 30_000,
   });
-  if (result.error || result.status !== 0) {
+  if (result.error) {
+    throw new Error("npm_registry_query_failed");
+  }
+  if (result.status !== 0) {
+    if (/(?:^|\s)E404(?:\s|$)|404 Not Found/m.test(result.stderr)) {
+      return [];
+    }
     throw new Error("npm_registry_query_failed");
   }
   const payload = JSON.parse(result.stdout);

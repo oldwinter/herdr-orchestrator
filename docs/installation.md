@@ -1,6 +1,7 @@
 # Distribution and installation
 
-Herdr Orchestrator uses two distribution layers with one project-local runtime contract.
+Herdr Orchestrator uses two installation layers plus a thin `herdr-manager` command package
+over one project-local runtime contract.
 
 ## Agent Skill
 
@@ -127,7 +128,7 @@ from a source checkout:
 
 ```bash
 just install-manager
-herdr-manager         # defaults to Grok
+herdr-manager         # Grok, then Codex, then Claude
 herdr-manager claude  # selects Claude
 ```
 
@@ -153,11 +154,17 @@ working, idle, and unknown colors remain projections of Herdr's current lifecycl
 Custom rows apply only to the expanded desktop Agent sidebar. Collapsed and mobile views retain
 Herdr's built-in indicators.
 
-From a source checkout, use `just manager` or `just manager claude`. For a one-off invocation,
-use `npx --yes herdr-orchestrator manager claude`.
+From a source checkout, use `just manager` or `just manager claude`. For a one-off invocation
+from any directory, use:
+
+```bash
+npx --yes herdr-manager
+npx --yes herdr-manager claude
+```
 
 The command fails unless `HERDR_ENV=1` and starts the selected harness with no extra arguments
-in the package's fixed manager workspace. Grok is the default. The backward-compatible
+in the package's fixed manager workspace. Without an explicit harness it tries Grok, Codex, then
+Claude, and fails clearly when none of those CLIs are available. The backward-compatible
 `herdr-orchestrator manager --project . --harness claude` form explicitly selects the manager
 workspace installed in a target project and validates the harness against that installation.
 
@@ -225,35 +232,37 @@ from `main` without an npm token:
 
 1. Python compile and test run on
    `[self-hosted, Linux, X64, herdr-orchestrator]`;
-2. after a successful `main` test, the same runner compares `package.json` with public
-   registry versions;
+2. after a successful `main` test, the release-plan runner compares both `package.json` and
+   `packages/herdr-manager/package.json` with public registry versions;
 3. an existing version is a successful no-op and allocates no GitHub-hosted runner;
-4. a missing version enables the GitHub-hosted publish job;
-5. that job publishes through npm Trusted Publishing.
+4. a missing runtime or manager version enables the GitHub-hosted publish job;
+5. that job publishes each missing package through npm Trusted Publishing, with the runtime
+   before the manager package.
 
-Registry lookup failures stop the job. The workflow never guesses that a failed lookup means
-a new package version. npm does not support Trusted Publishing from self-hosted runners, so
-the OIDC publish job must remain on `ubuntu-latest`. The repository is private, so npm
-provenance is not supported even though tokenless Trusted Publishing is.
+An explicit npm `E404` means a package has no published versions yet. Every other registry lookup
+failure stops the job; the workflow never treats an ambiguous network or registry error as a new
+version. npm does not support Trusted Publishing from self-hosted runners, so the OIDC publish job
+must remain on `ubuntu-latest`. The repository is private, so npm provenance is not supported even
+though tokenless Trusted Publishing is.
 
 ### Dedicated runner
 
-The repository-specific runner is `herdr-orchestrator-185` on `remote-185`. It runs under a
-dedicated operating-system account and advertises these labels:
+The trusted release-planning runner is `herdr-orchestrator-185` on `remote-185`. It runs under
+a dedicated operating-system account and advertises these labels:
 
 ```yaml
 runs-on: [self-hosted, Linux, X64, herdr-orchestrator]
 ```
 
-Both self-hosted jobs disable checkout credential persistence. Keep this runner scoped to
-this private repository, and do not run untrusted pull request code on it.
+The release-plan job disables checkout credential persistence. Keep this runner scoped to this
+private repository, and do not run untrusted pull request code on it.
 
 ### One-time trusted publisher setup
 
 1. Create the GitHub Environment `npm`. Optional required reviewers can protect production
    releases.
 2. From an authenticated maintainer terminal, register the exact repository, workflow file,
-   and Environment:
+   and Environment for the existing runtime package:
 
    ```bash
    npm trust github herdr-orchestrator \
@@ -262,7 +271,24 @@ this private repository, and do not run untrusted pull request code on it.
      --env npm \
      --allow-publish \
      -y
+
    ```
+
+   Bootstrap the brand-new `herdr-manager` name once, then configure the same trusted publisher:
+
+   ```bash
+   npm publish --access public ./packages/herdr-manager
+
+   npm trust github herdr-manager \
+     --file ci.yml \
+     --repo oldwinter/herdr-orchestrator \
+     --env npm \
+     --allow-publish \
+     -y
+   ```
+
+   Perform that one-time bootstrap only as an explicitly authorized release action. All later
+   versions remain tokenless through the workflow.
 
 3. Before releasing a new version, ensure GitHub Actions can start hosted runners. Account
    billing or spending-limit failures block only the missing-version publish job; routine
@@ -273,7 +299,7 @@ The publish job grants only `contents: read` and `id-token: write`. Do not add
 
 ### Releasing a new version
 
-Create a normal pull request that updates both npm manifests:
+Create a normal pull request that updates the runtime version when runtime behavior changes:
 
 ```bash
 npm version patch --no-git-tag-version
@@ -281,12 +307,21 @@ npm run release:plan
 just check
 ```
 
-Use `minor` or `major` instead of `patch` when appropriate. After the version PR merges,
-the `main` workflow publishes that exact version. npm versions are immutable, so changing
-runtime code without changing `package.json` does not create a release.
+When the thin manager package itself changes, also bump its independent version and keep its
+`herdr-orchestrator` dependency compatible:
+
+```bash
+npm version patch --no-git-tag-version --prefix packages/herdr-manager
+```
+
+Use `minor` or `major` instead of `patch` when appropriate. After the version PR merges, the
+`main` workflow plans and publishes each missing version independently. npm versions are
+immutable, so changing package code without changing the corresponding `package.json` does not
+create a release.
 
 For a local package-content preview:
 
 ```bash
 npm pack --dry-run --json
+npm pack --dry-run --json ./packages/herdr-manager
 ```

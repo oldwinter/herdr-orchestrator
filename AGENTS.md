@@ -66,8 +66,9 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - `skills/herdr-orchestrator/`：`npx skills` 分发的通用 orchestrator Skill
 - `bin/herdr-orchestrator.mjs`：npm 安装、诊断、升级、卸载和 runtime 包装入口
 - `package.json`：`herdr-orchestrator` npm 分发清单
+- `packages/herdr-manager/`：提供 `npx herdr-manager` 的薄 npm 入口
 - `scripts/npm-release-plan.mjs`：main 发布前的 registry 版本 gate
-- `.github/workflows/ci.yml`：专属 self-hosted 测试/版本 gate 与 GitHub-hosted npm OIDC 发布编排
+- `.github/workflows/ci.yml`：专属 self-hosted 版本 gate 与 GitHub-hosted 测试/npm OIDC 发布编排
 
 ## 安全边界
 
@@ -87,8 +88,10 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - 普通 queue 的 `blocked` 是 terminal，不自动回答；只有人工显式 `resume --response-file`
   可恢复原 agent/pane/attempt。仅 opt-in 标准交付执行自动的有界 controller response loop。
 - runtime state、完整终端输出和原始 prompt 不进入 Git。
-- npm Trusted Publishing 不支持 self-hosted runner；只有测试和版本 gate 使用专属 runner，
-  `publish` 必须保持 GitHub-hosted 且不得引入长期 npm token。
+- npm Trusted Publishing 不支持 self-hosted runner；只有可信 `main` 的版本 gate 使用专属
+  runner，PR 测试和 `publish` 必须保持 GitHub-hosted，且不得引入长期 npm token。
+- `herdr-manager` 只能用固定 argv 转发到 `herdr-orchestrator manager`，不得使用 shell，
+  默认 harness 候选只能来自 `grok → codex → claude` 固定 allowlist。
 
 ## 修改约定
 
