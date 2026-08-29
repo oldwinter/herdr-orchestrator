@@ -1,214 +1,161 @@
 # 数据模型
 Active contributors: oldwinter, chendongdong
 
-本页区分四层数据：Python 内存对象、普通 queue 的 SQLite 状态、Dashboard 只读投影，以及 opt-in 标准化交付 artifact。核心定义分别位于 `src/herdr_orchestrator/model.py`、`src/herdr_orchestrator/store.py`、`src/herdr_orchestrator/dashboard/observer.py`、`src/herdr_orchestrator/dashboard/projector.py` 与 `src/herdr_orchestrator/delivery_protocol.py`。
+herdr-orchestrator 有三类不能混用的数据：`src/herdr_orchestrator/model.py` 中的进程内对象、`src/herdr_orchestrator/store.py` 中的 durable queue 表，以及 `src/herdr_orchestrator/delivery_protocol.py` 校验的 opt-in 交付 JSON。前者是 frozen dataclass，后两者分别是 SQLite 持久化契约和文件 artifact 契约。
 
-> 稳定性提示：dataclass 都是 `frozen=True, slots=True`，适合模块间不可变传递，但字段本身不是通用 JSON API。公共消费者应使用有 `schema_version` 或严格 loader 的输出，而不是依赖 Python 对象布局。
+## 共享枚举
 
-## 核心 enum
-
-| Enum | 值 | 用途 |
+| Enum | 值 | 使用位置 |
 | --- | --- | --- |
-| `Harness` | `droid`, `grok`, `codex`, `pi`, `claude`, `hermes` | Controller/worker kind |
-| `JobState` | `pending`, `running`, `succeeded`, `blocked`, `failed` | Durable queue 状态 |
-| `AgentState` | `idle`, `working`, `blocked`, `done`, `unknown` | 一次 Herdr agent observation |
-| `PlacementMode` | `hybrid`, `tab`, `pane`, `worktree` | Workflow 全局 topology policy |
+| `Harness` | `droid`, `grok`, `codex`, `pi`, `claude`, `hermes` | Workflow、catalog、job、CLI |
+| `JobState` | `pending`, `running`, `succeeded`, `blocked`, `failed` | Durable queue |
+| `AgentState` | `idle`, `working`, `blocked`, `done`, `unknown` | Herdr outcome observation |
+| `PlacementMode` | `hybrid`, `tab`, `pane`, `worktree` | Workflow 全局 policy |
 | `PlacementTarget` | `tab`, `pane`, `worktree` | 已确定的 job topology |
-| `ReceiptKind` | `output-prefix`, `file` | 普通 queue 的 task receipt 类型 |
+| `ReceiptKind` | `output-prefix`, `file` | 普通 queue 的内容验收 |
 | `TrackerBackend` | `local-markdown`, `github` | 标准化交付 tracker |
-| `WayfinderMode` | `auto`, `always`, `never` | 标准化交付 route policy |
+| `WayfinderMode` | `auto`, `always`, `never` | Wayfinder route policy |
 
-`src/herdr_orchestrator/delivery_protocol.py` 另定义：
+`src/herdr_orchestrator/delivery_protocol.py` 另定义 `ProxyAction`、`AuthorityCategory` 和 `FindingSeverity`。Secret 或 production 权限类别只能得到 `escalate` 决策；review finding 只有 `must-fix` 与 `advisory` 两级。
 
-| Enum | 值 |
+## 进程内 dataclass
+
+`src/herdr_orchestrator/model.py` 中的 dataclass 都使用 `frozen=True, slots=True`，用于模块间不可变传递。它们包含 `Path`、enum 和 tuple，不应被当成可直接消费的公共 JSON schema。
+
+### 配置与 catalog
+
+| Dataclass | 作用 |
 | --- | --- |
-| `ProxyAction` | `answer`, `approve`, `deny`, `escalate` |
-| `AuthorityCategory` | `local-reversible`, `spec-authorized`, `secret`, `production` |
-| `FindingSeverity` | `must-fix`, `advisory` |
-
-## 核心 dataclass
-
-### 配置对象
-
-| Dataclass | 角色 |
-| --- | --- |
-| `CoordinatorConfig` | poll、parallelism、lease、attempt 与 agent timeout |
-| `PlacementConfig` | 全局 mode 与 worktree runtime 根 |
-| `StandardizedDeliveryConfig` | tracker、artifact、Wayfinder 与 repair bounds |
-| `PlannerConfig` | planner 开关、controller/pool、prompt/output 与 cadence |
-| `HarnessProfile` | compact catalog metadata 与完整 context 引用 |
-| `WorkerConfig` | worker 名、harness、replica 与默认 placement |
+| `CoordinatorConfig` | Poll、parallelism、lease、attempt 和 agent timeout |
+| `PlacementConfig` | 全局 placement mode 与 worktree root |
+| `StandardizedDeliveryConfig` | Tracker、artifact root、Wayfinder 与 repair bounds |
+| `PlannerConfig` | Planner 开关、controller、worker pool、文件和 cadence |
+| `HarnessProfile` | Compact metadata 与完整 context 文件引用 |
+| `WorkerConfig` | Worker 名、harness、replica 与默认 placement |
 | `SeedJobConfig` | 可幂等 seed packet |
-| `WorkflowConfig` | 已解析、已交叉校验的完整 workflow 聚合 |
+| `WorkflowConfig` | 完整解析结果 |
 
-这些对象中的 `Path` 已按配置规则解析；`PlannerConfig.harness=None` 和
-`WorkerConfig.placement=None` 分别表示 `auto`/无 override。
+`PlannerConfig.harness=None` 表示 `auto`；`WorkerConfig.placement=None` 表示没有 worker override。`src/herdr_orchestrator/catalog.py` 的 compact payload 使用 `schema_version=1`，只输出能力字段和 `profile_ref`；full payload 才附加 `context`。
 
-### Durable queue 与 dispatch 对象
+### Queue 与 dispatch
 
-| Dataclass | 生命周期与关键字段 |
+| Dataclass | 关键字段和阶段 |
 | --- | --- |
-| `TaskReceipt` | `kind + value`；声明内容级成功条件 |
-| `NewJob` | 入库 packet：workflow、title、harness、prompt、dedupe、attempt budget、placement、receipt |
-| `ClaimedJob` | claim 后的 job 快照：job id、attempt、agent slot、确定 placement、correlation id |
-| `DispatchContext` | 交给 transport 的 topology、task/batch key、worktree root 与 receipt |
-| `DispatchOutcome` | transport observation：agent state、pane/workspace、error、settlement、verification 与 timings |
-| `PlannerTask` | 通过 planner schema 校验后可入队的 title/harness/prompt/dedupe |
+| `TaskReceipt` | `kind + value`，在 dispatch 前声明验收条件 |
+| `NewJob` | Workflow、title、harness、prompt、dedupe、attempt、placement、receipt |
+| `ClaimedJob` | Job id、attempt、agent slot、确定 placement、correlation id |
+| `DispatchContext` | Topology、task/batch key、worktree root、receipt、correlation id |
+| `DispatchOutcome` | Agent state、pane/workspace、error、settlement、verification、phase timing |
+| `PlannerTask` | Planner JSON 校验后的 title、harness、prompt、dedupe |
 
-`DispatchOutcome.state` 只说明 agent 生命周期；job 是否成功还要结合 `error_code` 和
-`task_verified`。`idle`/`done` 不是独立质量证明。
+`DispatchOutcome.state` 只是 agent 生命周期观察。Job 成功还要满足没有 `error_code`，且已声明 receipt 时 `task_verified is True`；`idle` 或 `done` 本身不是内容验收。
 
-### 标准化交付对象
+## SQLite schema v4
 
-| 阶段 | Dataclass |
-| --- | --- |
-| Wayfinder route/map | `WayfinderRoute`, `DecisionTicket`, `WayfinderMap`, `WayfinderResolution` |
-| Spec 与 ticket DAG | `DeliveryTicket`, `DeliveryPlan` |
-| 实现验收 | `AcceptanceResult`, `TicketReceipt` |
-| 双轴 review | `ReviewFinding`, `ReviewReport`, `ReviewVerdict` |
-| Principal proxy | `ProxyDecision` |
-| 最终运行结果 | `DeliveryResult`（定义于 `src/herdr_orchestrator/delivery.py`） |
-
-`ReviewReport.must_fix` 是从 Standards 与 Spec 两轴中筛选 `must-fix` finding 的计算属性，不是单独持久化表。
-
-## SQLite durable queue
-
-当前 schema version 是 **4**。`Store.initialize()` 创建 `schema_meta`、`jobs`、
-`receipts`、`metadata` 和 runnable index，并能按顺序迁移 v1 → v2 → v3 → v4。
-SQLite 使用 foreign keys、WAL journal 和写事务 `BEGIN IMMEDIATE`。
+`Store.initialize()` 在 `src/herdr_orchestrator/store.py` 中创建四张表和 runnable index，并按 v1 → v2 → v3 → v4 顺序迁移旧数据库。连接启用 foreign keys 和 WAL；涉及 claim、outcome、retry、resume 的复合写入使用 `BEGIN IMMEDIATE`。
 
 ### `jobs`
 
-`jobs` 保存 job 的当前状态。
+`jobs` 是每个 job 的当前视图。
 
-| 列组 | 列与 SQLite 声明 |
+| 列组 | 列 |
 | --- | --- |
-| 标识 | `id INTEGER PRIMARY KEY AUTOINCREMENT`; `workflow TEXT NOT NULL`; `UNIQUE(workflow, dedupe_key)` |
-| 输入 | `title TEXT NOT NULL`, `harness TEXT NOT NULL`, `prompt TEXT NOT NULL`, `dedupe_key TEXT NOT NULL` |
-| 调度 | `placement TEXT NULL`, `state TEXT NOT NULL`, `attempts INTEGER NOT NULL DEFAULT 0`, `max_attempts INTEGER NOT NULL`, `available_at REAL NOT NULL`, `lease_until REAL NULL` |
-| Agent/runtime | `agent_name TEXT NULL`, `execution_path TEXT NULL`, `herdr_workspace_id TEXT NULL`, `correlation_id TEXT NULL` |
-| 成功/错误 | `error_code TEXT NULL`, `error_summary TEXT NULL`, `agent_settled INTEGER NULL`, `task_verified INTEGER NULL` |
-| Receipt 声明 | `receipt_kind TEXT NULL`, `receipt_value TEXT NULL` |
-| 时间 | `created_at REAL NOT NULL`, `updated_at REAL NOT NULL` |
+| 身份 | `id`, `workflow`, `title`, `harness`, `prompt`, `dedupe_key` |
+| 调度 | `placement`, `state`, `attempts`, `max_attempts`, `available_at`, `lease_until` |
+| Agent/topology | `agent_name`, `execution_path`, `herdr_workspace_id` |
+| Receipt/结果 | `receipt_kind`, `receipt_value`, `agent_settled`, `task_verified` |
+| 错误/关联 | `error_code`, `error_summary`, `correlation_id` |
+| 时间 | `created_at`, `updated_at` |
 
-索引 `jobs_runnable` 覆盖 `(workflow, state, available_at, lease_until)`。`placement=NULL`
-表示 topology 尚未决策；claim 只选择 placement 已确定、attempt 未耗尽且可运行或 lease
-已过期的记录。
+`UNIQUE(workflow, dedupe_key)` 提供幂等 enqueue；`jobs_runnable` 覆盖 `(workflow, state, available_at, lease_until)`。只有 placement 已确定、attempt 尚有预算、可运行或 lease 已过期的记录能被 claim。
 
 ### `receipts`
 
-`receipts` 保存每次 outcome observation；blocked job 恢复时可以在**同一个 attempt**
-追加第二条 receipt。
+`receipts` 为每次 outcome observation 追加一行：
 
-| 列组 | 列与 SQLite 声明 |
+| 列组 | 列 |
 | --- | --- |
-| 标识 | `id INTEGER PRIMARY KEY AUTOINCREMENT`, `job_id INTEGER NOT NULL REFERENCES jobs(id)`, `attempt INTEGER NOT NULL` |
-| Durable/agent 状态 | `state TEXT NOT NULL`, `agent_state TEXT NOT NULL`, `agent_name TEXT NOT NULL` |
-| 所有权/topology | `member_reused INTEGER NOT NULL`, `pane_id TEXT NULL`, `placement TEXT NULL`, `execution_path TEXT NULL`, `herdr_workspace_id TEXT NULL` |
-| 成功/错误 | `error_code TEXT NULL`, `error_summary TEXT NULL`, `agent_settled INTEGER NULL`, `task_verified INTEGER NULL` |
-| 关联与时间 | `correlation_id TEXT NULL`, `observed_at REAL NOT NULL` |
+| 身份 | `id`, `job_id`, `attempt` |
+| 状态 | `state`, `agent_state`, `agent_name`, `member_reused` |
+| Topology | `pane_id`, `placement`, `execution_path`, `herdr_workspace_id` |
+| 结果 | `error_code`, `error_summary`, `agent_settled`, `task_verified` |
+| 关联与时间 | `correlation_id`, `observed_at` |
 
-`jobs` 是当前视图，`receipts` 是 outcome 时间线来源。实现目前追加 receipt，但数据库
-schema 没有把它声明成不可变审计日志；外部代码不应绕过 `Store` 直接写表。
+Blocked job 的人工 `resume` 复用 agent、pane、placement 和同一个 attempt，因此同一 attempt 可以有多条 receipt。表通过 `job_id REFERENCES jobs(id)` 关联，但 schema 没有把它声明成不可变审计日志；外部代码不应绕过 `Store` 写表。
 
 ### 其他表
 
-- `schema_meta(version INTEGER NOT NULL)`：数据库 schema version。
-- `metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)`：当前用于 coordinator 的少量运行 metadata，例如 planner cadence；它不是通用配置存储。
+- `schema_meta(version INTEGER NOT NULL)` 保存数据库 schema version。
+- `metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)` 保存 coordinator 的少量 runtime metadata，例如 planner cadence；它不是通用配置表。
 
-### 状态迁移
+## Queue 状态迁移
 
 ```mermaid
 stateDiagram-v2
     [*] --> pending: enqueue / seed
     pending --> running: claim，attempt + 1，设置 lease
-    running --> running: lease 过期且仍有 budget 时重新 claim，attempt + 1
-    running --> succeeded: settled 且无错误；已声明 receipt 必须验证
+    running --> running: lease 过期且尚有预算时重新 claim
+    running --> succeeded: settled，无错误，已声明 receipt 验证通过
     running --> blocked: agent blocked
-    running --> pending: 可重试失败，指数 backoff（最多 60 秒）
+    running --> pending: 可重试失败，指数 backoff，最大 60 秒
     running --> failed: attempt 耗尽或耗尽后的 lease 过期
     failed --> pending: retry，增加 max_attempts
-    blocked --> succeeded: resume 成功，复用 agent/pane/attempt
+    blocked --> succeeded: resume 成功，复用 attempt
     blocked --> blocked: resume 仍未成功
 ```
 
-Receipt 三态语义：
+普通 task receipt 的三态是：
 
-- `task_verified=true`：声明的 output/file receipt 已验证。
+- `task_verified=true`：声明的 output prefix 或文件已经验证。
 - `task_verified=false`：receipt 明确无效。
-- `task_verified=null`：兼容 job 未声明 receipt，或 transport 未报告验证；若 job 声明了 receipt，未报告会 fail closed。
+- `task_verified=null`：兼容 job 未声明 receipt，或 transport 没有报告；已声明 receipt 时此值会 fail closed。
 
-## Dashboard snapshot
+更完整的恢复语义见[任务与收据](../primitives/jobs-and-receipts.md)和[收据与恢复](../features/receipts-and-recovery.md)。
 
-Dashboard 不直接暴露数据库行。`SqliteObserver` 以只读 SQLite URI 读取白名单列，
-`HerdrObserver` 读取并过滤当前 workspace 的 Herdr topology，`RuntimeProjector` 再把两者关联成 `schema_version=1` snapshot。
+## 标准化交付 artifact
 
-| 顶层字段 | 内容 |
-| --- | --- |
-| `schema_version` | 当前为 `1` |
-| `workflow`, `generated_at` | Scope 与生成时间 |
-| `source_health` | queue/Herdr observation 健康度和受限 error code |
-| `summary` | Job state counts、active agents、worktrees、attention count |
-| `jobs` | 不含 prompt 的 job 投影、匹配到的 runtime agent、drift code |
-| `attention` | blocked/failed、source failure、runtime drift、stale job |
-| `topology` | 兼容的 workspace 视图，以及 project → worktree/workspace → tab → pane；agent 作为 pane 数据而非额外图节点 |
-| `timeline` | 合成 enqueue event 与 SQLite receipt event；按时间倒序，最多 100 项 |
+`src/herdr_orchestrator/delivery_protocol.py` 的 loader 要求 JSON 顶层和嵌套对象 key 精确匹配，额外或缺失字段都会失败。交付对象同样使用 frozen、slotted dataclass。
 
-HTTP `/api/snapshot` 外层是 `{"event_id": ..., "snapshot": ...}`；SSE
-`/api/events` 的 `snapshot` event data 是 snapshot 本身。投影明确不读取或输出 job
-prompt、环境变量和 terminal output；Herdr 对象也只保留
-`src/herdr_orchestrator/dashboard/observer.py` 中的字段白名单。
+| Artifact | 对象 | 关键不变量 |
+| --- | --- | --- |
+| `wayfinder-route.json` | `WayfinderRoute` | `use_wayfinder` 必须是 boolean |
+| `wayfinder-map.json` | `WayfinderMap`、`DecisionTicket` | Decision id 唯一；kind 受 allowlist 限制；blocker 必须先出现 |
+| `wayfinder/resolution-ID.json` | `WayfinderResolution` | 必须匹配选中的 decision；新 decision 不得预先 resolved |
+| `delivery-plan.json` | `DeliveryPlan`、`DeliveryTicket` | 至少一个 ticket；acceptance 非空；依赖只指向前序 ticket |
+| `receipts/ticket-ID.json` | `TicketReceipt`、`AcceptanceResult` | Commit 为 7–64 位小写十六进制；criterion 文本和顺序精确匹配；全部通过 |
+| `reviews/round-N/standards.json`、`spec.json` | `ReviewFinding` | 各文件只含对应 axis |
+| `reviews/round-N/verdict.json` | `ReviewVerdict` | accepted/dismissed 不重叠，并完整划分候选 finding id |
+| `proxy/*.json` | `ProxyDecision` | 非 escalation 必须提供 response；secret/production 必须 escalation |
 
-Snapshot 中的 `runtime`、`topology` 来自当次观察，会随 Herdr 状态变化；`drift` 是 queue
-与 runtime 的派生比较，不会回写 SQLite。除顶层 `schema_version` 所描述的结构外，调用方
-不应把 Herdr 的可变内部字段当作 queue 的公共持久化承诺。
+Delivery slug 最长 63 字符，只含小写字母、数字和连字符；ticket/decision id 是 2–3 位数字。普通 queue 的 `TaskReceipt`、SQLite `receipts` 行和交付 `TicketReceipt` 名称相近，但生命周期、验证条件和存储位置完全不同。完整说明见[交付 Artifact](../primitives/delivery-artifacts.md)。
 
-## 标准化交付 artifact 与其他模型的关系
+## 关系图
 
 ```mermaid
 flowchart LR
-    TOML["WorkflowConfig"]
-    TOML --> Q["普通 queue"]
-    Q --> J["SQLite jobs"]
-    Q --> R["SQLite receipts"]
-    J --> D["Dashboard snapshot"]
-    R --> D
-    H["Herdr observation"] --> D
+    Config["WorkflowConfig"] --> Queue["普通 durable queue"]
+    Config --> Catalog["HarnessProfile"]
+    Queue --> Jobs["SQLite jobs 当前视图"]
+    Queue --> Receipts["SQLite receipts 时间线"]
+    Catalog --> Dispatch["DispatchContext"]
+    Dispatch --> Outcome["DispatchOutcome"]
+    Outcome --> Jobs
+    Outcome --> Receipts
 
-    TOML --> SD["显式 deliver"]
-    SD --> A["artifact_root / run-id"]
-    A --> P["delivery-plan.json"]
-    A --> TR["receipts/ticket-ID.json"]
-    A --> RV["reviews/round-N/*.json"]
-    A --> WF["wayfinder*.json"]
-    A --> G["integration branch / result.json"]
+    Config --> Deliver["显式 deliver"]
+    Deliver --> Plan["DeliveryPlan"]
+    Plan --> Ticket["DeliveryTicket"]
+    Ticket --> TicketReceipt["TicketReceipt"]
+    TicketReceipt --> Review["ReviewReport / ReviewVerdict"]
 ```
 
-普通 queue 与 `deliver` 共用 workflow、harness profile 和 Herdr transport，但
-`deliver` 有独立的恢复目录、ticket DAG、worktree/integration 流程和 receipt。当前
-Dashboard 只投影 SQLite jobs/receipts 与 Herdr topology，**不会解析标准化交付目录**。
-Local Markdown tracker 的 spec/ticket 文件位于 `tracker_root/<slug>/`，也不属于 SQLite。
+## 关键源文件
 
-### 严格 JSON artifact
-
-`src/herdr_orchestrator/delivery_protocol.py` 的 loader 要求对象 key 集精确匹配，额外或缺失字段都会失败。
-
-| Artifact | 精确结构与关键不变量 |
+| 完整路径 | 用途 |
 | --- | --- |
-| `wayfinder-route.json` | `use_wayfinder`, `reason` |
-| `wayfinder-map.json` | `destination`, `notes`, `decisions`, `not_yet_specified`, `out_of_scope`；decision 含 `id/title/question/kind/blocked_by/resolution` |
-| `wayfinder/resolution-ID.json` | `ticket_id`, `resolution`, `new_decisions`, `not_yet_specified`, `out_of_scope`；必须匹配当前 decision |
-| `delivery-plan.json` | `slug`, `title`, problem/solution、story/decision/scope/seam arrays、`tickets`；至少一个 ticket |
-| `receipts/ticket-ID.json` | `ticket_id`, `commit`, `acceptance`, `checks`, `summary`；criterion 必须与 ticket acceptance criteria 文本和顺序完全一致且全部通过 |
-| `reviews/round-N/standards.json` | 只含 `standards` finding array |
-| `reviews/round-N/spec.json` | 只含 `spec` finding array |
-| `reviews/round-N/verdict.json` | `accepted`, `dismissed`, `rationale`；两组不重叠且完整划分候选 finding id |
-| `proxy/*.json` | `action`, `category`, `response`, `rationale`；secret/production 必须 `escalate` |
-
-共同约束包括：slug 为最多 63 字符的小写数字/连字符形式；ticket/decision id 是 2–3 位数字；
-dependency 必须引用列表中更早出现的 ticket；receipt commit 是 7–64 位小写十六进制；
-review severity 只能是 `must-fix` 或 `advisory`。
-
-恢复目录还包含 `state.json`、`decision-ledger.jsonl`、`routes/`、`worktrees/` 与最终
-`result.json`。这些是 `src/herdr_orchestrator/delivery.py` 的运行/恢复实现面，不应与
-`delivery_protocol.py` 中受严格校验的 agent artifact 混为同一个公共 schema。
+| `src/herdr_orchestrator/model.py` | 共享 enum 与 dataclass |
+| `src/herdr_orchestrator/config.py` | 配置对象的构建与交叉校验 |
+| `src/herdr_orchestrator/catalog.py` | Harness profile、compact/full payload |
+| `src/herdr_orchestrator/store.py` | SQLite schema、迁移、claim、outcome、retry、resume |
+| `src/herdr_orchestrator/delivery_protocol.py` | 交付 JSON dataclass 与严格 loader |
+| `docs/workflow-schema.md` | Workflow schema v1 |

@@ -1,157 +1,103 @@
-# 维护者指南
+# 维护者
 Active contributors: oldwinter, chendongdong
 
-本页区分三件事：仓库中声明的 review ownership、Git 历史中可核验的真实贡献，以及建议
-采用的维护 handoff。建议不是尚未存在的组织制度；当前权威配置仍以
-`.github/CODEOWNERS`、`.github/workflows/ci.yml`、`SECURITY.md` 和仓库实际权限为准。
+本页把 `.github/CODEOWNERS` 的正式 review ownership 与 `origin/main` 的近期人类贡献记录并列展示。仓库当前有 oldwinter 和 chendongdong 两名可核验的人类贡献者，因此保留本页；不按 commit 数、代码量或其他指标排名。
 
-## CODEOWNERS 现状
+## 数据口径
 
-`.github/CODEOWNERS` 当前把以下范围全部指派给 `@oldwinter`：
+- 正式 owner 来自 `.github/CODEOWNERS`。
+- Recent contributors 与 last activity 来自 `git log origin/main -- <path>`，不是当前工作分支。
+- `dependabot[bot]`、`factory-droid[bot]` 等 bot 账户被排除。
+- Git 历史只能说明谁近期改过对应路径，不能证明平台权限、值班安排、雇佣关系或长期责任。
+- 表中的日期是 `origin/main` 在对应 scope 的最近提交日期；本次快照中各 scope 最近活动均为 2026-08-28。
 
-| pattern | 当前 code owner |
-| --- | --- |
-| `*` | `@oldwinter` |
-| `/.github/` | `@oldwinter` |
-| `/scripts/` | `@oldwinter` |
-| `/src/herdr_orchestrator/` | `@oldwinter` |
-| `/workflows/` | `@oldwinter` |
+## 正式 CODEOWNERS
 
-这表示 `@oldwinter` 是声明式 review owner，包括安全敏感自动化；它不表示其他贡献者没有
-维护贡献，也不能证明 GitHub 分支保护一定要求其批准。分支保护、Environment 审批和 npm
-Trusted Publisher 权限必须在对应平台上另行核验，不能从 `CODEOWNERS` 推断。
+`.github/CODEOWNERS` 当前的 fallback 和全部具体 pattern 都指向 `@oldwinter`：
 
-## 可核验的贡献者
-
-对全部可见 Git refs 执行只读 `git shortlog -sne --all` 和 `git log --all` 的结果显示：
-
-- `oldwinter`：12 个作者记录；
-- `chendongdong`：10 个作者记录；
-- `dependabot[bot]`：6 个自动依赖更新记录。
-
-因此，当前可核验的活跃人类贡献者是 `oldwinter` 和 `chendongdong`。Git 历史显示两人均
-参与核心实现；其中 `chendongdong` 的作者记录覆盖拓扑执行、dashboard、一次性分发、
-npm Trusted Publishing、恢复与 CI，`oldwinter` 的作者记录覆盖初始 orchestrator、
-harness catalog、标准化交付、可信 dispatch、仓库 readiness、自动化启动及后续修复。
-这些事实来自提交作者和主题，不等同于平台权限、雇佣关系或长期值班承诺。
-
-## 关键系统 ownership 建议
-
-目前只有一个 repository-wide code owner。为降低单点风险，后续 handoff 可以为每个
-系统明确“主要维护人、备份维护人、验证命令和敏感边界”；在
-`.github/CODEOWNERS` 或其他权威文件真正更新前，不应把建议写成既成事实。
-
-| 系统 | 关键真源 | handoff 时应明确的责任 |
+| Pattern | 正式 owner | 含义 |
 | --- | --- | --- |
-| Coordinator 与 durable queue | `src/herdr_orchestrator/`、`tests/` | schema/SQLite 向后兼容、lease、重试、receipt、稳定错误语义 |
-| Workflow 与 harness catalog | `workflows/multi-harness.toml`、`workflows/prompts/`、`profiles/harnesses/`、`docs/workflow-schema.md` | planner schema、启用 worker、紧凑/完整 profile 分层及 launch policy |
-| npm/Python 分发 | `package.json`、`package-lock.json`、`pyproject.toml`、`bin/herdr-orchestrator.mjs`、`tests/test_distribution.py` | 版本同步、打包清单、manifest ownership、升级与卸载兼容 |
-| Registry 与 release 自动化 | `scripts/npm-release-plan.mjs`、`.github/workflows/ci.yml`、`tests/test_release.py` | test gate、registry fail-closed、GitHub-hosted OIDC、GitHub Release 恢复 |
-| Dashboard 与本地数据 | `src/herdr_orchestrator/dashboard/`、`docs/dashboard.md`、`docs/observability.md` | 只读语义、SSE/topology、脱敏、外部导出 fail-closed |
-| 安全与依赖 | `SECURITY.md`、`.github/dependabot.yml`、`uv.lock`、`package-lock.json` | 私密披露、精确 pin、依赖审计、自动 security insight 的安全处理 |
-| 贡献与文档 | `AGENTS.md`、`CONTRIBUTING.md`、`docs/`、`droid-wiki/` | 命令与实现同步、风险/回滚说明、禁止提交运行时与敏感内容 |
+| `*` | `@oldwinter` | 仓库默认 review owner |
+| `/.github/` | `@oldwinter` | CI、Dependabot、CODEOWNERS 等仓库自动化 |
+| `/scripts/` | `@oldwinter` | 生成、质量和发布脚本 |
+| `/src/herdr_orchestrator/` | `@oldwinter` | Python 控制面 |
+| `/workflows/` | `@oldwinter` | 声明式 workflow 与 prompt |
 
-涉及 `.github/workflows/ci.yml`、`scripts/npm-release-plan.mjs`、
-`bin/herdr-orchestrator.mjs`、安全数据处理或版本元数据的变更，建议至少由熟悉发布边界的
-维护者复核；这是风险控制建议，不代表仓库当前已经配置了双人审批规则。
+CODEOWNERS 不会自动证明 branch protection 必须请求该 owner，也不会描述 npm Trusted Publisher、GitHub Environment 或 repository admin 权限。这些设置必须在对应平台核验。
 
-## 发布前检查表
+## 子系统 ownership 图
 
-### 变更与版本
+下表不排名贡献者；同一单元格只列出 `origin/main` 中可核验的近期人类参与者。
 
-- [ ] 变更有聚焦的行为测试，风险和回滚方式已写清楚。
-- [ ] `package.json`、`package-lock.json`、`pyproject.toml` 与
-      `src/herdr_orchestrator/__init__.py` 中的 `__version__` 使用同一个新 SemVer。
-- [ ] 新版本尚未存在于 npm；`npm run release:plan` 输出 `publish=true` 和
-      `reason=version_missing`。
-- [ ] `npm pack --dry-run --json` 的文件清单只包含 `package.json` 允许的分发内容。
-- [ ] 用户可见 CLI 变化已用 `just docs-generate` 更新 `docs/generated/cli.md`。
-- [ ] telemetry 或 exporter 变化已同步 `docs/observability.md`、`.env.example` 和 feature
-      flag 生命周期。
+| 子系统 | 完整路径 | 正式 owner | Recent contributors | Last activity |
+| --- | --- | --- | --- | --- |
+| Coordinator、queue、Herdr、Dashboard、delivery | `src/herdr_orchestrator/` | `@oldwinter` | oldwinter, chendongdong | 2026-08-28 |
+| Workflow、profile 与文档 schema | `workflows/`、`profiles/`、`docs/` | `@oldwinter`（`workflows/` 显式，其余由 `*`） | oldwinter, chendongdong | 2026-08-28 |
+| Python/npm 分发与 manager | `pyproject.toml`、`package.json`、`package-lock.json`、`packages/`、`bin/`、`scripts/` | `@oldwinter` | oldwinter, chendongdong | 2026-08-28 |
+| CI、发布与安全配置 | `.github/`、`SECURITY.md` | `@oldwinter` | oldwinter, chendongdong | 2026-08-28 |
+| 贡献指南与 Wiki | `AGENTS.md`、`CONTRIBUTING.md`、`droid-wiki/` | `@oldwinter`（由 `*`） | oldwinter, chendongdong | 2026-08-28 |
 
-### 本地验证
+`chendongdong` 是近期核心贡献者，但当前没有单独的 CODEOWNERS pattern。若团队要建立 backup owner 或双人 review，必须修改 `.github/CODEOWNERS` 和相应平台规则；不能只在 Wiki 中宣称已经存在。
 
-- [ ] 已执行 `uv sync --locked`。
-- [ ] 迭代期间已运行最小相关测试以及 `just lint`。
-- [ ] 提交 review 前已运行 `just check`。
-- [ ] 分发改动至少通过 `tests/test_distribution.py`；发布改动至少通过
-      `tests/test_release.py`。
-- [ ] `git status` 中没有 `.orchestrator/`、原始 prompt、终端输出、凭据或真实 `.env`。
+## 维护责任
 
-### CI 与发布权限
+| 范围 | 需要守住的契约 | 相关页面 |
+| --- | --- | --- |
+| Durable queue | SQLite v1→v4 migration、lease、attempt、retry/resume、receipt fail-closed | [数据模型](reference/data-models.md)、[Coordinator](systems/coordinator-and-queue.md) |
+| Workflow/catalog | Schema v1、六 harness allowlist、compact/full profile 分层、planner 受限输出 | [配置](reference/configuration.md)、[Catalog 与路由](systems/catalog-and-routing.md) |
+| 分发 | Python/npm 版本同步、package files、manifest ownership、manager 固定 argv 转发 | [依赖](reference/dependencies.md)、[安装与分发](systems/installation-and-distribution.md) |
+| 发布/CI | Registry version gate、GitHub-hosted publish、OIDC、无长期 npm token | [部署](deployment.md)、[开发工具](how-to-contribute/tooling.md) |
+| Dashboard/observability | 只读投影、loopback、脱敏、外部 exporter 默认关闭 | [Dashboard](systems/dashboard.md)、[安全](security.md) |
+| Wiki/贡献 | 命令与实现同步、完整源码路径、运行态和敏感数据不入 Git | [如何贡献](how-to-contribute/index.md) |
 
-- [ ] `.github/workflows/ci.yml` 的 compile 和六个质量 gate 全部成功；没有把
-      `continue-on-error` 误读为允许失败。
-- [ ] pull request 测试仍在 GitHub-hosted runner，未把不可信代码移到 self-hosted
-      runner。
-- [ ] `release-plan` 查询失败时仍是 fail-closed，已存在版本仍是成功 no-op。
-- [ ] `publish` 仍在 GitHub-hosted `ubuntu-latest`，绑定 Environment `npm` 并拥有
-      `id-token: write`。
-- [ ] 没有引入 `NODE_AUTH_TOKEN`、长期 npm token、未审查的 action tag 或
-      `npm publish --provenance`。
-- [ ] npm Trusted Publisher 精确绑定
-      `oldwinter/herdr-orchestrator`、`ci.yml` 和 Environment `npm`。
-- [ ] 已确认 GitHub-hosted runner 可启动；账单或 spending limit 不会阻断本次发布。
+## 变更与发布检查
 
-### 发布后
+### 合入前
 
-- [ ] npm registry 中出现准确版本，且包内容与本地 dry-run 预览相符。
-- [ ] GitHub Release `v<version>` 指向执行发布的确切 `main` commit。
-- [ ] 如果 npm 已成功而 GitHub Release 失败，按部署页的恢复步骤补建 Release；不要尝试
-      覆盖不可变 npm 版本。
-- [ ] 没有把 npm/GitHub Release 误当作生产部署；使用方安装和生产运行仍需独立授权。
+- 先运行最小相关测试，收口前运行 `just check`。
+- Workflow 字段变化同步 `docs/workflow-schema.md` 和相关行为测试。
+- CLI parser 变化运行 `just docs-generate` 与 `just docs-check`，不要手改 `docs/generated/cli.md`。
+- SQLite 变化保持顺序 migration 和旧数据库兼容。
+- 分发变化核对 `pyproject.toml`、`package.json`、`package-lock.json`、`packages/herdr-manager/package.json` 与 `src/herdr_orchestrator/__init__.py` 的版本/依赖关系。
+- `git status` 中不得出现 `.orchestrator/`、原始 prompt、终端输出、凭据或真实 `.env`。
 
-## 安全升级
+### 发布边界
 
-`SECURITY.md` 声明：最新 npm release 和当前 `main` 接收安全修复。漏洞必须通过 GitHub
-private vulnerability reporting 提交：
+- `scripts/npm-release-plan.mjs` 的 registry 查询必须 fail closed；已存在版本仍是成功 no-op。
+- npm publish 必须留在 GitHub-hosted runner，使用 OIDC `id-token: write`；不得引入长期 npm token。
+- Self-hosted runner 不能执行不可信 pull request 代码。
+- npm 版本不可覆盖；若 npm 已发布而 GitHub Release 缺失，应核验原提交后补建 Release。
+- npm/GitHub Release 是包发布，不等于生产部署。
+
+更完整的本地与 CI 命令见[开发工作流](how-to-contribute/development-workflow.md)和[部署](deployment.md)。
+
+## 安全报告与升级
+
+`SECURITY.md` 指定 GitHub private vulnerability reporting：
 
 <https://github.com/oldwinter/herdr-orchestrator/security/advisories/new>
 
-不要用公开 issue 提交凭据、prompt、终端输出、会话内容或 exploit 细节。维护者收到安全
-报告后，应先控制披露范围，再核验受影响版本、可达路径、最小修复和回归测试。若修复需要
-发布：
+不要在公开 issue、普通 handoff 或 Git 中放入 token、登录态、原始 prompt、完整终端输出、私密 exploit 细节或真实 `.env`。涉及 secret、production、权限修改或无法确认的数据暴露时，停止自动处理并升级给拥有对应平台权限的人。仓库没有声明安全邮箱、聊天频道或值班表，本页不补写不存在的联系方式。
 
-1. 在私密范围内保留最少、已脱敏的复现证据；
-2. 修复当前 `main`，并判断最新 npm release 是否需要新的不可变 SemVer；
-3. 运行 `just security`、最小回归测试和 `just check`；
-4. 通过正常的 OIDC 发布链路发布新版本，不复用旧 npm 版本；
-5. 在不泄露细节的前提下完成公告或 advisory 后续。
+## Handoff 最小信息
 
-`.github/workflows/ci.yml` 在 `main` 的 security gate 失败时会创建或更新一个去重的
-security insight issue。它是自动化告警，不是公开披露漏洞细节的通道；敏感证据仍应留在
-private vulnerability reporting 中。
+维护 handoff 应记录：
 
-涉及 secret、生产访问、权限修改或无法确认的数据暴露时，必须停止推测并升级给具备相应
-平台权限的人。仓库没有提供其他安全邮箱、聊天频道或值班表，本页不虚构这些联系方式。
+1. 受影响系统和完整仓库根相对路径。
+2. 当前 branch/commit、包版本与最后通过的 gate。
+3. 已执行命令、退出码、脱敏证据位置和失败原因。
+4. 不得破坏的 schema、migration、receipt、manifest ownership 与安全边界。
+5. 下一步、预期结果、回滚点和所需平台权限。
 
-## 维护 handoff
+## 关键源文件
 
-handoff 应让接手者能在不依赖隐性上下文的情况下恢复工作。建议在现有 issue、pull
-request 或私密 advisory 中记录适合其敏感级别的以下内容：
-
-1. **范围**：受影响系统以及准确的仓库根相对路径。
-2. **状态**：当前 branch/commit、npm 版本、GitHub Release 状态和最后一个通过的 gate。
-3. **证据**：执行过的命令、退出码、失败原因和已脱敏的 artifact 位置。
-4. **不变量**：不得破坏的 schema、manifest ownership、SQLite/receipt 兼容与安全边界。
-5. **下一步**：一个可执行动作、预期结果、回滚点和需要何种平台权限。
-6. **未决风险**：registry、OIDC、runner、版本不可变性、用户修改文件或本地状态的影响。
-
-以下内容不得进入普通 handoff 文本或 Git：
-
-- npm/GitHub token、OIDC 凭据、登录态或真实 `.env`；
-- 原始 prompt、完整终端输出、runtime state 或未脱敏 telemetry；
-- private advisory 中尚未公开的 exploit 细节；
-- 无法从配置、平台权限或 Git 历史核验的 ownership 承诺。
-
-接手发布故障时，先区分“测试未通过”“registry 计划失败”“npm 未发布”和“npm 已发布但
-GitHub Release 缺失”。最后一种情况重跑 workflow 会因 `version_exists` 成为 no-op，
-必须核验原发布 commit 后补建 Release；详细命令见
-[部署、发布与维护](deployment.md#失败恢复)。
-
-## 延伸阅读
-
-- [安装与分发系统](systems/installation-and-distribution.md)
-- [安全边界与报告](security.md)
-- [如何贡献](how-to-contribute/index.md)
-- [依赖参考](reference/dependencies.md)
+| 完整路径 | 用途 |
+| --- | --- |
+| `.github/CODEOWNERS` | 正式 review ownership |
+| `.github/workflows/ci.yml` | CI、release gate 与 npm OIDC 发布 |
+| `SECURITY.md` | 支持范围和私密漏洞报告入口 |
+| `AGENTS.md` | 仓库开发与安全约束 |
+| `CONTRIBUTING.md` | 贡献流程 |
+| `scripts/npm-release-plan.mjs` | npm registry version gate |
+| `package.json`、`package-lock.json` | 根 npm 发布元数据 |
+| `packages/herdr-manager/package.json` | Manager 薄包发布元数据 |

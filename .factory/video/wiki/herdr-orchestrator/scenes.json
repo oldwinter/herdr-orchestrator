@@ -91,12 +91,12 @@
   },
   {
     "id": "11",
-    "title": "零运行时包依赖的分发面",
-    "goal": "说明 npm bootstrap 与可信发布",
-    "archetype": "release-pipeline",
-    "evidence": ["package.json", "pyproject.toml", "bin/herdr-orchestrator.mjs", ".github/workflows/ci.yml"],
-    "labels": ["NODE 20+", "PYTHON 3.12+", "REGISTRY PLAN", "OIDC PUBLISH"],
-    "narration": "Python 控制面和 npm wrapper 都没有第三方运行时包依赖，外部能力来自本机 CLI。Npm 安装器把 workflow、profiles 和 ownership manifest 放进目标项目，并保留用户修改。发布从 main 的完整质量门禁开始。专用 runner 只查询 registry 是否缺少当前版本。真正的 npm publish 仍在 GitHub hosted runner 上使用 OIDC Trusted Publishing，不保存长期 npm token，也不会自动部署任何生产环境。"
+    "title": "三种管理面，三套状态语义",
+    "goal": "区分 durable queue、Manual Manager 与侧栏投影",
+    "archetype": "management-surfaces",
+    "evidence": ["manager/AGENTS.md", "bin/herdr-orchestrator.mjs", "packages/herdr-manager/", "plugins/manager-light/"],
+    "labels": ["DURABLE QUEUE", "MANUAL MANAGER", "MANAGER LIGHT", "COLOR IS NOT A RECEIPT"],
+    "narration": "无人值守任务进入 durable queue，由 Coordinator 管理 lease、retry 与 receipt。临场操作则使用 Manual Manager：在当前 Herdr session 的固定策略目录中启动一个交互式 harness，只观察并管理当前终端，不模拟队列。npx herdr-manager 提供一条命令入口，默认按 Grok、Codex、Claude 探测。可选的 Manager Light 只把当前 pane 与 agent 状态投影到侧栏，使用受管配置块和互斥 metadata token；颜色不是任务收据，也不会接管生命周期。"
   },
   {
     "id": "12",
@@ -104,7 +104,7 @@
     "goal": "以规模、测试和贡献入口收束",
     "archetype": "metrics-and-recap",
     "evidence": ["by-the-numbers.md", "tests/", "justfile", "CONTRIBUTING.md"],
-    "labels": ["19 COMMITS", "26 PYTHON MODULES", "198 TEST FUNCTIONS", "JUST CHECK"],
-    "narration": "当前仓库有十九个可达提交、二十六个包内 Python 模块和一百九十八个静态测试函数。测试代码与 Python 源码的物理行数比例接近零点八八比一。贡献时先运行最小相关测试，收口前运行 just check，再用真实 doctor 或只读 smoke 验证 harness。最终要记住的不是命令数量，而是三个不变量：模型输出受约束，状态由 coordinator 拥有，成功必须由当前执行的新证据证明。"
+    "labels": ["26 COMMITS", "26 PYTHON MODULES", "22 TEST FILES", "0.96:1 TEST / SOURCE"],
+    "narration": "v0.1.6 基线目前有二十六个可达提交、二十六个包内 Python 模块与二十二个 Python 测试文件。九千五百四十三行 Python 测试，相对九千九百一十六行包内 Python 源码约为零点九六比一；这是体量比例，不是覆盖率。贡献者先跑聚焦测试，再执行 just check，必要时补真实 doctor 或只读 smoke。最后记住三个不变量：模型输出受约束，状态由 Coordinator 拥有，成功必须由当前执行产生的新证据证明。"
   }
 ]

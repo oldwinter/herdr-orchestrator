@@ -1,227 +1,296 @@
-# 部署、发布与维护
+# 部署、分发与发布
 Active contributors: oldwinter, chendongdong
 
-本项目的“发布”是把 `herdr-orchestrator` 发布到 npm，并为同一提交创建 GitHub
-Release；它不等于把控制面部署到任何生产环境。使用者仍需在目标 Git 仓库中显式安装、
-诊断并启动项目本地运行面。
+本项目没有常驻生产服务部署。仓库中的“发布”是把两个 npm 包发布到 registry，并在运行包
+发版时创建对应 GitHub Release；使用者仍需在自己的 Git 仓库中显式安装、诊断和启动本地
+控制面。
 
-## 发布与运行面的边界
+当前分发单元：
 
-发布链路的真源是：
+| 包 | 当前仓库版本 | 入口 | 责任 |
+| --- | --- | --- | --- |
+| `herdr-orchestrator` | `0.1.6` | `bin/herdr-orchestrator.mjs` | 完整安装器、Python runtime、manager、manager-light |
+| `herdr-manager` | `0.1.0` | `packages/herdr-manager/bin/herdr-manager.mjs` | 只把固定 argv 转发到运行包的 `manager` 命令 |
 
-- `package.json`：npm 包名、版本、公开访问级别、Node.js 版本要求、可执行文件与打包清单。
-- `pyproject.toml`：Python 包版本、Python 3.12+ 要求、零运行时依赖及开发工具锁定。
-- `bin/herdr-orchestrator.mjs`：npm 可执行文件以及安装、升级、诊断、卸载和运行时转发。
-- `scripts/npm-release-plan.mjs`：查询 npm registry 并决定当前版本是否需要发布。
-- `.github/workflows/ci.yml`：测试 gate、release plan、OIDC 发布和 GitHub Release。
+版本号是仓库快照，不是“最新 registry 版本”的动态承诺。采用时可显式固定需要的不可变 npm
+版本。
 
-`package.json` 声明 Node.js 20+，npm 包本身没有运行时 npm 依赖。目标机器还必须提供
-Python 3.12+、Herdr，以及至少一个受支持的 harness CLI；Python 不会被复制或下载。
-支持的 harness 名称为 `droid`、`grok`、`codex`、`pi`、`claude` 和 `hermes`。
+## 运行前提与依赖边界
 
-## 从 npm 安装
+- `package.json` 要求 Node.js 20+；Python 控制面由 `pyproject.toml` 要求 Python 3.12+。
+- `herdr-orchestrator` 根 npm 包没有 npm runtime dependency；Python
+  `[project].dependencies` 也为空。
+- `herdr-manager` 有一个 runtime dependency：
+  `herdr-orchestrator ^0.1.6`，因此它与完整运行包共享实现而不复制控制逻辑。
+- 真实 dispatch 仍要求 Herdr、Git、至少一个受支持且已登录的 harness CLI。
+- Manager-light 要求 Herdr 0.8.2+。
 
-在目标 Git 仓库根目录执行：
+完整依赖表见[依赖参考](reference/dependencies.md)，安装器内部见
+[安装与分发系统](systems/installation-and-distribution.md)。
+
+## 使用方安装
+
+### 完整控制面
+
+在目标 Git 仓库执行：
 
 ```bash
-npx --yes herdr-orchestrator install --project .
+npx --yes herdr-orchestrator@0.1.6 install --project .
 ```
 
-为了可复现安装，可以固定一个已经发布的不可变版本：
+自动探测不适合时，显式指定 harness：
 
 ```bash
-npx --yes herdr-orchestrator@0.1.2 install --project .
-```
-
-安装器会自动探测本机 harness；也可以显式收窄：
-
-```bash
-npx --yes herdr-orchestrator install --project . \
+npx --yes herdr-orchestrator@0.1.6 install --project . \
   --harness droid \
   --harness codex
 ```
 
-如果目标仓库已经有 `.agents/skills/`，安装器默认不注入项目 Skill。确需由安装器管理时
-必须显式执行：
+如果目标已有 `.agents/skills/` router，Skill 注入默认跳过；确需由 manifest 管理时：
 
 ```bash
-npx --yes herdr-orchestrator install --project . --install-skill
+npx --yes herdr-orchestrator@0.1.6 install \
+  --project . \
+  --install-skill
 ```
 
-只安装可移植 Agent Skill、而不安装 Python 控制面和 workflow 时，使用独立分发入口：
+安装后先执行：
+
+```bash
+npx --yes herdr-orchestrator@0.1.6 doctor --project .
+```
+
+只有 `installation.ok`、`runtime.ok` 和顶层 `ok` 都为 true 才健康。Wrapper/manifest
+版本不同会报告 `version_skew`。
+
+### 只安装可移植 Skill
 
 ```bash
 npx skills add oldwinter/herdr-orchestrator \
   --skill herdr-orchestrator --agent '*' -y
 ```
 
-## 项目本地受管面
+这只安装 `skills/herdr-orchestrator/SKILL.md`，不复制 Python 控制面，也不创建 workflow。
 
-`bin/herdr-orchestrator.mjs` 把以下内容安装到目标仓库：
+### 手动 manager
 
-| 目标路径 | 用途与 ownership |
-| --- | --- |
-| `.herdr-orchestrator/manifest.json` | 记录 schema、包版本、harness、Skill 偏好，以及受管文件的 SHA-256 |
-| `.herdr-orchestrator/workflows/` | 项目相对 workflow 和 planner prompt |
-| `.herdr-orchestrator/profiles/` | 仅包含已选择 harness 的紧凑与完整 profile |
-| `.agents/skills/herdr-orchestrator/` | 可选的项目 Agent Skill |
-| `.orchestrator/.gitignore` | 让 durable runtime state 留在本地 |
-
-安装器还在目标仓库的 Git-local `.git/info/exclude` 中维护带起止标记的区块，而不修改受
-版本控制的 `.gitignore`。只有 manifest 真正拥有的 Skill 才会被加入该区块。受管路径或
-Git exclude 路径中的符号链接会被拒绝，以避免越界写入。
-
-ownership 以 manifest 中的内容哈希为准：
-
-- 未受管但内容冲突的文件会让安装在写入前停止。
-- 内容相同但由其他工具安装的 Skill 可复用，但不会被安装器接管。
-- 用户修改过的受管文件在重装、升级和卸载时都会保留。
-- 部分协调返回退出码 `1`，并在 JSON 的 `preserved` 中列出需要人工处理的路径。
-- `uninstall` 只删除哈希未变化的受管文件；处理后会移除 manifest，保留文件不再受管。
-
-安装后先运行：
+一次性启动：
 
 ```bash
-npx --yes herdr-orchestrator doctor --project .
+npx --yes herdr-manager@0.1.0
+npx --yes herdr-manager@0.1.0 claude
 ```
 
-只有输出中的 `installation.ok`、`runtime.ok` 和顶层 `ok` 均为 `true` 才算健康。manifest
-版本与当前 npm wrapper 版本不一致会报告 `version_skew`。
+它必须在 Herdr session 内运行；默认按 Grok、Codex、Claude 选择。源码 checkout 的高频入口：
 
-## 版本同步
+```bash
+just install-manager
+herdr-manager
+```
 
-当前版本同时出现在 npm 与 Python 分发元数据中。发布变更必须保持以下位置一致：
+`just install-manager` 先全局安装当前运行包，再显式执行
+`herdr-orchestrator manager-light install`。裸 `npm install --global .` 本身不修改 Herdr
+配置；manager-light 是独立 opt-in side effect。
+
+## 项目本地 ownership
+
+```mermaid
+flowchart TD
+    包[npm 运行包] --> 预检[路径、manifest、symlink 与冲突预检]
+    预检 -->|冲突| 停止[退出 2，不进入 reconciliation]
+    预检 -->|可协调| 写入[写入或更新 owned files]
+    写入 --> 清单[manifest.json + SHA-256]
+    清单 --> 排除[Git-local info/exclude 标记区块]
+    清单 --> 诊断[doctor 检查 missing/modified/version skew]
+```
+
+| 目标路径 | 用途 |
+| --- | --- |
+| `.herdr-orchestrator/manifest.json` | schema、包版本、harness、Skill 偏好和 owned hashes |
+| `.herdr-orchestrator/workflows/` | 项目相对 workflow 与 planner prompt |
+| `.herdr-orchestrator/profiles/` | 仅已选 harness 的 compact/full profile |
+| `.herdr-orchestrator/manager/` | 固定手动 manager policy workspace |
+| `.agents/skills/herdr-orchestrator/` | 可选 portable Skill |
+| `.orchestrator/.gitignore` | 阻止 runtime state 被提交 |
+
+安装器还在 Git-local `info/exclude` 中维护带标记区块，不改 tracked `.gitignore`。它遵守：
+
+- 未托管且内容冲突：任何目标写入前停止；
+- 未托管但内容相同：复用，不取得 ownership；
+- 已托管但被用户修改：重装、升级、卸载均保留，并返回 `preserved`；
+- Manifest 和受管路径拒绝路径逃逸与 symlink redirection；
+- 卸载只删除仍匹配记录 hash 的文件，随后移除 manifest。
+
+详细 JSON 和退出码见 [CLI 机器契约](api/cli-contracts.md)。
+
+## Manager-light 的配置发布面
+
+Manager-light 不属于目标项目 manifest。它操作用户 Herdr 配置和包内 plugin：
+
+1. 检查 Herdr 版本和 plugin 列表；
+2. 拒绝 symlink config、损坏 marker、外部拥有的 Agent row 或同名外部 plugin；
+3. 生成临时候选配置并用 `herdr config check` 验证；
+4. 原子 rename 候选，链接/启用 plugin；
+5. reload config 并刷新 token projection。
+
+卸载只移除完整 owned block 和 owned plugin。配置区块外字节保持不变。状态检查：
+
+```bash
+herdr-orchestrator manager-light status
+herdr-orchestrator manager-light uninstall
+```
+
+## 版本协调
+
+运行包版本必须同步：
 
 1. `package.json` 的 `version`；
-2. `package-lock.json` 中的包版本；
+2. `package-lock.json` 的 root version；
 3. `pyproject.toml` 的 `project.version`；
-4. `src/herdr_orchestrator/__init__.py` 中公开的 `__version__`。
+4. `src/herdr_orchestrator/__init__.py` 的 `__version__`。
 
-`tests/test_distribution.py` 会核验 npm CLI 的 `--version`、`pyproject.toml` 与 Python
-包版本一致；`tests/test_release.py` 会核验 release-plan 和 CI 发布约束。常规升级流程
-可以从下面开始：
+`packages/herdr-manager/package.json` 有独立版本，并需要保持对
+`herdr-orchestrator` 的依赖范围兼容。常规准备：
 
 ```bash
 npm version patch --no-git-tag-version
 # 同步 pyproject.toml 与 src/herdr_orchestrator/__init__.py
+
+npm version patch --no-git-tag-version --prefix packages/herdr-manager
+
 npm run release:plan
 npm pack --dry-run --json
+npm pack --dry-run --json ./packages/herdr-manager
 just check
 ```
 
-需要破坏性或新增功能版本时，将 `patch` 换成合适的 `minor` 或 `major`。版本变更通过
-正常 pull request 合入 `main`；不要在本地提前创建同名发布 tag。
+只在对应包内容变化时增加该包版本。npm 版本不可变；代码变化但版本不变会在 release-plan
+阶段成为成功 no-op。
 
-## CI 测试 gate
+## CI 质量 gate
 
-`.github/workflows/ci.yml` 在 pull request 和推送到 `main` 时运行。当前测试 job 使用
-GitHub-hosted `ubuntu-latest`，因此不可信 pull request 代码不会进入专用 self-hosted
-runner。checkout 不持久化凭据，主要工具和 GitHub Actions 均固定版本或 commit SHA。
+`.github/workflows/ci.yml` 在 pull request 和 `main` push 上运行。`test` job 使用
+GitHub-hosted `ubuntu-latest`，而不是持久 self-hosted runner：
 
-测试顺序为：
+1. checkout 时 `persist-credentials: false`；
+2. 安装 Python 3.12、Node.js 24、uv 0.12.5 和 rust-just 1.57.0；
+3. `uv sync --locked`；
+4. 编译 `src/`、`tests/`、`scripts/`；
+5. 分别收集 lint、branch coverage、flaky stability、security、package metrics 与 profiling；
+6. 始终生成并上传 `.orchestrator/quality/`，保留 14 天；
+7. 最后的 enforcement 要求六个 outcome 全部成功。
 
-1. 安装 Python 3.12、Node.js 24、uv 0.12.5 和 rust-just 1.57.0；
-2. 用 `uv sync --locked` 安装锁定工具链；
-3. 编译 `src/`、`tests/` 和 `scripts/`；
-4. 分别执行 `just lint`、`just test-coverage`、`just test-stability`、
-   `just security`、`just build-metrics` 和 `just profile-tests`；
-5. 始终生成质量摘要并上传 `.orchestrator/quality/`，保留 14 天；
-6. 最后的 `Enforce all outcomes` 要求六个 gate 全部成功。
+质量步骤的 `continue-on-error` 只为收集完整证据，最终仍 fail closed。
 
-各质量步骤使用 `continue-on-error` 是为了收集完整证据，并不把失败变成成功。最后的
-enforcement 失败会阻止 `release-plan`，进而阻止 npm 发布和 GitHub Release。
+PR 的自动评论位于独立 `pr-review` job：它只有 `pull-requests: write`，不 checkout
+contributor code，只下载质量 artifact 并更新评论。默认分支 security gate 失败时，
+独立 `security-insight` job 才有 `issues: write`，按固定标题创建或更新 insight。
 
-## Registry release-plan
+## 双包 release plan 与发布
 
-只有通过测试的 `main` push 才运行 `release-plan`。该 job 使用标签
-`[self-hosted, Linux, X64, herdr-orchestrator]`，执行：
+```mermaid
+flowchart TD
+    合入[可信 main push] --> 测试[GitHub-hosted test gate]
+    测试 -->|成功| 规划[self-hosted release-plan]
+    规划 --> 运行包[查询 herdr-orchestrator 版本]
+    规划 --> 管理包[查询 herdr-manager 版本]
+    运行包 --> 条件{任一版本缺失?}
+    管理包 --> 条件
+    条件 -->|都存在| 空操作[成功 no-op]
+    条件 -->|至少一个缺失| 发布[GitHub-hosted OIDC publish]
+    发布 -->|按输出条件| npm1[发布运行包]
+    发布 -->|按输出条件| npm2[发布 manager 包]
+    npm1 -->|仅运行包新发| Release[GitHub Release + generated notes]
+```
+
+### Release plan
+
+只有成功的 `main` 测试进入标签
+`[self-hosted, Linux, X64, herdr-orchestrator]` 的仓库专属 runner。该 job 分别运行：
 
 ```bash
 node scripts/npm-release-plan.mjs --package-json package.json
+node scripts/npm-release-plan.mjs \
+  --package-json packages/herdr-manager/package.json
 ```
 
-脚本严格验证包名和 SemVer，再执行 `npm view herdr-orchestrator versions --json`：
+`scripts/npm-release-plan.mjs` 严格校验包名和 SemVer，然后查询
+`npm view <name> versions --json`：
 
-- registry 已有该版本：输出 `publish=false`、`reason=version_exists`，本次是成功 no-op；
-- registry 缺少该版本：输出 `publish=true`、`reason=version_missing`；
-- 查询失败或返回结构无效：退出码 `2`，停止发布，绝不把网络失败猜成“新版本”。
+- 版本存在：`publish=false, reason=version_exists`；
+- 版本缺失：`publish=true, reason=version_missing`；
+- 明确 npm `E404`：视为尚无版本；
+- 其他失败或非法响应：退出 `2`，不把网络歧义当新版本。
 
-因此，只有 `package.json` 中尚未出现于公开 registry 的确切版本才会进入发布 job。
+Persistent runner 只处理可信 `main` 的版本查询，不执行 pull request 代码。Checkout
+不持久化 credential。
 
-## GitHub-hosted OIDC Trusted Publishing
+### OIDC Trusted Publishing
 
-npm Trusted Publishing 不支持 self-hosted runner。真正的 `publish` job 必须保留在
-GitHub-hosted `ubuntu-latest`，并绑定 GitHub Environment `npm`。仓库侧与 npm 侧的一次
-性配置必须精确匹配仓库、workflow 文件和 Environment：
+任一包缺失时，`publish` 在 GitHub-hosted `ubuntu-latest` 运行，并绑定 Environment `npm`：
 
-```bash
-npm trust github herdr-orchestrator \
-  --file ci.yml \
-  --repo oldwinter/herdr-orchestrator \
-  --env npm \
-  --allow-publish \
-  -y
-```
+- `id-token: write` 用于 npm Trusted Publishing；
+- `contents: write` 用于随后创建运行包的 GitHub Release；
+- 不使用 `NODE_AUTH_TOKEN` 或长期 npm token；
+- 安装 npm 12.0.2，执行 `npm ci --ignore-scripts`；
+- 按 release-plan 输出分别发布运行包和 manager 包。
 
-发布 job 只在 release-plan 输出 `publish=true` 时启动，并授予
-`contents: write`（创建 GitHub Release）和 `id-token: write`（OIDC）权限。它会：
+npm Trusted Publishing 不支持 self-hosted runner，因此真正 publish 不能迁移到 release-plan
+runner。两个 npm 包都必须在 npm 侧配置与仓库、`.github/workflows/ci.yml` 和 Environment
+`npm` 精确匹配的 trusted publisher。Brand-new package name 的首次 bootstrap 是单独、
+显式授权的 release 动作。
 
-1. 以 `persist-credentials: false` checkout 对应的 `main` 提交；
-2. 配置 Node.js 24 和 `https://registry.npmjs.org`；
-3. 安装支持 OIDC 的 npm 12.0.2；
-4. 执行 `npm ci --ignore-scripts`；
-5. 执行 `npm publish --access public`。
-
-不要添加 `NODE_AUTH_TOKEN` 或长期 npm token，也不要把该 job 移到 self-hosted runner。
-当前 workflow 不使用 `--provenance`。
-
-## GitHub Release 与不可变版本
-
-npm 发布成功后，同一个 job 执行等价于以下命令的操作：
+只有运行包新发时才执行：
 
 ```bash
 gh release create "v$VERSION" \
-  --repo oldwinter/herdr-orchestrator \
+  --repo "$GITHUB_REPOSITORY" \
   --target "$GITHUB_SHA" \
   --title "v$VERSION" \
   --generate-notes
 ```
 
-这会让 `v<version>` GitHub Release 指向实际发布的 `main` 提交。npm 版本不可变：
-
-- 已存在版本不能覆盖、修补或重发；
-- 只改运行时代码而不增加 `package.json` 版本，只会得到 release-plan no-op；
-- 已发布版本有缺陷时，应提交修复并发布一个新 SemVer，而不是尝试替换旧 tarball。
+Manager-only 发布不会创建以 manager 版本命名的 GitHub Release。
 
 ## 失败恢复
 
-| 失败位置 | 状态判定 | 恢复方式 |
+| 失败位置 | Registry 状态 | 恢复 |
 | --- | --- | --- |
-| 编译或质量 gate | 未进入 release-plan；registry 未改变 | 根据完整质量摘要修复，运行 `just check`，再通过正常提交触发 CI |
-| registry 查询 | `npm_registry_query_failed`，退出码 `2` | 确认 registry 可用后重跑；不要手工把 plan 改成 `publish=true` |
-| hosted runner、Environment 或 OIDC | 版本仍缺失时没有发布 | 修复 GitHub-hosted runner、Environment `npm` 或 npm Trusted Publisher 配置后重跑 |
-| `npm publish` 之前 | registry 仍缺少版本 | 重跑后 release-plan 仍会选择同一确切版本 |
-| npm 已成功、GitHub Release 创建失败 | registry 已有版本，整条 workflow 重跑会成为 no-op | 核验 npm 版本与发布提交，再用上面的 `gh release create` 命令补建缺失 Release |
-| 已发布版本包含缺陷 | npm 版本不可变 | 回滚使用方或停止采用该版本；提交修复并发布新的 patch/minor/major 版本 |
-| 目标仓库升级返回 `preserved` | 用户修改内容未被覆盖 | 逐项审查并手工合并；在内容与 manifest 重新一致后运行 `doctor`，不要强删本地状态 |
+| 编译/质量 gate | 未变 | 修复后运行 `just check`，通过正常 PR/main 流程重试 |
+| Registry 查询 | 未知，plan 失败 | 恢复 registry 后重跑；不得手工猜 `publish=true` |
+| Hosted runner、Environment、OIDC | 缺失版本尚未发布 | 修复 GitHub/npm trusted publisher 配置后重跑 |
+| 某包 publish 前失败 | 该包仍缺失 | 重跑，release plan 会再次选中精确版本 |
+| 运行包已发布、manager 未发布 | 运行包变为 no-op，manager 仍缺失 | 重跑只发布 manager |
+| npm 成功、GitHub Release 失败 | 运行包版本已存在，整条重跑可能 no-op | 核验发布提交后，显式补建 Release |
+| 已发布包有缺陷 | 版本不可覆盖 | 修复并发布新 SemVer；必要时在 registry deprecate 旧版本 |
+| 目标安装返回 `preserved` | 用户改动未覆盖 | 人工合并，恢复 manifest 一致性后再运行 doctor |
 
-若 npm 已成功但需要手工补建 GitHub Release，`GITHUB_SHA` 必须是当次 npm 发布所对应的
-确切提交，而不是当前分支上任意更新的提交。
+手工补建 Release 时，target 必须是实际 npm 发布对应的精确提交，不能使用当前分支上的任意
+更新提交。
 
-## 不自动部署生产
+## 不自动执行的动作
 
-`.github/workflows/ci.yml` 自动化的是测试、npm 分发与 GitHub Release，不会：
+CI 与 npm 包不会自动：
 
-- 在任何使用方仓库运行 `install`、`upgrade`、`run` 或 `dashboard`；
-- push、merge、部署服务、修改生产数据或授予生产权限；
-- 把 workflow 生成的本地控制面状态提交到 Git；
-- 将 harness 的高自动化启动参数解释为生产操作授权。
+- 在使用方仓库执行 `install`、`upgrade`、`run` 或 `dashboard`；
+- push、合并、创建 PR、部署服务、修改生产数据或扩大权限；
+- 提交 `.orchestrator/`、原始 prompt 或 terminal output；
+- 把 harness 最大自动化参数解释为 production 授权。
 
-生产采用、升级和运行必须由目标环境的责任人另行显式执行，并遵守项目的安全边界。
+标准化交付成功也只停在隔离 integration branch。采用、升级、运行和生产变更仍需责任人
+显式授权。
 
-## 延伸阅读
+## 关键文件与延伸阅读
 
-- [安装与分发系统](systems/installation-and-distribution.md)
-- [安全边界与报告](security.md)
-- [如何贡献](how-to-contribute/index.md)
+- `package.json`
+- `packages/herdr-manager/package.json`
+- `bin/herdr-orchestrator.mjs`
+- `packages/herdr-manager/bin/herdr-manager.mjs`
+- `scripts/npm-release-plan.mjs`
+- `.github/workflows/ci.yml`
+- `docs/installation.md`
+- `tests/test_distribution.py`
+- `tests/test_release.py`
+- [安全与信任边界](security.md)
+- [CLI 机器契约](api/cli-contracts.md)
 - [依赖参考](reference/dependencies.md)

@@ -1,119 +1,150 @@
-# 代码库数字
-Active contributors: oldwinter, chendongdong
+# 数字中的代码库
 
-> 数据采集于 2026-08-26，基线是当前 `HEAD` / `origin/main` 的同一提交
-> `61400e5`。Wiki 目录尚未被 Git 跟踪，因此不进入代码统计。
+数据采集日期为 **2026-08-29**。Git 历史基线是 `origin/main` 的 `7291093`
+（同时标记为 `v0.1.6`）；统计时又核对了当前工作树，除本次重建的 Wiki 页面外，
+纳入统计的代码与该提交没有差异。
 
 ## 统计口径
 
-- 文件清单来自在 `.` 执行的 `git ls-files -z`：共 139 个跟踪条目，其中 137 个普通文件、2 个兼容性符号链接。
-- 下文行数均为物理行数（按字节内容的 `splitlines()` 计数），不是去空行后的 SLOC。
-- 主统计排除 vendored 文件 `src/herdr_orchestrator/dashboard/static/cytoscape.min.js`，也排除两个锁文件；因此覆盖 134 个普通文件、26,140 行。
-- `droid-wiki/` 在采集时未被 Git 跟踪，不进入任何代码统计；工作区中的其他未跟踪文件同样不进入统计。
+- 文件清单来自仓库根目录执行的 `git ls-files -z`，只统计 Git 跟踪内容；物理行数按
+  UTF-8 文本的 `splitlines()` 计算，不是去空行、去注释后的 SLOC。
+- 主统计排除 `droid-wiki/**`、`.factory/video/**`、所有 `package-lock.json`、
+  `uv.lock`、`.secrets.baseline`、`docs/generated/**`、`security-findings.json`，
+  以及 vendored/minified 文件
+  `src/herdr_orchestrator/dashboard/static/cytoscape.min.js`。这些分别代表本 Wiki、
+  视频制作资产、锁定结果、安全/生成报告或第三方生成物，不应冒充一方源码。
+- 原始树有 222 个跟踪条目。排除上述内容后剩 145 个条目，其中
+  `.agent/skills` 与 `.claude/skills` 是符号链接；下文 LOC、字节数和平均值以其余
+  **143 个普通文本文件**为分母。
+- 语言按扩展名映射；“其他文本”包括 `justfile`、ignore、INI、license、CODEOWNERS
+  和没有单独语言映射的纯文本。
 
-## 语言构成
+## 语言与物理 LOC
 
 ```mermaid
 xychart-beta horizontal
-    title "按语言/格式统计的物理行数"
-    x-axis ["Python", "Markdown", "JavaScript", "Rhai", "CSS", "YAML", "TOML", "其他格式", "HTML", "JSON"]
-    y-axis "物理行数" 0 --> 19000
-    bar [18249, 2931, 1656, 1012, 791, 410, 398, 408, 151, 134]
+    title "按语言或格式统计的物理 LOC"
+    x-axis ["Python", "Markdown", "JavaScript", "Rhai", "CSS", "TOML", "YAML", "其他文本", "HTML", "JSON"]
+    y-axis "物理行数" 0 --> 20000
+    bar [19459, 3054, 2516, 1012, 791, 427, 422, 274, 151, 150]
 ```
 
-| 语言或格式 | 文件数 | 物理行数 | 占比 |
+| 语言或格式 | 文件数 | 物理 LOC | 占比 |
 | --- | ---: | ---: | ---: |
-| Python | 54 | 18,249 | 69.8% |
-| Markdown | 42 | 2,931 | 11.2% |
-| JavaScript（含 `.mjs`） | 4 | 1,656 | 6.3% |
-| Rhai | 2 | 1,012 | 3.9% |
-| CSS | 1 | 791 | 3.0% |
-| YAML | 8 | 410 | 1.6% |
-| TOML | 9 | 398 | 1.5% |
-| 其他专用/纯文本格式 | 9 | 408 | 1.6% |
-| HTML | 1 | 151 | 0.6% |
-| JSON | 4 | 134 | 0.5% |
-| **合计** | **134** | **26,140** | **100.0%** |
+| Python | 55 | 19,459 | 68.9% |
+| Markdown | 45 | 3,054 | 10.8% |
+| JavaScript（含 `.mjs`） | 8 | 2,516 | 8.9% |
+| Rhai | 2 | 1,012 | 3.6% |
+| CSS | 1 | 791 | 2.8% |
+| TOML | 10 | 427 | 1.5% |
+| YAML | 8 | 422 | 1.5% |
+| 其他文本 | 9 | 274 | 1.0% |
+| HTML | 1 | 151 | 0.5% |
+| JSON | 4 | 150 | 0.5% |
+| **合计** | **143** | **28,256** | **100.0%** |
 
-“其他专用/纯文本格式”合并了 Justfile、INI、ignore、license、CODEOWNERS 和无已映射扩展名的文本；占比以 26,140 为分母并四舍五入，因此显示值合计可能有舍入误差。语言按扩展名映射，完整根路径为 `.`。
+占比以 28,256 行为分母并四舍五入，因此显示值可能有微小舍入误差。
 
-### 锁文件与 vendored 文件
+## 源码、测试与配置
 
-| 单独处理的文件 | 物理行数 | 字节数 | 处理方式 |
+三个分类用于回答不同问题，可以有概念交集，不能把文件数直接相加：
+
+| 分类 | 文件数 | 物理 LOC | 口径 |
 | --- | ---: | ---: | --- |
-| `package-lock.json` | 19 | 357 | 锁文件，不并入语言、文件大小或测试比统计 |
-| `uv.lock` | 1,484 | 259,798 | 锁文件，不并入语言、文件大小或测试比统计 |
-| `src/herdr_orchestrator/dashboard/static/cytoscape.min.js` | 31 | 435,503 | vendored/minified，完全排除 |
+| 一方源码 | 43 | 13,374 | `src/herdr_orchestrator/**`、`scripts/**`、`bin/herdr-orchestrator.mjs`、`packages/herdr-manager/bin/herdr-manager.mjs` 与 `plugins/manager-light/*.mjs` 中的 `.py/.js/.mjs/.css/.html`，继续应用总排除规则 |
+| 测试源码 | 22 | 9,543 | `tests/*.py` |
+| 配置 | 27 | 1,206 | 跟踪的 `.toml/.yml/.yaml/.json`，另含 `.env.example`、`.importlinter`、`.npmignore`、`.gitignore` 与 `justfile`，继续应用总排除规则 |
 
-两个锁文件合计 1,503 行、260,155 字节；它们反映依赖解析结果而不是手写实现。依赖含义见[依赖参考](reference/dependencies.md)。
+`src/herdr_orchestrator/**/*.py` 共有 **26 个包内 Python 模块、9,916 行**；
+`scripts/*.py` 另有 7 个 Python 工具模块。测试与源码的物理行比为：
 
-## 文件、测试与配置
+- 同语言口径：9,543 行 Python 测试 ÷ 9,916 行包内 Python = **96.2%**，
+  即约 **0.96:1**。
+- 宽口径：9,543 行测试 ÷ 13,374 行全部一方源码 = **71.4%**，
+  即约 **0.71:1**。
 
-| 指标 | 数量 | 行数 | 计算口径 |
-| --- | ---: | ---: | --- |
-| 运行时代码 | 30 个文件 | 11,253 | `src` 下的 `.py/.js/.css/.html`；排除 Cytoscape vendored 文件和 license 文本 |
-| 工具与入口代码 | 9 个文件 | 1,257 | `scripts` 下 8 个 `.py/.mjs`，加 `bin/herdr-orchestrator.mjs` |
-| **源文件合计** | **39 个文件** | **12,510** | 上述两类相加 |
-| 测试代码 | 21 个文件 | 8,337 | `tests` 下所有已跟踪 `.py` |
-| 配置 | 23 个文件 | 1,089 | 仓库级 `.toml/.yml/.yaml/.json`，另含 `.env.example`、`.importlinter`、`justfile`；排除锁文件、`security-findings.json` 报告及源码目录内文件 |
+这两个比值衡量的是文件体量，不是覆盖率。测试命令和覆盖率门禁见
+[测试指南](how-to-contribute/testing.md)。
 
-Python AST 中共有 **198 个**名称以 `test_` 开头的测试函数；这是静态定义数，不等同于参数化展开后的 pytest case 数。运行方式与质量门禁见[测试指南](how-to-contribute/testing.md)。
+## Git 活动与最近趋势
 
-### 测试代码比
+`origin/main` 从 **2026-08-23** 到 **2026-08-28** 共有 **26 个可达提交**：
 
-- 同语言口径：`tests` 的 8,337 行 Python ÷ `src` 的 9,481 行 Python = **87.9%**，即约 **0.88:1**。
-- 宽口径：8,337 行测试 ÷ 12,510 行全部源代码 = **66.6%**，即约 **0.67:1**。
+```mermaid
+xychart-beta
+    title "origin/main 每日提交数"
+    x-axis ["08-23", "08-24", "08-25", "08-26", "08-27", "08-28"]
+    y-axis "提交数" 0 --> 8
+    bar [2, 8, 8, 2, 3, 3]
+```
 
-同语言比更适合观察测试投入；宽口径会把 CSS、HTML、JavaScript 和 npm 包装入口计入分母。两者都只比较物理行数，不代表覆盖率。
+| 日期 | 提交数 | 新增行 | 删除行 | churn |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-08-23 | 2 | 3,329 | 15 | 3,344 |
+| 2026-08-24 | 8 | 13,990 | 238 | 14,228 |
+| 2026-08-25 | 8 | 9,955 | 1,534 | 11,489 |
+| 2026-08-26 | 2 | 584 | 247 | 831 |
+| 2026-08-27 | 3 | 581 | 89 | 670 |
+| 2026-08-28 | 3 | 2,042 | 80 | 2,122 |
+| **合计** | **26** | **30,481** | **2,203** | **32,684** |
 
-## 提交活动
+churn 是对 `git log origin/main --numstat` 中“新增 + 删除”的路径级累加，并应用与
+当前树相同的排除规则。仓库历史只有六天，因此“最近 90 天”会等于全部历史；这里不把短样本
+包装成长期趋势。可以可靠描述的是：前 3 天贡献 18/26 个提交和 88.9% 的 churn；
+2026-08-26 至 2026-08-27 明显收窄，2026-08-28 随 manager-light 与一键
+`herdr-manager` 分发工作回升。churn 只表示改动量，不代表生产率或质量。
 
-采集时 `origin/main` 与本地 `HEAD` 都指向 `61400e5`，当前分支历史共
-**19 个提交**。计算命令分别等价于 `git rev-list --count origin/main` 和
-`git rev-list --count HEAD`；这里只看当前分支可达历史，不统计其他远端分支。
+### churn 热点
 
-| 日期 | `origin/main` 提交数 | 本地 `HEAD` 提交数 |
-| --- | ---: | ---: |
-| 2026-08-23 | 2 | 2 |
-| 2026-08-24 | 8 | 8 |
-| 2026-08-25 | 8 | 8 |
-| 2026-08-26 | 1 | 1 |
-
-19 个提交集中在 4 天内，其中 16 个（84.2%）发生于 8 月 24—25 日；按主题行前缀归类为
-9 个 `feat`、2 个 `ci`、2 个 `fix`、5 个 merge 和 1 个非 Conventional Commit 标题。
-仓库历史仅从 2026-08-23 开始，样本很短，不宜外推长期开发速度。
-
-### Git 中可见的 bot 协作证据
-
-- 当前 `HEAD` / `origin/main` 的 19 个提交中，8 个带有
-  `Co-authored-by: factory-droid[bot]` trailer：**42.1%**。
-- 没有可达提交以 bot 身份作为主 author。
-
-这里仅匹配 Git author 身份和提交正文中的 bot `Co-authored-by` trailer。未写入 trailer 的模型使用无法从 Git 证明，所以这些百分比只是 **AI 辅助提交占比的下限**，不是对代码生成比例的估算。统计不提供个人贡献排名。
-
-## 最近 90 天 churn 热点
-
-窗口为 2026-05-28 至 2026-08-26；以当前 `HEAD` 执行 `git log --since=2026-05-28 --numstat`，对每个路径累加“新增行 + 删除行”。同样排除 Cytoscape vendored 文件和两个锁文件。由于仓库在窗口内才创建，这实际上覆盖当前分支的全部历史；合计 **28,184 行新增、2,042 行删除、30,226 行 churn**。
-
-| 路径 | 新增 | 删除 | churn |
+| 完整仓库路径 | 新增 | 删除 | churn |
 | --- | ---: | ---: | ---: |
 | `tests/test_herdr.py` | 2,438 | 45 | **2,483** |
 | `src/herdr_orchestrator/herdr.py` | 1,705 | 289 | **1,994** |
 | `src/herdr_orchestrator/cli.py` | 1,235 | 392 | **1,627** |
+| `tests/test_distribution.py` | 1,291 | 29 | **1,320** |
 | `src/herdr_orchestrator/store.py` | 1,088 | 224 | **1,312** |
 | `src/herdr_orchestrator/dashboard/static/dashboard.js` | 863 | 284 | **1,147** |
 | `src/herdr_orchestrator/delivery.py` | 1,047 | 71 | **1,118** |
 | `src/herdr_orchestrator/runner.py` | 978 | 104 | **1,082** |
-| `tests/test_runner.py` | 938 | 27 | **965** |
 
-表格按 churn 降序取前 8 个路径。churn 衡量改动量而非质量或缺陷风险；初始化提交会天然抬高大文件数值。结构关系见[架构概览](overview/architecture.md)，可维护性后续项见[清理机会](cleanup-opportunities.md)。
+初始化提交会天然抬高长寿大文件的 churn；热点更适合作为阅读导航，而不是风险排行。
 
-## 规模与复杂度信号
+### Git 可识别的 bot 归因下界
 
-- 排除项后的 134 个普通文件平均 **195.1 行/文件**，中位数 **70 行/文件**；计算式为 26,140 ÷ 134。
-- 39 个源文件平均 **320.8 行/文件**；计算式为 12,510 ÷ 39。
-- 全仓最长文件是 `tests/test_herdr.py`，**2,393 行**；最长源文件是 `src/herdr_orchestrator/herdr.py`，**1,416 行**。
-- `src` 的 26 个 Python 模块有 **139 个公共顶层符号代理**：79 个类、60 个函数。口径是 AST 顶层 `class`/`def` 名称不以下划线开头；它表示可见 API 表面积，不保证符号一定被包级导出。
-- 内部 Python import 图有 **26 个节点、56 条直接边、0 个环**。最长简单链为 7 个模块：`src/herdr_orchestrator/__main__.py` → `src/herdr_orchestrator/cli.py` → `src/herdr_orchestrator/dashboard/__init__.py` → `src/herdr_orchestrator/dashboard/server.py` → `src/herdr_orchestrator/store.py` → `src/herdr_orchestrator/observability.py` → `src/herdr_orchestrator/feature_flags.py`。口径是 Python AST 中指向 `herdr_orchestrator` 包内模块的直接 `import`/`from ... import ...`；标准库和第三方依赖不计入。
+- 26 个提交中有 10 个的提交正文带可识别 bot trailer，均为
+  `Co-authored-by: factory-droid[bot]`：**38.5%**。
+- `origin/main` 没有以可识别 bot account 作为主 author 的提交。
 
-这些数值是模块尺寸、API 表面积和依赖深度的导航信号，不是复杂度评分。
+统计只匹配 author account 与 `Co-authored-by` / `Signed-off-by` trailer。
+没有写入 Git 身份或 trailer 的自动化协作无法被历史证明，所以 **38.5% 只是可识别
+bot-attributed commit 百分比的下界**，不是 AI 生成代码比例。本页不做个人贡献排行。
+
+## 文件大小
+
+- 143 个普通文本文件平均 **197.6 行、7,126 字节**；中位数为 **62 行**。
+- 43 个一方源文件平均 **311.0 行**。
+- 排除项之后，按行数和字节数最大的文件都是 `tests/test_herdr.py`：
+  **2,393 行、90,538 字节**。
+- 最大的一方非测试源文件是 `src/herdr_orchestrator/herdr.py`：
+  **1,416 行、51,029 字节**。
+
+若不排除生成物，`src/herdr_orchestrator/dashboard/static/cytoscape.min.js`
+会以 435,503 字节压过一方文件，而 `uv.lock` 有 259,798 字节；这正是主统计不把
+vendored bundle 与锁文件算作维护规模的原因。
+
+## 可重复测得的复杂度
+
+使用仓库环境中的 **Radon 6.0.1** 对 `src/herdr_orchestrator/**/*.py` 执行
+cyclomatic complexity 分析：
+
+- 共分析 **432 个类、函数和方法**，平均复杂度 **3.65（A）**；
+- A 级 349 个、B 级 55 个、C 级 28 个，没有 D/E/F 级；
+- 最大值为 **20（C）**，出现在
+  `src/herdr_orchestrator/store.py` 的 `record_outcome`、
+  `src/herdr_orchestrator/runner.py` 的 `_gc_agents`、
+  `src/herdr_orchestrator/herdr.py` 的 `_prompt`，以及
+  `src/herdr_orchestrator/dashboard/projector.py` 的 `_topology`。
+
+另以 Python AST 解析包内直接 import：26 个模块形成 **56 条包内直接依赖边，
+没有强连通环**。前者是工具定义的分支复杂度，后者只是模块耦合信号；两者都不是代码质量
+总分。如何在整体结构中定位这些模块，见[架构总览](overview/architecture.md)。

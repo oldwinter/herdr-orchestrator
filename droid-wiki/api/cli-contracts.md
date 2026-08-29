@@ -1,79 +1,226 @@
 # CLI 机器接口契约
 Active contributors: oldwinter, chendongdong
 
-CLI 入口由 `src/herdr_orchestrator/cli.py` 定义。所有子命令都要求 `--workflow`，先加载 workflow，再调用 command handler。对自动化调用方而言，契约由三条通道共同组成：
+本项目有两个相邻但不同的 CLI 层：
 
-- **stdout**：成功结果；多数一次性命令为一个完整 JSON 对象。
-- **stderr**：参数用法、稳定错误 token、长运行命令的停止提示。
-- **process exit code**：区分成功、可报告的业务未达成、输入/配置/transport 错误和 delivery escalation。
+- `bin/herdr-orchestrator.mjs` 是 npm 分发入口，负责项目安装与 ownership、手动 manager、
+  manager-light，以及把 runtime 命令转发给包内 Python；
+- `src/herdr_orchestrator/cli.py` 是运行时入口，负责 queue、readiness、Dashboard 和显式
+  标准化交付。
 
-## 没有统一的顶层 JSON envelope
+自动化调用方必须同时收集 stdout、stderr 和退出码。两层都没有统一的顶层 JSON envelope。
 
-一次性命令直接输出 command-specific 对象，例如：
+## 通用输出与退出码
 
-```json
-{"created":true,"harness":"pi","job_id":9}
+| 退出码 | 含义 | 典型命令 |
+| --- | --- | --- |
+| `0` | 命令或目标条件成功；长运行被 Ctrl-C 正常停止 | 大多数命令 |
+| `1` | 命令完成，但健康、排空、恢复或 reconciliation 条件未满足 | `doctor`、`smoke`、`run --until-idle`、`resume`、部分 install/uninstall |
+| `2` | 参数、配置、catalog、store、transport、tracker、artifact 或 wrapper 受控错误 | 两层 CLI |
+| `3` | 标准化交付遇到必须交还用户的 secret/production decision | Python `deliver` |
+
+规则：
+
+1. `1` 经常仍有可解析 JSON stdout；不能把所有非零结果都当作“无响应”。
+2. 受控 `2` 通常把稳定错误 token 或 `str(exception)` 写到 stderr，不保证 JSON。
+3. argparse 自己也用 `2` 输出 usage；它发生在 Python handler 的异常捕获之前。
+4. Node wrapper 的 runtime 子命令继承 Python 退出码；wrapper 自身异常统一为 `2`。
+5. `catalog/profile --format text`、help、version 和 manager 不是 JSON 输出。
+
+## Node npm 包装器
+
+### 参数解析
+
+`--project PATH` 对所有 wrapper 命令可用，默认当前目录。`--harness NAME` 只被
+`install|update|upgrade|manager` 消费；runtime 命令中的 harness filter 会留在 `rest`
+并转发给 Python。支持的安装 harness 为 `droid`、`grok`、`codex`、`pi`、`claude`、
+`hermes`。
+
+```mermaid
+flowchart TD
+    A[Node argv] --> B{setup / manager?}
+    B -->|install/update/upgrade| I[manifest 驱动 reconciliation]
+    B -->|doctor| D[installation 检查 + Python doctor]
+    B -->|manager| M[固定 manager workspace 启动一个 harness]
+    B -->|manager-light| L[Herdr plugin/config 协调]
+    B -->|uninstall| U[删除 hash 未变化的 owned files]
+    B -->|其他 runtime 命令| R[注入 installed workflow + PYTHONPATH]
+    R --> P[Python CLI]
 ```
 
-它不是 `{"result": ...}`。`result` envelope 只存在于内部 Herdr subprocess protocol。CLI 错误也只是 stderr 文本，并不保证 `{"error": ...}`。因此调用方应：
+### `install`、`update`、`upgrade`
 
-1. 收集 stdout、stderr 与退出码；
-2. 仅对该命令声明为 JSON 的 stdout 做一次 JSON 解码；
-3. 根据退出码解释同一 payload，尤其是 `doctor`、`smoke`、`resume` 与 `run --until-idle`；
-4. 不把 stderr 的附加路径或说明当作固定全文，只在需要时读取首个稳定错误 token。
+```text
+herdr-orchestrator install --project PATH
+  [--harness NAME ...]
+  [--install-skill | --skip-skill]
+```
 
-例外输出：
+`update` 和 `upgrade` 与 `install` 进入同一 reconciliation 逻辑。首次无显式 harness 时，
+包装器依次执行六个 CLI 的 `--version` 探测；升级未传 harness 时沿用 manifest 列表。
+输出：
 
-- `catalog --format text` 输出多行文本。
-- `profile --format text` 只输出完整 profile context。
-- 不带 `--once` 或 `--until-idle` 的 `run` 持续运行，不产生每轮 JSON。
-- `dashboard` 先输出一个启动 JSON，随后持续服务。
+```json
+{
+  "harnesses": ["droid", "codex"],
+  "local_exclude": "managed",
+  "manager": ".herdr-orchestrator/manager",
+  "manifest": ".herdr-orchestrator/manifest.json",
+  "ok": true,
+  "preserved": [],
+  "project": "/absolute/project",
+  "skill": "managed",
+  "unmanaged": [],
+  "workflow": ".herdr-orchestrator/workflows/multi-harness.toml"
+}
+```
 
-## 命令分组
+- `preserved[]` 是已由 manifest 管理但后来被用户修改、因而未覆盖的路径；
+- `unmanaged[]` 是内容相同而由其他工具拥有、安装器复用但不接管的路径；
+- `skill` 可为 `managed`、`existing_unmanaged`、`skipped` 或
+  `skipped_existing_router`；
+- 有 `preserved` 时 `ok=false`、退出 `1`；
+- 未托管冲突、无 harness、非法 manifest 或 symlink guard 失败时退出 `2`。
+
+### Wrapper `doctor`
+
+```text
+herdr-orchestrator doctor --project PATH [Python doctor options]
+```
+
+它把安装层和 Python runtime 层组合为一个对象：
+
+```json
+{
+  "installation": {
+    "manifest": true,
+    "missing": [],
+    "modified": [],
+    "ok": true,
+    "installed_version": "0.1.6",
+    "runtime_version": "0.1.6",
+    "version_skew": false
+  },
+  "ok": true,
+  "project": "/absolute/project",
+  "runtime": {
+    "checks": [],
+    "ok": true,
+    "summary": {}
+  }
+}
+```
+
+只有 `installation.ok && runtime.ok` 时退出 `0`。安装 workflow 不存在时，runtime 保持
+`{"checks":[],"ok":false}`；Python stdout 不是 JSON 时记录
+`runtime_doctor_invalid_output`，而不是猜测成功。
+
+### `uninstall`
+
+```text
+herdr-orchestrator uninstall --project PATH
+```
+
+输出：
+
+```json
+{
+  "local_exclude": "removed",
+  "ok": true,
+  "preserved": [],
+  "project": "/absolute/project"
+}
+```
+
+只删除仍匹配 manifest SHA-256 的文件；用户改动列入 `preserved`，此时退出 `1`。处理后
+manifest 被移除，保留项不再受包管理。
+
+### `manager`
+
+```text
+herdr-manager [HARNESS]
+herdr-orchestrator manager [HARNESS] [--project PATH]
+```
+
+该命令不输出 JSON；它继承 harness 的终端 stdio 和退出码。必须满足 `HERDR_ENV=1`。
+显式 `HARNESS` 可选择六个受支持值之一；未显式指定时只按
+`grok → codex → claude` 选择第一个可执行且在项目安装中启用的候选。
+显式 `--project` 使用目标项目的 `.herdr-orchestrator/manager`；否则使用包内固定
+`manager/`。Harness 以空参数数组启动，manager policy 不模拟 queue、lease、retry 或 receipt。
+
+独立 `herdr-manager` npm 包的
+`packages/herdr-manager/bin/herdr-manager.mjs` 只以固定 argv 调用运行包的 `manager`
+入口，不使用 shell。
+
+### `manager-light`
+
+```text
+herdr-orchestrator manager-light install|status|uninstall
+```
+
+`install`/`uninstall` 成功对象包含 `action`、`config`、`ok`、`plugin` 与 `runtime`；
+`status` 包含 `action`、`config`、`ok` 与 `plugin`。例如：
+
+```json
+{
+  "action": "status",
+  "config": {
+    "owned": true,
+    "path": "/home/user/.config/herdr/config.toml",
+    "state": "owned"
+  },
+  "ok": true,
+  "plugin": {
+    "enabled": true,
+    "installed": true,
+    "owned": true,
+    "reachable": true
+  }
+}
+```
+
+`status` 在 config block、plugin enablement 或 plugin ownership 不完整时返回 `ok=false`
+和退出 `1`。不支持的 Herdr 版本、外部 ownership、marker 损坏或候选配置校验失败返回 `2`。
+
+### Runtime 转发
+
+其余命令要求目标项目已有
+`.herdr-orchestrator/workflows/multi-harness.toml`。包装器将其注入为 `--workflow`，
+将 npm 包的 `src/` 注入 `PYTHONPATH`，其余参数原样转发。子进程无法启动是 wrapper 错误；
+否则退出码原样透传。
+
+## Python runtime 命令
+
+直接调用 Python 时，每个子命令都要求 `--workflow PATH`。命令与 durable 影响：
 
 | 分组 | 命令 | 状态影响 |
 | --- | --- | --- |
-| 发现与就绪 | `catalog`、`profile`、`doctor`、`smoke` | 前两者读 catalog；后两者执行受限探测，不写任务队列 |
-| Queue 输入与查询 | `seed`、`enqueue`、`status` | `seed`/`enqueue` 幂等写 queue；`status` 读取 durable state |
-| 执行与恢复 | `run`、`retry`、`resume`、`gc` | claim/dispatch、显式重试、恢复原 blocked agent、清理本运行拥有的 terminal agent |
-| 本地观察 | `dashboard` | 初始化数据库并启动只读 HTTP/SSE 投影 |
-| 显式标准交付 | `deliver` | opt-in delivery 流程；不是普通 queue 命令 |
+| 发现与验证 | `catalog`、`profile`、`doctor`、`smoke` | 前两者只读；后两者创建受限 readiness turn |
+| Queue 输入与查询 | `seed`、`enqueue`、`status` | 幂等写入或读取 SQLite |
+| 执行与恢复 | `run`、`retry`、`resume`、`gc` | claim/dispatch、追加预算、恢复 blocked、清理 owned terminal |
+| 本地观察 | `dashboard` | 初始化 DB 后提供只读 HTTP/SSE |
+| 显式交付 | `deliver` | opt-in delivery 阶段机，不复用普通 queue 状态机 |
 
-## JSON 输出形状
-
-以下字段来自 `src/herdr_orchestrator/cli.py`、`src/herdr_orchestrator/runner.py` 和 `src/herdr_orchestrator/store.py`；未列为固定字段的嵌套 adapter 结果不应被猜测。
-
-### Queue 输入与查询
-
-#### `seed`
+### `seed`
 
 ```json
-{"added":2,"existing":1}
+{"added": 2, "existing": 1}
 ```
 
-- `added`：本次新建的 seed job 数。
-- `existing`：被 `(workflow, dedupe_key)` 去重的既有 job 数。
-- 可重复调用；两者之和等于 workflow 中本次处理的 seed 数。
+`added` 是新建 seed job；`existing` 是被 `(workflow, dedupe_key)` 去重的既有 job。
 
-#### `enqueue`
+### `enqueue`
 
 ```json
-{"created":true,"harness":"pi","job_id":9}
+{"created": true, "harness": "pi", "job_id": 9}
 ```
 
-- `created` 为 `false` 时，`job_id` 和 `harness` 指向同一 dedupe key 的既有 job。
-- `harness` 是 `droid|grok|codex|pi|claude|hermes`。
-- `--harness auto` 是默认值；controller 只负责选出候选 worker，coordinator 校验后才入队。
-- `--placement auto` 是默认值；最终 durable placement 为 `tab|pane|worktree`。
+- `--harness auto` 与 `--placement auto` 是默认值；
+- `--receipt-prefix` 去空白后必须为 1–256 字符且无 CR/LF；
+- `--receipt-file` 必须是 execution root 下、1–500 字符、无 `..` 的相对路径；
+- dedupe 命中时 `created=false`，返回既有 job 与原 harness。
 
-Task receipt 二选一：
-
-- `--receipt-prefix`：去除首尾空白后长度为 1–256，不得含 CR/LF。
-- `--receipt-file`：去除首尾空白后长度为 1–500，必须是 execution root 下无 `..` 的相对路径。
-
-声明 receipt 后，agent settled 仍不足以成功；验证结果必须为 `task_verified=true`。
-
-#### `status`
+### `status`
 
 ```json
 {
@@ -85,43 +232,20 @@ Task receipt 二选一：
     "succeeded": 2
   },
   "jobs": [],
-  "workflow": "example"
+  "workflow": "multi-harness"
 }
 ```
 
-`counts` 总是为五种 durable state 提供整数计数。`jobs[]` 按 job ID 排序，当前字段为：
+`jobs[]` 当前投影包含 ID/title/harness/placement/state、attempt budget、agent/error、
+execution path/workspace、receipt 声明、`agent_settled`、`task_verified` 与
+`correlation_id`；不包含 prompt。
 
-| 字段 | 类型/取值 |
-| --- | --- |
-| `id` | integer |
-| `title` | string |
-| `harness` | harness 枚举字符串 |
-| `placement` | `tab|pane|worktree|null` |
-| `state` | job state |
-| `attempts`, `max_attempts` | integer |
-| `agent_name` | string 或 null |
-| `error_code`, `error_summary` | string 或 null |
-| `execution_path`, `herdr_workspace_id` | string 或 null |
-| `receipt_kind` | `output-prefix|file|null` |
-| `receipt_value` | string 或 null |
-| `agent_settled`, `task_verified` | boolean 或 null |
-| `correlation_id` | string 或 null |
+### `run --once`
 
-`status` 不输出 job prompt。
-
-### 执行、恢复与清理
-
-#### `run --once`
-
-一次 claim/dispatch wave 返回：
+一次 wave 返回兼容的顶层五状态计数，以及：
 
 ```json
 {
-  "blocked": 0,
-  "failed": 0,
-  "pending": 0,
-  "running": 0,
-  "succeeded": 1,
   "claimed": 1,
   "batch": {
     "blocked": 0,
@@ -140,42 +264,43 @@ Task receipt 二选一：
 }
 ```
 
-顶层五个 state 计数与 `batch` 相同，表示本 wave 记录的结果；`queue` 是返回时整个 workflow 的 durable 计数。即使某个 job 进入 `blocked` 或 `failed`，该 wave 仍是已成功执行的 CLI 操作，`run --once` 返回 `0`。
+顶层状态计数与 `batch` 表示本 wave 结果；`queue` 是返回时的全 workflow 计数。Job 进入
+blocked/failed 并不使“执行一次 wave”本身报 CLI 错误，因此 `--once` 仍退出 `0`。
 
-#### `run --until-idle` / `run --drain`
+### `run --until-idle` / `run --drain`
 
-返回累计 wave 报告：
+除累计 `batch`、`queue` 和 `claimed` 外，还包含：
 
-| 字段 | 契约 |
+| 字段 | 值或语义 |
 | --- | --- |
-| 五个顶层 state 与 `batch` | 本次 drain 的累计 outcome 计数 |
-| `mode` | 固定为 `until_idle` |
-| `scope` | 固定为 `worker_pool` |
-| `idle` | worker 候选池是否达到 idle |
-| `worker_pool_idle`, `queue_idle` | 候选池与全 workflow queue 的独立判断 |
-| `reason` | `queue_idle|worker_pool_idle|blocked|drain_timeout` |
-| `waves`, `claimed` | wave 数与累计 claim 数 |
-| `queue` | 返回时全 workflow state 计数 |
+| `mode` | `until_idle` |
+| `scope` | `worker_pool` |
+| `idle` | 当前 worker pool 是否排空 |
+| `worker_pool_idle` / `queue_idle` | pool 与全 workflow 的独立判断 |
+| `reason` | `queue_idle`、`worker_pool_idle`、`blocked` 或 `drain_timeout` |
+| `waves` | 本次 drain 执行的 wave 数 |
 
-退出码仅在 `idle=true` 时为 `0`；`blocked` 或 deadline 到期等 `idle=false` 结果返回 `1`，但 stdout 仍是有效 JSON。`--drain-timeout-seconds` 的 CLI 合法范围为 1–86400。
+`idle=true` 退出 `0`；blocked 或总 deadline 到期返回有效 JSON 和退出 `1`。
+`--drain-timeout-seconds` 合法范围为 1–86400。
 
-#### 持续 `run`
+### 持续 `run`
 
-未选 mode 时进入 `run_forever()`。每轮结果不写 stdout；收到 `KeyboardInterrupt` 后 stderr 输出 `coordinator_stopped`，进程正常返回 `0`。
+未选择 mode 时进入 `run_forever()`，不为每轮打印 JSON。Ctrl-C 在 stderr 输出
+`coordinator_stopped`，正常退出 `0`。
 
-#### `retry`
+### `retry`
 
-仅接受 failed job，并增加 1–10 次 attempt budget：
+只接受 failed job，`--extra-attempts` 范围 1–10：
 
 ```json
-{"attempts":2,"job_id":42,"max_attempts":4,"state":"pending"}
+{"attempts": 2, "job_id": 42, "max_attempts": 4, "state": "pending"}
 ```
 
-`attempts` 是已经发生的 claim 数，`max_attempts` 是增加后的上限。命令把 state 重置为 `pending`，同时清除 lease 和上次错误/验证/关联字段；它不会立即 dispatch。
+它保留 job ID、dedupe key 与历史 receipts，只增加 attempt budget 并把当前投影置回 pending。
 
-#### `resume`
+### `resume`
 
-`--response-file` 必须存在且内容去除首尾空白后非空。命令恢复原 blocked job 的同一 agent、pane 和 attempt，不创建普通新 attempt：
+`--response-file` 必须存在且去空白后非空。命令恢复原 blocked agent、pane 和 attempt：
 
 ```json
 {
@@ -186,192 +311,122 @@ Task receipt 二选一：
   "error_code": null,
   "job_id": 42,
   "pane_id": "workspace:pane",
-  "queue": {
-    "blocked": 0,
-    "failed": 0,
-    "pending": 0,
-    "running": 0,
-    "succeeded": 1
-  },
   "state": "succeeded",
-  "task_verified": true
+  "task_verified": true,
+  "queue": {}
 }
 ```
 
-只有返回的 durable `state` 为 `succeeded` 时退出 `0`，否则退出 `1`。
+只有 durable `state=succeeded` 时退出 `0`；再次 blocked、timeout 或验收失败返回 `1`，
+同时仍追加同 attempt receipt。
 
-#### `gc`
+### `gc`
 
-必须显式选择 `--succeeded-agents` 或 `--failed-agents`；默认 dry-run，只有 `--apply` 才执行关闭。顶层对象包含：
+必须二选一：`--succeeded-agents` 或 `--failed-agents`。默认 dry-run，`--apply` 才关闭：
 
-- `dry_run`
-- `candidate_count`
-- `candidates[]`：每项含 `job_id`、`agent_name`、`placement`、`pane_id`、`state`
-- `actions[]`：transport cleanup adapter 的逐项结果
-- `states[]`
-- `skipped_blocked`、`skipped_worktrees`、`skipped_unowned`、`skipped_active`
+- `dry_run`、`candidate_count`、`candidates[]`、`actions[]`、`states[]`；
+- `skipped_blocked`、`skipped_worktrees`、`skipped_unowned`、`skipped_active`。
 
-GC 排除 worktree、未被本 workflow 拥有的 agent、仍被 active job 使用的 agent；普通 blocked agent 不属于 succeeded/failed 清理目标。
+Worktree、blocked、复用/foreign、仍被活动 job 引用或缺少创建 receipt 的 terminal 不会被关。
 
-### 发现、就绪与观察
+### `catalog` 与 `profile`
 
-#### `catalog --format json`
+`catalog --format json` 输出
+`{"schema_version":1,"harnesses":[compact profiles...]}`。`profile HARNESS --format json`
+输出 `{"schema_version":1,"profile":{...,"context":"..."}}`。默认格式分别是 JSON 和 text；
+完整 Markdown context 只为被选 harness 加载。
+
+### Python `doctor`
+
+输出 `{checks, ok, summary}`。System check 覆盖 Herdr session 环境、Herdr/Git、可选 `gh`；
+每个 harness 另有 executable、profile 和真实 readiness receipt。Readiness status 为：
+
+`ready | auth_required | model_invalid | timeout | unavailable | error`
+
+全部通过退出 `0`，否则退出 `1`。Probe timeout 范围为 5–300 秒；重复 `--harness` 只能选择
+workflow 已启用项。
+
+### `smoke`
 
 ```json
 {
-  "schema_version": 1,
-  "harnesses": [
-    {
-      "avoid_for": [],
-      "best_for": [],
-      "display_name": "Example",
-      "harness": "pi",
-      "profile_ref": "harness:pi",
-      "strengths": [],
-      "summary": "Example summary",
-      "traits": []
-    }
+  "failures": [],
+  "results": [
+    {"harness": "codex", "state": "done", "task_verified": true}
   ]
 }
 ```
 
-数组只含当前 workflow 启用 worker 的 compact profile，顺序跟随 worker 配置。实际 profile 列表字段按配置提供内容；示例空数组只用于展示 JSON 类型。
+每个选中 worker 都必须完成真实只读 turn 并产生当前 turn 的固定 output receipt；任一失败
+退出 `1`。
 
-#### `profile <harness> --format json`
+### `dashboard`
+
+绑定成功后立即 flush：
+
+```json
+{"status": "dashboard_started", "url": "http://127.0.0.1:8765"}
+```
+
+随后持续服务。默认 host/port/poll 为 `127.0.0.1`、`8765`、`2.0` 秒；Ctrl-C 在 stderr
+输出 `dashboard_stopped` 并正常退出。HTTP wire contract 见
+[Dashboard HTTP 与 SSE](dashboard-http-sse.md)。
+
+### `deliver`
+
+成功对象：
 
 ```json
 {
-  "schema_version": 1,
-  "profile": {
-    "avoid_for": [],
-    "best_for": [],
-    "context": "full execution context",
-    "display_name": "Example",
-    "harness": "pi",
-    "profile_ref": "harness:pi",
-    "strengths": [],
-    "summary": "Example summary",
-    "traits": []
-  }
-}
-```
-
-只有所选 harness 的完整 Markdown context 被加载。默认 text 格式仅输出 `context` 内容。
-
-#### `doctor`
-
-无论 readiness 是否全部通过，stdout 都是报告：
-
-```json
-{
-  "checks": [],
-  "ok": true,
-  "summary": {
-    "checks": 0,
-    "failed": 0,
-    "harnesses": [],
-    "passed": 0,
-    "readiness_ms": 0
-  }
-}
-```
-
-实际 `checks[]` 的公共字段为 `check`、`ok`、`value`；readiness check 使用 `status`、`error_code`、`error_summary`、`duration_ms`、`phase_timings_ms`。探测状态可包括 `ready`、`auth_required`、`model_invalid`、`timeout`、`unavailable`、`error`。全部 check 通过时退出 `0`，否则退出 `1`。`--probe-timeout-seconds` 必须为 5–300；可重复 `--harness` 只探测已启用 harness。
-
-#### `smoke`
-
-```json
-{
-  "failures": [{"error":"error_code_or_agent_state","harness":"pi"}],
-  "results": [{"harness":"codex","state":"done","task_verified":true}]
-}
-```
-
-所有被选 worker 都验证成功时退出 `0`，否则退出 `1`。Smoke 要求固定 output-prefix receipt；`idle`/`done` 但未验证仍计为失败。
-
-#### `dashboard`
-
-绑定成功后立即 flush 一行：
-
-```json
-{"status":"dashboard_started","url":"http://127.0.0.1:8765"}
-```
-
-随后进程持续服务。默认 host/port/poll interval 为 `127.0.0.1`、`8765`、`2.0` 秒；服务端进一步校验 host、port 与 poll 范围。HTTP 契约见 [Dashboard HTTP 与 SSE](dashboard-http-sse.md)。
-
-### 显式标准交付
-
-#### `deliver`
-
-成功对象字段固定为：
-
-```json
-{
-  "artifact_root": ".orchestrator/deliveries/run-id",
-  "integration_branch": "ho/<slug>/integration",
+  "artifact_root": "/repo/.orchestrator/deliveries/run-id",
+  "integration_branch": "ho/slug/integration",
   "integration_commit": "commit-id",
   "review_rounds": 1,
   "run_id": "run-id",
   "status": "succeeded",
   "tickets_completed": 2,
-  "tracker_references": {"ticket-id":"reference"}
+  "tracker_references": {"ticket-id": "reference"}
 }
 ```
 
-该命令是显式 opt-in gate。Delivery 需要用户处理的 escalation 返回退出码 `3`；普通 queue 命令不会自动进入这条流程。
+成功只停在隔离 integration branch，不自动 push、PR、合并用户分支、release 或 deploy。
+需要用户处理 protected category 时退出 `3` 并保留 artifact。
 
-## 状态枚举与成功含义
+## 状态与成功含义
 
-枚举真源是 `src/herdr_orchestrator/model.py`。
+| 类型 | 值 |
+| --- | --- |
+| Durable `JobState` | `pending`、`running`、`succeeded`、`blocked`、`failed` |
+| Runtime `AgentState` | `idle`、`working`、`blocked`、`done`、`unknown` |
+| `PlacementTarget` | `tab`、`pane`、`worktree` |
+| `ReceiptKind` | `output-prefix`、`file` |
 
-| 类型 | 值 | 含义 |
-| --- | --- | --- |
-| `JobState` | `pending`、`running`、`succeeded`、`blocked`、`failed` | durable queue 状态 |
-| `AgentState` | `idle`、`working`、`blocked`、`done`、`unknown` | 当前 Herdr lifecycle 观察 |
-| `PlacementTarget` | `tab`、`pane`、`worktree` | dispatch 拓扑 |
-| `ReceiptKind` | `output-prefix`、`file` | 内容验证方式 |
+`blocked` 与 `failed` 是不同的 durable 终态；blocked 只能由显式 `resume` 续答原 turn。
+`idle/done` 只证明 settled。声明 receipt 后，`task_verified` 不为 `true` 就不能成功；
+`unknown`、timeout、旧 receipt 和 prompt echo 都不是成功。
 
-关键判定：
+## 内部 Herdr subprocess 协议
 
-- `blocked` 与 `failed` 都是 durable terminal state；blocked 只通过显式 `resume --response-file` 恢复原 agent。
-- `idle`/`done` 只说明 agent settled。
-- 声明 receipt 的 job 只有 `task_verified=true` 才能进入成功路径。
-- `unknown`、timeout 或未满足 receipt 都不是成功。
-
-## 退出码与错误通道
-
-| 退出码 | 来源 | stdout/stderr 约定 |
-| --- | --- | --- |
-| `0` | 命令成功；或 `doctor`/`smoke` 全通过；或 drain idle；或 resume succeeded | 按命令输出 JSON/文本 |
-| `1` | readiness/smoke 未通过、drain 未 idle、resume 未 succeeded | 通常仍有可解析 JSON stdout |
-| `2` | argparse 用法错误；配置、catalog、store、transport、tracker、输入验证等受控错误 | argparse 输出 usage；handler 错误将 `str(exception)` 写 stderr |
-| `3` | `DeliveryEscalation` | escalation 文本写 stderr |
-
-参数解析发生在 handler 的异常捕获之前，但 argparse 自身同样以 `2` 表示用法错误。受控 handler 错误没有统一 JSON body，例如 token 可为 `drain_timeout_out_of_range`、`receipt_prefix_invalid`、`response_file_not_found: ...`。未被 `main()` 显式捕获的程序错误不属于这组稳定分类。
-
-## 内部 Herdr subprocess protocol
-
-`src/herdr_orchestrator/protocol.py` 是 coordinator/observer 到 Herdr CLI 的内部边界：
+`src/herdr_orchestrator/protocol.py` 的 JSON 成功响应必须是：
 
 ```json
-{"id":"request-id","result":{"agents":[]}}
+{"id": "request-id", "result": {"agents": []}}
 ```
 
-`run_json()` 的契约是：
+内部 `run_json()` 返回解包后的 `result`。Timeout 映射为 `herdr_timeout`，启动失败映射为
+`herdr_unavailable`，非法成功 JSON 映射为 `herdr_invalid_response`。非零退出只接受 stderr
+JSON 中匹配 `[a-z][a-z0-9_]{0,63}` 的 code；其他情况降级为
+`herdr_command_failed`。这套 envelope 不应外推为顶层 CLI schema。
 
-1. 在指定 cwd、timeout 下执行 argv，并捕获 stdout/stderr。
-2. timeout 映射为 `herdr_timeout`，进程无法启动映射为 `herdr_unavailable`。
-3. 非零退出时尝试解析 stderr 的 `error.code`。code 必须匹配 `[a-z][a-z0-9_]{0,63}`；否则降级为 `herdr_command_failed`。
-4. 零退出时 stdout 必须是 JSON object，且 `result` 也必须是 object；否则为 `herdr_invalid_response`。
-5. 返回给内部调用方的是解包后的 `result`，不是整个 envelope。
+## 相关页面与源码
 
-`run_text()` 使用相同的 timeout、启动失败和非零退出映射，但成功时直接返回 stdout，不做 JSON 校验。`TransportError` 可携带 `code`、子进程 `exit_code`、可选 `summary` 与 `agent_settled`；这些是内部 adapter 信息，不是外部 CLI 统一错误 schema。
-
-## 相关实现与测试
-
+- [CLI 参考](../reference/cli-reference.md)
+- [数据模型](../reference/data-models.md)
+- [安装与分发](../systems/installation-and-distribution.md)
+- [Coordinator 与队列](../systems/coordinator-and-queue.md)
+- [Harness readiness](../features/harness-readiness-and-automation.md)
+- `bin/herdr-orchestrator.mjs`
 - `src/herdr_orchestrator/cli.py`
-- `src/herdr_orchestrator/model.py`
 - `src/herdr_orchestrator/protocol.py`
-- `src/herdr_orchestrator/runner.py`
-- `src/herdr_orchestrator/store.py`
 - `tests/test_cli.py`
+- `tests/test_distribution.py`

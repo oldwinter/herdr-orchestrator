@@ -1,262 +1,361 @@
-# 清理机会
+# 可执行的清理机会
 Active contributors: oldwinter, chendongdong
 
-本页记录**能由当前代码、配置、测试或文档直接证明，但尚未形成已编号工作项**的维护机会。它不是缺陷清单，也不假定存在未公开 issue；每项都明确当前风险、保留现状的取舍和适合处理的触发条件。
+本页只记录能由当前代码、配置、测试、文档或 `origin/main` 直接证明的维护机会。它不是缺陷
+清单，不声称存在 dead code，也不代替 issue tracker。每项都给出证据、风险、动作和触发
+条件，避免把安全/恢复不变量误当成“可以顺手删掉的东西”。
 
-仓库的 `scripts/check_repository.py` 会拒绝没有 issue 与 owner 的行内债务标记，因此“此类标记很少或为零”只能说明没有无主便签，不能推出没有技术债。完整边界见[安全](security.md)，结构背景见[系统架构](overview/architecture.md)和[设计决策](background/design-decisions.md)。
+## 基线检查
+
+### 债务标记
+
+`scripts/check_repository.py` 要求四类行内债务关键词必须采用“关键词 + issue 编号 +
+owner”的受跟踪格式。对 `origin/main` 搜索后：
+
+- 仓库自有源码没有未跟踪的行内债务便签；
+- 命中来自 policy checker 自身的正则/示例，以及 vendored
+  `src/herdr_orchestrator/dashboard/static/cytoscape.min.js` 的单行第三方 bundle；
+- 因此没有证据可据此宣布某段代码“已废弃”或“无人维护”。
+
+另外，`just lint` 运行 `vulture --min-confidence 90`。这说明 dead-code 检查已有 gate，但仍
+不能把一次静态扫描解释为仓库不存在任何维护成本。
+
+### 文件大小
+
+当前主要热点：
+
+| 文件 | 行数 | 字节 | 仓库门槛 |
+| --- | ---: | ---: | ---: |
+| `src/herdr_orchestrator/herdr.py` | 1,416 | 51,029 | Python source 1,500 行 |
+| `tests/test_herdr.py` | 2,393 | 90,538 | Python test 2,500 行 |
+| `src/herdr_orchestrator/delivery.py` | 976 | 35,754 | 1,500 行 |
+| `src/herdr_orchestrator/runner.py` | 874 | 31,403 | 1,500 行 |
+| `src/herdr_orchestrator/store.py` | 864 | 33,119 | 1,500 行 |
+| `src/herdr_orchestrator/cli.py` | 843 | 29,918 | 1,500 行 |
+| `bin/herdr-orchestrator.mjs` | 912 | 27,816 | 通用文本 2,000 行 |
+| `tests/test_distribution.py` | 1,262 | 48,247 | Python test 2,500 行 |
+
+门槛真源是 `scripts/check_repository.py`：普通文件 512 KiB、Python source 1,500 行、test
+2,500 行、其他文本 2,000 行；vendored Cytoscape 与 overview video 有明确 size exemption。
+
+### 复杂度与依赖
+
+`just lint` 用 Xenon 强制 `--max-absolute C --max-modules B --max-average A`，并运行 Ruff、
+Black、mypy、Pylint、Vulture、import-linter 与 deptry。一个不替代 Xenon 的标准库 AST
+分支计数用于导航时，热点集中在：
+
+- `Store.record_outcome()`：约 20；
+- `Store.record_resume_outcome()`、`Coordinator._gc_agents()`、
+  `HerdrTransport._prompt()`：各约 19；
+- `RuntimeProjector._topology()`：约 18；
+- CLI `doctor()`：约 17。
+
+这些数字只是维护 triage，不是质量评分或正式 gate 结果；正式复杂度标准仍以 Xenon 退出码
+为准。
+
+依赖配置显示：
+
+- Python `[project].dependencies = []`；
+- 根 `package.json` 无 npm dependencies；
+- `packages/herdr-manager/package.json` 只有
+  `herdr-orchestrator ^0.1.6` 一个 runtime dependency；
+- Python dev tools 在 `uv.lock` 中精确锁定，包括 Radon 6.0.1 与 Xenon 0.9.3；
+- `package-lock.json` 根包无第三方 dependency tree。
+
+因此清理方案不应随意引入 runtime framework；新增依赖必须证明标准库/现有薄包边界无法满足。
 
 ## 机会地图
 
 ```mermaid
 flowchart TD
-    E[证据链] --> SR[统一安全报告]
-    E --> RD[收敛文档与运行真源]
-    M[可维护性] --> HF[拆分 Herdr 生命周期测试]
-    M --> SC[减少 schema 双写]
-    H[条件性硬化] --> FR[Receipt 大文件与竞态]
-    H --> PX[Principal proxy 分类]
-    H --> SSE[Dashboard 连接预算]
-    L[生命周期] --> RT[Runtime retention]
-    L --> IN[Installer 事务化]
-    L --> CI[拆分发布权限]
+    规模[规模与复杂度] --> 生命周期[拆分 Herdr 生命周期测试]
+    规模 --> 状态折叠[收敛 Store outcome 写入]
+    证据[证据一致性] --> 安全报告[统一安全 finding 真源]
+    证据 --> 发布文档[对齐 CI 权限与安装文档]
+    证据 --> 目录命名[对齐 telemetry 文档路径]
+    生命周期2[资源生命周期] --> Retention[定义 runtime retention]
+    生命周期2 --> 安装事务[提升 installer 崩溃一致性]
+    硬化[条件性硬化] --> 文件[File receipt 大小与 TOCTOU]
+    硬化 --> SSE[SSE 连接预算]
+    协议[协议维护] --> Schema[减少 prompt/schema 双写]
 ```
 
-这些节点不是优先级排序。是否实施取决于触发条件；当前 local-first、单 OS 用户和零运行时依赖的设计本身也是需要保留的价值。
+这些节点不表示优先级。实施前应建立 issue、owner、触发条件和拒绝路径测试。
 
-## 1. 统一安全报告的机器真源
+## 1. 在行数硬门槛前拆分 Herdr 生命周期测试
 
-**事实依据**
+**证据**
 
-- `justfile` 的 `security` recipe 生成 `.orchestrator/quality/bandit.json` 与 `.orchestrator/quality/pip-audit.json`，secret scan 通过进程退出状态报告。
-- `.github/workflows/ci.yml` 根据 `just security` 的 outcome 阻断 gate，并在 `main` 失败时维护一个 insight issue。
-- `security-findings.json` 是一次独立的 14 文件、零 finding 快照；`.factory/security-config.json` 另行保存 STRIDE pattern 与 severity policy。
-- 当前树中没有 `scripts/check_security_report.py`，也没有现存代码证明这三类机器结果会合并或验证 freshness。
-
-**风险**
-
-维护者可能把 `security-findings.json` 的“零 finding”误当作当前 CI 结果，或在 threat-model version、severity policy、scanner output 之间发生无提示漂移。公开 insight 只指向 Actions run，无法在本地用一个稳定 schema 重放相同判定。
-
-**取舍**
-
-统一报告需要定义 Bandit、pip-audit、secret scan 与 STRIDE 的归一化 schema、去重和 freshness 规则；若只是复制原始结果，会增加又一个可漂移 artifact。报告还必须避免写入 prompt、terminal output、credential 和 exploit details。
-
-**何时处理**
-
-在把 `security-findings.json` 用作 release/merge 证据、增加新 scanner、修改 `.factory/security-config.json` 门槛，或需要跨 CI run 比较 finding 前处理。此前应继续把 `just security` 和 CI outcome 视为实际 gate，把静态 JSON 视为时间点证据。
-
-相关：[安全报告流程](security.md#扫描报告与响应流程) · [可观测性与 Attention](features/observability-and-attention.md)
-
-## 2. 在行数门槛触发前拆分 Herdr 生命周期测试
-
-**事实依据**
-
-- `src/herdr_orchestrator/herdr.py` 当前约 1,416 行；`scripts/check_repository.py` 对 Python source 的上限是 1,500 行。
-- `tests/test_herdr.py` 当前约 2,393 行；测试 Python 文件上限是 2,500 行。
-- 两个文件同时承载 startup、readiness、prompt reconciliation、settlement、runtime error、blocked response、receipt 与 cleanup ownership。
+- `src/herdr_orchestrator/herdr.py` 距 1,500 行上限只剩 84 行；
+- `tests/test_herdr.py` 距 2,500 行上限只剩 107 行；
+- 两者同时承载 startup、readiness、prompt reconciliation、settlement、fatal signal、
+  blocked response、receipt 和 cleanup；
+- `_prompt()` 的分支复杂度也处于当前热点。
 
 **风险**
 
-下一次增加 lifecycle 或 receipt 分支就可能碰到硬门槛；更早的风险是修改者难以判断 fake runner 的长响应序列属于哪个 phase，安全拒绝路径容易与一般 happy path 混杂。
+下一次加入 startup/provider/receipt 分支会直接撞仓库门槛；长 fake-runner 响应序列也难以
+判断属于哪个 phase，安全拒绝路径容易和 happy path 混杂。
 
-**取舍**
+**可执行动作**
 
-按 startup、turn、receipt、resume/cleanup 拆测试会改善导航，但过度抽 helper 可能隐藏完整 Herdr argv 顺序和 timeout 证据。拆 production 模块也可能把 thread-local deadline、创建 ownership 与 settlement 状态分散到更浅的接口。
+先按测试责任拆为 startup/readiness、turn/reconciliation、receipt、resume/cleanup 等文件，
+共享最小 fixture builder，同时保留每个用例可见的完整 Herdr argv/sequence。生产代码只有在
+形成清晰深模块接口时再拆，不为降低行数机械搬运私有函数。
 
-**何时处理**
+**触发条件**
 
-在下一次新增 harness startup 分支、receipt kind、runtime error detector 或 blocked/cleanup 行为时进行，而不是仅为降低行数机械搬运。拆分后仍应让 `tests/test_harness_automation.py` 固定最大自动化参数与 Claude execution-root guard。
+下一次新增 harness startup 分支、receipt kind、fatal detector 或 blocked/cleanup 行为时。
+拆分后仍由 `tests/test_harness_automation.py` 单独固定最大自动化 flags 与 Claude trust guard。
 
-相关：[Herdr runtime](systems/herdr-runtime.md) · [任务收据与恢复](features/receipts-and-recovery.md) · [运行时经验](background/runtime-lessons.md)
+## 2. 收敛普通 dispatch 与 resume 的 outcome 持久化
 
-## 3. 减少模型 artifact 的 prompt/schema 双写
+**证据**
 
-**事实依据**
+`src/herdr_orchestrator/store.py::record_outcome()` 和 `record_resume_outcome()` 分别约有
+20/19 的分支计数，并重复：
 
-- `src/herdr_orchestrator/planner.py` 同时手写 planner/router prompt 中的 JSON shape 与对应 loader 的 exact-key/长度规则。
-- `src/herdr_orchestrator/topology.py` 同样分别维护 prompt schema 和 `load_topology_decision()`。
-- `src/herdr_orchestrator/delivery_prompts.py` 描述交付 artifact，`src/herdr_orchestrator/delivery_protocol.py` 再独立实现 exact-key、枚举、DAG、commit 和长度校验。
-- 当前测试覆盖 loader 拒绝路径与主要交付流程，没有证据表明现有 shape 已发生漂移。
+- Receipt fail-closed 错误折叠；
+- `agent_settled` 默认推导；
+- bounded error summary；
+- Job current projection update；
+- Attempt receipt insert。
 
-**风险**
-
-未来只更新 prompt 或只更新 loader 时，模型会被要求写出 coordinator 必然拒绝的文件；在两次 artifact retry 的上限内，这表现为昂贵但不易定位的稳定失败。
-
-**取舍**
-
-从单一声明生成 prompt 与 validator 能减少双写，但也可能模糊当前精确、可测试的错误码，并引入复杂生成框架或新的运行时依赖。项目当前的手写 schema 很直接，不能为了抽象而牺牲 fail-closed 可读性。
-
-**何时处理**
-
-在新增 artifact 版本、同一字段第三次跨 prompt/loader/renderer 修改，或出现真实 schema drift 回归时处理。合适结果可以只是测试共享的 schema fixture，不必立即引入通用 JSON Schema 引擎。
-
-相关：[Harness catalog 与路由](systems/catalog-and-routing.md) · [交付 Artifact](primitives/delivery-artifacts.md) · [数据模型参考](reference/data-models.md)
-
-## 4. 为 file receipt 定义大小预算与更窄的文件读取原语
-
-**事实依据**
-
-- `src/herdr_orchestrator/herdr.py` 的 file receipt 会在 prompt 前后用 `Path.read_bytes()` 读取完整文件，再计算 size 与 SHA-256。
-- 路径已拒绝绝对值、`..`、symlink chain 和 resolve 后逃逸；`tests/test_herdr.py` 覆盖旧文件、空文件、当前 turn 新文件和 symlink。
-- 当前 workflow 没有 file receipt 最大字节数；威胁模型接受同 OS 用户为信任域。
+两者不能简单合并：普通 dispatch 可进入 pending/failed 并退避，resume 只能
+succeeded/blocked，且 resume 不增加 attempt。
 
 **风险**
 
-误把大 artifact 声明为 receipt 会在每次 baseline/verification 中分配整文件内存，造成局部资源耗尽。路径检查与后续读取也不是跨进程原子的；在更弱的本地信任模型下，检查后替换仍是竞态。
+未来新增 receipt/error/correlation 字段时只改一条路径，可能让普通 dispatch 与同 attempt
+resume 的持久证据发生漂移。
 
-**取舍**
+**可执行动作**
 
-流式 hash 可降低内存峰值，但不能单独消除 pathname TOCTOU；基于 file descriptor、regular-file metadata 和 no-follow 的实现更稳健，却需要平台语义与额外测试。新增大小上限会改变已存在的大 receipt 的兼容行为。
+提取无状态的“verification/error normalization”和共享 receipt-row 构造；保留两个公开事务
+方法及各自 state precondition。不要抽掉 `running` 与 `blocked` 的不同状态检查，也不要把
+resume 变成新 attempt。
 
-**何时处理**
+**触发条件**
 
-在 file receipt 被用于构建产物、支持远程/低信任 worker、出现大文件案例，或项目改变“同 OS 用户可信”假设时处理。当前小型 sentinel 文件场景可以继续依赖现有简单实现。
+新增 outcome 字段、receipt kind、job state，或同一字段第三次同时修改两种 record 方法时。
+先用 `tests/test_store.py` 固定两条路径的差异。
 
-相关：[任务收据与恢复](features/receipts-and-recovery.md) · [安全](security.md#receiptpane-ownership-与路径安全)
+## 3. 统一安全 finding 的机器真源
 
-## 5. 明确 runtime state 的 retention、权限与压缩边界
+**证据**
 
-**事实依据**
-
-- `src/herdr_orchestrator/store.py` 持久化原始 job prompt，并以 append-only receipts 保留 attempt 历史。
-- `src/herdr_orchestrator/observability.py` 持续 append `events.jsonl`、`metrics.jsonl` 和 `alerts.jsonl`；代码不设置最大文件数、时间或大小。
-- 标准化交付失败会保留 artifact、branch 和 worktree 以支持恢复；普通 GC 明确不删除 worktree。
-- `docs/observability.md` 把本地文件生命周期交给操作者的 filesystem retention policy。
-
-**风险**
-
-长期运行会累积 prompt、路径、receipt、ledger 和 telemetry；共享账号、备份或磁盘压力会放大本地信息披露与可用性风险。默认创建依赖进程 umask，没有独立的权限/加密层。
-
-**取舍**
-
-自动 prune 会损失 crash recovery、审计时间线、失败现场和幂等 artifact；删除 worktree 还可能丢失未集成代码。压缩/轮转增加恢复与 Dashboard 读取复杂度，应用层加密又引入密钥生命周期。
-
-**何时处理**
-
-在引入常驻 supervisor、共享开发机、合规保留要求、明显磁盘增长或备份 runtime state 前处理。应先区分可重建 telemetry、durable queue、失败交付证据和用户 worktree，不能用单一清空命令处理全部数据。
-
-相关：[Durable execution](features/durable-execution.md) · [可观测性与 Attention](features/observability-and-attention.md) · [Placement 与 worktree](primitives/placement-and-worktrees.md)
-
-## 6. 收敛 observability 目录命名的文档漂移
-
-**事实依据**
-
-- `src/herdr_orchestrator/runner.py` 构造 telemetry root 为 `config.state_db.parent / "telemetry"`。
-- `src/herdr_orchestrator/observability.py` 写入该目录下三个 JSONL。
-- `docs/observability.md` 当前写成 `.orchestrator/observability/`，而实现和现有 Wiki 的可观测性页面使用 `.orchestrator/telemetry/`。
+- `just security` 生成 Bandit、pip-audit 和 secret-scan outcome；
+- `.factory/security-config.json` 记录 threat-model version 和 severity policy；
+- `security-findings.json` 是 `origin/main..staged`、23 个文件、零 finding 的时间点快照；
+- 在 `justfile`、`scripts/`、`.github/` 和 tests 中没有对
+  `security-findings.json` 的消费或 freshness 校验。
 
 **风险**
 
-运维人员可能在错误目录排查或清理 incident evidence；脚本若按文档路径采集，会静默漏掉实际 telemetry。
+维护者可能把静态“零 finding”误认为当前 CI 结果，或者 scanner、threat-model version、
+severity policy 与报告 scope 无提示漂移。
 
-**取舍**
+**可执行动作**
 
-只修文档最小但保留“类名 Observability / 目录 telemetry”的术语差异；迁移代码目录会影响已有本地数据和外部采集脚本，需要兼容读取或明确迁移。
+先定义最小统一 schema：scanner、scope/commit range、generated-at、threat-model version、
+severity、fingerprint、source artifact；再实现只读 validator，明确 snapshot 与 merge gate
+的关系。不得把 prompt、terminal、credential 或完整 exploit 写进聚合报告。
 
-**何时处理**
+**触发条件**
 
-在下一次修改 `docs/observability.md`、增加 telemetry collector、实现 retention，或把该路径纳入稳定 API 前处理。当前实现路径应被视为运行真源。
+当 `security-findings.json` 要用于 release/merge 证据、加入新 scanner、修改 severity policy
+或需要跨 run 比较 finding 时。此前以 `just security` 和 CI outcome 为实际 gate。
 
-相关：[可观测性与 Attention](features/observability-and-attention.md) · [配置参考](reference/configuration.md)
+## 4. 减少模型 artifact 的 prompt/schema 双写
 
-## 7. 扩展 principal-proxy 的受保护类别检测策略
+**证据**
 
-**事实依据**
+- `src/herdr_orchestrator/planner.py` 同时手写 planner/router prompt shape 与 loader；
+- `src/herdr_orchestrator/topology.py` 分别维护 topology prompt 和 decision loader；
+- `src/herdr_orchestrator/delivery_prompts.py` 描述交付 artifact，
+  `delivery_protocol.py` 再独立实现 exact-key、长度、枚举、DAG 和 commit 校验。
 
-- `src/herdr_orchestrator/delivery.py` 在调用 controller 前，用一个关键词正则检查 API key、credential、password、secret、token、production/prod。
-- `src/herdr_orchestrator/delivery_protocol.py` 强制 `secret`/`production` category 只能 escalate。
-- 每个 blocked turn 最多 8 轮，ledger 不记录实际回答；`tests/test_delivery.py` 覆盖明确的 production API token 文本。
+当前没有证据表明 schema 已漂移。
 
 **风险**
 
-不含现有英文关键词的敏感问题、其他语言、个人数据、付款、权限变更或生产同义词可能绕过第一层词法 guard，转而依赖不可信 controller 正确分类。
+未来只更新 prompt 或只更新 loader，模型会被要求生成必然被 coordinator 拒绝的 artifact，
+并消耗有限 retry。
 
-**取舍**
+**可执行动作**
 
-扩大关键词会提高误升级率并打断本地可逆工作；通用敏感信息分类器又会引入模型依赖和不确定性。当前窄 guard 与 strict decision schema 是双层防护，不能用更复杂 prompt 替代确定性 escalation。
+优先增加共享的测试 fixture/字段常量，对比 prompt 示例与 loader 接受对象；不必立即引入
+JSON Schema framework。保留现有稳定错误码和 fail-closed 可读性。
 
-**何时处理**
+**触发条件**
 
-在 principal proxy 获得新的 authority category、覆盖更多语言、允许外部副作用，或真实 blocked transcript 暴露漏检类别时处理。每个新增类别都应先有 fail-closed test 和明确用户升级路径。
+新增 artifact version、同一字段再次跨 prompt/loader/renderer 修改，或发生真实 drift 回归。
 
-相关：[标准化交付](systems/standardized-delivery.md) · [安全](security.md#standardized-deliveryprincipal-proxy-与-tracker-限权)
+## 5. 为 file receipt 增加大小预算与更窄读取原语
+
+**证据**
+
+`src/herdr_orchestrator/herdr.py::_file_receipt_snapshot()` 使用 `Path.read_bytes()` 在 turn 前后
+整文件读入内存，再计算 size/SHA-256。路径 containment、symlink 和 freshness 已有测试，
+但 workflow 没有 file receipt 最大字节数。
+
+**风险**
+
+误把大型 build artifact 当 receipt 会在 baseline 和 verification 各分配整文件内存。路径
+检查与后续读取也不是同一原子操作；更弱本地信任模型下存在 pathname TOCTOU。
+
+**可执行动作**
+
+先为 intended sentinel 用例定义兼容的 size policy；采用流式 hash 降低内存峰值。若信任
+模型扩大，再评估 file descriptor、regular-file metadata 和 no-follow 的平台实现。
+
+**触发条件**
+
+File receipt 开始用于构建产物、出现大文件案例、支持低信任 worker，或改变“同 OS 用户可信”
+假设时。
+
+## 6. 定义 runtime state 的 retention 与权限边界
+
+**证据**
+
+- SQLite 保存原始 job prompt 与 append-only attempt receipts；
+- `src/herdr_orchestrator/observability.py` 持续追加
+  `events.jsonl`、`metrics.jsonl`、`alerts.jsonl`，没有时间/文件数/大小上限；
+- Delivery 失败保留 artifact、branch 和 worktree；
+- 普通 GC 明确不删除 worktree；
+- 文件 mode 依赖进程 umask，没有应用层加密。
+
+**风险**
+
+长期运行会积累 prompt、path、receipt、ledger、telemetry 和 checkout；共享账号、备份和磁盘
+压力会放大信息泄露与可用性风险。
+
+**可执行动作**
+
+先把数据分为：可重建 telemetry、durable queue、失败 delivery evidence、用户 worktree。
+分别定义默认权限、观察/归档/删除命令和保留窗口；删除必须预览并保守处理未集成代码。
+
+**触发条件**
+
+引入常驻 supervisor、共享开发机、合规保留要求、自动备份或可观测磁盘增长时。不得提供一个
+不区分类别的“全部清空”命令。
+
+## 7. 收敛 telemetry 目录的文档漂移
+
+**证据**
+
+- `src/herdr_orchestrator/runner.py` 把 root 设为 `state_db.parent / "telemetry"`；
+- `src/herdr_orchestrator/observability.py` 写入该目录；
+- `docs/observability.md` 仍写 `.orchestrator/observability/`。
+
+**风险**
+
+Incident 采集或人工清理会查错目录，静默漏掉实际 telemetry。
+
+**可执行动作**
+
+把 `docs/observability.md` 对齐到 `.orchestrator/telemetry/`；如果未来改实现路径，必须提供
+兼容读取/迁移，而不是只重命名目录。
+
+**触发条件**
+
+下一次修改 observability 文档、增加 collector、实现 retention 或把该路径定义为稳定 API 时。
 
 ## 8. 为 Dashboard SSE 增加显式连接预算
 
-**事实依据**
+**证据**
 
-- `src/herdr_orchestrator/dashboard/server.py` 使用 `ThreadingHTTPServer`，每个 `/api/events` 连接在循环中等待 feed，并每 15 秒 heartbeat。
-- Server 只绑定 `127.0.0.1`/`localhost`、验证 Host，且没有写路由；`tests/test_dashboard.py` 固定这些边界。
-- 当前没有认证、最大 SSE 连接数、每客户端总时长或全局 thread budget。
-
-**风险**
-
-同一 OS 用户下的恶意或故障本地进程可以建立大量连接并消耗线程/文件描述符。当前 loopback 信任假设降低了外部攻击面，但不消除本地 DoS。
-
-**取舍**
-
-连接上限、idle cutoff 或单线程 async server 会增加状态和兼容复杂度，也可能误断浏览器重连。为当前单用户只读工具加入网络认证，会显著扩大配置与 secret 管理面，未必比保持 loopback 更安全。
-
-**何时处理**
-
-在 Dashboard 变成长驻服务、出现多客户端、观察到连接泄漏，或任何人提议扩大 bind 范围前处理。若要远程访问，应重新设计认证/授权/CSRF，而不是只提高连接上限。
-
-相关：[本地 Dashboard](systems/dashboard.md) · [安全](security.md#dashboardloopbackhostcsp-与白名单)
-
-## 9. 提升 npm installer 多文件协调的崩溃一致性
-
-**事实依据**
-
-- `bin/herdr-orchestrator.mjs` 会先计算 conflicts、preserved、removals 和 desired files，再逐项 unlink/write，最后写 manifest 和 Git exclude。
-- Hash ownership、symlink guard 和用户修改保留已经由 `tests/test_distribution.py` 覆盖。
-- 多个目标文件及 Git exclude 的更新不是一个文件系统事务；进程在中途崩溃可能留下部分新内容和旧/缺 manifest。
+`src/herdr_orchestrator/dashboard/server.py` 使用 `ThreadingHTTPServer`。每个
+`/api/events` 连接在循环中等待 feed，每 15 秒 heartbeat；当前没有连接数、总时长或 thread
+budget。Server 只绑定 loopback、验证 Host 且无写路由。
 
 **风险**
 
-异常退出、磁盘满或机器中断后，doctor 可能只能报告 partial installation，用户需要重新 install 或人工判断 ownership。当前逻辑防止越界覆盖，但不保证跨文件原子可见。
+同 OS 用户下的故障或恶意本地进程可建立大量连接，消耗线程和文件描述符。Loopback 降低远程
+攻击面，但不消除本地 DoS。
 
-**取舍**
+**可执行动作**
 
-临时目录加 rename 能改善单文件原子性，却无法把项目文件、manifest 和 Git common-dir exclude 纳入同一事务；完整 rollback journal 会增加 installer 状态、恢复规则和测试矩阵，与当前零 npm runtime dependency 的简单性相冲突。
+先加可测试的全局连接计数与明确 429/503 行为，确保断线释放；仅在真实并发需求出现后评估
+async server。远程访问必须另行设计 auth/CSRF，不能用“提高连接上限”代替。
 
-**何时处理**
+**触发条件**
 
-在托管根/文件数量继续增长、installer 用于无人值守批量部署，或出现真实 partial-install 事故时处理。此前保留 stable doctor 输出和可重复 install，比假装存在跨文件原子性更重要。
+Dashboard 变成长驻服务、出现多客户端/连接泄漏，或有人提议扩大 bind 范围前。
 
-相关：[安装与分发](systems/installation-and-distribution.md) · [依赖参考](reference/dependencies.md)
+## 9. 提升 npm installer 的崩溃一致性
 
-## 10. 对齐 npm publish 的实际权限、文档与测试
+**证据**
 
-**事实依据**
-
-- `.github/workflows/ci.yml` 的 `publish` job 当前同时拥有 `contents: write` 与 `id-token: write`；前者用于 `gh release create`，后者用于 npm Trusted Publishing。
-- `docs/installation.md` 仍写“publish job 只有 `contents: read` 与 `id-token: write`”。
-- `tests/test_release.py` 验证 OIDC、main/version gate、GitHub-hosted runner、无 `NODE_AUTH_TOKEN` 和 action SHA，但没有固定 `contents` permission。
+`bin/herdr-orchestrator.mjs` 先计算 conflict/preserved/removal/desired files，再逐项
+unlink/write，最后写 manifest 和 Git exclude。Hash ownership、symlink guard 和用户修改保留
+已有测试；但跨多个项目文件、manifest 与 Git common-dir exclude 不是一个文件系统事务。
 
 **风险**
 
-维护者可能基于过时文档误判 least-privilege 边界；未来 workflow 变更也可能在没有测试提示的情况下扩大或缩小 repository write 权限。
+磁盘满、进程异常或机器中断可能留下部分新内容与旧/缺 manifest。Doctor 可以发现部分问题，
+但用户仍需重跑或人工判断 ownership。
 
-**取舍**
+**可执行动作**
 
-把 npm publish 与 GitHub release 拆成两个 job 可让 registry publish 保持 `contents: read`，但会增加 job、权限交接和失败恢复状态；保留单 job 更简单，则需要准确记录 `contents: write` 的用途并由测试固定。
+优先为每个文件使用同目录 temporary + fsync/rename，并记录最小 reconciliation journal；
+设计可重复恢复测试。不要声称可以把项目 checkout 和外部 Git common dir 纳入真正单事务。
 
-**何时处理**
+**触发条件**
 
-在下一次修改 release workflow、Environment policy、release notes 或 npm Trusted Publishing 配置时处理。无论选择拆分还是保留，都应以 `.github/workflows/ci.yml` 为运行真源，并保持 contributor code 不进入 self-hosted/OIDC 写权限边界。
+受管文件继续增长、进入无人值守批量安装，或出现真实 partial-install 事故时。
 
-相关：[安装与分发](systems/installation-and-distribution.md) · [安全](security.md#ci-与-npm-oidc) · [部署与发布](deployment.md)
+## 10. 对齐发布文档、实际权限和回归测试
 
-## 刻意不列为“清理”的设计边界
+**证据**
 
-以下行为看似可以“自动收拾”，但当前证据表明它们是安全或恢复不变量，不应在普通维护中顺手改变：
+当前 `.github/workflows/ci.yml`：
+
+- `test` 在 `ubuntu-latest`；
+- 只有 `release-plan` 在 self-hosted runner；
+- `publish` 拥有 `contents: write` 与 `id-token: write`；
+- 发布两个 npm 包，运行包发布后创建 GitHub Release。
+
+但 `docs/installation.md` 仍写 test 在 self-hosted runner，并写 publish 只有
+`contents: read` 与 `id-token: write`。`tests/test_release.py` 固定 runner 数量、OIDC、无
+token 和 action pinning，但没有断言 `contents` permission 及其用途。
+
+**风险**
+
+维护者会基于过时文档误判不可信代码与 write permission 边界；未来 workflow 权限变化也
+可能缺少测试提示。
+
+**可执行动作**
+
+先把 `docs/installation.md` 对齐当前 workflow；再在 `tests/test_release.py` 中断言：
+test/release-plan 的只读边界、publish 的 `contents: write`/`id-token: write`，以及
+GitHub Release 是 contents write 的唯一当前用途。若拆分 npm publish 与 GitHub Release
+job，则同步降低前者权限并更新恢复文档。
+
+**触发条件**
+
+应立即在下一次安装/发布文档或 CI 变更中处理，因为运行真源与文档已可证明不一致。
+
+## 刻意不列为清理的边界
 
 | 不应顺手做的事 | 原因 |
 | --- | --- |
-| 自动删除失败/成功 worktree、branch 或 checkout | Worktree 是可恢复任务与未集成代码证据；普通 GC 明确排除它 |
-| 让普通 queue 自动回答 blocked agent | 人工 `resume --response-file` 是权限边界；只有显式标准化交付有有界 principal proxy |
-| 把 Dashboard 变成 retry/resume/focus 控制面 | 当前无认证模型只适用于 loopback、只读投影 |
-| 把 `idle`/`done` 当成任务成功 | Settlement 与 `task_verified` 是两个独立事实 |
-| 把标准化交付合并进普通 SQLite job 状态机 | 两条运行面的授权、artifact、退出码和恢复语义刻意分离 |
-| 让 installer 接管内容相同的既有 Skill | 内容相同不等于 ownership；现有测试要求复用但不接管 |
+| 自动删除成功/失败 worktree、branch 或 checkout | 它们可能含未集成代码和恢复证据；普通 GC 明确排除 |
+| 让普通 queue 自动回答 blocked agent | 人工 resume 是授权边界；只有显式 delivery 有有界 proxy |
+| 给 Dashboard 增加 retry/resume/focus | 当前无认证模型只适用于 loopback 只读 |
+| 把 `idle/done` 当任务成功 | Settlement 与 verification 是独立事实 |
+| 合并普通 queue 与 delivery 状态机 | 两者授权、artifact、退出码和恢复语义刻意分离 |
+| 让 installer 接管内容相同的外部 Skill | 内容相同不等于 ownership |
+| 删除“似乎重复”的 store/herdr 分支 | 分支承载 running/blocked、attempt、pane ownership 等不同前置条件 |
+| 因根包零依赖就内联 `herdr-manager` 薄包 | 薄包提供独立 `npx herdr-manager` 分发面，并通过单依赖复用真源 |
 
-创建正式工作项前，应先用对应测试复现风险、确认 owner 与范围，再按仓库债务策略记录；本页本身不替代 issue tracker。
+创建正式工作项前，应先用相关测试复现维护风险，确认 owner、兼容范围与验收标准，再采用仓库
+要求的带 issue/owner 债务格式；本页本身不替代 issue。
+
+## 相关页面
+
+- [安全与信任边界](security.md)
+- [设计取舍](background/design-decisions.md)
+- [运行时经验](background/runtime-lessons.md)
+- [依赖参考](reference/dependencies.md)
+- [贡献约定](how-to-contribute/patterns-and-conventions.md)

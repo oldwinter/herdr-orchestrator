@@ -1,80 +1,105 @@
 # 依赖
 Active contributors: oldwinter, chendongdong
 
-herdr-orchestrator 的控制面刻意使用 Python 标准库；Python 包与 npm 包都没有第三方
-runtime package dependency。外部能力通过本机 CLI 和 Herdr terminal runtime 提供。
+核心 Python runtime 只用标准库，没有第三方生产依赖。开发工具、Node 分发包装、外部 CLI 和 Dashboard 内置的 Cytoscape.js 属于不同依赖层，升级时不能把它们混成一张 runtime package 清单。
 
-## Runtime package dependency：零
+## 依赖概览
 
-| 分发面 | 证据 | 结论 |
-| --- | --- | --- |
-| Python | `pyproject.toml` 的 `[project].dependencies = []` | 安装后的 Python runtime 不拉取第三方 Python 包 |
-| Python lock | `uv.lock` 中 root package `herdr-orchestrator==0.1.2` 只有 dev dependency group | Lock 中的第三方包用于开发/质量门禁，不是 runtime dependency |
-| npm | `package.json` 没有 `dependencies`/`devDependencies`；`package-lock.json` 只有 root package | npm wrapper 只使用 Node 内建模块 |
+| 层 | 直接依赖数 | 真源 | 结论 |
+| --- | ---: | --- | --- |
+| Python 生产 runtime | 0 | `pyproject.toml` 的 `[project].dependencies = []` | 安装核心包不拉取第三方 Python runtime 包 |
+| Python build | 1 | `pyproject.toml` 的 `[build-system]` | `setuptools==80.9.0` 只用于构建 |
+| Python 开发工具 | 17 | `pyproject.toml` 的 `[dependency-groups].dev` | 全部精确 pin；`uv.lock` 锁定其传递图 |
+| 根 npm 包 | 0 | `package.json`、`package-lock.json` | Node wrapper 只用内建模块并携带 Python/runtime 文件 |
+| `herdr-manager` npm 包 | 1 | `packages/herdr-manager/package.json` | 依赖 `herdr-orchestrator ^0.1.6` |
+| Vendored 浏览器库 | 1 | `src/herdr_orchestrator/dashboard/static/cytoscape.min.js` | 仓库内静态 asset，不经 npm/CDN 获取 |
 
-主要标准库能力包括 `argparse`、`dataclasses`、`enum`、`json`、`pathlib`、`sqlite3`、
-`subprocess`、`tomllib`、`concurrent.futures` 与 `http.server`。SQLite 是 Python 标准库
-模块，不需要独立数据库服务。
+当前 `uv.lock` 有 73 个 package entry，其中一个是 editable root `herdr-orchestrator==0.1.6`；其余是 17 个直接开发工具的解析结果和传递依赖，不会改变生产依赖为零这一事实。
 
-## 必需或按功能启用的系统/CLI 工具
+## Python 生产与构建
 
-| 工具 | 版本/条件 | 何时需要 |
+`pyproject.toml` 要求 Python 3.12+，入口点是：
+
+```toml
+[project.scripts]
+herdr-orchestrator = "herdr_orchestrator.cli:main"
+```
+
+核心实现使用 `argparse`、`concurrent.futures`、`dataclasses`、`enum`、`http.server`、`json`、`pathlib`、`sqlite3`、`subprocess`、`tomllib` 和 `urllib.request` 等标准库模块。SQLite 通过 Python 标准库提供，不需要独立数据库服务；可选 Sentry、PostHog 和 webhook exporter 也没有引入 SDK。
+
+Build backend 是 `setuptools.build_meta`，构建环境依赖 `setuptools==80.9.0`。这是 build-time dependency，不是 `[project].dependencies` 中的生产 runtime dependency。
+
+## Python 开发依赖
+
+`pyproject.toml` 和 `uv.lock` 精确固定以下 17 个直接开发工具：
+
+| 类别 | 工具与版本 |
+| --- | --- |
+| 测试与覆盖率 | `pytest==9.1.1`、`pytest-cov==7.1.0`、`pytest-json-report==1.5.0`、`coverage==7.15.4` |
+| 格式、lint 与类型 | `ruff==0.16.4`、`black==26.5.1`、`mypy==2.3.1`、`pylint==4.0.7` |
+| 安全 | `bandit==1.9.4`、`pip-audit==2.10.1`、`detect-secrets==1.5.0` |
+| 依赖与架构 | `deptry==0.25.1`、`import-linter==2.13` |
+| 复杂度与 dead code | `radon==6.0.1`、`vulture==2.16`、`xenon==0.9.3` |
+| 本地 hook | `pre-commit==4.6.2` |
+
+源码 checkout 使用 `uv sync --locked` 还原这些工具。质量入口见[开发工具](../how-to-contribute/tooling.md)；新增 Python 生产依赖时必须同时更新 `pyproject.toml`、`uv.lock`、分发测试和依赖审计。
+
+## Node 包与 runtime
+
+### 根包 `herdr-orchestrator`
+
+`package.json` 当前版本是 `0.1.6`，要求 Node.js 20+，暴露两个 bin 名：
+
+- `herdr-orchestrator` → `bin/herdr-orchestrator.mjs`
+- `herdr-manager` → `bin/herdr-orchestrator.mjs`
+
+根包没有 `dependencies` 或 `devDependencies`；`package-lock.json` 也只有 root package。它把 `bin/`、`manager/`、`plugins/manager-light/`、`profiles/`、`skills/`、Python 源码、Dashboard 静态资源和一个 planner prompt 一并打包。Node 是安装、升级、卸载和 runtime 转发层，不替代 Python 3.12+、Herdr 或 harness CLI。
+
+### 薄包 `herdr-manager`
+
+`packages/herdr-manager/package.json` 当前版本是 `0.1.0`，要求 Node.js 20+，只暴露 `packages/herdr-manager/bin/herdr-manager.mjs`。它唯一的生产 package dependency 是 `herdr-orchestrator ^0.1.6`，用于把 `npx herdr-manager` 转发到 canonical manager 实现；它不是第二套 coordinator。
+
+安装和 manager 模式的边界见[安装与分发](../systems/installation-and-distribution.md)。
+
+## 外部 runtime 与命令
+
+这些工具不在 Python/npm dependency graph 中，但对应功能运行时需要它们：
+
+| 工具 | 条件 | 使用场景 |
 | --- | --- | --- |
 | Python | 3.12+ | 所有 Python runtime 命令 |
-| Herdr | 0.8.2+；`HERDR_ENV=1`，并具有 pane/workspace id | Dispatch、readiness、smoke、Dashboard topology；应从 Herdr pane 内运行 |
-| Git | 本机 `git` CLI | `doctor` 总会检查；worktree placement 与标准化交付依赖 Git repository |
-| 至少一个 harness CLI | `droid`、`grok`、`codex`、`pi`、`claude`、`hermes` 之一，且已登录 | Controller/worker 的真实 turn；配置中启用的 harness 必须有 profile，运行还需要可执行文件和健康认证态 |
-| Node.js | 20+ | 仅 npm 一键安装、升级、卸载与 `npx` runtime wrapper |
-| GitHub CLI `gh` | 已认证 | 仅 `[standardized_delivery].tracker_backend="github"`；会创建、更新和关闭该次交付的 issue |
-| `just` | 无固定版本声明 | 仅源码 checkout 的稳定 recipe 入口 |
-| `uv` | 能消费当前 `uv.lock` | 仅源码 checkout 的同步、测试和质量命令 |
+| Herdr | 仓库文档基线为 0.8.2+ | Agent pane、workspace、worktree、readiness、smoke、Dashboard topology |
+| Git | 本机 CLI | Doctor 检查、worktree placement、标准化交付 |
+| Harness CLI | 启用的 `droid`、`grok`、`codex`、`pi`、`claude`、`hermes` | Controller 与 worker 的真实 turn；还需要各自登录态 |
+| Node.js | 20+ | npm/npx 安装包装与 manager 入口 |
+| GitHub CLI `gh` | 已认证 | 仅标准化交付的 GitHub tracker backend |
+| `just` | 仓库未 pin 版本 | 源码 checkout 的稳定 recipe |
+| `uv` | 能消费当前 `uv.lock` | 开发环境同步、测试和质量门禁 |
 
-`doctor` 不只检查 executable：它还验证 Herdr 环境、`herdr --version`、Git、profile 文件，
-并对所选 harness 做有界真实 readiness turn。若 GitHub tracker 已启用，还会检查 `gh`。
+这些 executable 的存在不等于健康。`doctor` 还检查 Herdr 环境、profile、Git 和有界 harness readiness。命令用法见 [CLI](cli-reference.md)。
 
-Harness agent 的最高自动化启动参数由 `src/herdr_orchestrator/herdr.py` 固定，不是可安装的
-Python dependency，也不能由 planner 注入：
+## Vendored Cytoscape.js
 
-| Harness | 参数 |
+Dashboard topology 使用 vendored Cytoscape.js **3.34.1**：
+
+| 完整路径 | 用途 |
 | --- | --- |
-| Droid | `--auto high` |
-| Grok Build | `--always-approve --permission-mode bypassPermissions` |
-| Codex | `--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust` |
-| pi | `--approve` |
-| Claude Code | `--dangerously-skip-permissions` |
-| Hermes | `--yolo --accept-hooks` |
+| `src/herdr_orchestrator/dashboard/static/cytoscape.min.js` | 压缩后的浏览器 runtime；文件内版本为 3.34.1 |
+| `src/herdr_orchestrator/dashboard/static/cytoscape.LICENSE.txt` | Cytoscape Consortium 的 MIT License |
+| `src/herdr_orchestrator/dashboard/static/index.html` | 从 `/assets/cytoscape.min.js` 本地加载 |
+| `src/herdr_orchestrator/dashboard/server.py` | 只从 allowlist 提供该 asset |
 
-这些参数降低本地交互确认，不扩大任务对 push、merge、发布、权限或生产操作的授权。
+`pyproject.toml` 的 package data 和 `package.json` 的 files 清单都会分发 `.js` 与 `.txt`。因此它不是 npm install 产生的 runtime dependency，也不依赖 CDN 或网络。升级时要保留许可文件，并验证 `tests/test_dashboard.py` 与 `tests/test_topology_js.py`。
 
-## Build 与开发工具
+## 关键源文件
 
-Python build backend 是 `setuptools.build_meta`，构建依赖固定为 `setuptools==80.9.0`。
-`pyproject.toml` 与 `uv.lock` 固定下列 dev group：
-
-| 工具 | 版本 | 用途 |
-| --- | --- | --- |
-| `pytest`, `pytest-cov`, `pytest-json-report` | 9.1.1, 7.1.0, 1.5.0 | 测试、branch coverage、机器报告 |
-| `coverage` | 7.15.4 | Coverage 数据 |
-| `ruff`, `black` | 0.16.4, 26.5.1 | Lint 与格式检查 |
-| `mypy`, `pylint` | 2.3.1, 4.0.7 | 严格类型与补充 lint |
-| `bandit`, `pip-audit`, `detect-secrets` | 1.9.4, 2.10.1, 1.5.0 | 安全检查 |
-| `deptry`, `import-linter` | 0.25.1, 2.3 | Dependency 与 import architecture |
-| `radon`, `vulture`, `xenon` | 6.0.1, 2.16, 0.9.3 | 复杂度与 dead-code gate |
-| `pre-commit` | 4.6.2 | 本地 hook orchestration |
-
-`justfile` 的 `just check` 会先执行 `uv sync --locked`，再运行 compile、lint、coverage、
-stability、security、metrics、profiling 与 quality summary。新增 runtime dependency
-需要更新 `pyproject.toml`、`uv.lock` 和分发/安全契约，不能只在源码中 import。
-
-## Vendored Cytoscape
-
-Dashboard 的 topology 图使用 vendored **Cytoscape.js 3.34.1**：
-
-- 文件：`src/herdr_orchestrator/dashboard/static/cytoscape.min.js`
-- 许可：文件头保留 Cytoscape Consortium 的 MIT License
-- 分发：由 `pyproject.toml` package data 和 `package.json` files 清单随 runtime 打包
-- 加载：Dashboard 从 `/assets/cytoscape.min.js` 本地提供，不依赖 CDN、npm install 或网络
-
-因此 Cytoscape 是仓库内静态 vendor asset，而不是 Python/npm runtime package dependency。
-升级时必须保留许可头，并同步验证 `tests/test_dashboard.py` 和
-`tests/test_topology_js.py`。
+| 完整路径 | 用途 |
+| --- | --- |
+| `pyproject.toml` | Python 版本、build backend、生产与开发依赖 |
+| `uv.lock` | Python 开发工具的完整解析结果 |
+| `package.json` | 根 npm 包、bin、engine 与分发清单 |
+| `package-lock.json` | 根 npm 包锁文件 |
+| `packages/herdr-manager/package.json` | Manager 薄包及其一个 package dependency |
+| `.env.example` | 可选 exporter 的无 SDK 配置模板 |
+| `src/herdr_orchestrator/dashboard/static/cytoscape.min.js` | Vendored Cytoscape.js |
+| `src/herdr_orchestrator/dashboard/static/cytoscape.LICENSE.txt` | Vendored 许可 |

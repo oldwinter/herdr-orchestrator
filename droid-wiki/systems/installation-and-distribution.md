@@ -1,191 +1,342 @@
 # 安装与分发
 Active contributors: oldwinter, chendongdong
 
-Active contributors: oldwinter, chendongdong
+## 定位
 
-## Purpose
+Herdr Orchestrator 的分发面由三个彼此独立、职责不同的入口组成：
 
-Herdr Orchestrator 有两层分发面：`npx skills add` 安装可移植的 agent 操作说明，`npx --yes herdr-orchestrator install` 安装项目本地 workflow、profiles、可选 Skill 和 Python control plane 的运行入口。Node wrapper 通过 ownership manifest 管理自己写入的文件，升级和卸载都保留用户修改。
+1. `npx skills add` 只安装 agent 操作说明；
+2. `npx --yes herdr-orchestrator install` 把 durable control plane 安装到目标 Git 仓库；
+3. `npx --yes herdr-manager` 启动一次性的手动 Herdr 管理会话。
 
-本页说明实现契约。首次使用步骤见[快速开始](../overview/getting-started.md)，CI 与发布边界见[部署](../deployment.md)，安装器的信任边界见[安全](../security.md)。
+主 npm 包中的 `bin/herdr-orchestrator.mjs` 是无运行时 npm 依赖的 installer/runtime
+wrapper。它不下载 Python，而是携带 Python 源码、workflow 模板、harness profiles、固定
+Manager policy 与 Manager Light 插件，再通过目标机器已有的 Python 3.12+ 执行控制面。
 
-## 布局
+首次使用见[快速开始](../overview/getting-started.md)；交互式入口见
+[手动 Manager](manual-manager.md)；sidebar 投影见[Manager Light](manager-light.md)；
+发布流水线见[部署、发布与维护](../deployment.md)；信任边界见
+[安全与信任边界](../security.md)。
+
+## 仓库布局
 
 ```text
-bin/
-└── herdr-orchestrator.mjs       # npm executable、安装器和 runtime wrapper
-package.json                     # npm 元数据、打包清单与 Node 版本
-pyproject.toml                   # Python 包、CLI 入口与 Python 版本
-skills/herdr-orchestrator/
-└── SKILL.md                     # 可移植 agent 操作契约
-profiles/harnesses/              # npm 包携带的 profile 模板
-workflows/prompts/planner.md     # npm 包携带的 planner prompt
-scripts/
-└── npm-release-plan.mjs         # Registry 版本 gate
-.github/workflows/
-└── ci.yml                       # 测试、release plan、npm publish
-tests/
-├── test_distribution.py
-├── test_release.py
-└── test_skill_package.py
+bin/herdr-orchestrator.mjs                 # 主 npm executable、安装器、runtime wrapper
+package.json                               # herdr-orchestrator 包元数据和打包清单
+packages/herdr-manager/
+├── package.json                           # 薄 herdr-manager npm 包
+└── bin/herdr-manager.mjs                  # 固定 argv 转发到主 runtime
+manager/
+├── AGENTS.md                              # 手动 Manager canonical policy
+└── CLAUDE.md                              # Claude 适配入口，只引用 AGENTS.md
+plugins/manager-light/                     # 可选 Herdr sidebar metadata 投影
+profiles/harnesses/                        # 六种 harness 的紧凑与完整 profiles
+skills/herdr-orchestrator/SKILL.md         # 可移植 agent Skill
+workflows/prompts/planner.md               # 安装包携带的 planner prompt
+scripts/npm-release-plan.mjs               # npm registry 版本 gate
+.github/workflows/ci.yml                   # 测试、双包 release plan、OIDC 发布
+tests/test_distribution.py                 # 安装、ownership、Manager 分发契约
+tests/test_manager_light.py                # Manager Light 契约
+tests/test_release.py                       # 双包 release 与 OIDC 契约
 ```
 
-安装到目标项目后的托管面是：
+安装到目标仓库后，项目本地受管面为：
 
 ```text
 <project>/
 ├── .herdr-orchestrator/
 │   ├── manifest.json
-│   ├── workflows/
-│   │   ├── multi-harness.toml
-│   │   └── prompts/planner.md
-│   └── profiles/harnesses/<selected>.{toml,md}
+│   ├── manager/
+│   │   ├── AGENTS.md
+│   │   └── CLAUDE.md
+│   ├── profiles/harnesses/<selected>.{toml,md}
+│   └── workflows/
+│       ├── multi-harness.toml
+│       └── prompts/planner.md
 ├── .agents/skills/herdr-orchestrator/SKILL.md  # 可选
 └── .orchestrator/.gitignore
 ```
 
 ## 关键抽象
 
-| 抽象 | 所在文件 | 作用 |
-| --- | --- | --- |
-| `install()` | `bin/herdr-orchestrator.mjs` | 探测 harness、生成 workflow、协调托管文件并写 manifest。 |
-| `loadManifest()` | `bin/herdr-orchestrator.mjs` | 校验 manifest schema、版本、harness 列表、文件哈希和允许路径。 |
-| `isManagedPath()` | `bin/herdr-orchestrator.mjs` | 把 manifest ownership 限制在三个项目本地根及 runtime ignore 文件。 |
-| `assertNoSymlink()` | `bin/herdr-orchestrator.mjs` | 拒绝托管路径任一层的符号链接。 |
-| `installLocalGitExcludes()` | `bin/herdr-orchestrator.mjs` | 在 Git-local `info/exclude` 中维护带边界标记的 ignore block。 |
-| `inspectInstallation()` / `doctor()` | `bin/herdr-orchestrator.mjs` | 比对 manifest 哈希和版本，再合并 Python runtime doctor 结果。 |
-| `runRuntime()` | `bin/herdr-orchestrator.mjs` | 注入已安装 workflow 路径与包内 `src/` 的 `PYTHONPATH`，转发 Python CLI 命令。 |
-| `uninstall()` | `bin/herdr-orchestrator.mjs` | 仅删除仍与 manifest 哈希一致的文件，保留已修改文件。 |
-| Release plan | `scripts/npm-release-plan.mjs` | 查询 npm registry，只在当前版本尚不存在时启用发布 job。 |
+| 抽象 | 职责与不变量 |
+| --- | --- |
+| `install()` | 探测或校验 harness、生成 workflow、协调受管文件、写 manifest，并维护 Git-local exclude。 |
+| `loadManifest()` | 校验 schema 1、包名、版本、唯一 harness 列表、Skill 偏好和每个 SHA-256。 |
+| `isManagedPath()` | 将 manifest ownership 限制在 `.herdr-orchestrator/`、可选 Skill 根和 `.orchestrator/.gitignore`。 |
+| `assertNoSymlink()` | 在读写前逐层 `lstat` 受管路径；任何 symlink 都失败关闭。 |
+| `gitExcludePath()` | 通过 `git -C <project> rev-parse --git-path info/exclude` 找到 Git-local exclude。 |
+| `inspectInstallation()` / `doctor()` | 检查 missing、modified、version skew，再合并 Python runtime doctor。 |
+| `runRuntime()` | 注入已安装 workflow 和包内 `src/` 的 `PYTHONPATH`，其余参数原样转发。 |
+| `uninstall()` | 只删除仍匹配 manifest hash 的文件；用户修改项保留。 |
+| `packages/herdr-manager/bin/herdr-manager.mjs` | 不使用 shell，只把 argv 转发给主包的 `manager` 子命令。 |
+| `scripts/npm-release-plan.mjs` | 分别检查两个 npm 包的当前版本是否已存在，只有明确缺失才发布。 |
 
-## How it works
+## 三条安装路径
 
-```mermaid
-graph TD
-    Command["npx herdr-orchestrator install"] --> Parse["解析 project / harness / Skill 选项"]
-    Parse --> Detect["显式 harness 或本机 CLI 探测"]
-    Detect --> Stage["生成 workflow，暂存 profiles / prompt / Skill"]
-    Stage --> Safety["路径、symlink、ownership 与 hash 校验"]
-    Safety -->|冲突| Stop["退出 2，不写入目标文件"]
-    Safety -->|可协调| Reconcile["写新文件，保留用户修改，删除未改旧文件"]
-    Reconcile --> Manifest["写 manifest.json"]
-    Manifest --> Exclude["更新 Git-local info/exclude"]
-    Exclude --> Runtime["后续命令转发 Python CLI"]
-```
-
-### 1. 两种安装入口
-
-`docs/installation.md` 给出的 Skill-only 命令是：
+### 只安装可移植 Skill
 
 ```bash
 npx skills add oldwinter/herdr-orchestrator \
   --skill herdr-orchestrator --agent '*' -y
 ```
 
-它只复制 `skills/herdr-orchestrator/SKILL.md` 一类 agent 指令，不安装 Python control plane，也不创建 workflow。`tests/test_skill_package.py` 要求可移植 Skill 始终使用 npm runtime，不引用源码 checkout 的 `PYTHONPATH=src` 或仓库内 workflow 路径。
+该入口只复制 `skills/herdr-orchestrator/SKILL.md`，不创建 workflow、不安装项目 runtime，
+也不接管 durable state。使用 `-g` 可安装为用户级 Skill。仓库同时包含 opt-in
+standardized-delivery Skills，因此命令必须显式指定 `--skill herdr-orchestrator`。
 
-完整 bootstrap 使用：
+### 安装项目 runtime
 
 ```bash
+cd /path/to/target-repository
 npx --yes herdr-orchestrator install --project .
+npx --yes herdr-orchestrator doctor --project .
 ```
 
-`package.json` 要求 Node.js 20 或更高；`pyproject.toml` 要求 Python 3.12 或更高。npm 包没有 runtime npm dependency，Python 项目也没有 runtime Python dependency，但目标机器仍需 Git、Herdr 和至少一个受支持且可用的 harness CLI。
+前置条件是 Node.js 20+、Python 3.12+、Git、Herdr，以及至少一个已安装的 harness CLI。
+主 npm 包本身没有 runtime npm dependencies，也不会执行全局安装或要求提权。
 
-### 2. Harness 与 Skill 选择
+首次安装未给 `--harness` 时，wrapper 依次对六个稳定名称运行 `<harness> --version`，
+把成功者写入安装：
 
-`install()` 在 `bin/herdr-orchestrator.mjs` 中支持重复 `--harness`。没有显式列表时，首次安装会对六个稳定名称执行 `<harness> --version`，保留成功的 CLI；升级时若未传新列表，则沿用 manifest 中的 harnesses。空结果返回 `no_harness_detected`，未知名称返回 `unsupported_harness`。
+```text
+droid · grok · codex · pi · claude · hermes
+```
 
-Skill 安装遵循以下顺序：
+这只是 executable 探测，不证明认证、模型或 provider 健康。可以显式固定：
 
-1. `--install-skill` 或 `--skip-skill` 显式决定；
-2. 升级沿用 manifest 的 `install_skill` 或既有托管文件；
-3. 首次安装且目标已有 `.agents/skills/` router 时默认跳过；
-4. 其他首次安装默认写入项目 Skill。
+```bash
+npx --yes herdr-orchestrator install --project . \
+  --harness droid \
+  --harness codex
+```
 
-若目标已有内容相同但不受 manifest 管理的 Skill，安装器复用它但不取得 ownership，也不会把该 Skill 根加入 installer 的 Git exclude。
+升级未传 `--harness` 时沿用 manifest 中的列表；显式传入新列表则协调 profiles 与
+workflow。无候选时返回 `no_harness_detected`，未知名称返回 `unsupported_harness`。
 
-### 3. 生成项目本地运行面
+### 启动一次性 Manager
 
-`renderWorkflow()` 在 `bin/herdr-orchestrator.mjs` 中根据选定 harness 动态生成 worker 表、`planner.worker_harnesses` 和不超过 6 的 `coordinator.max_parallel`。安装器从 npm 包复制对应的 `profiles/harnesses/<name>.toml`、`profiles/harnesses/<name>.md` 和 `workflows/prompts/planner.md`，并写入 `.orchestrator/.gitignore`。
+```bash
+npx --yes herdr-manager
+npx --yes herdr-manager claude
+```
 
-`package.json` 的 `files` 清单包含 Node wrapper、全部 profile、portable Skill、Python 包、Dashboard 静态资源和 planner prompt。Workflow 本身由 wrapper 生成，因此 npm 清单只需要携带 prompt 模板。`tests/test_distribution.py` 会实际 `npm pack`，再从 checkout 外通过该 tarball 执行安装，固定这项可移植性契约。
+`herdr-manager` 是薄 npm 包，只依赖 `herdr-orchestrator` 并把固定 argv 转发给其 runtime；
+它不复制项目文件、不创建 manifest，也不需要 `--project`。默认 harness 顺序严格为
+`grok → codex → claude`。完整行为见[手动 Manager](manual-manager.md)。
 
-### 4. Manifest 驱动协调
-
-`.herdr-orchestrator/manifest.json` 保存 schema version、包名、已安装版本、harness 列表、Skill 选择以及每个托管文件的 SHA-256。`loadManifest()` 只接受以下 ownership 范围：
-
-- `.herdr-orchestrator/`
-- `.agents/skills/herdr-orchestrator/`
-- `.orchestrator/.gitignore`
-
-安装前，`assertNoSymlink()` 检查托管路径每一层；Git exclude 也必须是安全的普通文件。协调规则是：
-
-| 当前状态 | 安装/升级行为 |
-| --- | --- |
-| 文件不存在 | 写入并记录新 hash |
-| 非托管文件与期望内容相同 | 复用但不取得 ownership |
-| 非托管文件与期望内容不同 | 在任何目标写入前以 `unmanaged_file_conflict` 停止 |
-| 托管文件仍等于旧 hash | 更新到包内期望内容 |
-| 托管文件已被用户修改 | 保留内容和旧 hash，结果返回 `ok=false`、退出码 1 |
-| 旧托管文件已不再需要且未修改 | 删除 |
-| 旧托管文件已不再需要但被修改 | 保留并继续记录旧 hash |
-
-安装器在仓库的 Git-local `info/exclude` 中维护带 `BEGIN/END` 标记的 block，不修改 tracked `.gitignore`。原生 linked worktree 的外部 common Git directory 被允许，但符号链接伪装的 `.git` 或 exclude 会被拒绝。`tests/test_distribution.py` 覆盖了冲突、symlink、linked worktree、用户修改保留和 Git status 不变等行为。
-
-### 5. 诊断、运行与卸载
-
-`doctor()` 先由 `inspectInstallation()` 检查 missing、modified 和 manifest/runtime version skew，再调用包内 Python 模块的 `doctor --workflow <installed-workflow>`。stdout 是一个 JSON 文档，顶层 `ok` 只有在 installation 与 runtime 都健康时才为 true。
-
-除 setup 命令外，`runRuntime()` 把 `.herdr-orchestrator/workflows/multi-harness.toml` 作为 `--workflow` 注入，并将 npm 包的 `src/` 加入子进程 `PYTHONPATH`。wrapper 未消费的参数原样转发给 `src/herdr_orchestrator/cli.py`。
-
-`upgrade` 和 `update` 都复用 `install()` 的协调逻辑。`uninstall()` 只删除仍匹配 manifest hash 的文件，保留用户修改项并以退出码 1 报告；处理后会移除 manifest，因此保留项不再受安装器管理。只有相关托管根都不存在时，安装器才移除 Git exclude block。
-
-### 6. npm 发布
+## 安装控制流
 
 ```mermaid
-graph LR
-    Push["push 到 main"] --> Tests["CI test gate"]
-    Tests --> Plan["self-hosted release-plan"]
-    Plan --> Registry["查询 npm 已有版本"]
-    Registry -->|版本已存在| Noop["成功 no-op"]
-    Registry -->|版本缺失| Publish["ubuntu-latest OIDC publish"]
-    Publish --> Npm["npm registry"]
-    Publish --> Release["GitHub release notes"]
+flowchart TD
+    A[npx herdr-orchestrator install] --> B[解析 project、harness、Skill 选项]
+    B --> C[解析 Git info/exclude 并检查 symlink]
+    C --> D[读取并校验旧 manifest]
+    D --> E[生成 workflow 与目标文件集合]
+    E --> F{非托管冲突?}
+    F -- 是 --> X[退出 2，不协调目标文件]
+    F -- 否 --> G[保留用户修改项]
+    G --> H[写新文件并删除未改旧文件]
+    H --> I[写 manifest 和 SHA-256]
+    I --> J[更新带 marker 的 Git-local exclude]
+    J --> K[输出机器可读 JSON]
+    K --> L{存在 preserved?}
+    L -- 是 --> M[退出 1，等待人工协调]
+    L -- 否 --> N[退出 0]
 ```
 
-当前 `.github/workflows/ci.yml` 在 `ubuntu-latest` 上运行测试和质量 gate。`main` 测试成功后，带仓库专属标签的 self-hosted runner 执行 `scripts/npm-release-plan.mjs`：它严格校验 `package.json` 的 name/version，查询 `npm view <name> versions --json`，registry 错误会中止，已有版本是成功 no-op。
+`renderWorkflow()` 根据已选 harness 生成 worker 表、planner 候选池和最多为 6 的
+`coordinator.max_parallel`。安装器复制对应的 compact/full profiles、planner prompt、
+`manager/AGENTS.md`、`manager/CLAUDE.md`，并写入只忽略 runtime state 的
+`.orchestrator/.gitignore`。
 
-缺失版本才会启用 GitHub-hosted `publish` job。该 job 使用 npm Trusted Publishing 的 OIDC `id-token: write`，不设置长期 `NODE_AUTH_TOKEN`，执行 `npm publish --access public`，随后为同一版本创建 GitHub release notes。`tests/test_release.py` 固定了 registry failure、版本 gate、runner 类型、OIDC 和 action pinning。
+## 操作说明选择
+
+项目 Skill 是否由 installer 管理，按以下优先级决定：
+
+1. 显式 `--install-skill` 或 `--skip-skill`；
+2. 升级沿用 manifest 的 `install_skill`，旧 manifest 则从受管文件推导；
+3. 首次安装且目标已有 `.agents/skills/` router 时默认跳过；
+4. 其他首次安装默认安装。
+
+```bash
+npx --yes herdr-orchestrator install --project . --install-skill
+npx --yes herdr-orchestrator upgrade --project . --skip-skill
+```
+
+内容完全相同、但已由 `npx skills` 等外部工具安装的 Skill 会被复用而不被写入 manifest。
+因此 installer 不会在升级或卸载时删除它，也不会把其目录加入自己的 Git exclude block。
+
+## 清单所有权
+
+`.herdr-orchestrator/manifest.json` 记录：
+
+- `schema_version = 1`；
+- 固定包名 `herdr-orchestrator`；
+- 安装时包版本；
+- 唯一且受支持的 harness 列表；
+- `install_skill` 偏好；
+- 每个受管文件的 SHA-256。
+
+Manifest 路径必须是项目相对路径，不能含反斜线、`..` 或受管根之外的条目。协调规则如下：
+
+| 当前状态 | 安装、升级或卸载行为 |
+| --- | --- |
+| 目标文件不存在 | 写入并记录期望 hash。 |
+| 非托管文件内容相同 | 复用，不取得 ownership。 |
+| 非托管文件内容不同 | 在目标协调前以 `unmanaged_file_conflict` 退出 2。 |
+| 受管文件仍等于旧 hash | 更新到新内容，或在不再需要时删除。 |
+| 受管文件已被用户修改 | 保留字节和旧 hash；返回 `preserved`、`ok=false`、退出 1。 |
+| 卸载时受管文件未修改 | 删除。 |
+| 卸载时受管文件已修改 | 保留；manifest 仍会移除，该文件随后不再受管。 |
+
+`doctor` 会把 manifest 的 missing、modified 和 `version_skew` 与 Python runtime 检查合并：
+
+```bash
+npx --yes herdr-orchestrator doctor --project .
+```
+
+只有 `installation.ok`、`runtime.ok` 与顶层 `ok` 都为 `true` 才健康。真实 dispatch 还要求
+运行于具备正确 `HERDR_*` 环境的 Herdr pane；详见
+[Herdr runtime](herdr-runtime.md)。
+
+## Git `info/exclude`
+
+安装器不修改目标仓库已跟踪的 `.gitignore`，而是在 Git-local `info/exclude` 中维护：
+
+```text
+# BEGIN herdr-orchestrator managed paths
+/.herdr-orchestrator/
+/.orchestrator/
+/.agents/skills/herdr-orchestrator/   # 仅当 manifest 拥有 Skill
+# END herdr-orchestrator managed paths
+```
+
+这样生成面不会改变 `git status`，也不会把本地策略强加给其他 clone。实现先用 Git 解析
+真实 exclude 路径，再检查：
+
+- 项目内 `.git` 祖先或 exclude 本身若是 symlink，则拒绝写入；
+- exclude 已存在时必须是普通文件；
+- 原生 linked worktree 指向外部 common Git directory 的路径被允许；
+- marker 不完整时拒绝猜测或覆盖；
+- 卸载后只有相关受管根均不存在才移除 block。
+
+该设计把“Git 不显示”与“installer 拥有”分开：未被 manifest 接管的 Skill 不会被悄悄隐藏。
+
+## 运行时包装器
+
+安装完成后，wrapper 为 Python CLI 补齐项目 workflow：
+
+```bash
+npx --yes herdr-orchestrator catalog --project .
+npx --yes herdr-orchestrator status --project .
+npx --yes herdr-orchestrator run --project . --once
+npx --yes herdr-orchestrator run --project . --until-idle
+npx --yes herdr-orchestrator retry --project . --job-id 42
+npx --yes herdr-orchestrator resume --project . \
+  --job-id 43 --response-file approval.txt
+npx --yes herdr-orchestrator gc --project . --succeeded-agents
+npx --yes herdr-orchestrator dashboard --project .
+```
+
+`runRuntime()` 将
+`<project>/.herdr-orchestrator/workflows/multi-harness.toml` 固定为 `--workflow`，把 npm
+包内 `src/` 放进子进程 `PYTHONPATH`，并原样转发 wrapper 未消费的参数。Queue、lease、
+retry、receipt 与 GC 的语义仍由 Python coordinator 决定，不由 Node wrapper 重写。
+
+## 升级与卸载
+
+```bash
+npx --yes herdr-orchestrator upgrade --project .
+npx --yes herdr-orchestrator update --project .       # upgrade 的别名
+npx --yes herdr-orchestrator uninstall --project .
+```
+
+升级是同一套 manifest reconciliation，不是覆盖式复制。显式改变 harness 列表时，未修改且
+不再选择的 profiles 会删除，已修改文件会保留。卸载处理所有 manifest 条目后删除 manifest；
+返回 `preserved` 的文件由用户继续拥有。
+
+## 双 npm 包发布与 OIDC
+
+```mermaid
+flowchart LR
+    P[push 到 main] --> T[ubuntu-latest 测试与质量 gate]
+    T --> R[self-hosted release-plan]
+    R --> O[检查 herdr-orchestrator 版本]
+    R --> M[检查 herdr-manager 版本]
+    O --> D{任一版本明确缺失?}
+    M --> D
+    D -- 否 --> N[成功 no-op]
+    D -- 是 --> H[ubuntu-latest publish]
+    H --> A[先发布 herdr-orchestrator]
+    A --> B[再发布 herdr-manager]
+    A --> G[为 runtime 版本创建 GitHub Release]
+```
+
+`.github/workflows/ci.yml` 对 `package.json` 和
+`packages/herdr-manager/package.json` 分别运行 `scripts/npm-release-plan.mjs`：
+
+- registry 已有版本时是成功 no-op；
+- 显式 npm `E404` 表示新包或无已发布版本，可以发布；
+- 其他 registry、网络或 JSON 错误全部停止，不能猜成“版本缺失”；
+- 两个包独立决定是否发布，runtime 包先于依赖它的 Manager 薄包。
+
+真正的 publish 必须留在 GitHub-hosted `ubuntu-latest`，因为 npm Trusted Publishing
+不支持 self-hosted runner。Job 绑定 `npm` Environment，授予 `id-token: write` 取得 OIDC，
+并用 `npm publish --access public` 发布；不设置 `NODE_AUTH_TOKEN` 或长期 npm token。
+仓库为私有仓库，因此当前流程不传 `--provenance`。`contents: write` 只用于 runtime 新版本
+发布后创建 GitHub Release。
+
+版本是不可变的：只改包内容而不提升对应 `package.json` 版本不会产生新发布。Manager 薄包
+发生变化时还必须独立提升 `packages/herdr-manager/package.json` 的版本，并保持其
+`herdr-orchestrator` 依赖范围兼容。
 
 ## 集成点
 
-- `skills/herdr-orchestrator/SKILL.md` 把安装、doctor、catalog、enqueue、drain、retry 和 GC 串成 agent 可执行的操作契约。
-- `bin/herdr-orchestrator.mjs` 以 `src/herdr_orchestrator/cli.py` 为 Python runtime 入口，并固定目标项目的 workflow 路径。
-- 安装时生成的 profile 与 workflow 进入 [Harness catalog 与路由](catalog-and-routing.md)，其 schema 由 `src/herdr_orchestrator/config.py` 校验。
-- `.github/workflows/ci.yml` 使用 `package.json` 和 `scripts/npm-release-plan.mjs` 决定是否发布；`package.json` 与 `pyproject.toml` 的版本必须保持一致。
-- 权限、symlink、Git-local exclude 和最大自动化启动参数的边界见[安全](../security.md)。
+- [Harness catalog 与路由](catalog-and-routing.md)消费安装器生成的 workflow 与 selected
+  profiles。
+- [Herdr runtime](herdr-runtime.md)消费 Node wrapper 转发的 Python CLI 调用与项目运行环境。
+- [手动 Manager](manual-manager.md)复用主 npm 包中的固定 policy，不共享 durable queue 状态。
+- [Manager Light](manager-light.md)随主 npm 包分发，但只有显式 `manager-light install`
+  才修改 Herdr 配置。
+- [安全与信任边界](../security.md)定义 symlink、manifest、最大自动化和 npm OIDC 的授权边界。
 
 ## 修改入口
 
-修改安装、升级、卸载或 runtime 参数转发时，从 `bin/herdr-orchestrator.mjs` 和 `tests/test_distribution.py` 开始，并用真实 tarball 场景验证 checkout 外安装。修改 portable Skill 时同步运行 `tests/test_skill_package.py`；修改打包内容、版本 gate 或发布 runner 时检查 `package.json`、`scripts/npm-release-plan.mjs`、`.github/workflows/ci.yml` 和 `tests/test_release.py`。
+| 修改目标 | 首要入口 | 必须同步验证 |
+| --- | --- | --- |
+| 安装、升级、卸载、manifest、Git exclude | `bin/herdr-orchestrator.mjs` | `tests/test_distribution.py` |
+| 主 npm 包名、bin、Node 版本或打包内容 | `package.json` | 真实 `npm pack --dry-run --json` 与 packed tarball 测试 |
+| `npx herdr-manager` 转发或依赖 | `packages/herdr-manager/bin/herdr-manager.mjs`、`packages/herdr-manager/package.json` | `tests/test_distribution.py` |
+| Manager policy 被安装的内容 | `manager/AGENTS.md`、`manager/CLAUDE.md` | 源码、packed 主包和项目安装三种入口 |
+| Manager Light 打包与安装 | `plugins/manager-light/` | `tests/test_manager_light.py`、`tests/test_distribution.py` |
+| Registry gate 或 OIDC 发布 | `scripts/npm-release-plan.mjs`、`.github/workflows/ci.yml` | `tests/test_release.py` |
 
-发布前同时更新 `package.json` 与 `pyproject.toml` 的版本，运行 `npm run release:plan` 和仓库质量检查。不要把 npm token 加入 workflow，也不要把 OIDC publish 移到 self-hosted runner。
+收口前运行：
 
-## 关键源文件表
+```bash
+PYTHONPATH=src python3 -m unittest -v \
+  tests.test_distribution tests.test_manager_light tests.test_release
+npm pack --dry-run --json
+npm pack --dry-run --json ./packages/herdr-manager
+just check
+```
 
-| 文件 | 作用 |
+## 关键源文件
+
+| 完整路径 | 作用 |
 | --- | --- |
-| `bin/herdr-orchestrator.mjs` | 安装、升级、doctor、卸载、manifest 与 Python runtime wrapper。 |
-| `package.json` | npm executable、Node engine、打包清单和 release script。 |
-| `pyproject.toml` | Python 包版本、Python engine 与 `herdr-orchestrator` CLI 入口。 |
-| `skills/herdr-orchestrator/SKILL.md` | 面向 agent 的项目 bootstrap 和 queue 操作契约。 |
-| `docs/installation.md` | 面向维护者和使用者的安装、诊断及发布说明。 |
+| `bin/herdr-orchestrator.mjs` | 无 npm runtime dependency 的 installer/runtime wrapper、Manager launcher 与 Manager Light CLI。 |
+| `package.json` | `herdr-orchestrator` 的 bin、Node engine、打包清单与公开发布配置。 |
+| `packages/herdr-manager/package.json` | 薄 Manager 包的独立版本、bin 和主 runtime 依赖。 |
+| `packages/herdr-manager/bin/herdr-manager.mjs` | 通过 Node argv 无 shell 转发到主包 `manager` 子命令。 |
+| `manager/AGENTS.md` | 手动 Manager canonical policy。 |
+| `manager/CLAUDE.md` | Claude 兼容入口，只要求读取 canonical policy。 |
+| `plugins/manager-light/configure.mjs` | Herdr 插件与受管 sidebar block 的安装、状态、卸载事务。 |
+| `skills/herdr-orchestrator/SKILL.md` | 独立 Skill 分发入口。 |
 | `scripts/npm-release-plan.mjs` | npm registry 版本存在性 gate。 |
-| `.github/workflows/ci.yml` | 测试、release plan、Trusted Publishing 和 GitHub release。 |
-| `profiles/harnesses/*.toml` | npm 安装器复制的紧凑 profile 元数据。 |
-| `profiles/harnesses/*.md` | npm 安装器复制的完整执行 profile。 |
-| `workflows/prompts/planner.md` | 安装后 workflow 使用的 planner prompt。 |
-| `tests/test_distribution.py` | 安装 ownership、安全路径、升级、卸载和 packed npm 测试。 |
-| `tests/test_release.py` | Registry gate 与 CI 发布边界测试。 |
-| `tests/test_skill_package.py` | Portable Skill 的 npm runtime 和 CLI 示例测试。 |
+| `.github/workflows/ci.yml` | 测试、双包计划、GitHub-hosted OIDC 发布与 Release。 |
+| `docs/installation.md` | 面向维护者的 canonical 安装和发布契约。 |
+| `tests/test_distribution.py` | 安装 ownership、Git exclude、Manager launcher 与 packed npm 行为。 |
+| `tests/test_manager_light.py` | 插件配置事务和 metadata 投影行为。 |
+| `tests/test_release.py` | 双包版本 gate、runner、OIDC、token absence 和 action pinning。 |

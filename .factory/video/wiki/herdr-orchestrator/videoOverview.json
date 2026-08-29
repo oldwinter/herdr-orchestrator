@@ -1,22 +1,28 @@
 {
   "status": "ready",
-  "sizeBytes": 11070753,
+  "sizeBytes": 10812905,
   "contentType": "video/mp4",
-  "generatedAt": "2026-08-26T11:34:29.000Z",
-  "durationSeconds": 438.709,
+  "generatedAt": "2026-08-29T06:39:44Z",
+  "durationSeconds": 443.352,
   "captionTracks": [
     {
       "language": "en",
       "label": "English",
-      "sizeBytes": 10098,
+      "sizeBytes": 10384,
+      "contentType": "text/vtt"
+    },
+    {
+      "language": "zh-CN",
+      "label": "简体中文",
+      "sizeBytes": 9328,
       "contentType": "text/vtt"
     }
   ],
   "warnings": [
-    "Prior Factory wiki video history lookup was unavailable (HTTP 403), so this overview was generated fresh.",
+    "The prior playable overview was based on commit 61400e5. The seven-commit, 102-file change to v0.1.6 was classified as major, so the video was regenerated rather than reused.",
     "The live Factory brand guide and official asset URLs returned HTTP 404; the composition uses the documented fallback palette, local Geist fonts, a white mono Factory label, and the host Noto CJK fallback.",
     "Live application screenshot capture was skipped because .factory/skills/qa/config.yaml is absent; all visuals are grounded in repository paths, contracts, flows, and measured metrics.",
-    "HyperFrames reported no deterministic alias for the host Noto Sans CJK font during render; local Geist assets are embedded and poster visual QA confirmed the Chinese fallback rendered correctly.",
-    "The Chinese narration has a local Simplified Chinese sidecar at video/captions.zh-CN.vtt, but Droid 0.204.0 exposed only the canonical English caption track in the Factory player."
+    "HyperFrames reported no deterministic alias for the host Noto Sans CJK font during render; local Geist assets are embedded, and poster plus scene visual QA confirmed that the Chinese fallback rendered correctly.",
+    "HyperFrames doctor reported version 0.4.44 and low free memory; the final 443.352-second render completed successfully with one worker and passed stream, audio-level, caption-range, and MP4-header validation."
   ]
 }

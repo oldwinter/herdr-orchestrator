@@ -1,9 +1,7 @@
 # Herdr runtime
 Active contributors: oldwinter, chendongdong
 
-Active contributors: oldwinter, chendongdong
-
-> **Critical**：Herdr 是六种 harness 的交互式终端运行时，不是推理主控。Coordinator 决定任务是否入队、placement、lease、重试与验收；本层只把一次已接受的任务安全地映射为 Herdr workspace/tab/pane/worktree、PTY 输入和可验证的生命周期结果。
+Herdr 是六种 harness 的交互式终端运行时，不是推理主控。Coordinator 决定任务是否入队、placement、lease、重试与验收；本层只把一次已接受的任务映射为 Herdr workspace/tab/pane/worktree、PTY 输入和可验证的生命周期结果。
 
 ## Purpose
 
@@ -18,7 +16,7 @@ Herdr runtime 层解决三个问题：
 ## 目录布局
 
 ```text
-
+.
 ├── src/herdr_orchestrator/
 │   ├── herdr.py                 # transport、agent 生命周期、错误检测、receipt
 │   ├── herdr_layout.py          # tab/pane/worktree 的创建、复用与清理
@@ -54,7 +52,9 @@ Agent 名称是内部稳定 identity，不是 tab 标题：
 - worktree agent：任务级名称包含 job id；worktree 不复用普通 replica slot。
 - tab label 来自任务 title，经压缩后最长 32 字符；复用 tab 时只 rename label，不改 agent name。
 
-## 总控制流
+## 工作原理
+
+### 总控制流
 
 ```mermaid
 flowchart TD
@@ -284,14 +284,13 @@ worktree identifier 为 `<title-slug>-<sha256(workflow + NUL + task_key)前7位>
 生命周期改动的最小收口命令是：
 
 ```bash
-cd .
 PYTHONPATH=src python3 -m unittest -v tests.test_herdr tests.test_herdr_layout tests.test_harness_automation
 just check
 ```
 
 真实连通性验证应从单 harness、只读 smoke 开始，不要先扩大为六 harness 写任务。
 
-## 关键源文件
+## Key source files
 
 | 完整路径 | 作用 |
 | --- | --- |

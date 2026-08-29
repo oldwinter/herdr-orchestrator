@@ -1,119 +1,211 @@
 # 拓扑感知派发
 Active contributors: oldwinter, chendongdong
 
-Topology decision 与 harness selection 是两个独立 seam：harness 决定“谁做”，placement 决定“在哪里做”。普通 durable queue 支持 `pane`、`tab` 和 `worktree`，并把最终 placement 持久化到 job；retry 因而可以恢复同一 agent slot 或同一 worktree checkout。
+## Purpose
 
-## 决策优先级
+拓扑感知派发把已接受任务映射到 Herdr 的 `pane`、`tab` 或 `worktree`。Harness selection 决定“谁做”，placement 决定“在哪里做”；两者是独立 seam。最终 placement 在 claim 前持久化，dispatch、retry、receipt、Dashboard 和 GC 都消费同一结果。
+
+这一功能属于普通 durable queue。Standardized delivery 有自己的 integration/ticket worktree DAG，不与这里的 placement 状态混用。Queue 状态机见 [Durable execution](durable-execution.md)，三个 placement 的领域对象见 [Placement 与 worktree](../primitives/placement-and-worktrees.md)。
+
+下文源码路径均为仓库根目录完整路径。
+
+## 目录布局
+
+```text
+src/herdr_orchestrator/model.py          # PlacementMode/Target、DispatchContext
+src/herdr_orchestrator/config.py         # placement TOML 与 runtime root 校验
+src/herdr_orchestrator/topology.py       # 静态规则、controller protocol、label/slug
+src/herdr_orchestrator/runner.py         # claim 前 placement、agent slots、dispatch context
+src/herdr_orchestrator/store.py          # placement 持久化与 claim 前置条件
+src/herdr_orchestrator/herdr_layout.py   # tab/pane/worktree provision 与局部 cleanup
+src/herdr_orchestrator/herdr.py          # transport、agent identity 与 GC terminal 边界
+workflows/multi-harness.toml              # hybrid 默认策略
+workflows/grok-research.toml              # worker 默认 pane 的样例
+tests/test_topology.py                    # 规则、controller JSON、Git 能力、label
+tests/test_herdr_layout.py                # 原生 Herdr 命令、split、worktree 保留
+```
+
+## 关键抽象
+
+| 抽象 | 完整源码路径 | 责任 |
+| --- | --- | --- |
+| `PlacementMode` | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | Workflow 策略：`hybrid`、`tab`、`pane`、`worktree`。 |
+| `PlacementTarget` | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | 已落定且可持久化的三种 target。 |
+| `PlacementConfig` | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | 保存 mode 与 `worktree_root`。 |
+| `static_placement()` | [`src/herdr_orchestrator/topology.py`](../../src/herdr_orchestrator/topology.py) | 应用 override、worker default、固定 mode 和 hybrid 文本规则。 |
+| `topology_decision_prompt()` / `load_topology_decision()` | [`src/herdr_orchestrator/topology.py`](../../src/herdr_orchestrator/topology.py) | 对歧义任务定义 controller allowlist 与 exact JSON 校验。 |
+| `DispatchContext` | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | 把 placement、title、task/batch key、worktree root 与 receipt 交给 transport。 |
+| `HerdrLayout` | [`src/herdr_orchestrator/herdr_layout.py`](../../src/herdr_orchestrator/herdr_layout.py) | 将 target 转换为 Herdr 原生 tab、pane 或 worktree 操作。 |
+| `ProvisionedTerminal` | [`src/herdr_orchestrator/herdr_layout.py`](../../src/herdr_orchestrator/herdr_layout.py) | 记录真实 pane/tab/workspace/cwd 及允许清理的对象。 |
+
+## 决策工作流
 
 ```mermaid
 flowchart TD
-    Task[已接受任务] --> Override{显式 task override?}
-    Override -->|有| Validate[Git-aware validation]
-    Override -->|无| Worker{Worker default?}
-    Worker -->|有| Validate
-    Worker -->|无| Mode{固定 mode 或 hybrid?}
-    Mode -->|固定 pane/tab/worktree| Validate
-    Mode -->|hybrid| Rules{确定性信号}
-    Rules -->|硬只读 / read| Pane[pane]
-    Rules -->|write 且 Git| Worktree[worktree]
-    Rules -->|write 且非 Git| Tab[tab]
-    Rules -->|歧义| Controller[受限 controller JSON]
-    Controller --> Validate
-    Validate --> Target[Validated PlacementTarget]
+    A[Pending task, placement=NULL] --> B{显式 task override?}
+    B -->|是| V[Git-aware validation]
+    B -->|否| C{Worker default?}
+    C -->|是| V
+    C -->|否| D{mode 是否固定?}
+    D -->|pane/tab/worktree| V
+    D -->|hybrid| E{命中强只读信号?}
+    E -->|是| P[pane]
+    E -->|否| F{命中写信号?}
+    F -->|是且支持 worktree| W[worktree]
+    F -->|是但不支持| T[tab]
+    F -->|否| G{命中 inspect/review/audit?}
+    G -->|是| P
+    G -->|否| H[Controller 写严格 JSON]
+    H --> V
+    P --> S[Store.set_placement]
+    W --> S
+    T --> S
+    V --> S
+    S --> Q[允许 claim]
 ```
 
-优先级实现位于 `src/herdr_orchestrator/topology.py::static_placement`：
+### 1. 优先级固定
 
-1. `enqueue --placement` 的显式 override；
-2. Workflow 中该 worker 的默认 placement；
-3. 非 `hybrid` workflow 的固定 mode，或 `hybrid` 下的确定性读写规则；
-4. 仍歧义时，由 controller 写严格 topology JSON。
+[`src/herdr_orchestrator/topology.py`](../../src/herdr_orchestrator/topology.py) 的 `static_placement()` 按以下顺序短路：
 
-Hybrid 规则首先识别“只读 / 不得修改 / do not modify / read-only”等硬只读信号并选 `pane`；再识别实现、修复、修改、写入、refactor 等写信号，在 Git checkout 中选 `worktree`，否则选 `tab`；普通 inspect/review/audit 选 `pane`。未命中才返回 `None` 进入 controller，而不是猜测。
+1. 单任务显式 override，例如 `enqueue --placement` 或 seed placement；
+2. 对应 `WorkerConfig.placement`；
+3. 非 `hybrid` 的 workflow mode；
+4. `hybrid` 文本规则；
+5. 返回 `None`，由 controller 处理歧义。
 
-Controller 只能写：
+显式值和 worker default 也必须通过 worktree 能力校验。Coordinator 当前以 workflow workspace 下是否存在 `.git` 判断 `supports_worktree`。不支持时，任何显式或模型伪造的 `worktree` 都报 `topology_worktree_requires_git`。
+
+### 2. Hybrid 规则保守且有顺序
+
+静态规则把 title 与 prompt 合并后做 `casefold()`。强只读信号先判断，包括“只读”“不得修改”“不要修改”“do not modify”“read only”“read-only”；这防止“不得修改”中的“修改”被后续写规则误判。
+
+写信号覆盖中英文实现、修复、修改、创建文件、写入、`implement`、`fix`、`modify`、`edit`、`write`、`create file`、`refactor`。支持 worktree 时返回 `worktree`，否则返回 `tab`。一般读信号目前只有 `inspect`、`review`、`audit`，命中后返回 `pane`。未命中不猜测，进入 controller seam。
+
+这些词表是确定性启发式，不是自然语言权限判定；任务授权仍来自外层任务契约。
+
+### 3. 歧义任务只允许 topology JSON
+
+Controller 不执行任务，只能把一个 runtime artifact 写到 planner output 目录：
 
 ```json
 {"placement":"tab|pane|worktree","rationale":"..."}
 ```
 
-`load_topology_decision()` 要求 key 精确为 `placement` 和 `rationale`，rationale 非空且不超过 2000 字符，placement 必须在当前 allowlist 中。Workspace 没有 `.git` 时，prompt 不提供 `worktree`，即便伪造该值也会得到 `topology_worktree_requires_git`。
+[`src/herdr_orchestrator/topology.py`](../../src/herdr_orchestrator/topology.py) 要求 key 集恰为 `placement` 与 `rationale`；rationale 必须非空且不超过 2,000 字符，placement 必须能转为 `PlacementTarget`。不支持 worktree 时，prompt 的 allowlist 只含 `tab|pane`，loader 仍会做第二次能力校验。
+
+[`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) 为 artifact 使用由 workflow 与 dedupe key 派生的 `topology-<12位摘要>.json`。Controller turn 必须无 error 并以 `idle` 或 `done` 结束；读取后无论成功与否都删除 artifact。
+
+### 4. Placement 在 claim 前一次性落库
+
+[`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) 的 `_assign_pending_placements()` 遍历当前 worker pool 中 `placement IS NULL` 的 pending jobs，先跑静态规则，必要时再调用 controller，最后交给 [`src/herdr_orchestrator/store.py`](../../src/herdr_orchestrator/store.py) 的 `set_placement()`。
+
+`set_placement()` 只更新同时满足以下条件的行：
+
+```text
+state = pending
+attempts = 0
+placement IS NULL
+```
+
+Store 的 claim 查询只选择 `placement IS NOT NULL` 的 job。因此模型决策没有通过校验时任务不会进入 running；retry 复用已持久化 target，不重新做 topology 分类。
 
 ## 三种执行位置
 
-| Placement | 隔离与复用 | 创建方式 | 生命周期 |
+| Placement | Checkout / terminal 隔离 | Provision | 保留与清理 |
 | --- | --- | --- | --- |
-| `pane` | 同一 `run_once` 批次共享一个 tab；每任务独立 pane 和 agent；共享 checkout | 首任务 `herdr tab create --no-focus`，后续 `herdr pane split --no-focus` | 适合只读或协作任务；失败 pane 可按所有权清理 |
-| `tab` | 每任务 full-size tab；共享 workflow checkout | `herdr tab create --no-focus` | 适合需要完整终端但不需要独立 checkout 的任务 |
-| `worktree` | 独立 branch、checkout、Herdr workspace、tab、pane 和 agent | `herdr worktree create`，已有 checkout 时 `list/open` | Durable evidence；普通 queue 不自动 merge、close 或删除 |
+| `pane` | 同一 `run_once` batch 共享 tab 与 checkout；每 task 独立 pane/agent | 首任务创建 batch tab；后续对 pane 执行 split | Root pane 失败时关闭本次 batch tab；子 pane 失败只关闭该 pane |
+| `tab` | 每 task 独立 full-size tab；共享 workflow checkout | `herdr tab create --no-focus` | Provision/临时失败可关闭本次创建的 tab；GC 只关闭经证明拥有的 agent pane |
+| `worktree` | 独立 branch、checkout、Herdr workspace、tab、pane 和 agent | `herdr worktree create/open` | 普通 queue 永不自动 merge、关闭 workspace、删除 checkout 或 branch |
 
-实现真源是 `src/herdr_orchestrator/herdr_layout.py::HerdrLayout`。
+原生命令与返回 JSON 的解析真源是 [`src/herdr_orchestrator/herdr_layout.py`](../../src/herdr_orchestrator/herdr_layout.py)。Herdr 的 readiness 与 settlement 语义见 [Herdr runtime](../systems/herdr-runtime.md)。
 
-### Pane 布局
+### Pane：批次共享，分割最大区域
 
-Pane placement 要求 `DispatchContext.batch_key`。`HerdrLayout` 为每个 batch 缓存一个 `_BatchTab`；新增 pane 前调用 `herdr pane layout`，按 `width * height` 选择当前面积最大的 pane。若 `width >= height * 2` 则向右 split，否则向下 split，避免连续把同一方向机械切窄。
+`pane` 要求非空 `DispatchContext.batch_key`。`HerdrLayout` 在进程内以 batch key 缓存 `_BatchTab`：第一个任务创建一个短标题 tab，并使用 root pane；后续任务先读取 `herdr pane layout`，从具有合法 width/height 的 panes 中选 `width × height` 最大者。若该 pane `width >= height × 2` 则向右 split，否则向下 split。
 
-### Tab 与用户可见 label
+该策略减少连续按同一方向切割造成的窄 TUI。若 batch root terminal 清理，cache 中整个 batch entry 删除；子 pane 清理时只移除对应 pane ID。
 
-内部 agent name 带稳定 digest，用于跨 replica、workspace 和重启保持唯一。用户可见 tab label 使用 `short_display_label()`：压缩空白、最多 32 字符、超长时以省略号结尾，不暴露 hash。复用 tab agent 时只刷新 tab label，不改变 agent identity。
+### Tab：可见标题与内部 identity 分离
 
-### Worktree 恢复
+`short_display_label()` 压缩 title 空白，默认最长 32 字符；超长时保留 31 字符并添加 `…`。用户看到的是 task title，不是带摘要的 agent name。复用 tab agent 时只执行 tab rename，agent identity 不变。
 
-`HerdrLayout._worktree_coordinates()` 从 workflow name、task key 和 title 稳定派生：
+### Worktree：稳定坐标与恢复
 
-- Path：`<worktree_root>/<workflow-slug>/<task-slug>-<7位digest>`
-- Branch：`ho/<workflow-slug>/<task-slug>-<7位digest>`
+[`src/herdr_orchestrator/herdr_layout.py`](../../src/herdr_orchestrator/herdr_layout.py) 根据 workflow、task key 与 title 生成：
 
-若路径已经存在，adapter 先用 `herdr worktree list --cwd <repo>` 查找 `open_workspace_id`，并复用 cwd 匹配的 pane；尚未打开则执行 `herdr worktree open`。因此 retry 不会随意创建第二个 checkout。Worktree 是 checkout 隔离，不是安全沙箱，也不代表 coordinator 会 merge 或删除 branch。
-
-## Coordinator 与 store 的衔接
-
-`src/herdr_orchestrator/runner.py` 在 claim 前运行 `_assign_pending_placements()`：
-
-1. 查询 `src/herdr_orchestrator/store.py::unplaced_jobs()`；
-2. 尝试 `_static_placement()`；
-3. 歧义任务调用 `_select_topology()`；
-4. `Store.set_placement()` 只允许尚未 attempt 的 `pending` job 从 `NULL` 设置一次；
-5. `_slot_names()` 按 harness + placement 提供 agent slot，worktree agent 额外按 job ID 隔离。
-
-Dispatch 时 `DispatchContext` 携带 placement、title、dedupe key、batch key、worktree root 和 receipt。Outcome 再把 placement、execution path 和 Herdr workspace ID 写回 job 与 attempt receipt，供 status、恢复、GC 和 Dashboard 使用。
-
-## GC：证明所有权后只关闭 pane
-
-GC 是显式操作，默认 dry-run：
-
-```bash
-herdr-orchestrator gc --workflow /absolute/path/to/workflow.toml --succeeded-agents
-herdr-orchestrator gc --workflow /absolute/path/to/workflow.toml --failed-agents
-# 审核 JSON 后才追加 --apply
+```text
+digest     = sha256("<workflow>\0<task_key>")[:7]
+identifier = <stable_slug(title, max=32)>-<digest>
+path       = <worktree_root>/<stable_slug(workflow, max=32)>/<identifier>
+branch     = ho/<stable_slug(workflow)>/<identifier>
 ```
 
-`Coordinator._gc_agents()` 对 succeeded 和 failed 使用独立 scope。候选必须同时满足：
+若 path 不存在，执行 `herdr worktree create --base HEAD`。若 path 已存在，先用 `herdr worktree list` 查找对应 `open_workspace_id`，再从该 workspace 查找 cwd 精确等于 path 的 pane：匹配时直接复用；找不到可复用 terminal 时执行 `herdr worktree open`。Retry 因稳定 task key 返回同一 checkout，而不是创建随机目录。
 
-- 非 `worktree`；
-- agent name 属于当前 workflow、worker、replica 和 placement 的稳定 slot；
-- 历史 receipt 证明该 agent 由本 workflow 创建，即 `member_reused=false` 且记录过 pane；
-- 同名 agent 没有 pending/running/blocked 等非目标 job；
-- 当前 runtime agent 的 identity、pane、workspace、cwd/foreground cwd 与记录匹配；
-- 当前状态为 `idle` 或 `done`。
+Worktree 是 checkout 隔离，不是安全沙箱：secret、网络、端口、数据库和生产系统仍可能共享。普通 queue 保留它作为 durable task evidence。
 
-`blocked`、worktree、active、foreign、预先存在且被复用的 agent 都跳过。即使原 placement 是 `tab`，`HerdrTransport.close_agent_terminal()` 也只执行 `herdr pane close <owned-pane>`，不会关闭整个 tab，避免误伤后来移动到同一 tab 的用户 pane。Pane ID 漂移会返回 `agent_pane_mismatch` 而不是继续清理。
+## Agent slot 与 outcome
 
-## 关键抽象与源文件
+[`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) 为 `tab` 和 `pane` 按 harness、placement、replica 生成稳定 slot；worktree 则为每个 job ID 生成独立 agent name。三种 placement 都受 worker 的 `replicas` 总并发限制，不能靠多建 worktree 绕过 slot 上限。
 
-| 抽象 | 完整路径 | 责任 |
+Dispatch 时 `DispatchContext` 包含：
+
+- 已持久化 placement；
+- title 与稳定 dedupe task key；
+- wave 的 batch key；
+- 已校验的 worktree root；
+- 可选 task receipt。
+
+`DispatchOutcome` 再带回 placement、真实 execution path 和 Herdr workspace ID，写入 job/attempt receipt，供 status、恢复与 Dashboard 投影。
+
+## 安全 GC
+
+GC 是显式操作且默认 dry-run。它不删除 job、receipt 或 worktree。普通 terminal 候选只有在 durable receipt 与 live Herdr facts 同时证明所有权后才能关闭：
+
+- Job 属于选定的 `succeeded` 或 `failed` scope；
+- placement 不是 `worktree`，状态也不是 `blocked`；
+- agent name 属于当前 workflow、harness、placement 与 replica 推导的 allowlist；
+- receipt 证明该 pane 是本 workflow 新建而非复用；
+- 同名 agent 没有 active job；
+- live agent 的 identity、pane、workspace、cwd 与 settled state 匹配。
+
+即使原 placement 是 `tab`，最终 cleanup 也只关闭经证明拥有的 agent pane，不关闭整个 tab。详细 queue/GC 语义见 [Coordinator 与队列](../systems/coordinator-and-queue.md)。
+
+## 集成点
+
+| 上下游 | 接口 |
+| --- | --- |
+| Workflow 配置 | [`src/herdr_orchestrator/config.py`](../../src/herdr_orchestrator/config.py) 解析 `[placement]` 与 worker default，并把 worktree root 限制在 workspace 的 `.orchestrator` 内。 |
+| Durable store | [`src/herdr_orchestrator/store.py`](../../src/herdr_orchestrator/store.py) 保存 target，拒绝 claim 未 placement job，并记录 execution path/workspace。 |
+| Coordinator | [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) 在 claim 前决策，构造 slot 与 `DispatchContext`。 |
+| Herdr runtime | [`src/herdr_orchestrator/herdr_layout.py`](../../src/herdr_orchestrator/herdr_layout.py) provision topology；[`src/herdr_orchestrator/herdr.py`](../../src/herdr_orchestrator/herdr.py) 驱动 agent 生命周期。 |
+| Dashboard | [`src/herdr_orchestrator/dashboard/projector.py`](../../src/herdr_orchestrator/dashboard/projector.py) 只读关联 job → agent → pane → tab → workspace/worktree，不参与选择。 |
+| 配置文档 | [配置参考](../reference/configuration.md) 记录 override 与字段范围；[`docs/workflow-schema.md`](../../docs/workflow-schema.md) 是 schema 说明。 |
+
+## 修改入口
+
+| 想修改的行为 | 首要入口 | 必须同步 |
 | --- | --- | --- |
-| `PlacementMode`, `PlacementTarget`, `DispatchContext` | `src/herdr_orchestrator/model.py` | Topology 领域模型 |
-| `static_placement` / controller protocol | `src/herdr_orchestrator/topology.py` | Override、worker default、规则和严格 JSON |
-| `Coordinator._assign_pending_placements` | `src/herdr_orchestrator/runner.py` | Claim 前完成并持久化 placement |
-| `HerdrLayout` / `ProvisionedTerminal` | `src/herdr_orchestrator/herdr_layout.py` | Provision pane、tab 和 worktree |
-| Agent slot 与安全 GC | `src/herdr_orchestrator/herdr.py` | 稳定名称、runtime identity/cwd 验证和 pane close |
-| Placement persistence | `src/herdr_orchestrator/store.py` | Placement、execution path、workspace ID 和 receipt |
+| 改优先级、信号或 controller schema | [`src/herdr_orchestrator/topology.py`](../../src/herdr_orchestrator/topology.py) | [`tests/test_topology.py`](../../tests/test_topology.py)、[`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py)。 |
+| 改 placement 持久化时机 | [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py)、[`src/herdr_orchestrator/store.py`](../../src/herdr_orchestrator/store.py) | Claim 查询、retry/recovery、migration 与 runner/store 测试。 |
+| 改 pane split、label 或 worktree 坐标 | [`src/herdr_orchestrator/herdr_layout.py`](../../src/herdr_orchestrator/herdr_layout.py) | [`tests/test_herdr_layout.py`](../../tests/test_herdr_layout.py)；坐标变化需兼容已有 checkout。 |
+| 改 mode、root 或 worker default | [`src/herdr_orchestrator/config.py`](../../src/herdr_orchestrator/config.py)、[`workflows/*.toml`](../../workflows/) | [配置参考](../reference/configuration.md)、[`tests/test_config.py`](../../tests/test_config.py)。 |
+| 新增 placement target | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | Config enum、topology、Store migration、slot key、layout match、status/receipt、Dashboard、GC 与测试。 |
+| 改 GC | [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py)、[`src/herdr_orchestrator/herdr.py`](../../src/herdr_orchestrator/herdr.py) | 保留默认 dry-run、owned pane 证据、active/worktree/blocked 排除。 |
 
-## 集成点与修改入口
+## Key source files
 
-- 改决策顺序或关键词：修改 `src/herdr_orchestrator/topology.py`，同步 `tests/test_topology.py` 和 `tests/test_runner.py`。
-- 改 pane split、label 或 worktree 命名：修改 `src/herdr_orchestrator/herdr_layout.py`，同步 `tests/test_herdr_layout.py`；稳定坐标变化必须考虑已有 checkout 的恢复。
-- 新增 placement：必须联动 model、workflow schema、store migration、slot key、layout provision、receipt/status、Dashboard projection 与 GC fail-closed 规则。
-- 改 GC：同时检查 `src/herdr_orchestrator/runner.py::_gc_agents` 和 `src/herdr_orchestrator/herdr.py::close_agent_terminal`，保留“只关闭已证明拥有的 pane”边界。
-- 架构语义见 `docs/architecture.md`；现场 topology 诊断见 `docs/runtime-troubleshooting.md`。
+| 仓库根目录完整路径 | 作用 |
+| --- | --- |
+| [`src/herdr_orchestrator/topology.py`](../../src/herdr_orchestrator/topology.py) | 决策优先级、hybrid 信号、严格 controller JSON、label 与 slug。 |
+| [`src/herdr_orchestrator/herdr_layout.py`](../../src/herdr_orchestrator/herdr_layout.py) | 三种 placement 的 Herdr provision、复用、坐标与局部 cleanup。 |
+| [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | Placement enum/config、`DispatchContext`、outcome 模型。 |
+| [`src/herdr_orchestrator/config.py`](../../src/herdr_orchestrator/config.py) | Placement TOML、worker default 与 runtime root 校验。 |
+| [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) | Claim 前 placement、controller turn、slot map 与 dispatch context。 |
+| [`src/herdr_orchestrator/store.py`](../../src/herdr_orchestrator/store.py) | Placement 一次性写入、claim gate 与执行坐标持久化。 |
+| [`src/herdr_orchestrator/herdr.py`](../../src/herdr_orchestrator/herdr.py) | Stable agent identity、runtime lifecycle 与 owned-pane cleanup。 |
+| [`workflows/multi-harness.toml`](../../workflows/multi-harness.toml) | `hybrid` 与默认 worktree root。 |
+| [`workflows/grok-research.toml`](../../workflows/grok-research.toml) | Worker `placement = "pane"` 优先于 hybrid 的样例。 |
+| [`tests/test_topology.py`](../../tests/test_topology.py) | Read/write/ambiguous、override、Git-aware validation 与 label 测试。 |
+| [`tests/test_herdr_layout.py`](../../tests/test_herdr_layout.py) | Batch pane、最大 pane split、tab label 与 worktree retention 测试。 |

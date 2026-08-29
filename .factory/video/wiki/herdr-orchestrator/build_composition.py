@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SCENES = json.loads((ROOT / "scenes-timed.json").read_text(encoding="utf-8"))
-TOTAL_DURATION = 438.672
+TOTAL_DURATION = float(SCENES[-1]["end"])
 
 
 def esc(value: object) -> str:
@@ -182,21 +182,29 @@ BODIES = {
       <div class="trust-note reveal"><span>TRUST DOMAIN</span><b>SAME OS USER</b><span>RECEIPT</span><b>CONSERVATIVE EVIDENCE, NOT A SIGNATURE</b></div>
     """,
     "11": """
-      <div class="release-map reveal">
-        <div class="release-node"><small>SOURCE</small><b>MAIN</b></div><div class="release-arrow">→</div>
-        <div class="release-node"><small>GATE</small><b>JUST CHECK</b></div><div class="release-arrow">→</div>
-        <div class="release-node selected"><small>SELF-HOSTED</small><b>REGISTRY PLAN</b></div><div class="release-arrow">→</div>
-        <div class="release-node"><small>GITHUB-HOSTED</small><b>OIDC PUBLISH</b></div><div class="release-arrow">→</div>
-        <div class="release-node"><small>PUBLIC</small><b>NPM + RELEASE</b></div>
+      <div class="manager-grid reveal">
+        <div class="manager-card">
+          <small>UNATTENDED</small><b>DURABLE QUEUE</b>
+          <p>lease · retry · dedupe · receipt</p><span>COORDINATOR OWNS STATE</span>
+        </div>
+        <div class="manager-card selected">
+          <small>INTERACTIVE</small><b>MANUAL MANAGER</b>
+          <p>current Herdr session only</p><span>NO QUEUE SEMANTICS</span>
+        </div>
+        <div class="manager-card">
+          <small>OPTIONAL PROJECTION</small><b>MANAGER LIGHT</b>
+          <p>pane facts → sidebar tokens</p><span>COLOR ≠ RECEIPT</span>
+        </div>
       </div>
-      <div class="zero-deps reveal"><div><strong>0</strong><span>PYTHON RUNTIME<br>PACKAGE DEPS</span></div><div><strong>0</strong><span>NPM RUNTIME<br>PACKAGE DEPS</span></div><p>NODE 20+ · PYTHON 3.12+ · HERDR 0.8.2+</p></div>
+      <div class="manager-command reveal"><code>npx --yes herdr-manager</code><span>→</span><b>GROK</b><span>→</span><b>CODEX</b><span>→</span><b>CLAUDE</b></div>
+      <div class="manager-note reveal"><span>MANAGER LIGHT</span><b>OWNED CONFIG BLOCK · ATOMIC VALIDATION · MUTUALLY EXCLUSIVE TOKENS</b></div>
     """,
     "12": """
       <div class="metrics-grid reveal">
-        <div><strong>19</strong><span>REACHABLE<br>COMMITS</span></div>
+        <div><strong>26</strong><span>REACHABLE<br>COMMITS</span></div>
         <div><strong>26</strong><span>PYTHON<br>MODULES</span></div>
-        <div><strong>198</strong><span>STATIC TEST<br>FUNCTIONS</span></div>
-        <div><strong>0.88:1</strong><span>TEST / SOURCE<br>PYTHON LINES</span></div>
+        <div><strong>22</strong><span>PYTHON TEST<br>FILES</span></div>
+        <div><strong>0.96:1</strong><span>TEST / SOURCE<br>PYTHON LINES</span></div>
       </div>
       <div class="recap reveal">
         <div><em>01</em><b>模型输出受约束</b></div>
@@ -233,8 +241,8 @@ body:before{content:"";position:fixed;inset:0;opacity:.24;background-image:linea
 .dashboard-frame{border:1px solid var(--border);background:#0a0909}.dash-top{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--border)}.dash-top span{padding:14px;text-align:center;border-right:1px solid var(--border);font:11px "Geist Mono",monospace}.orange-text{color:var(--orange)}.dash-columns{display:grid;grid-template-columns:240px 1fr 220px;height:280px}.dash-columns>div{padding:17px;border-right:1px solid var(--border)}.dash-columns small{font:10px "Geist Mono",monospace;color:var(--gray)}.job{height:42px;border:1px solid var(--border);background:var(--surface);margin-top:15px}.job.compact{width:78%}.job.warning-job{border-left:3px solid var(--orange)}.graph-project{border:1px solid var(--border);padding:16px;margin-top:13px;font:10px "Geist Mono",monospace}.graph-worktree{border:1px solid var(--border);margin-top:12px;padding:12px}.graph-tab{border:1px solid var(--border);margin-top:10px;padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px}.graph-pane{border:1px solid var(--border);padding:20px 8px;text-align:center}.graph-pane.active{border-color:var(--orange)}.attention-list p{font:11px "Geist Mono",monospace;color:var(--muted);border-bottom:1px solid var(--border);padding:12px 0;margin:0}.security-strip{margin-top:14px}.security-strip span{flex:1;text-align:center;padding:8px}
 .dual-track{display:grid;grid-template-columns:1fr 110px 1.1fr;gap:16px;align-items:stretch}.track{border:1px solid var(--border);background:var(--surface);padding:26px;min-height:290px}.track h3{font-size:25px;font-weight:300}.track p{color:var(--muted);font-size:17px}.track>span{color:var(--gray);font-size:13px}.delivery-track{border-color:var(--orange)}.gate{display:flex;align-items:center;justify-content:center;text-align:center;font:11px "Geist Mono",monospace;color:var(--orange)}.delivery-steps{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:22px 0}.delivery-steps i{font-style:normal;font:11px "Geist Mono",monospace;border:1px solid var(--border);padding:12px;text-align:center}.review-axis{display:flex;align-items:center;gap:17px;margin-top:18px;border:1px solid var(--border);padding:13px 18px;font:12px "Geist Mono",monospace;color:var(--gray)}.review-axis b{font-weight:400;color:#fff}
 .boundary-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.boundary-grid>div{border:1px solid var(--border);background:var(--surface);padding:20px;min-height:126px}.boundary-grid b{display:block;font:17px "Geist Mono",monospace;font-weight:400;margin:13px 0}.boundary-grid p{color:var(--gray);margin:0}.trust-note{display:grid;grid-template-columns:auto 1fr auto 2fr;align-items:center;margin-top:14px;border:1px solid var(--border)}.trust-note span,.trust-note b{padding:14px;border-right:1px solid var(--border);font:11px "Geist Mono",monospace}.trust-note span{color:var(--orange)}.trust-note b{font-weight:400}
-.release-map{display:grid;grid-template-columns:1fr 32px 1fr 32px 1fr 32px 1fr 32px 1fr;align-items:stretch;margin-top:26px}.release-node{border:1px solid var(--border);background:var(--surface);padding:19px;min-height:110px}.release-node.selected{border-color:var(--orange)}.release-node b{display:block;font:14px "Geist Mono",monospace;font-weight:400;margin-top:19px}.zero-deps{display:grid;grid-template-columns:190px 190px 1fr;gap:14px;align-items:stretch;margin-top:34px}.zero-deps>div{border:1px solid var(--border);display:flex;gap:15px;align-items:center;padding:15px}.zero-deps strong,.metrics-grid strong{font-size:42px;font-weight:300;color:#fff}.zero-deps span{font:10px "Geist Mono",monospace;color:var(--gray)}.zero-deps p{border:1px solid var(--border);margin:0;padding:28px;font:12px "Geist Mono",monospace;color:var(--muted)}
-.metrics-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metrics-grid>div{border:1px solid var(--border);background:var(--surface);padding:20px;display:flex;align-items:center;gap:17px}.metrics-grid span{font:10px/1.4 "Geist Mono",monospace;color:var(--gray)}.metrics-grid>div:nth-child(3){border-color:var(--orange)}.recap{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:22px}.recap>div{border-top:1px solid var(--border);padding:18px 0;display:flex;gap:15px;align-items:center}.recap em{font:11px "Geist Mono",monospace;color:var(--orange);font-style:normal}.recap b{font-size:16px;font-weight:300}.final-command{display:flex;align-items:center;justify-content:center;gap:18px;margin-top:18px}.final-command code{font:14px "Geist Mono",monospace;border:1px solid var(--border);background:var(--surface);padding:10px 16px}.final-command span{color:var(--orange)}
+.manager-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:12px}.manager-card{border:1px solid var(--border);background:var(--surface);padding:24px;min-height:210px}.manager-card.selected{border-color:var(--orange)}.manager-card small{font:10px "Geist Mono",monospace;color:var(--orange)}.manager-card b{display:block;font:18px "Geist Mono",monospace;font-weight:400;margin:24px 0 18px}.manager-card p{color:var(--muted);font-size:15px}.manager-card span{display:block;margin-top:28px;color:var(--gray);font:10px "Geist Mono",monospace}.manager-command{display:flex;align-items:center;gap:17px;margin-top:18px}.manager-command code,.manager-command b{font:12px "Geist Mono",monospace;border:1px solid var(--border);background:#0b0a0a;padding:11px 14px}.manager-command b{font-weight:400}.manager-command span{color:var(--orange)}.manager-note{display:grid;grid-template-columns:160px 1fr;margin-top:12px;border:1px solid var(--border)}.manager-note span,.manager-note b{padding:11px 14px;font:10px "Geist Mono",monospace}.manager-note span{color:var(--orange);border-right:1px solid var(--border)}.manager-note b{font-weight:400;color:var(--gray)}
+.metrics-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metrics-grid>div{border:1px solid var(--border);background:var(--surface);padding:20px;display:flex;align-items:center;gap:17px}.metrics-grid strong{font-size:42px;font-weight:300;color:#fff}.metrics-grid span{font:10px/1.4 "Geist Mono",monospace;color:var(--gray)}.metrics-grid>div:nth-child(3){border-color:var(--orange)}.recap{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:22px}.recap>div{border-top:1px solid var(--border);padding:18px 0;display:flex;gap:15px;align-items:center}.recap em{font:11px "Geist Mono",monospace;color:var(--orange);font-style:normal}.recap b{font-size:16px;font-weight:300}.final-command{display:flex;align-items:center;justify-content:center;gap:18px;margin-top:18px}.final-command code{font:14px "Geist Mono",monospace;border:1px solid var(--border);background:var(--surface);padding:10px 16px}.final-command span{color:var(--orange)}
 """
 
 

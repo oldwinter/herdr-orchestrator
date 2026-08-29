@@ -1,77 +1,59 @@
 # 模式与约定
-Active contributors: oldwinter, chendongdong
 
-本仓库用确定性控制面包住不可信模型输出。新增功能时优先保持 schema、状态前置条件、错误码和 receipt 证据清晰，而不是把策略转移到 prompt。
+仓库的实现目标是让不可靠的交互式 agent 处在可恢复、可校验的确定性边界内。修改代码时优先保持 fail-closed、向后兼容和 automation-friendly 输出。
 
-## 模块边界
+## 代码约定
 
-`src/herdr_orchestrator/model.py` 保存跨模块不可变数据结构，`src/herdr_orchestrator/protocol.py` 保存子进程命令协议。`.importlinter` 禁止这两个叶子模块依赖 coordinator、store、delivery 或 CLI。新领域类型应先判断是否被三个以上系统共享，再决定是否放入 model。
+- Python 使用 3.12+ 标准库。生产依赖为空，新增依赖前必须说明必要性，配置见 `pyproject.toml`。
+- 核心数据使用 `@dataclass(frozen=True, slots=True)` 和 `StrEnum`，集中在 `src/herdr_orchestrator/model.py`。
+- CLI 成功输出 JSON，失败使用稳定错误码或明确原因。解析入口在 `src/herdr_orchestrator/cli.py`。
+- 外部命令通过固定 argv 调用，不用 shell 拼接。Python 侧见 `src/herdr_orchestrator/protocol.py`，Node 侧见 `bin/herdr-orchestrator.mjs`。
+- 配置、artifact 和 Herdr JSON 都做精确 shape、枚举、长度与路径校验。未知字段通常拒绝，而不是忽略。
 
-业务流由较深模块组合：
+## 状态与兼容性
 
-- `src/herdr_orchestrator/runner.py` 组合 queue、router、topology、catalog、transport 和 observability；
-- `src/herdr_orchestrator/delivery.py` 组合 protocol、Git worktree、tracker、controller 和 review；
-- `src/herdr_orchestrator/dashboard/projector.py` 组合只读 observation，不反向修改 store 或 Herdr。
+SQLite schema migration 必须向前迁移旧数据库。`src/herdr_orchestrator/store.py` 当前从 v1 逐步迁移到 v4；不要通过重建数据库绕过 migration。Workflow TOML 仍保持 schema version 1，字段边界见 `docs/workflow-schema.md`。
 
-## Fail closed
+兼容输出通过 additive 字段扩展。例如 `run_once` 保留顶层 state count，同时增加 `claimed`、`batch` 与 `queue`。Dashboard snapshot 保留 `topology.workspaces`，再增加 `topology.projects`。
 
-外部输入使用 allowlist 和精确 shape：
+## 安全边界
 
-- `src/herdr_orchestrator/config.py` 对枚举、长度、路径和 timeout 设边界；
-- `src/herdr_orchestrator/planner.py` 只接受精确 JSON key；
-- `src/herdr_orchestrator/delivery_protocol.py` 校验 artifact key、枚举、DAG 顺序、commit 和 acceptance；
-- `src/herdr_orchestrator/protocol.py` 只运行 argv 列表，不使用模型生成的 shell 字符串。
-
-不认识的状态、字段、harness、placement 或 schema 都应返回稳定错误，而不是猜测。
-
-## 状态与错误
-
-错误通过稳定字符串传播，例如 `agent_turn_not_observed`、`task_receipt_stale` 或 `job_lease_lost`。CLI 在 `src/herdr_orchestrator/cli.py` 中把预期错误映射为退出码 `2`，principal-proxy 敏感升级使用退出码 `3`。不要用异常文本替代可测试的错误码。
-
-SQLite 写操作使用参数化 SQL。Claim、outcome、resume 和 placement 更新都带状态与 attempt 前置条件，见 `src/herdr_orchestrator/store.py`。新增状态转换时必须测试并发或 stale caller 路径。
-
-## 路径和所有权
-
-相对 runtime 路径必须解析到明确 root。Planner output 和 delivery artifact 必须位于 workspace 的 `.orchestrator` 下；installer 只管理 `bin/herdr-orchestrator.mjs` 允许的三类根，并拒绝 symlink 重定向。Worktree 只是 checkout 隔离，不是安全沙箱。
-
-## 文档和命令
-
-稳定入口写在 `justfile`。用户可见 CLI 变更后运行：
-
-```bash
-just docs-generate
-just docs-check
-```
-
-`scripts/generate_reference.py` 生成 `docs/generated/cli.md`，不要手工修改生成文件。`scripts/check_docs.py` 会验证 README、AGENTS 和 CONTRIBUTING 中的本地链接及 `just` 命令。
-
-## 技术债约定
-
-`scripts/check_repository.py` 限制源码、测试和文本文件行数，并要求所有技术债标记都使用带 issue 与 owner 的格式：
-
-```text
-TODO(#123 owner=name):
-```
-
-Vendored `src/herdr_orchestrator/dashboard/static/cytoscape.min.js` 是明确的大小豁免。不要用新增豁免绕过可拆分的本仓库代码。
+- Planner 只能写受校验的 task/route/topology JSON，不得提交 shell command。
+- 普通 queue 不自动回答 blocked agent。只有显式 `resume` 回到原 agent、pane 与 attempt。
+- Worktree 不是安全沙箱。Coordinator 不自动 merge、remove 或删除 branch。
+- 终端输出是不可信观察值，只能用于稳定 fatal signal、有限诊断摘要或显式 output receipt。
+- Secret、prompt、terminal 与 token 等字段必须经过 `src/herdr_orchestrator/observability.py` 的脱敏。
+- 外部 exporter 由 `src/herdr_orchestrator/feature_flags.py` 默认关闭，并且只接受明确布尔值。
 
 ## 测试模式
 
-- 配置、协议和 store 使用纯 Python unit tests；
-- Herdr adapter 注入 fake command runner，断言完整 argv、超时和响应顺序；
-- Dashboard projector 使用 fixture 验证白名单与 drift；
-- `src/herdr_orchestrator/dashboard/static/topology.js` 保持无 DOM，由 `tests/test_topology_js.py` 用 Node 直接求值；
-- npm wrapper 由 `tests/test_distribution.py` 在临时 Git 仓库中验证 ownership、symlink 和幂等行为。
+测试按行为 surface 组织在 `tests/`。常用对应关系：
 
-详见[测试](testing.md)、[工具链](tooling.md)和[安全](../security.md)。
+| 改动 | 最小测试 |
+| --- | --- |
+| SQLite、lease、retry、resume | `tests/test_store.py` |
+| Herdr lifecycle、receipt、startup | `tests/test_herdr.py` |
+| Coordinator wave、placement、GC | `tests/test_runner.py` |
+| Dashboard snapshot、HTTP/SSE | `tests/test_dashboard.py`、`tests/test_topology_js.py` |
+| npm installer 与 manager | `tests/test_distribution.py` |
+| Manager Light | `tests/test_manager_light.py` |
+| 标准化交付 | `tests/test_delivery.py`、`tests/test_delivery_protocol.py` |
+
+迭代时先跑最小测试，收口前运行 `just check`。CLI 参数变化还要运行 `just docs-generate` 并提交 `docs/generated/cli.md`。
+
+## 文档与路径
+
+代码说明必须引用从仓库根目录开始的完整路径，例如 `src/herdr_orchestrator/runner.py`。运行语义更新 `docs/architecture.md`，workflow 字段更新 `docs/workflow-schema.md`，telemetry/exporter 更新 `docs/observability.md` 与 `.env.example`。
 
 ## 关键源文件
 
-| 文件 | 作用 |
+| 文件 | 用途 |
 | --- | --- |
-| `.importlinter` | 叶子模块依赖契约 |
-| `scripts/check_repository.py` | 文件大小和技术债策略 |
-| `scripts/check_feature_flags.py` | Feature flag 生命周期契约 |
-| `scripts/check_docs.py` | 文档链接和命令契约 |
-| `src/herdr_orchestrator/protocol.py` | 子进程 argv 和 JSON/text 协议 |
-| `tests/test_herdr.py` | 生命周期契约的主要回归套件 |
+| `AGENTS.md` | 仓库语义、安全边界和 canonical surface |
+| `CONTRIBUTING.md` | 贡献流程与 definition of done |
+| `pyproject.toml` | 格式、类型、coverage 与静态分析配置 |
+| `justfile` | 本地质量门禁 |
+| `.github/workflows/ci.yml` | CI、质量证据与 npm OIDC 发布 |
+| `scripts/check_repository.py` | 仓库级结构检查 |
+
+下一步阅读[开发工作流](development-workflow.md)和[测试](testing.md)。

@@ -1,109 +1,161 @@
 # Durable execution
 Active contributors: oldwinter, chendongdong
 
-Active contributors: oldwinter, chendongdong
+## Purpose
 
-Durable execution 是普通任务派发的持久化执行面：coordinator 决定任务何时入队、由谁 claim、何时重试以及何时写入 receipt；Herdr 只负责承载交互式 agent。进程重启后，SQLite 中的 queue、attempt、lease 和 receipt 仍然存在，因此“长期运行”依赖的是可恢复状态机，而不是某个一直存活的终端进程。
+Durable execution 是普通任务派发的持久控制面：Coordinator 决定任务何时入队、claim、重试、阻塞和完成，SQLite 保存可恢复事实，Herdr 只承载交互式 agent。Coordinator 重启后，queue、lease、attempt、dedupe 和 receipt 仍可恢复；因此持久性来自数据库状态机，不来自某个永不退出的 Python 线程或 terminal pane。
 
-相关页面：[Coordinator 与队列](../systems/coordinator-and-queue.md) · [Dashboard](../systems/dashboard.md) · [可观测性与 Attention](observability-and-attention.md) · [安全边界](../security.md)
+相关页面：[Coordinator 与 durable queue](../systems/coordinator-and-queue.md) · [Herdr runtime](../systems/herdr-runtime.md) · [任务与收据](../primitives/jobs-and-receipts.md) · [任务收据与恢复](receipts-and-recovery.md) · [本地 Dashboard](../systems/dashboard.md)
 
-## 执行主链路
+## 布局
+
+普通 queue 有三个彼此独立但串联的运行面：
+
+| 运行面 | 真源 | 负责 | 不负责 |
+| --- | --- | --- | --- |
+| Durable control | SQLite `jobs` / `receipts` | 状态、attempt、lease、dedupe、retry、resume 前置条件 | 推理、终端布局 |
+| Coordinator | `Coordinator` + workflow policy | claim wave、replica 限制、deadline、dispatch、结果持久化 | 成为第二套状态数据库 |
+| Interactive runtime | Herdr agent/pane/tab/worktree | Agent 进程、输入、lifecycle 观测 | 决定 job 是否 succeeded |
 
 ```mermaid
 flowchart LR
-    A["enqueue / seed<br/>dedupe_key"] --> B[("SQLite jobs<br/>pending")]
-    B --> C["Store.claim()<br/>BEGIN IMMEDIATE"]
-    C --> D["running<br/>attempt + 1 / lease / correlation ID"]
-    D --> E{"每个 wave 的<br/>ThreadPool worker"}
-    E --> F["Herdr dispatch"]
-    F --> G{"record_outcome()"}
-    G -->|DONE/IDLE 且 receipt 合格| H["succeeded"]
-    G -->|BLOCKED| I["blocked<br/>等待人工 resume"]
-    G -->|失败且尚有预算| J["pending<br/>指数退避"]
-    G -->|attempt 用尽| K["failed"]
-    J --> C
-    I -->|resume：同 pane、同 attempt| G
-    K -->|显式 retry：增加预算| B
+    Enqueue["enqueue / seed\ndedupe_key"] --> Pending[("pending")]
+    Pending --> Claim["BEGIN IMMEDIATE claim"]
+    Claim --> Running["running\nattempt + 1 / lease / slot"]
+    Running --> Dispatch["Herdr dispatch"]
+    Dispatch --> Outcome{"record_outcome"}
+    Outcome -->|"idle/done + 无错误\n+ 声明的 receipt 通过"| Succeeded["succeeded"]
+    Outcome -->|"persistent blocked"| Blocked["blocked"]
+    Outcome -->|"错误且仍有 budget"| Backoff["pending\n有界退避"]
+    Outcome -->|"budget 耗尽"| Failed["failed"]
+    Backoff --> Claim
+    Blocked -->|"人工 resume\n同 agent/pane/attempt"| Outcome
+    Failed -->|"显式 retry\n增加 budget"| Pending
 ```
 
-`Coordinator.run_once()` 先初始化 schema，按需执行 planner，并为尚未 placement 的任务确定 topology；随后最多 claim `coordinator.max_parallel` 个任务，以本 wave 的 `batch_key` 并发派发，最后逐个将 outcome 转换为 durable state 和 receipt。默认 workflow 的全局并发是 6、lease 是 900 秒、单次 agent timeout 是 300 秒、默认最大尝试次数是 2；这些值来自 `workflows/multi-harness.toml`。
+### Durable 状态
 
-`Coordinator.run_forever()` 在 `run_once()` 之间按 `poll_seconds` 休眠，适合常驻 worker。它本身不是服务管理器：进程崩溃后应由外部 supervisor 重新启动；恢复依据仍是 SQLite，而不是 Python 线程。
+`JobState` 只有五个值：`pending`、`running`、`succeeded`、`blocked`、`failed`。
 
-## Lease 与崩溃恢复
+- `pending`：等待 `available_at`、placement 和可用 replica slot。
+- `running`：已 claim，持有 `lease_until`，attempt 已增加。
+- `succeeded`：agent 已稳定 `idle` / `done`、无错误；如声明 task receipt，还要求 `task_verified=true`。
+- `blocked`：agent 持续要求人工输入。普通 queue 不自动回答，也不把它转为 retry。
+- `failed`：attempt budget 已耗尽；只能经显式 `retry` 回到 `pending`。
 
-claim 在 `BEGIN IMMEDIATE` 事务内完成，确保多个 coordinator 不会同时拿到同一个 attempt。claim 会：
+`working`、`unknown`、timeout、协议错误都不是 job 成功。Agent lifecycle 与 durable job state 的区别见[Herdr runtime](../systems/herdr-runtime.md)。
 
-1. 选择已到 `available_at` 的 `pending` 任务，或 lease 已过期的 `running` 任务；
-2. 将 `attempts` 加一，写入固定的 `lease_until`、确定性 `agent_name` 和本 attempt 的随机 `correlation_id`；
-3. 同步占用 harness replica slot，然后才把 `ClaimedJob` 交给 dispatcher。
+## 执行模式
 
-lease 过期但尚有 attempt 预算时，任务可被下一次 claim 回收；预算已耗尽时，`_expire_exhausted()` 将其标记为 `failed`，稳定错误码为 `lease_expired`。写 outcome 时，store 再校验任务仍为 `running` 且 attempt 未变化；旧 worker 在任务已被重新 claim 后写回，会收到 `job_lease_lost`，不能覆盖新 attempt。
+### `run_once`
 
-当前 lease 是一次性期限，没有 heartbeat 或续租协议，也不会在期限到达时杀死 Herdr agent。因此 `lease_seconds` 应明显大于预期 dispatch 上限；修改 timeout/lease 时要同时验证“旧执行仍在运行、新 attempt 已启动”的重叠风险。
+`Coordinator.run_once()` 依次：初始化 store；按需运行 planner；为未放置 job 决定 topology；创建本 wave 的 `batch_key`；按 `max_parallel`、worker pool 与 replica slot claim；用 `ThreadPoolExecutor` 并发 dispatch；最后逐项 `record_outcome()`。
 
-## Idempotency 与 receipt
+返回报告同时保留：
 
-- **入队幂等**：`jobs` 表的 `UNIQUE(workflow, dedupe_key)` 是最终约束；`INSERT ... ON CONFLICT DO NOTHING` 返回原 job ID。`seed()` 因而可重复执行。
-- **执行不是 exactly-once**：lease 到期、进程崩溃或 provider 状态不明都可能让同一任务产生多个 attempt。外部副作用必须由任务自身使用稳定 key 做幂等保护。
-- **attempt 级关联**：每次 claim 生成新的 correlation ID，写入当前 job，并随 attempt receipt 保存；详见[可观测性与 Attention](observability-and-attention.md)。
-- **成功 fail-closed**：只有无 `error_code` 的 `IDLE`/`DONE` 才可成功；如果任务声明了 `TaskReceipt`，`task_verified` 还必须为 `true`。缺失验证变成 `task_receipt_missing`，显式失败变成 `task_receipt_invalid`。`idle`/`done` 只说明 agent settled，不单独证明任务完成。
-- **错误重试**：未用尽预算的普通失败回到 `pending`，退避为 `min(60, 2^(attempt-1))` 秒；用尽预算才进入 `failed`。`retry_failed()` 是人工动作，每次可增加 1–10 次预算。
-- **blocked 不自动回答**：`blocked` 对普通 queue 是终态；`resume_blocked()` 必须显式提供非空 response，并校验最近 receipt 中的 pane。恢复沿用原 agent、pane 和 attempt，只为恢复动作加临时 lease。
+- 顶层本 wave 各状态计数；
+- `claimed`：本 wave claim 数；
+- `batch`：本 wave状态计数副本；
+- `queue`：结束时全 workflow 的 durable 状态快照。
 
-## Worker pool 与 waves
+### `run_until_idle`
 
-并发受到三层约束：
+`Coordinator.run_until_idle(timeout_seconds=...)` 在一个总 deadline 内重复 `run_once()`：planner、topology 和每个 worker dispatch 都只能使用剩余时间。它不会把每个 wave 都重新获得完整 timeout。
 
-| 层级 | 约束 |
+| 字段 / reason | 语义 |
 | --- | --- |
-| wave | 一次 `run_once()` 最多 claim `coordinator.max_parallel` 个 job |
-| harness | `slot_limits[harness]` 来自 worker 的 `replicas`，同一 harness 的有效 `running` 数不能超限 |
-| slot | tab/pane 使用确定性 replica 名；worktree 使用 job 专属 agent 名；已被有效 lease 占用的名字不会重复分配 |
+| `worker_pool_idle` | 本次允许的 harness 范围内没有 `pending` / `running` / `blocked` |
+| `queue_idle` | 全 workflow 没有 `pending` / `running` / `blocked` |
+| `reason=queue_idle` | 所选 pool 与全局 queue 都排空 |
+| `reason=worker_pool_idle` | 所选 pool 排空，但被排除 harness 仍有活动 job |
+| `reason=blocked` | 所选 pool 出现 blocked，立即返回 `idle=false` |
+| `reason=drain_timeout` | 总 deadline 用尽，返回 `idle=false` |
 
-`ThreadPoolExecutor` 只为本 wave 已 claim 的任务创建线程，不是另一套 queue。`run_until_idle(timeout_seconds=...)` 在一个总 deadline 内连续运行 waves，汇总每个状态、claimed 数和 queue 快照。它区分：
+`failed` 与 `succeeded` 是完成态，不阻止 idle。空 wave 在尚未 idle 时按 `poll_seconds` 有界休眠，避免 busy loop。
 
-- `queue_idle`：全 workflow 没有 `pending`、`running`、`blocked`；
-- `worker_pool_idle`：本次 `allowed_harnesses` 范围内没有上述状态；
-- `reason=worker_pool_idle`：选定 worker pool 已排空，但被排除 harness 仍可能有 pending job；
-- `reason=blocked`：范围内出现 blocked，立即停止 drain 并等待人工处理；
-- `reason=drain_timeout`：总 deadline 到达；planner、topology 选择和 worker dispatch 都共享该 deadline。
+## Lease、attempt、replica 与 dedupe
 
-空 wave 会按 `poll_seconds` 等待，避免 busy loop。对 replica 为 1、队列中有 3 个同 harness 任务的情况，测试证明会分 3 个 wave 顺序排空，而不是绕过 slot 限制。
+### Claim 与 lease
 
-## 持久化模型与边界
+`Store.claim()` 在 `BEGIN IMMEDIATE` 内完成，避免两个 Coordinator 同时 claim 同一个 attempt。候选是已到 `available_at` 的 pending job，或 lease 已过期且仍有 budget 的 running job。成功 claim 时：
 
-SQLite 使用 WAL、外键检查和显式事务。`jobs` 保存当前投影，`receipts` 追加每个观察到的 attempt outcome，`metadata` 保存 planner 等周期状态；schema migration 从 v1 顺序升级到当前 v4，新增字段时必须保持迁移链与旧数据库兼容。
+1. `attempts += 1`；
+2. 写入 `lease_until = now + lease_seconds`；
+3. 选择未占用的确定性 `agent_name`；
+4. 为本次 dispatch 生成 `uuid4().hex` correlation ID；
+5. 返回不可变 `ClaimedJob`。
 
-必须明确以下边界：
+过期 running job 若已耗尽 budget，claim 前由 `_expire_exhausted()` 转为 `failed`，错误码 `lease_expired`。Store 写结果时还会核对 durable state 仍是同一 running attempt；迟到 worker 会收到 `job_lease_lost`，不能覆盖后来 attempt。
 
-- durable queue 不是安全沙箱；worktree 只隔离 checkout，任务仍需遵守[安全边界](../security.md)。
-- SQLite 持久化 prompt，因此 state DB 是本地敏感 runtime state，不应提交 Git；Dashboard observer 刻意不读取 prompt。
-- timeout、`unknown`、`working` 都不是成功；未 settled 的 outcome 会得到 `agent_not_settled`。
-- coordinator 不自动 push、merge、发布、发消息、删除或修改生产数据；任务中的外部副作用也不能因“有 queue”而视为安全。
-- GC 只处理本 workflow 创建且已记录 pane 的 owned tab/pane agent；跳过 worktree、复用 agent、active agent 和 blocked job，也不会关闭其他运行创建的 pane。
-- `run_forever()` 没有内建多进程选主、OS 级守护或无限续租；高可用部署必须在这些边界外设计。
+lease 没有 heartbeat，也不会在过期时终止原 agent。配置时必须考虑旧执行与新 attempt 重叠；有外部副作用的任务仍需自己使用稳定幂等键。
 
-## 关键抽象与源文件
+### Replica slot
 
-| 抽象 / 契约 | 完整路径 | 作用 |
+- 一个 wave 最多 claim `coordinator.max_parallel` 个 job。
+- 每个 harness 的有效并发上限来自 worker `replicas`。
+- Tab/pane 使用稳定 replica 名；worktree 使用带 job ID 的任务专属 slot。
+- 带未过期 lease 的 running job 占用 harness count 和 agent name；不能再次分配同一 slot。
+
+因此 replica 为 1 时，同 harness 的三个 pending job 会跨三个 wave 串行执行，即使全局 `max_parallel` 更高。
+
+### Dedupe 与 retry
+
+`jobs` 表的 `UNIQUE(workflow, dedupe_key)` 是入队幂等的最终约束。重复 enqueue 通过 `ON CONFLICT DO NOTHING` 返回原 job ID，不创建新 attempt；`seed()` 因而可安全重复运行。
+
+普通失败在尚有 budget 时回到 pending，退避为 `min(60, 2 ** (attempt - 1))` 秒。`Store.retry_failed()` 只接受 failed job，允许一次增加 1–10 个 `max_attempts`，清空当前错误/验证投影并回到 pending；原 job ID、dedupe key 和历史 receipts 不变。Pending、running、blocked 或 succeeded 都拒绝 retry。
+
+Dedupe 只保证“同一 workflow/key 只有一条 job”，不保证 exactly-once execution。
+
+## 关键抽象
+
+| 抽象 | 责任 | 完整路径（仓库根目录相对） |
 | --- | --- | --- |
-| `Coordinator` | `src/herdr_orchestrator/runner.py` | enqueue、claim、并发 dispatch、waves、resume、GC 与 deadline |
-| `Store` | `src/herdr_orchestrator/store.py` | SQLite schema/migration、事务 claim、lease、幂等、状态转换和 receipt |
-| job / outcome / receipt 模型 | `src/herdr_orchestrator/model.py` | `JobState`、`ClaimedJob`、`DispatchOutcome`、`TaskReceipt` 等类型 |
-| workflow 配置 | `workflows/multi-harness.toml` | coordinator policy、worker replicas、placement 和 planner |
-| coordinator 行为测试 | `tests/test_runner.py` | waves、deadline、worker pool、resume、GC、seed 和 receipt 集成 |
-| store 行为测试 | `tests/test_store.py` | claim 竞争、replica、lease 回收、重试、迁移和验证闭环 |
+| `Coordinator.run_once` | 单 wave 的 planner、placement、claim、dispatch 与报告 | `src/herdr_orchestrator/runner.py` |
+| `Coordinator.run_until_idle` | 共享总 deadline 的连续 wave 与 idle 判定 | `src/herdr_orchestrator/runner.py` |
+| `Store.claim` | 事务 claim、lease 回收、attempt 和 replica 分配 | `src/herdr_orchestrator/store.py` |
+| `Store.record_outcome` | 将 runtime outcome 原子映射为 job 状态与 receipt | `src/herdr_orchestrator/store.py` |
+| `Store.retry_failed` | 为 failed job 追加有界 attempt budget | `src/herdr_orchestrator/store.py` |
+| `JobState` / `ClaimedJob` / `NewJob` | Durable 状态和值对象 | `src/herdr_orchestrator/model.py` |
+| `replica_slot_names` / `worktree_agent_name` | 稳定 slot 与任务专属 agent identity | `src/herdr_orchestrator/herdr.py` |
 
-## 集成点与修改入口
+## 恢复与 GC 边界
 
-| 想修改的行为 | 首要入口 | 同步检查 |
+- **崩溃恢复**：Coordinator 重启后重新读取 SQLite；lease 到期才允许回收 running job。
+- **Blocked 恢复**：只经人工 `resume --response-file`；保持原 attempt、agent 和 pane，不重发原任务 prompt。详见[任务收据与恢复](receipts-and-recovery.md)。
+- **Worktree**：普通 queue 不自动 merge、删除 branch/checkouts 或关闭 workspace。详见[Placement 与 worktree](../primitives/placement-and-worktrees.md)。
+- **GC**：succeeded 与 failed 分 scope；默认 `dry_run=true`。只候选当前 workflow 可证明创建、身份/pane/workspace/cwd/placement 匹配且已 settled 的 tab/pane agent；blocked、worktree、active、foreign 和预先存在的 reused agent跳过。即使 placement 是 tab，也只关闭 owned pane，不关闭整个 tab。
+- **Runtime state**：SQLite 保存 prompt，是本地敏感状态；`.orchestrator/` 不进入 Git。Dashboard observer 刻意不读取 prompt 或完整 terminal transcript。
+
+## 集成
+
+- `src/herdr_orchestrator/cli.py` 把 `run-once`、`run-until-idle`、`run`、`retry`、`resume` 与 `gc` 映射到 Coordinator/Store。
+- `workflows/multi-harness.toml` 提供 `poll_seconds`、`max_parallel`、`lease_seconds`、`max_attempts`、`agent_timeout_seconds` 与 worker replicas。
+- Placement 必须在 claim 前确定；决策链见[拓扑感知派发](topology-aware-dispatch.md)。
+- Herdr transport 只返回 `DispatchOutcome`；Store 才拥有 durable 状态转换权。
+- `src/herdr_orchestrator/observability.py` 使用 attempt correlation ID 发出事件；[本地 Dashboard](../systems/dashboard.md)只读 store 与 runtime 投影。
+- 总体恢复契约在 `docs/architecture.md`，现场排错在 `docs/runtime-troubleshooting.md`。
+
+## 修改入口
+
+| 想修改的行为 | 首选入口 | 必须保持 / 验证 |
 | --- | --- | --- |
-| 状态转换、退避或 lease 回收 | `src/herdr_orchestrator/store.py` | migration、receipt 追加语义、`tests/test_store.py` |
-| wave、总 deadline 或 drain 报告 | `src/herdr_orchestrator/runner.py` | `worker_pool_idle` 与 `queue_idle` 的区别、`tests/test_runner.py` |
-| 全局并发、lease、attempt、poll | `workflows/multi-harness.toml` | agent timeout、replicas、workflow schema 和长期运行重叠风险 |
-| worker replica/agent 命名 | `src/herdr_orchestrator/herdr.py` | slot key 与 owned-agent GC 规则 |
-| receipt 成功条件 | `src/herdr_orchestrator/store.py` 与 `src/herdr_orchestrator/herdr.py` | `agent_settled`、`task_verified`、稳定错误码 |
-| attempt 诊断信号 | `src/herdr_orchestrator/observability.py` | correlation ID、sanitization、Dashboard attention |
+| 状态转换、退避、lease 回收 | `src/herdr_orchestrator/store.py` | `BEGIN IMMEDIATE`、stale outcome 防护、migration、`tests/test_store.py` |
+| Wave、deadline、drain 报告 | `src/herdr_orchestrator/runner.py` | worker-pool/global idle 区分、`tests/test_runner.py` |
+| Replica/agent naming | `src/herdr_orchestrator/herdr.py` | slot key、worktree job scope、GC ownership |
+| Coordinator policy | `workflows/multi-harness.toml` | workflow schema、timeout/lease 重叠风险 |
+| Retry/resume CLI | `src/herdr_orchestrator/cli.py` | 稳定错误原因、自动化 JSON、状态前置条件 |
+| SQLite 字段或版本 | `src/herdr_orchestrator/store.py` | v1→当前版本的顺序 migration 与旧 DB 兼容 |
 
-任何 schema 或状态机修改都应先加最小回归测试，随后运行 `just check`；不得把 `.orchestrator/`、原始 prompt 或完整终端输出纳入 Git。
+## Key source files
+
+- `src/herdr_orchestrator/runner.py`
+- `src/herdr_orchestrator/store.py`
+- `src/herdr_orchestrator/model.py`
+- `src/herdr_orchestrator/herdr.py`
+- `src/herdr_orchestrator/cli.py`
+- `workflows/multi-harness.toml`
+- `docs/architecture.md`
+- `docs/runtime-troubleshooting.md`
+- `tests/test_store.py`
+- `tests/test_runner.py`
+- `tests/test_herdr.py`

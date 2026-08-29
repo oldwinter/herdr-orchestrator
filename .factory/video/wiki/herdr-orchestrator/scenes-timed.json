@@ -16,9 +16,9 @@
     ],
     "narration": "如果一个智能体进程消失，任务状态不应该跟着消失。Herdr Orchestrator 把多种编码工具放进同一个本地控制面。模型可以提出任务，也可以选择执行者。但队列、租约、重试和成功判定，始终由确定性的 Python 与 SQLite 掌管。你可以把它记成一句话：Herdr 承载终端，Coordinator 拥有事实。",
     "start": 0.0,
-    "spokenDuration": 29.845,
-    "duration": 30.295,
-    "end": 30.295
+    "spokenDuration": 29.504,
+    "duration": 29.954,
+    "end": 29.954
   },
   {
     "id": "02",
@@ -36,10 +36,10 @@
       "FULL PROFILE"
     ],
     "narration": "第一步不是启动模型，而是加载声明式工作流。TOML 固定并发、租约、超时、执行位置和允许的 worker。路由器只看到紧凑的 harness catalog，不会预先吞下六份长上下文。选定 Droid、Grok、Codex、Pi、Claude 或 Hermes 之后，完整 profile 才在派发前注入。这样既缩小上下文，也把候选集合锁在配置允许的范围内。",
-    "start": 30.295,
-    "spokenDuration": 32.576,
-    "duration": 33.026,
-    "end": 63.321
+    "start": 29.954,
+    "spokenDuration": 32.533,
+    "duration": 32.983,
+    "end": 62.937
   },
   {
     "id": "03",
@@ -59,10 +59,10 @@
       "FAILED"
     ],
     "narration": "任务进入 SQLite 后，去重键保证重复入队不会复制工作。Claim 在立即写事务中完成，并同时增加 attempt、写入 lease、选择 replica slot 和生成 correlation ID。一个 wave 最多拿到配置允许的任务，再并行交给 Herdr。成功、阻塞、退避重试和失败，都由 Store 根据结构化 outcome 推进。旧 attempt 即使迟到，也不能覆盖已经重新 claim 的新执行。",
-    "start": 63.321,
-    "spokenDuration": 36.181,
-    "duration": 36.631,
-    "end": 99.952
+    "start": 62.937,
+    "spokenDuration": 35.883,
+    "duration": 36.333,
+    "end": 99.27
   },
   {
     "id": "04",
@@ -82,10 +82,10 @@
       "VERIFIED"
     ],
     "narration": "Herdr runtime 不把进程存在当作任务开始。它先证明 pane 的 shell 已经就绪，再证明 harness 可以交互。提交 prompt 前记录 state change sequence，只有序号严格前进，才算观察到本次新 turn。随后必须稳定处于 idle 或 done，blocked、working、unknown 和 timeout 都不是成功。所有等待共享一个总 deadline，避免某个控制命令无限占住队列。",
-    "start": 99.952,
-    "spokenDuration": 35.029,
-    "duration": 35.479,
-    "end": 135.431
+    "start": 99.27,
+    "spokenDuration": 35.456,
+    "duration": 35.906,
+    "end": 135.176
   },
   {
     "id": "05",
@@ -104,10 +104,10 @@
       "HYBRID ROUTING"
     ],
     "narration": "执行者确定以后，还要决定任务在哪里运行。Tab 给任务独立可见位置。Pane 让同一个 wave 共享 tab，但每个任务仍有自己的终端。Worktree 创建任务级 branch、checkout 和 Herdr workspace，适合写入工作。显式覆盖和 worker 默认优先，确定性的读写信号其次，只有真正模糊时才调用受限 topology controller。Worktree 是 checkout 隔离，不是安全沙箱。",
-    "start": 135.431,
-    "spokenDuration": 36.672,
-    "duration": 37.122,
-    "end": 172.553
+    "start": 135.176,
+    "spokenDuration": 36.523,
+    "duration": 36.973,
+    "end": 172.149
   },
   {
     "id": "06",
@@ -128,10 +128,10 @@
       "HERMES"
     ],
     "narration": "六种 harness 使用各自固定的最高自动化启动参数，planner 不能覆盖这些参数。自动化只减少本地确认，不会扩大 push、merge、发布或生产权限。Claude 的首次 workspace trust 还有额外闸门。检测输出必须同时包含三个稳定标记，并且预期 execution root 必须独占一行。登录、认证、不同目录或缺少标记时，系统不会自动发送按键。",
-    "start": 172.553,
-    "spokenDuration": 34.517,
-    "duration": 34.967,
-    "end": 207.52
+    "start": 172.149,
+    "spokenDuration": 34.816,
+    "duration": 35.266,
+    "end": 207.415
   },
   {
     "id": "07",
@@ -150,10 +150,10 @@
       "RESUME SAME PANE"
     ],
     "narration": "Settled 只说明 agent 停下来了，不说明任务做对了。Output receipt 只能来自当前 turn 的新增输出，prompt echo 和旧输出都不能冒充证据。File receipt 必须留在 execution root 内，拒绝绝对路径、上跳和符号链接，并且字节必须相对 baseline 发生变化。失败任务可以显式增加 attempt 预算。Blocked 任务则复用原 agent、原 pane 和原 attempt，由人工提供 response 后继续。",
-    "start": 207.52,
-    "spokenDuration": 38.293,
-    "duration": 38.743,
-    "end": 246.263
+    "start": 207.415,
+    "spokenDuration": 38.251,
+    "duration": 38.701,
+    "end": 246.116
   },
   {
     "id": "08",
@@ -172,10 +172,10 @@
       "PROJECT → WORKTREE → TAB → PANE"
     ],
     "narration": "Dashboard 把 SQLite durable state 与 Herdr runtime 拍成同一份只读快照。它展示队列、attention、receipt 时间线，以及 project、worktree、tab、pane 的 compound topology。结构变化才重新布局，状态变化只更新内容，所以实时刷新不会让画布反复跳动。服务只绑定 loopback，校验 Host 与端口，使用 CSP 和字段白名单，也不读取 prompt、环境变量或完整终端输出。",
-    "start": 246.263,
-    "spokenDuration": 36.8,
-    "duration": 37.25,
-    "end": 283.513
+    "start": 246.116,
+    "spokenDuration": 36.821,
+    "duration": 37.271,
+    "end": 283.387
   },
   {
     "id": "09",
@@ -194,10 +194,10 @@
       "STANDARDS ∥ SPEC REVIEW"
     ],
     "narration": "普通派发之外，还有一条必须显式触发的标准化交付面。它先消除阻碍规格的决策迷雾，再生成 accepted spec 和依赖有序的 ticket DAG。每个 ticket 在独立 worktree 实现，并用 commit 与逐条验收证据收口。集成后，Standards 与 Spec 两个 fresh reviewer 并行检查，controller 完整裁决 finding。修复轮数有上限，成功也只停在隔离 integration branch。",
-    "start": 283.513,
-    "spokenDuration": 35.563,
-    "duration": 36.013,
-    "end": 319.526
+    "start": 283.387,
+    "spokenDuration": 35.861,
+    "duration": 36.311,
+    "end": 319.698
   },
   {
     "id": "10",
@@ -216,33 +216,33 @@
       "DRY-RUN GC"
     ],
     "narration": "这个项目不是操作系统沙箱。它保护的是状态推进、证据和授权边界。模型产物先经过精确 key、枚举、长度和 allowlist 校验。Telemetry 默认留在本地，外发功能默认关闭，字段在持久化前统一脱敏。安装器只管理 manifest 声明的项目路径，遇到 symlink 或用户修改就保守停止。GC 默认 dry-run，只处理有创建收据、pane 身份和当前所有权证据的终态 agent。",
-    "start": 319.526,
-    "spokenDuration": 38.165,
-    "duration": 38.615,
-    "end": 358.141
+    "start": 319.698,
+    "spokenDuration": 37.867,
+    "duration": 38.317,
+    "end": 358.015
   },
   {
     "id": "11",
-    "title": "零运行时包依赖的分发面",
-    "goal": "说明 npm bootstrap 与可信发布",
-    "archetype": "release-pipeline",
+    "title": "三种管理面，三套状态语义",
+    "goal": "区分 durable queue、Manual Manager 与侧栏投影",
+    "archetype": "management-surfaces",
     "evidence": [
-      "package.json",
-      "pyproject.toml",
+      "manager/AGENTS.md",
       "bin/herdr-orchestrator.mjs",
-      ".github/workflows/ci.yml"
+      "packages/herdr-manager/",
+      "plugins/manager-light/"
     ],
     "labels": [
-      "NODE 20+",
-      "PYTHON 3.12+",
-      "REGISTRY PLAN",
-      "OIDC PUBLISH"
+      "DURABLE QUEUE",
+      "MANUAL MANAGER",
+      "MANAGER LIGHT",
+      "COLOR IS NOT A RECEIPT"
     ],
-    "narration": "Python 控制面和 npm wrapper 都没有第三方运行时包依赖，外部能力来自本机 CLI。Npm 安装器把 workflow、profiles 和 ownership manifest 放进目标项目，并保留用户修改。发布从 main 的完整质量门禁开始。专用 runner 只查询 registry 是否缺少当前版本。真正的 npm publish 仍在 GitHub hosted runner 上使用 OIDC Trusted Publishing，不保存长期 npm token，也不会自动部署任何生产环境。",
-    "start": 358.141,
-    "spokenDuration": 40.043,
-    "duration": 40.493,
-    "end": 398.634
+    "narration": "无人值守任务进入 durable queue，由 Coordinator 管理 lease、retry 与 receipt。临场操作则使用 Manual Manager：在当前 Herdr session 的固定策略目录中启动一个交互式 harness，只观察并管理当前终端，不模拟队列。npx herdr-manager 提供一条命令入口，默认按 Grok、Codex、Claude 探测。可选的 Manager Light 只把当前 pane 与 agent 状态投影到侧栏，使用受管配置块和互斥 metadata token；颜色不是任务收据，也不会接管生命周期。",
+    "start": 358.015,
+    "spokenDuration": 41.472,
+    "duration": 41.922,
+    "end": 399.937
   },
   {
     "id": "12",
@@ -256,15 +256,15 @@
       "CONTRIBUTING.md"
     ],
     "labels": [
-      "19 COMMITS",
+      "26 COMMITS",
       "26 PYTHON MODULES",
-      "198 TEST FUNCTIONS",
-      "JUST CHECK"
+      "22 TEST FILES",
+      "0.96:1 TEST / SOURCE"
     ],
-    "narration": "当前仓库有十九个可达提交、二十六个包内 Python 模块和一百九十八个静态测试函数。测试代码与 Python 源码的物理行数比例接近零点八八比一。贡献时先运行最小相关测试，收口前运行 just check，再用真实 doctor 或只读 smoke 验证 harness。最终要记住的不是命令数量，而是三个不变量：模型输出受约束，状态由 coordinator 拥有，成功必须由当前执行的新证据证明。",
-    "start": 398.634,
-    "spokenDuration": 39.531,
-    "duration": 39.981,
-    "end": 438.615
+    "narration": "v0.1.6 基线目前有二十六个可达提交、二十六个包内 Python 模块与二十二个 Python 测试文件。九千五百四十三行 Python 测试，相对九千九百一十六行包内 Python 源码约为零点九六比一；这是体量比例，不是覆盖率。贡献者先跑聚焦测试，再执行 just check，必要时补真实 doctor 或只读 smoke。最后记住三个不变量：模型输出受约束，状态由 Coordinator 拥有，成功必须由当前执行产生的新证据证明。",
+    "start": 399.937,
+    "spokenDuration": 42.965,
+    "duration": 43.415,
+    "end": 443.352
   }
 ]

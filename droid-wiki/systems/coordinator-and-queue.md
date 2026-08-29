@@ -15,7 +15,7 @@ Coordinator 是普通 durable queue 的确定性控制面：它把已验证的 w
 
 下文所有源码路径均为从仓库根开始的完整路径。
 
-## 目录与文件布局
+## 目录布局
 
 ```text
 src/herdr_orchestrator/
@@ -66,7 +66,9 @@ tests/test_cli.py             # queue CLI 参数、scope 与默认安全行为
 
 `record_outcome` 只接受数据库中仍为 `running` 且 `attempts == ClaimedJob.attempt` 的写入，否则报稳定错误 `job_lease_lost`。这使已被新 claim 接管的旧 worker 不能覆盖较新的 attempt。Resume 写入同样校验 job 仍为 `blocked` 且 attempt 未变化。
 
-## 入队到 dispatch 的单个 wave
+## 工作原理
+
+### 入队到 dispatch 的单个 wave
 
 `Coordinator.run_once()` 的顺序是固定的：
 
@@ -225,7 +227,7 @@ Store 也用同一 sanitizer 约束持久化的 `error_summary`，但原 prompt 
 | 改 telemetry | [`src/herdr_orchestrator/observability.py`](../../src/herdr_orchestrator/observability.py) | 先脱敏、默认关闭 exporter、HTTPS、bounded timeout、telemetry 故障不影响调度。 |
 | 改 GC 范围 | [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) | 默认 dry-run、created-vs-reused 证据、expected pane ID、active name 和 worktree 排除。 |
 
-## 关键源文件
+## Key source files
 
 | 文件 | 为什么关键 |
 | --- | --- |

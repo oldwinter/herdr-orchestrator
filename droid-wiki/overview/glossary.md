@@ -1,42 +1,44 @@
 # 术语表
-Active contributors: oldwinter, chendongdong
 
-本页统一 Herdr Orchestrator 在代码、CLI 和运行时输出中使用的词汇。状态和枚举的真源是 `src/herdr_orchestrator/model.py`。
+本页解释代码、CLI 和运行文档中反复出现的项目术语。建议先理解 durable queue、harness、placement 和 receipt，再阅读系统实现。
 
-| 术语 | 含义 |
-| --- | --- |
-| Agent | Herdr 中一个具名的交互式 harness 进程，绑定 pane、cwd 和 lifecycle state。 |
-| Attempt | Job 被成功 claim 的次数。Lease 过期后重新 claim 会增加 attempt；`resume` 不增加。 |
-| Blocked | Agent 已进入需要输入的终态。普通 queue 只允许显式 `resume`，标准化交付可使用有界 principal proxy。 |
-| Compact catalog | `profiles/harnesses/*.toml` 中供 controller 选择 worker 的紧凑能力元数据。 |
-| Controller | 执行 planner、worker router、topology decision 或交付裁决的 harness；它不是队列状态真源。 |
-| Correlation ID | 每次 dispatch attempt 的随机 ID，用于关联 job、receipt 与本地可观测性记录。 |
-| Dedupe key | Workflow 范围内的稳定任务标识，SQLite 对 `(workflow, dedupe_key)` 建唯一约束。 |
-| Durable queue | `src/herdr_orchestrator/store.py` 管理的 SQLite job、lease、attempt 和 receipt 状态。 |
-| Execution root | Agent 实际运行目录。Pane/tab 使用 workflow workspace，worktree 使用独立 checkout。 |
-| Full profile | 被选中 harness 的 Markdown 上下文，只在 dispatch 前由 `src/herdr_orchestrator/catalog.py` 动态加载。 |
-| Harness | Droid、Grok Build、Codex、pi、Claude Code 或 Hermes 之一。 |
-| Herdr | 提供 PTY、workspace、tab、pane、worktree 和 agent lifecycle 的本地 terminal runtime。 |
-| Job | 普通 durable queue 中一个带 title、prompt、harness、placement、attempt budget 和可选 receipt 的工作项。 |
-| Lease | Running job 在 SQLite 中持有的有界执行权。Coordinator 崩溃后，过期 lease 可被重新 claim。 |
-| Pane placement | 同一 `run_once` 批次共享 tab，但每个任务使用独立 pane 和 agent。 |
-| Principal proxy | 仅在显式标准化交付中代用户回答规格内、本地、可逆问题的 controller；secret 和 production 必须升级。 |
-| Receipt | Job attempt 的持久生命周期记录，或任务声明的 output-prefix/file 机器验收契约。 |
-| Replica | 同一 harness 可同时占用的 slot 数。默认 1。 |
-| Settled | Agent 在当前 turn 后稳定处于 `idle` 或 `done`；不代表任务内容正确。 |
-| Standardized delivery | 显式 opt-in 的 spec、ticket DAG、隔离 worktree、双轴 review 与 repair 流程。 |
-| Task verified | 声明的 output-prefix 或 file receipt 已通过。未声明时值为 `null`。 |
-| Topology | Task 在 Herdr 中的执行位置，即 tab、pane 或原生 worktree。 |
-| Worktree placement | Herdr 创建或打开独立 Git checkout、branch 和 workspace；普通 queue 不自动 merge 或删除。 |
-| Worker | 实际执行 task packet 的 harness。Controller 和 worker 可分别选择。 |
+| 术语 | 含义 | 主要定义 |
+| --- | --- | --- |
+| Harness | 被 Herdr 承载的交互式 agent CLI。当前支持 Droid、Grok、Codex、pi、Claude、Hermes | `src/herdr_orchestrator/model.py` |
+| Herdr | 提供真实 PTY、workspace、tab、pane、agent lifecycle 和原生 worktree 的 terminal runtime | `src/herdr_orchestrator/herdr.py` |
+| Coordinator | 拥有 claim、lease、wave、retry、placement 和 outcome 持久化的确定性调度器 | `src/herdr_orchestrator/runner.py` |
+| Durable queue | SQLite 中可在 coordinator 重启后恢复的任务队列 | `src/herdr_orchestrator/store.py` |
+| Planner | 可选的任务提出者，只能写严格 task JSON，不拥有调度权 | `src/herdr_orchestrator/planner.py` |
+| Controller / router | 为单个任务选择 harness 或 topology 的受限 agent turn | `src/herdr_orchestrator/selection.py`、`src/herdr_orchestrator/topology.py` |
+| Compact catalog | Planner/Router 可见的 harness 摘要，不含完整执行上下文 | `src/herdr_orchestrator/catalog.py` |
+| Full profile | Harness 被选中后才读取的 Markdown 执行契约 | `profiles/harnesses/*.md` |
+| Placement | 任务在 Herdr 中的执行位置，取值为 `tab`、`pane`、`worktree` | `src/herdr_orchestrator/model.py` |
+| Wave | 一次 `run_once` claim 并并发处理的任务集合 | `src/herdr_orchestrator/runner.py` |
+| Replica | 同一种 harness 可并发占用的 slot 数 | `workflows/multi-harness.toml` |
+| Lease | Running job 在一段时间内的所有权。过期后可回收或失败 | `src/herdr_orchestrator/store.py` |
+| Attempt | Job 每次成功 claim 的序号 | `src/herdr_orchestrator/store.py` |
+| `dedupe_key` | Workflow 内防止重复入队的稳定键 | `src/herdr_orchestrator/model.py` |
+| Agent settled | Agent 的当前 turn 稳定进入 `idle` 或 `done` | `src/herdr_orchestrator/herdr.py` |
+| Task receipt | 对任务输出前缀或 execution-root 文件的机器验收契约 | `src/herdr_orchestrator/model.py` |
+| `task_verified` | Receipt 是否通过；未声明 receipt 时为 `null` | `src/herdr_orchestrator/store.py` |
+| Blocked | Agent 有持续交互问题。普通 queue 不自动回答 | `src/herdr_orchestrator/model.py` |
+| Resume | 人工审查后向原 blocked agent/pane 回答，不增加 attempt，不重发任务 prompt | `src/herdr_orchestrator/runner.py` |
+| GC | 只回收可证明由当前 workflow 创建的 settled pane；默认 dry-run | `src/herdr_orchestrator/runner.py` |
+| Runtime drift | Durable job 与实时 Herdr topology/lifecycle 不一致 | `src/herdr_orchestrator/dashboard/projector.py` |
+| Correlation ID | 连接 job、receipt、事件、指标和告警的随机标识 | `src/herdr_orchestrator/store.py` |
+| Manual manager | 当前 Herdr session 的临时交互式管理 agent，不具备 durable 语义 | `manager/AGENTS.md` |
+| Manager Light | 把 Manager role 和 Agent lifecycle 投影到 Herdr sidebar token 的可选插件 | `plugins/manager-light/` |
+| Standardized delivery | 显式触发的 Wayfinder、spec、ticket DAG、integration 与 review 流程 | `src/herdr_orchestrator/delivery.py` |
+| Principal proxy | 标准化交付中处理规格内本地问题的受限 controller loop | `src/herdr_orchestrator/delivery.py` |
 
-更多领域对象见[数据模型参考](../reference/data-models.md)，运行状态转换见[任务与收据](../primitives/jobs-and-receipts.md)，执行位置见[Placement 与 worktree](../primitives/placement-and-worktrees.md)。
+术语之间的关系见[系统架构](architecture.md)，持久化字段见[数据模型](../reference/data-models.md)。
 
 ## 关键源文件
 
-| 文件 | 作用 |
+| 文件 | 用途 |
 | --- | --- |
-| `src/herdr_orchestrator/model.py` | Harness、JobState、AgentState、PlacementTarget 和 dataclass |
-| `src/herdr_orchestrator/store.py` | Attempt、lease、job 与 receipt 的持久语义 |
-| `src/herdr_orchestrator/delivery_protocol.py` | 标准化交付 artifact 词汇 |
-| `docs/runtime-troubleshooting.md` | Provisioned、ready、turn observed 与 settled 的证据层次 |
+| `src/herdr_orchestrator/model.py` | 核心枚举和 dataclass |
+| `src/herdr_orchestrator/store.py` | Durable 状态与 receipt 字段 |
+| `src/herdr_orchestrator/topology.py` | Placement 规则 |
+| `manager/AGENTS.md` | 手动 Manager 边界 |
+| `docs/architecture.md` | 运行与恢复语义 |

@@ -1,165 +1,202 @@
 # Harness catalog 与路由
 Active contributors: oldwinter, chendongdong
 
-Active contributors: oldwinter, chendongdong
-
 ## Purpose
 
-Catalog 与路由系统把“有哪些 harness”与“本次任务选哪个 harness”分开处理。Planner 和 router 只看到当前 workflow 允许的紧凑能力描述；coordinator 校验选择结果后，才在 dispatch 前读取该 harness 的完整执行上下文。
+Catalog 与路由系统负责回答“当前 workflow 允许使用哪些 harness”以及“一个任务应交给谁”。它不负责 claim、lease 或执行位置；前者属于 [Coordinator 与队列](coordinator-and-queue.md)，后者属于[拓扑感知派发](../features/topology-aware-dispatch.md)。
 
-这种两级加载减少 controller prompt 体积，也把模型输出限制为结构化任务或单个 harness 名称。Harness profile 的字段含义见 [Harness profiles](../primitives/harness-profiles.md)，workflow 选项见[配置参考](../reference/configuration.md)。
+系统采用两级 profile：controller 只读取紧凑 TOML 元数据，worker 确定后才读取对应 Markdown 执行契约。这样既控制 controller prompt 大小，也避免未选中 harness 的完整上下文进入 task turn。模型给出的 route 或 planner task 只是候选输入，必须通过 exact-shape JSON、枚举和当前 worker pool 校验后才能入队。
 
-## 布局
+下文源码路径均为仓库根目录完整路径。
+
+## 目录布局
 
 ```text
-src/herdr_orchestrator/
-├── catalog.py             # Profile 装载、紧凑视图与完整上下文
-├── config.py              # Workflow/profile/worker 关联校验
-├── planner.py             # Planner 与 router 的提示和 JSON 校验
-├── selection.py           # Worker pool 与 controller 选择
-├── runner.py              # Queue 中的自动路由、planner 和 dispatch
-├── delivery.py            # 标准化交付中的自动路由
-└── model.py               # Harness、HarnessProfile、PlannerTask 等模型
+src/herdr_orchestrator/catalog.py       # profile schema、compact catalog、按需 context
+src/herdr_orchestrator/planner.py       # planner/router prompt 与严格 JSON loader
+src/herdr_orchestrator/selection.py     # 有效 worker pool 与 controller 选择
+src/herdr_orchestrator/config.py        # workflow、worker、profile 的交叉校验
+src/herdr_orchestrator/model.py         # Harness、HarnessProfile、PlannerTask
+src/herdr_orchestrator/runner.py        # queue router、周期 planner、dispatch 注入
+src/herdr_orchestrator/cli.py           # catalog/profile 命令
 profiles/harnesses/
-├── droid.toml             # 紧凑元数据
-├── droid.md               # 完整执行上下文
-└── ...                    # grok、codex、pi、claude、hermes
+├── droid.toml / droid.md
+├── grok.toml / grok.md
+├── codex.toml / codex.md
+├── pi.toml / pi.md
+├── claude.toml / claude.md
+└── hermes.toml / hermes.md
 workflows/
-├── multi-harness.toml
-├── grok-research.toml
-└── prompts/
-    └── planner.md
+├── multi-harness.toml                  # 六 worker，planner 默认关闭
+└── grok-research.toml                  # 单 Grok worker，planner 开启
 ```
 
 ## 关键抽象
 
-| 抽象 | 所在文件 | 作用 |
+| 抽象 | 完整源码路径 | 责任 |
 | --- | --- | --- |
-| `Harness` | `src/herdr_orchestrator/model.py` | 六个受支持 harness 的稳定枚举：`droid`、`grok`、`codex`、`pi`、`claude`、`hermes`。 |
-| `HarnessProfile` | `src/herdr_orchestrator/model.py` | 保存 TOML 元数据及已校验的 Markdown context 路径。 |
-| `load_harness_profiles()` | `src/herdr_orchestrator/catalog.py` | 按文件名排序装载 profile，拒绝空 catalog、重复 harness、未知字段和越界 context 路径。 |
-| `render_compact_catalog()` | `src/herdr_orchestrator/catalog.py` | 输出不含完整 Markdown context 的 JSON catalog。 |
-| `execution_prompt()` | `src/herdr_orchestrator/catalog.py` | 在 dispatch 时把已选 profile 的完整 context 与 task packet 拼接。 |
-| `effective_worker_harnesses()` | `src/herdr_orchestrator/selection.py` | 从 CLI override、planner worker 列表或 workflow workers 计算有效候选池。 |
-| `select_controller_harness()` | `src/herdr_orchestrator/selection.py` | 解析显式 controller 或按固定优先序选择本机可执行 controller。 |
-| `worker_selection_prompt()` / `load_worker_selection()` | `src/herdr_orchestrator/planner.py` | 定义并校验单任务路由的 `{"harness":"..."}` 协议。 |
-| `planner_prompt()` / `load_planner_tasks()` | `src/herdr_orchestrator/planner.py` | 定义并校验批量任务规划协议。 |
+| `Harness` | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | 六个稳定身份：`droid`、`grok`、`codex`、`pi`、`claude`、`hermes`。 |
+| `HarnessProfile` | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | 保存已校验的 compact metadata 与 `context_file` 路径，不缓存 Markdown 内容。 |
+| `load_harness_profiles()` | [`src/herdr_orchestrator/catalog.py`](../../src/herdr_orchestrator/catalog.py) | 按文件名排序装载 `*.toml`，拒绝空目录、重复 harness、未知字段和路径逃逸。 |
+| `profiles_for_workers()` | [`src/herdr_orchestrator/catalog.py`](../../src/herdr_orchestrator/catalog.py) | 按 workflow worker 顺序取 profile；worker 缺 profile 时 fail closed。 |
+| `render_compact_catalog()` | [`src/herdr_orchestrator/catalog.py`](../../src/herdr_orchestrator/catalog.py) | 生成 controller 可见的 JSON，不读取完整 Markdown。 |
+| `execution_prompt()` | [`src/herdr_orchestrator/catalog.py`](../../src/herdr_orchestrator/catalog.py) | Dispatch 时读取一个已选 profile，并与 task packet 拼接。 |
+| `effective_worker_harnesses()` | [`src/herdr_orchestrator/selection.py`](../../src/herdr_orchestrator/selection.py) | 解析 CLI override、`planner.worker_harnesses` 与全部 workers 的优先级。 |
+| `select_controller_harness()` | [`src/herdr_orchestrator/selection.py`](../../src/herdr_orchestrator/selection.py) | 解析显式 controller 或按固定顺序探测本机 CLI。 |
+| `PlannerTask` | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | Planner 产出的 `title`、`harness`、`prompt`、`dedupe_key`。 |
+| Router / planner loaders | [`src/herdr_orchestrator/planner.py`](../../src/herdr_orchestrator/planner.py) | 校验 route 与批量 task JSON；不接受 shell command 字段。 |
 
-## How it works
+## 工作流
 
 ```mermaid
 sequenceDiagram
-    participant W as Workflow config
-    participant C as Catalog
-    participant O as Controller agent
-    participant V as Output validator
-    participant Q as Coordinator
-    participant H as Worker harness
+    participant T as Workflow TOML
+    participant L as Config/Catalog loader
+    participant C as Controller
+    participant V as JSON validator
+    participant Q as Coordinator/Queue
+    participant W as Selected worker
 
-    W->>C: workers + profiles_dir
-    C-->>Q: 已校验的 profiles
-    Q->>C: 仅筛选有效 worker profiles
-    C-->>O: 紧凑 catalog
-    O-->>V: {"harness":"codex"}
-    V->>V: exact shape + enum + allowed pool
-    V-->>Q: Harness.CODEX
-    Q->>C: 请求 codex 完整 profile
-    C-->>Q: Markdown context
-    Q->>H: 完整 profile + task packet
+    T->>L: profiles_dir + workers + planner pool
+    L->>L: profile schema 与交叉校验
+    L-->>C: 当前 worker pool 的 compact catalog
+    C-->>V: route JSON 或 planner tasks JSON
+    V->>V: exact keys + enum + bounds + allowlist
+    V-->>Q: 已验证 Harness / PlannerTask
+    Q->>L: profile_for_harness(selected)
+    L->>L: 此时读取 selected context_file
+    L-->>Q: 完整 profile + task packet
+    Q->>W: dispatch
 ```
 
-### 1. Workflow 先封闭候选集合
+### 1. Workflow 先封闭候选池
 
-`load_workflow()` 在 `src/herdr_orchestrator/config.py` 中解析 `profiles_dir` 和 `[[workers]]`。它要求每个 worker 有唯一名称、唯一 harness 和对应 profile；`planner.worker_harnesses` 中的每一项也必须有已配置 worker。显式 `planner.harness` 可以位于 worker pool 之外，但仍必须有 profile。
+[`src/herdr_orchestrator/config.py`](../../src/herdr_orchestrator/config.py) 先解析 `profiles_dir` 与 `[[workers]]`。Worker 名和 harness 都必须唯一；每个 worker 必须有 profile。`planner.worker_harnesses` 若存在，只能引用已声明 worker。显式 `planner.harness` 可以不属于 worker pool，但仍必须有 catalog profile；真正 dispatch 时对应 CLI 也必须可用。
 
-`effective_worker_harnesses()` 在 `src/herdr_orchestrator/selection.py` 中应用运行时 `--worker-harness` override。若没有 override，则优先用非空的 `planner.worker_harnesses`，否则使用全部 configured workers。空集合、重复项或没有 worker 的 harness 都会失败。
+有效 worker pool 的优先级由 [`src/herdr_orchestrator/selection.py`](../../src/herdr_orchestrator/selection.py) 固定：
 
-### 2. TOML 是紧凑索引，Markdown 是执行上下文
+1. 运行时重复传入的 `--worker-harness`，整体替换 TOML 候选；
+2. 非空的 `planner.worker_harnesses`；
+3. 全部 `[[workers]]`。
 
-每个 `profiles/harnesses/*.toml` 声明 `display_name`、`summary`、`strengths`、`best_for`、`avoid_for`、`traits` 和相对 `context_file`。`src/herdr_orchestrator/catalog.py` 只允许 schema version 1，context 必须位于 profile 目录内、存在且不能通过绝对路径或 `..` 逃逸。
+空池、重复 harness 或没有对应 worker 的 override 都会失败。这个有效池同时限制 planner catalog、单任务自动路由以及本次 queue claim，不能借模型输出扩大。
 
-紧凑 catalog 只输出路由字段和形如 `harness:codex` 的 `profile_ref`，不会提前读取 Markdown 内容。`load_profile_context()` 在 `full_profile_payload()` 或 `execution_prompt()` 被调用时才读取 context，并限制为 50,000 字符。`tests/test_catalog.py` 还固定了一个重要行为：catalog 装载后修改 context，随后 dispatch 会读到新内容。
+### 2. Compact catalog 只暴露路由信息
 
-当前 profile 的路由倾向来自 `profiles/harnesses/*.toml`：
+每个 [`profiles/harnesses/*.toml`](../../profiles/harnesses/) 只含：
 
-| Harness | 主要定位 |
+- `schema_version`、`harness`、`display_name`、`summary`；
+- `strengths`、`best_for`、`avoid_for`、`traits`；
+- 指向同目录 Markdown 的 `context_file`。
+
+`compact_catalog_payload()` 输出上述路由字段，并增加 `profile_ref = "harness:<name>"`。输出中没有 `context`。`context_file` 只保存为已校验路径，直到 `full_profile_payload()` 或 `execution_prompt()` 调用 `load_profile_context()` 才读取。因此 catalog 装载后更新 Markdown，后续 dispatch 会看到新内容；[`tests/test_catalog.py`](../../tests/test_catalog.py) 固定了这一行为。
+
+当前元数据的主定位如下；它是路由提示，不是权限表：
+
+| Harness | 路由定位 |
 | --- | --- |
-| `droid` | 端到端仓库任务、工具编排和多步骤交付 |
-| `grok` | 快速工程实现、仓库探索和结构化输出 |
-| `codex` | 精确实现、测试驱动修复和可验证 diff |
-| `pi` | 低延迟、小范围检查和短任务 |
-| `claude` | 架构设计、长上下文理解和深度评审 |
-| `hermes` | 研究、跨来源综合和探索性调查 |
+| `droid` | 端到端仓库任务、工具编排、运营型工作、多步骤交付 |
+| `grok` | 快速工程实现、仓库探索、结构化输出、并行构建 |
+| `codex` | 精确修改、测试驱动修复、重构、可验证 diff |
+| `pi` | 低延迟分析、局部检查、边界清晰的短任务 |
+| `claude` | 架构设计、长上下文理解、深度评审、风险权衡 |
+| `hermes` | 资料搜集、跨来源综合、探索性研究 |
 
-### 3. Controller 只产生受限输出
+完整字段与长度约束见 [Harness profile](../primitives/harness-profiles.md)。
 
-自动 controller 的优先序由 `AUTO_CONTROLLER_ORDER` 在 `src/herdr_orchestrator/selection.py` 固定为 `droid → grok → codex → claude → hermes → pi`。自动模式只在有效 worker pool 中寻找本机可执行 CLI；显式 CLI override 或 workflow 中的 controller 则直接优先于自动探测。`force_auto` 会忽略已配置 controller。
+### 3. Controller 与 worker 是两次独立选择
 
-Queue 的自动路由位于 `Coordinator._select_worker_harness()`，见 `src/herdr_orchestrator/runner.py`。它：
+Controller 是执行 planner/router turn 的 harness，不等于最终 worker。显式 CLI override 优先于 workflow 配置；未指定时，[`src/herdr_orchestrator/selection.py`](../../src/herdr_orchestrator/selection.py) 只在有效 worker pool 内按以下顺序寻找本机 executable：
 
-1. 用 workflow 名和 `dedupe_key` 生成稳定摘要，并在 planner runtime 目录下创建临时 `route-*.json`；
-2. 向 controller 发送任务标题、prompt、紧凑 catalog、允许的 harness 列表和唯一输出路径；
-3. 只接受 `IDLE` 或 `DONE` 且无 transport error 的 turn；
-4. 通过 `load_worker_selection()` 要求输出对象只有 `harness` 一个字段，并再次校验 allowed pool；
-5. 删除临时 route 文件；若 controller agent 是本次新建的，还会关闭该临时 agent。
+```text
+droid → grok → codex → claude → hermes → pi
+```
 
-标准化交付的 `StandardizedDelivery._select_worker()` 在 `src/herdr_orchestrator/delivery.py` 中复用相同 prompt 和 validator，但把路由 artifact 保存在该次 delivery 的 `routes/` 下，以便恢复时复用选择。
+`force_auto` 会忽略已配置 controller。显式 controller 不经过 executable 探测直接返回，运行时不可用会在 dispatch 层失败。
 
-### 4. Planner 能拆任务，但不能提交命令
+Queue 单任务自动路由由 [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) 完成。Controller 只获准在 runtime 目录写一个稳定命名的 `route-<digest>.json`：
 
-启用 `planner.enabled` 后，`Coordinator._run_planner_if_due()` 按 `interval_seconds` 运行 controller。`planner_prompt()` 要求唯一输出为：
+```json
+{"harness":"codex"}
+```
+
+[`src/herdr_orchestrator/planner.py`](../../src/herdr_orchestrator/planner.py) 要求对象只有 `harness` 一个 key，值必须能转换为 `Harness` 且位于当前 allowlist。Turn 必须无 transport error 并以 `idle` 或 `done` 结束。临时 route 文件最终删除；本次新建的临时 controller agent 也会关闭，复用 agent 则保留。
+
+显式 `enqueue --harness <name>` 跳过这次 router turn，但仍不能选择有效 worker pool 之外的 worker。
+
+### 4. Planner 只能提任务
+
+启用 planner 后，[`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) 按 `interval_seconds` 运行 controller，并只接受：
 
 ```json
 {
   "tasks": [
     {
-      "title": "...",
-      "harness": "codex",
-      "prompt": "...",
-      "dedupe_key": "..."
+      "title": "Review config",
+      "harness": "claude",
+      "prompt": "只读检查配置。",
+      "dedupe_key": "review-config-v1"
     }
   ]
 }
 ```
 
-`load_planner_tasks()` 在 `src/herdr_orchestrator/planner.py` 中要求顶层和每项字段完全匹配 schema，限制任务数量和字符串长度，校验 dedupe key 格式及批内唯一性，并把 harness 转换为稳定枚举。任何额外的 `command` 字段都会因 shape 不匹配而被拒绝；`src/herdr_orchestrator/runner.py` 入队前还会再次确认所有 harness 都在有效 worker pool 中。
+[`src/herdr_orchestrator/planner.py`](../../src/herdr_orchestrator/planner.py) 的 loader 要求顶层仅有 `tasks`，每项 key 恰为 `title`、`harness`、`prompt`、`dedupe_key`；同时限制任务数、字符串长度、dedupe 格式与批内唯一性。任何 `command` 等额外字段都会被 shape 校验拒绝。Loader 负责枚举校验，Coordinator 入队前再检查 harness 是否属于当前有效 pool。
+
+Planner 是 queue 的可选输入源，不拥有 claim、lease、retry 或 dispatch 决策。默认 [`workflows/multi-harness.toml`](../../workflows/multi-harness.toml) 明确关闭 planner；[`workflows/grok-research.toml`](../../workflows/grok-research.toml) 展示固定 Grok controller 与单 harness worker pool。
 
 ### 5. Dispatch 才展开完整 profile
 
-当 job 已经拥有确定 harness 后，`Coordinator._dispatch_job()` 在 `src/herdr_orchestrator/runner.py` 中调用 `profile_for_harness()`，再用 `execution_prompt()` 生成“完整 profile + task packet”。未选中的 Markdown profile 不进入 worker prompt。标准化交付的实现与 repair dispatch 也遵循同一加载方式。
+Job 已确定 harness 并被 claim 后，[`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) 查找该 harness profile，再调用 `execution_prompt()`。最终 packet 只有两段：
+
+```text
+# Dynamically loaded harness profile
+<selected Markdown context>
+
+# Task packet
+<job prompt>
+```
+
+未选 profile 不会进入该 turn。完整 profile 不写入 SQLite；queue 持久化的是 harness 身份与任务事实。Profile 只约束 worker 的工作方式，不授予联网、push、发布或生产操作权限。
 
 ## 集成点
 
-- `src/herdr_orchestrator/cli.py` 的 `catalog` 命令只展示当前 workflow workers 对应的紧凑 profiles；`profile` 命令用于查看单个完整 profile。
-- `src/herdr_orchestrator/config.py` 把 `workflows/*.toml`、`profiles/harnesses/*.toml` 和 worker 定义组装为 `WorkflowConfig`。
-- `src/herdr_orchestrator/runner.py` 同时消费 catalog、router、planner 和 controller selection；最终 dispatch 进入 Herdr transport。
-- `src/herdr_orchestrator/delivery.py` 共享同一 worker pool 与路由协议，避免标准化交付形成第二套 harness 选择规则。
-- `skills/herdr-orchestrator/SKILL.md` 要求真实派发前先运行 `doctor` 和读取 compact catalog，再显式约束 controller 与 candidate pool。
+| 上下游 | 接口 |
+| --- | --- |
+| 配置 | [`src/herdr_orchestrator/config.py`](../../src/herdr_orchestrator/config.py) 把 TOML、workers 和 profiles 组装为 `WorkflowConfig`；字段表见[配置参考](../reference/configuration.md)。 |
+| Queue | [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) 消费 worker pool、router/planner 结果，并在 dispatch 前注入完整 profile。 |
+| CLI | [`src/herdr_orchestrator/cli.py`](../../src/herdr_orchestrator/cli.py) 的 `catalog` 只列 workflow workers；`profile` 展开一个完整 profile。 |
+| Herdr runtime | [`src/herdr_orchestrator/herdr.py`](../../src/herdr_orchestrator/herdr.py) 使用同一个 `Harness` 选择 native launch 行为，但不参与能力路由。 |
+| Topology | [拓扑感知派发](../features/topology-aware-dispatch.md) 在 harness 已知后决定 `tab`、`pane` 或 `worktree`，与 worker selection 解耦。 |
+| Standardized delivery | [`src/herdr_orchestrator/delivery.py`](../../src/herdr_orchestrator/delivery.py) 复用 compact catalog、worker selection schema 与按需 profile，route artifact 则保存在 delivery runtime 中。 |
 
 ## 修改入口
 
-新增或调整 harness 能力描述时，同时修改对应的 `profiles/harnesses/<name>.toml` 与 `profiles/harnesses/<name>.md`，并从 `tests/test_catalog.py` 验证紧凑/完整两级契约。修改自动优先序或 override 规则时从 `src/herdr_orchestrator/selection.py` 和 `tests/test_selection.py` 开始；修改模型输出 schema 时必须同步更新 `src/herdr_orchestrator/planner.py`、调用方和 `tests/test_planner.py`。
+| 想修改的行为 | 首要入口 | 必须同步 |
+| --- | --- | --- |
+| 调整某 harness 的路由描述 | [`profiles/harnesses/<harness>.toml`](../../profiles/harnesses/) | 保持 exact keys、长度上限与相对 `context_file`；运行 [`tests/test_catalog.py`](../../tests/test_catalog.py)。 |
+| 调整完整执行契约 | [`profiles/harnesses/<harness>.md`](../../profiles/harnesses/) | 检查权限边界；确认 compact catalog 仍不含 Markdown。 |
+| 改 compact schema / context 加载 | [`src/herdr_orchestrator/catalog.py`](../../src/herdr_orchestrator/catalog.py) | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py)、[`tests/test_catalog.py`](../../tests/test_catalog.py)、配置文档。 |
+| 改 planner/router JSON | [`src/herdr_orchestrator/planner.py`](../../src/herdr_orchestrator/planner.py) | [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py)、[`tests/test_planner.py`](../../tests/test_planner.py)。 |
+| 改候选池或 controller 顺序 | [`src/herdr_orchestrator/selection.py`](../../src/herdr_orchestrator/selection.py) | [`tests/test_selection.py`](../../tests/test_selection.py)、CLI override 说明。 |
+| 新增 harness | [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | Profile TOML/Markdown、runtime launch spec、workflow worker、CLI choices 与所有枚举覆盖测试。 |
+| 改 workflow 关联规则 | [`src/herdr_orchestrator/config.py`](../../src/herdr_orchestrator/config.py) | [`docs/workflow-schema.md`](../../docs/workflow-schema.md)、[配置参考](../reference/configuration.md)、[`tests/test_config.py`](../../tests/test_config.py)。 |
 
-若修改 workflow 字段，不要绕过 `src/herdr_orchestrator/config.py` 的跨字段校验，并同步更新[配置参考](../reference/configuration.md)和 `tests/test_config.py`。
+## Key source files
 
-## 关键源文件表
-
-| 文件 | 作用 |
+| 仓库根目录完整路径 | 作用 |
 | --- | --- |
-| `src/herdr_orchestrator/catalog.py` | Profile schema、紧凑 catalog、完整 context 和执行 prompt。 |
-| `src/herdr_orchestrator/planner.py` | Planner/router 提示模板与严格 JSON 输出校验。 |
-| `src/herdr_orchestrator/selection.py` | Worker pool 与 controller 选择。 |
-| `src/herdr_orchestrator/config.py` | Workflow、worker、planner 和 profile 的装载及关联校验。 |
-| `src/herdr_orchestrator/runner.py` | Queue 自动路由、周期 planner 和 dispatch 前 profile 注入。 |
-| `src/herdr_orchestrator/delivery.py` | 标准化交付中的持久路由 artifact 与 profile 注入。 |
-| `src/herdr_orchestrator/cli.py` | `catalog` 与 `profile` 命令入口。 |
-| `src/herdr_orchestrator/model.py` | `Harness`、`HarnessProfile`、`PlannerTask` 和配置数据模型。 |
-| `profiles/harnesses/*.toml` | 六个 harness 的紧凑路由元数据。 |
-| `profiles/harnesses/*.md` | 六个 harness 的完整执行契约。 |
-| `workflows/multi-harness.toml` | 默认六 worker catalog 与关闭的 planner。 |
-| `workflows/grok-research.toml` | 启用 Grok planner、单 harness 多副本的示例。 |
-| `workflows/prompts/planner.md` | 默认 planner 的权限边界与任务质量要求。 |
-| `tests/test_catalog.py` | 两级 profile、按需读取和路径逃逸测试。 |
-| `tests/test_planner.py` | Router/planner schema、allowed pool 和禁止额外命令测试。 |
-| `tests/test_selection.py` | 自动 controller 顺序与 override 测试。 |
-| `tests/test_config.py` | Workflow 与 profile/worker 关联测试。 |
+| [`src/herdr_orchestrator/catalog.py`](../../src/herdr_orchestrator/catalog.py) | Profile exact schema、compact payload、按需 context 与 execution packet。 |
+| [`src/herdr_orchestrator/planner.py`](../../src/herdr_orchestrator/planner.py) | Planner/router prompt 与严格 JSON loader。 |
+| [`src/herdr_orchestrator/selection.py`](../../src/herdr_orchestrator/selection.py) | Worker pool 和 controller 选择优先级。 |
+| [`src/herdr_orchestrator/config.py`](../../src/herdr_orchestrator/config.py) | Workflow、worker、planner、profile 交叉校验。 |
+| [`src/herdr_orchestrator/model.py`](../../src/herdr_orchestrator/model.py) | `Harness`、`HarnessProfile`、`PlannerTask`、配置 dataclass。 |
+| [`src/herdr_orchestrator/runner.py`](../../src/herdr_orchestrator/runner.py) | 自动 route、周期 planner 与 dispatch 前 profile 注入。 |
+| [`src/herdr_orchestrator/cli.py`](../../src/herdr_orchestrator/cli.py) | `catalog` / `profile` 命令。 |
+| [`profiles/harnesses/`](../../profiles/harnesses/) | 六个 compact TOML 与完整 Markdown 的 canonical source。 |
+| [`workflows/multi-harness.toml`](../../workflows/multi-harness.toml) | 六 worker 默认 workflow。 |
+| [`workflows/grok-research.toml`](../../workflows/grok-research.toml) | 单 worker、多 replica、planner 开启示例。 |
+| [`tests/test_catalog.py`](../../tests/test_catalog.py) | 两级加载、context 新鲜度与路径逃逸测试。 |
+| [`tests/test_planner.py`](../../tests/test_planner.py) | Exact shape、allowed pool、dedupe 与额外字段拒绝测试。 |
+| [`tests/test_selection.py`](../../tests/test_selection.py) | Controller 顺序、显式 override 与 worker pool 测试。 |
+| [`tests/test_config.py`](../../tests/test_config.py) | Workflow/profile/worker 关联与样例配置测试。 |
