@@ -92,7 +92,7 @@ class HarnessAutomationTests(unittest.TestCase):
                         0,
                         (
                             "Accessing workspace:\n"
-                            f"{workspace}\n"
+                            f"{workspace.resolve()}\n"
                             "Quick safety check:\n"
                             "1. Yes, I trust this folder\n"
                             "2. No, exit\n"
@@ -162,7 +162,7 @@ class HarnessAutomationTests(unittest.TestCase):
                         0,
                         (
                             "Accessing workspace:\n"
-                            f"{workspace}\n"
+                            f"{workspace.resolve()}\n"
                             "Quick safety check:\n"
                             "1. Yes, I trust this folder\n"
                             "2. No, exit\n"

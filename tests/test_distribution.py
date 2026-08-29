@@ -229,10 +229,9 @@ class DistributionCliTests(unittest.TestCase):
             )
 
             self.assertEqual(manager.returncode, 0, manager.stderr)
-            self.assertEqual(
-                probe.read_text(encoding="utf-8").splitlines(),
-                [str(project / ".herdr-orchestrator/manager")],
-            )
+            probe_lines = probe.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(probe_lines), 1)
+            self.assertTrue(Path(probe_lines[0]).samefile(project / ".herdr-orchestrator/manager"))
 
     def test_manager_reports_and_clears_a_complete_best_effort_token_patch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1107,9 +1106,10 @@ class DistributionCliTests(unittest.TestCase):
             )
             self.assertEqual(installed.returncode, 0, installed.stderr)
             manager_bin = install_directory / "node_modules/.bin/herdr-manager"
-            self.assertEqual(
-                manager_bin.resolve(),
-                install_directory / "node_modules/herdr-manager/bin/herdr-manager.mjs",
+            self.assertTrue(
+                manager_bin.samefile(
+                    install_directory / "node_modules/herdr-manager/bin/herdr-manager.mjs"
+                )
             )
             probe = root / "manager-probe"
             for name in ("grok", "codex", "claude"):
