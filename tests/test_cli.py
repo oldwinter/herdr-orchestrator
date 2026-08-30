@@ -21,13 +21,110 @@ from herdr_orchestrator.model import (
     DispatchContext,
     DispatchOutcome,
     Harness,
+    NewJob,
     ReceiptKind,
 )
+from herdr_orchestrator.readiness import HarnessHealthRegistry
+from herdr_orchestrator.store import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliTests(unittest.TestCase):
+    def test_status_projects_enabled_health_and_pending_availability_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            droid_worker = next(
+                worker for worker in base.workers if worker.harness is Harness.DROID
+            )
+            config = replace(
+                base,
+                state_db=Path(temporary) / "state.db",
+                workers=(droid_worker,),
+                planner=replace(
+                    base.planner,
+                    harness=Harness.GROK,
+                    worker_harnesses=(Harness.DROID,),
+                ),
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(
+                NewJob(
+                    workflow=config.name,
+                    title="Deferred",
+                    harness=Harness.DROID,
+                    prompt="Wait for readiness.",
+                    dedupe_key="status-deferred",
+                    max_attempts=2,
+                )
+            )
+            HarnessHealthRegistry(config, store).record_probe(
+                Harness.DROID,
+                {
+                    "status": "timeout",
+                    "error_code": "herdr_timeout",
+                    "error_summary": "private terminal output",
+                },
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = cli_module._command_status(config, Namespace())
+            report = json.loads(output.getvalue())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [row["harness"] for row in report["harness_health"]],
+            ["droid", "grok"],
+        )
+        self.assertEqual(report["jobs"][0]["availability_reason"], "herdr_timeout")
+        self.assertNotIn("private terminal output", output.getvalue())
+
+    def test_doctor_records_targeted_readiness_for_later_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(base, state_db=Path(temporary) / "state.db")
+            store = Store(config.state_db)
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+
+            with redirect_stdout(io.StringIO()):
+                code = doctor(
+                    config,
+                    environ={
+                        "HERDR_ENV": "1",
+                        "HERDR_PANE_ID": "w1:p1",
+                        "HERDR_WORKSPACE_ID": "w1",
+                    },
+                    which=lambda name: f"/bin/{name}",
+                    version_runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                        ["herdr", "--version"],
+                        0,
+                        "herdr 0.8.2\n",
+                        "",
+                    ),
+                    readiness_probe=lambda workflow, harness, timeout: {
+                        "status": "ready",
+                        "error_code": None,
+                        "error_summary": None,
+                    },
+                    selected_harnesses=["grok"],
+                    health_registry=health,
+                )
+
+            projection = health.projection((Harness.GROK, Harness.CODEX))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(projection[0]["status"], "ready")
+        self.assertTrue(projection[0]["eligible"])
+        self.assertEqual(projection[0]["source"], "doctor")
+        self.assertEqual(projection[1]["status"], "unknown")
+
     def test_readiness_probe_classifies_invalid_model_and_closes_created_agent(self) -> None:
         config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
 
@@ -429,6 +526,7 @@ class CliCommandDispatchTests(unittest.TestCase):
             self.assertEqual(cli_module._command_retry(self.config, args), 0)
             self.assertEqual(cli_module._command_status(self.config, args), 0)
         self.assertIn('"added": 2', output.getvalue())
+        self.assertIn('"harness_health"', output.getvalue())
         store.initialize.assert_called()
 
     def test_enqueue_and_run_modes_forward_typed_arguments(self) -> None:

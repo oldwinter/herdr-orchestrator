@@ -4,6 +4,7 @@ import hashlib
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
@@ -39,6 +40,7 @@ from herdr_orchestrator.planner import (
     planner_prompt,
     worker_selection_prompt,
 )
+from herdr_orchestrator.readiness import HarnessHealthRegistry
 from herdr_orchestrator.selection import (
     effective_worker_harnesses,
     select_controller_harness,
@@ -90,16 +92,27 @@ class Coordinator:
         controller_auto: bool = False,
         worker_harnesses: Iterable[Harness] | None = None,
         observability: Observability | None = None,
+        health_registry: HarnessHealthRegistry | None = None,
     ) -> None:
         self.config = config
         self.store = store or Store(config.state_db)
+        uses_default_dispatcher = dispatcher is None
         self.dispatcher = dispatcher or HerdrTransport(config.name, config.workspace)
         self.controller_harness = controller_harness
         self.controller_auto = controller_auto
         self.worker_harnesses = effective_worker_harnesses(config, worker_harnesses)
         self.observability = observability or Observability(
-            config.state_db.parent / "telemetry",
+            config.state_db.parent / "observability",
             config.name,
+        )
+        self.health_registry = health_registry or (
+            HarnessHealthRegistry(
+                config,
+                self.store,
+                observability=self.observability,
+            )
+            if uses_default_dispatcher
+            else None
         )
 
     def initialize(self) -> None:
@@ -151,6 +164,8 @@ class Coordinator:
         if existing is not None:
             job_id, existing_harness = existing
             return job_id, False, existing_harness
+        if harness is not None:
+            self._require_eligible(harness)
         selected = harness or self._select_worker_harness(title, prompt, dedupe_key)
         if selected not in self.worker_harnesses:
             raise ValueError(f"harness_has_no_worker: {selected.value}")
@@ -188,13 +203,14 @@ class Coordinator:
         self._assign_pending_placements(dispatch_deadline)
         batch_key = f"run-{time.time_ns()}"
         slot_names = self._slot_names()
+        eligible_workers = self._eligible_worker_harnesses(dispatch_deadline)
         jobs = self.store.claim(
             self.config.name,
             limit=self.config.coordinator.max_parallel,
             lease_seconds=self.config.coordinator.lease_seconds,
             slot_names=slot_names,
             slot_limits={worker.harness.value: worker.replicas for worker in self.config.workers},
-            allowed_harnesses=self.worker_harnesses,
+            allowed_harnesses=eligible_workers,
         )
         results = {state.value: 0 for state in JobState}
         if not jobs:
@@ -236,6 +252,7 @@ class Coordinator:
             "claimed": claimed,
             "batch": dict(batch),
             "queue": self.store.status_counts(self.config.name),
+            "harness_health": self._health_projection(),
         }
 
     def run_until_idle(self, *, timeout_seconds: int) -> dict[str, object]:
@@ -264,7 +281,7 @@ class Coordinator:
                 last_queue = self.store.status_counts(self.config.name)
                 active = self.store.status_counts(
                     self.config.name,
-                    allowed_harnesses=self.worker_harnesses,
+                    allowed_harnesses=self._eligible_worker_harnesses(deadline),
                 )
                 return self._drain_report(
                     aggregate,
@@ -274,6 +291,20 @@ class Coordinator:
                     claimed=total_claimed,
                     queue=last_queue,
                     worker_pool_idle=_queue_is_idle(active),
+                    queue_idle=_queue_is_idle(last_queue),
+                )
+            except ValueError as exc:
+                if not str(exc).startswith("controller_harness_unavailable:"):
+                    raise
+                last_queue = self.store.status_counts(self.config.name)
+                return self._drain_report(
+                    aggregate,
+                    idle=False,
+                    reason="worker_pool_unavailable",
+                    waves=waves,
+                    claimed=total_claimed,
+                    queue=last_queue,
+                    worker_pool_idle=False,
                     queue_idle=_queue_is_idle(last_queue),
                 )
             waves += 1
@@ -288,11 +319,15 @@ class Coordinator:
             last_queue = {str(key): _integer(value) for key, value in queue.items()}
             active = self.store.status_counts(
                 self.config.name,
+                allowed_harnesses=self._eligible_worker_harnesses(deadline),
+            )
+            configured = self.store.status_counts(
+                self.config.name,
                 allowed_harnesses=self.worker_harnesses,
             )
             worker_pool_idle = _queue_is_idle(active)
             queue_idle = _queue_is_idle(last_queue)
-            if active[JobState.BLOCKED.value] > 0:
+            if configured[JobState.BLOCKED.value] > 0:
                 return self._drain_report(
                     aggregate,
                     idle=False,
@@ -313,6 +348,17 @@ class Coordinator:
                     claimed=total_claimed,
                     queue=last_queue,
                     worker_pool_idle=worker_pool_idle,
+                    queue_idle=queue_idle,
+                )
+            if worker_pool_idle and not _queue_is_idle(configured):
+                return self._drain_report(
+                    aggregate,
+                    idle=False,
+                    reason="worker_pool_unavailable",
+                    waves=waves,
+                    claimed=total_claimed,
+                    queue=last_queue,
+                    worker_pool_idle=False,
                     queue_idle=queue_idle,
                 )
             if worker_pool_idle:
@@ -371,6 +417,7 @@ class Coordinator:
                 error_code="resume_unhandled_error",
                 placement=job.placement,
             )
+        self._record_health(job.harness, outcome)
         state = self.store.record_resume_outcome(job, outcome)
         return {
             "job_id": job.job_id,
@@ -409,6 +456,7 @@ class Coordinator:
             "claimed": claimed,
             "batch": dict(aggregate),
             "queue": queue,
+            "harness_health": self._health_projection(),
         }
 
     def gc_succeeded_agents(self, *, dry_run: bool = True) -> dict[str, object]:
@@ -554,6 +602,7 @@ class Coordinator:
                 ),
             )
             outcome = replace(outcome, correlation_id=job.correlation_id)
+        self._record_health(job.harness, outcome)
         duration = time.monotonic() - started
         fields = {
             "attempt": job.attempt,
@@ -605,7 +654,7 @@ class Coordinator:
     def _assign_pending_placements(self, dispatch_deadline: float | None) -> None:
         for row in self.store.unplaced_jobs(
             self.config.name,
-            allowed_harnesses=self.worker_harnesses,
+            allowed_harnesses=self._eligible_worker_harnesses(dispatch_deadline),
         ):
             self._dispatch_timeout(dispatch_deadline)
             harness = Harness(str(row["harness"]))
@@ -650,7 +699,7 @@ class Coordinator:
         dedupe_key: str,
         dispatch_deadline: float | None = None,
     ) -> PlacementTarget:
-        controller = self._controller_harness()
+        controller = self._controller_harness(dispatch_deadline)
         digest = hashlib.sha256(f"{self.config.name}\0topology\0{dedupe_key}".encode()).hexdigest()[
             :12
         ]
@@ -678,6 +727,7 @@ class Coordinator:
                     f"topology:{job_id}",
                 ),
             )
+            self._record_health(controller, outcome)
             self._dispatch_timeout(dispatch_deadline)
             if outcome.error_code is not None or outcome.state not in {
                 AgentState.IDLE,
@@ -710,7 +760,10 @@ class Coordinator:
             self.config.workspace,
             controller,
         )
-        profiles = self._worker_profiles()
+        eligible_workers = self._eligible_worker_harnesses()
+        if not eligible_workers:
+            raise ValueError(self._unavailable_error("worker_harness_unavailable"))
+        profiles = self._worker_profiles(eligible_workers)
         digest = hashlib.sha256(f"{self.config.name}\0{dedupe_key}".encode()).hexdigest()[:12]
         output_file = self.config.planner.output_file.parent / f"route-{digest}.json"
         output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -723,7 +776,7 @@ class Coordinator:
                     f"Title: {title}\n\nPrompt:\n{prompt}",
                     output_file,
                     render_compact_catalog(profiles),
-                    self.worker_harnesses,
+                    eligible_workers,
                 ),
                 timeout_seconds=self.config.coordinator.agent_timeout_seconds,
                 agent_name=controller_name,
@@ -733,6 +786,7 @@ class Coordinator:
                     f"route:{dedupe_key}",
                 ),
             )
+            self._record_health(controller, outcome)
             if outcome.error_code is not None or outcome.state not in {
                 AgentState.IDLE,
                 AgentState.DONE,
@@ -740,10 +794,16 @@ class Coordinator:
                 raise ValueError(
                     f"worker_selection_failed:{outcome.error_code or outcome.state.value}"
                 )
-            return load_worker_selection(
+            selected = load_worker_selection(
                 output_file,
-                allowed_harnesses=self.worker_harnesses,
+                allowed_harnesses=eligible_workers,
             )
+            self._record_harness_selected(
+                "worker",
+                selected,
+                mode="controller_route",
+            )
+            return selected
         except PlannerOutputError as exc:
             raise ValueError(str(exc)) from exc
         finally:
@@ -762,17 +822,34 @@ class Coordinator:
             raise ValueError("dispatcher_controller_cleanup_unsupported")
         closer(controller_name)
 
-    def _controller_harness(self) -> Harness:
-        return select_controller_harness(
-            self.config,
-            worker_harnesses=self.worker_harnesses,
-            override=self.controller_harness,
-            force_auto=self.controller_auto,
+    def _controller_harness(self, deadline: float | None = None) -> Harness:
+        requested = (
+            None
+            if self.controller_auto
+            else (self.controller_harness or self.config.planner.harness)
         )
+        if requested is not None:
+            self._require_eligible(requested, deadline)
+            self._record_harness_selected("controller", requested, mode="explicit")
+            return requested
+        candidates = self._eligible_worker_harnesses(deadline)
+        if not candidates:
+            raise ValueError(self._unavailable_error("controller_harness_unavailable"))
+        selected = select_controller_harness(
+            self.config,
+            worker_harnesses=candidates,
+            force_auto=True,
+        )
+        self._record_harness_selected("controller", selected, mode="automatic")
+        return selected
 
-    def _worker_profiles(self) -> tuple[HarnessProfile, ...]:
+    def _worker_profiles(
+        self,
+        harnesses: Iterable[Harness] | None = None,
+    ) -> tuple[HarnessProfile, ...]:
         return tuple(
-            profile_for_harness(self.config.profiles, harness) for harness in self.worker_harnesses
+            profile_for_harness(self.config.profiles, harness)
+            for harness in (self.worker_harnesses if harnesses is None else harnesses)
         )
 
     def _run_planner_if_due(self, dispatch_deadline: float | None = None) -> None:
@@ -787,8 +864,11 @@ class Coordinator:
         self.store.set_metadata_float(metadata_key, now)
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)
         planner.output_file.unlink(missing_ok=True)
-        controller = self._controller_harness()
-        profiles = self._worker_profiles()
+        controller = self._controller_harness(dispatch_deadline)
+        eligible_workers = self._eligible_worker_harnesses(dispatch_deadline)
+        if not eligible_workers:
+            return
+        profiles = self._worker_profiles(eligible_workers)
         outcome = self.dispatcher.dispatch(
             controller,
             planner_prompt(
@@ -796,7 +876,7 @@ class Coordinator:
                 planner.output_file,
                 planner.max_tasks,
                 render_compact_catalog(profiles),
-                self.worker_harnesses,
+                eligible_workers,
             ),
             timeout_seconds=self._dispatch_timeout(dispatch_deadline),
             agent_name=_controller_agent_name(
@@ -810,6 +890,7 @@ class Coordinator:
                 f"planner:{self.config.name}",
             ),
         )
+        self._record_health(controller, outcome)
         self._dispatch_timeout(dispatch_deadline)
         if outcome.error_code is not None or outcome.state not in {
             AgentState.IDLE,
@@ -820,10 +901,15 @@ class Coordinator:
             tasks = load_planner_tasks(planner.output_file, max_tasks=planner.max_tasks)
         except PlannerOutputError:
             return
-        allowed_harnesses = set(self.worker_harnesses)
+        allowed_harnesses = set(eligible_workers)
         if any(task.harness not in allowed_harnesses for task in tasks):
             return
         for task in tasks:
+            self._record_harness_selected(
+                "worker",
+                task.harness,
+                mode="planner",
+            )
             self.store.enqueue(
                 NewJob(
                     workflow=self.config.name,
@@ -840,6 +926,91 @@ class Coordinator:
                     ),
                 )
             )
+
+    def _eligible_worker_harnesses(
+        self,
+        deadline: float | None = None,
+    ) -> tuple[Harness, ...]:
+        if self.health_registry is None:
+            return self.worker_harnesses
+        eligible = self.health_registry.eligible(
+            self.worker_harnesses,
+            deadline=deadline,
+        )
+        projection = self.health_registry.projection(self.worker_harnesses)
+        with suppress(Exception):
+            self.observability.event(
+                "harness_candidates_evaluated",
+                correlation_id="harness-routing",
+                fields={
+                    "candidates": [harness.value for harness in self.worker_harnesses],
+                    "eligible": [harness.value for harness in eligible],
+                    "excluded": [
+                        {
+                            "harness": row["harness"],
+                            "reason_code": row["reason_code"],
+                            "status": row["status"],
+                        }
+                        for row in projection
+                        if not row["eligible"]
+                    ],
+                    "role": "worker_pool",
+                },
+            )
+        return eligible
+
+    def _record_harness_selected(
+        self,
+        role: str,
+        harness: Harness,
+        *,
+        mode: str,
+    ) -> None:
+        with suppress(Exception):
+            self.observability.event(
+                "harness_selected",
+                correlation_id="harness-routing",
+                fields={
+                    "harness": harness.value,
+                    "mode": mode,
+                    "role": role,
+                },
+            )
+
+    def _record_health(self, harness: Harness, outcome: DispatchOutcome) -> None:
+        if self.health_registry is not None:
+            with suppress(Exception):
+                self.health_registry.record_dispatch(
+                    harness,
+                    outcome,
+                    workspace=(
+                        Path(outcome.execution_path)
+                        if outcome.execution_path is not None
+                        else self.config.workspace
+                    ),
+                )
+
+    def _require_eligible(
+        self,
+        harness: Harness,
+        deadline: float | None = None,
+    ) -> None:
+        if self.health_registry is not None:
+            self.health_registry.require(harness, deadline=deadline)
+
+    def _health_projection(self) -> list[dict[str, object]]:
+        if self.health_registry is None:
+            return []
+        return self.health_registry.projection(self.worker_harnesses)
+
+    def _unavailable_error(self, code: str) -> str:
+        if self.health_registry is None:
+            return code
+        reasons = ",".join(
+            f"{row['harness']}={row['reason_code']}"
+            for row in self.health_registry.projection(self.worker_harnesses)
+        )
+        return f"{code}:{reasons}"
 
     def _dispatch_timeout(self, dispatch_deadline: float | None) -> float:
         timeout_seconds = float(self.config.coordinator.agent_timeout_seconds)

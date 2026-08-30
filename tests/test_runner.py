@@ -7,6 +7,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.herdr import replica_slot_names, worktree_agent_name
@@ -20,6 +21,7 @@ from herdr_orchestrator.model import (
     ReceiptKind,
     TaskReceipt,
 )
+from herdr_orchestrator.readiness import HarnessHealthRegistry
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.store import Store
 
@@ -35,15 +37,20 @@ class FakeDispatcher:
         routed_harness: Harness | None = None,
         topology_placement: str | None = None,
         delay_seconds: float = 0,
+        planner_output: Path | None = None,
+        planned_harness: Harness | None = None,
     ) -> None:
         self.outcomes = outcomes
         self.route_output = route_output
         self.routed_harness = routed_harness
         self.topology_placement = topology_placement
         self.delay_seconds = delay_seconds
+        self.planner_output = planner_output
+        self.planned_harness = planned_harness
         self.calls: list[Harness] = []
         self.timeouts: list[float] = []
         self.prompts: dict[Harness, str] = {}
+        self.prompt_history: list[str] = []
         self.contexts: list[DispatchContext | None] = []
         self.closed_created_agents: list[str] = []
 
@@ -61,6 +68,7 @@ class FakeDispatcher:
             time.sleep(self.delay_seconds)
         self.calls.append(harness)
         self.prompts[harness] = prompt
+        self.prompt_history.append(prompt)
         self.contexts.append(context)
         if self.route_output is not None and self.routed_harness is not None:
             self.route_output.write_text(
@@ -81,6 +89,27 @@ class FakeDispatcher:
                     {
                         "placement": self.topology_placement,
                         "rationale": "Use the requested test topology.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+        if (
+            self.planner_output is not None
+            and self.planned_harness is not None
+            and '"tasks"' in prompt
+        ):
+            self.planner_output.parent.mkdir(parents=True, exist_ok=True)
+            self.planner_output.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "title": "Planned",
+                                "harness": self.planned_harness.value,
+                                "prompt": "Inspect the repository.",
+                                "dedupe_key": "planned-ready-worker",
+                            }
+                        ]
                     }
                 ),
                 encoding="utf-8",
@@ -148,6 +177,444 @@ class ResumeDispatcher(FakeDispatcher):
 
 
 class CoordinatorTests(unittest.TestCase):
+    def test_auto_routing_uses_ready_controller_and_worker_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(base.planner, output_file=root / "plans/planner.json"),
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Implement a focused change.", encoding="utf-8")
+            route_output = root / "plans/route-1ab25567ce25.json"
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.GROK: DispatchOutcome(
+                        "router",
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                    )
+                },
+                route_output=route_output,
+                routed_harness=Harness.GROK,
+            )
+            store = Store(config.state_db)
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: (
+                    {
+                        "status": "ready",
+                        "error_code": None,
+                        "error_summary": None,
+                    }
+                    if harness is Harness.GROK
+                    else {
+                        "status": "timeout",
+                        "error_code": "agent_turn_not_observed",
+                        "error_summary": None,
+                    }
+                ),
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+            observability = MagicMock()
+            coordinator = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                worker_harnesses=(Harness.DROID, Harness.GROK),
+                observability=observability,
+                health_registry=health,
+            )
+
+            _, created, selected = coordinator.enqueue_prompt_file(
+                harness=None,
+                title="Build",
+                prompt_file=prompt_file,
+                dedupe_key="ready-route",
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(selected, Harness.GROK)
+        self.assertEqual(dispatcher.calls, [Harness.GROK])
+        self.assertIn('"harness": "grok"', dispatcher.prompts[Harness.GROK])
+        self.assertNotIn('"harness": "droid"', dispatcher.prompts[Harness.GROK])
+        event_names = [call.args[0] for call in observability.event.call_args_list]
+        self.assertIn("harness_candidates_evaluated", event_names)
+        self.assertEqual(event_names.count("harness_selected"), 2)
+
+    def test_pending_job_waits_for_ready_worker_without_consuming_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            job_id, _ = store.enqueue(_job(config.name, Harness.DROID))
+            now = [100.0]
+            ready = [False]
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: {
+                    "status": "ready" if ready[0] else "timeout",
+                    "error_code": None if ready[0] else "herdr_timeout",
+                    "error_summary": None,
+                },
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: now[0],
+            )
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "droid-worker",
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                    )
+                }
+            )
+            coordinator = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                worker_harnesses=(Harness.DROID,),
+                health_registry=health,
+            )
+
+            deferred = coordinator.run_once()
+            job_before_recovery = store.jobs(config.name)[0]
+            ready[0] = True
+            now[0] = 401.0
+            recovered = coordinator.run_once()
+
+        self.assertEqual(deferred["claimed"], 0)
+        self.assertEqual(job_before_recovery["id"], job_id)
+        self.assertEqual(job_before_recovery["state"], "pending")
+        self.assertEqual(job_before_recovery["attempts"], 0)
+        self.assertEqual(deferred["harness_health"][0]["status"], "degraded")
+        self.assertEqual(recovered["succeeded"], 1)
+        self.assertEqual(dispatcher.calls, [Harness.DROID])
+
+    def test_explicit_unhealthy_worker_never_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Implement a focused change.", encoding="utf-8")
+            dispatcher = FakeDispatcher({})
+            health = HarnessHealthRegistry(
+                config,
+                Store(config.state_db),
+                probe=lambda workflow, harness, timeout: (
+                    {
+                        "status": "ready",
+                        "error_code": None,
+                        "error_summary": None,
+                    }
+                    if harness is Harness.GROK
+                    else {
+                        "status": "auth_required",
+                        "error_code": "agent_auth_required",
+                        "error_summary": None,
+                    }
+                ),
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+            coordinator = Coordinator(
+                config,
+                dispatcher=dispatcher,
+                worker_harnesses=(Harness.DROID, Harness.GROK),
+                health_registry=health,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "harness_unavailable:droid:agent_auth_required",
+            ):
+                coordinator.enqueue_prompt_file(
+                    harness=Harness.DROID,
+                    title="Build",
+                    prompt_file=prompt_file,
+                    dedupe_key="explicit-unhealthy-worker",
+                )
+
+        self.assertEqual(dispatcher.calls, [])
+
+    def test_automatic_all_unavailable_selection_reports_each_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Implement a focused change.", encoding="utf-8")
+            dispatcher = FakeDispatcher({})
+            health = HarnessHealthRegistry(
+                config,
+                Store(config.state_db),
+                probe=lambda workflow, harness, timeout: (
+                    {
+                        "status": "auth_required",
+                        "error_code": "agent_auth_required",
+                        "error_summary": None,
+                    }
+                    if harness is Harness.DROID
+                    else {
+                        "status": "model_invalid",
+                        "error_code": "agent_model_invalid",
+                        "error_summary": None,
+                    }
+                ),
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+            coordinator = Coordinator(
+                config,
+                dispatcher=dispatcher,
+                worker_harnesses=(Harness.DROID, Harness.GROK),
+                health_registry=health,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "controller_harness_unavailable:"
+                "droid=agent_auth_required,grok=agent_model_invalid",
+            ):
+                coordinator.enqueue_prompt_file(
+                    harness=None,
+                    title="Build",
+                    prompt_file=prompt_file,
+                    dedupe_key="all-unavailable",
+                )
+
+        self.assertEqual(dispatcher.calls, [])
+
+    def test_planner_catalog_contains_only_ready_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            planner_output = root / "plans/planner.json"
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(
+                    base.planner,
+                    enabled=True,
+                    interval_seconds=0,
+                    output_file=planner_output,
+                    worker_harnesses=(Harness.DROID, Harness.GROK),
+                ),
+            )
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.GROK: DispatchOutcome(
+                        "planner",
+                        AgentState.DONE,
+                        True,
+                        "w1:p1",
+                    )
+                },
+                planner_output=planner_output,
+                planned_harness=Harness.GROK,
+            )
+            store = Store(config.state_db)
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: (
+                    {
+                        "status": "ready",
+                        "error_code": None,
+                        "error_summary": None,
+                    }
+                    if harness is Harness.GROK
+                    else {
+                        "status": "timeout",
+                        "error_code": "herdr_timeout",
+                        "error_summary": None,
+                    }
+                ),
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+            coordinator = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                worker_harnesses=(Harness.DROID, Harness.GROK),
+                health_registry=health,
+            )
+            coordinator.initialize()
+
+            coordinator._run_planner_if_due()
+            planned_jobs = store.jobs(config.name)
+
+        self.assertEqual(planned_jobs[0]["harness"], "grok")
+        self.assertIn('"harness":"grok"', dispatcher.prompt_history[0])
+        self.assertNotIn('"harness":"droid', dispatcher.prompt_history[0])
+
+    def test_explicit_unhealthy_controller_never_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(base.planner, output_file=root / "plans/planner.json"),
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Implement a focused change.", encoding="utf-8")
+            dispatcher = FakeDispatcher({})
+            store = Store(config.state_db)
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: (
+                    {
+                        "status": "ready",
+                        "error_code": None,
+                        "error_summary": None,
+                    }
+                    if harness is Harness.GROK
+                    else {
+                        "status": "auth_required",
+                        "error_code": "agent_auth_required",
+                        "error_summary": None,
+                    }
+                ),
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+            coordinator = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID, Harness.GROK),
+                health_registry=health,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "harness_unavailable:droid:agent_auth_required",
+            ):
+                coordinator.enqueue_prompt_file(
+                    harness=None,
+                    title="Build",
+                    prompt_file=prompt_file,
+                    dedupe_key="explicit-unhealthy-controller",
+                )
+
+        self.assertEqual(dispatcher.calls, [])
+
+    def test_run_until_idle_reports_unavailable_worker_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: {
+                    "status": "model_invalid",
+                    "error_code": "agent_model_invalid",
+                    "error_summary": None,
+                },
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=FakeDispatcher({}),
+                worker_harnesses=(Harness.DROID,),
+                health_registry=health,
+            ).run_until_idle(timeout_seconds=10)
+
+        self.assertFalse(result["idle"])
+        self.assertEqual(result["reason"], "worker_pool_unavailable")
+        self.assertFalse(result["worker_pool_idle"])
+        self.assertFalse(result["queue_idle"])
+        self.assertEqual(result["queue"]["pending"], 1)
+        self.assertEqual(
+            result["harness_health"][0]["reason_code"],
+            "agent_model_invalid",
+        )
+
+    def test_planner_drain_reports_unavailable_worker_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            droid_worker = next(
+                worker for worker in base.workers if worker.harness is Harness.DROID
+            )
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                workers=(droid_worker,),
+                planner=replace(
+                    base.planner,
+                    enabled=True,
+                    interval_seconds=0,
+                    output_file=root / "plans/planner.json",
+                    worker_harnesses=(Harness.DROID,),
+                ),
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(
+                replace(
+                    _job(config.name, Harness.DROID),
+                    placement=PlacementTarget.PANE,
+                )
+            )
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: {
+                    "status": "timeout",
+                    "error_code": "herdr_timeout",
+                    "error_summary": None,
+                },
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=FakeDispatcher({}),
+                worker_harnesses=(Harness.DROID,),
+                health_registry=health,
+            ).run_until_idle(timeout_seconds=10)
+
+        self.assertFalse(result["idle"])
+        self.assertEqual(result["reason"], "worker_pool_unavailable")
+        self.assertEqual(result["claimed"], 0)
+        self.assertEqual(result["queue"]["pending"], 1)
+        self.assertEqual(
+            result["harness_health"][0]["reason_code"],
+            "herdr_timeout",
+        )
+
     def test_dispatches_claimed_jobs_and_records_results(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
@@ -282,12 +749,37 @@ class CoordinatorTests(unittest.TestCase):
                     "w1:p2",
                 ),
             )
-            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: {
+                    "status": "ready",
+                    "error_code": None,
+                    "error_summary": None,
+                },
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+            coordinator = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                health_registry=health,
+            )
             job_id, _ = store.enqueue(_job(config.name, Harness.DROID))
             coordinator.run_once()
+            health.record_probe(
+                Harness.DROID,
+                {
+                    "status": "timeout",
+                    "error_code": "herdr_timeout",
+                    "error_summary": None,
+                },
+            )
 
             result = coordinator.resume_blocked(job_id, "Approve this local action.")
             job = store.jobs(config.name)[0]
+            recovered_health = health.projection((Harness.DROID,))[0]
 
         self.assertEqual(result["state"], "succeeded")
         self.assertEqual(job["attempts"], 1)
@@ -297,6 +789,62 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(response[0], "droid-worker")
         self.assertEqual(response[2], "Approve this local action.")
         self.assertEqual(response[4], "w1:p2")
+        self.assertEqual(recovered_health["status"], "ready")
+
+    def test_worker_dispatch_health_uses_the_execution_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            execution_path = root / ".orchestrator/worktrees/task"
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: {
+                    "status": "ready",
+                    "error_code": None,
+                    "error_summary": None,
+                },
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "droid-worker",
+                        AgentState.UNKNOWN,
+                        False,
+                        "w1:p2",
+                        "agent_auth_required",
+                        execution_path=str(execution_path),
+                    )
+                }
+            )
+
+            Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                worker_harnesses=(Harness.DROID,),
+                health_registry=health,
+            ).run_once()
+            root_health = health.projection((Harness.DROID,))[0]
+            execution_health = health.projection(
+                (Harness.DROID,),
+                workspace=execution_path,
+            )[0]
+
+        self.assertEqual(root_health["status"], "ready")
+        self.assertEqual(execution_health["status"], "unavailable")
+        self.assertEqual(
+            execution_health["reason_code"],
+            "agent_auth_required",
+        )
 
     def test_run_until_idle_does_not_report_idle_after_the_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

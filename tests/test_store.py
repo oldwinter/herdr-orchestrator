@@ -11,6 +11,7 @@ from herdr_orchestrator.model import (
     AgentState,
     DispatchOutcome,
     Harness,
+    HarnessHealthStatus,
     JobState,
     NewJob,
     PlacementTarget,
@@ -323,6 +324,137 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(first.job_id, second.job_id)
         self.assertEqual(second.attempt, 2)
 
+    def test_harness_health_persists_by_workflow_workspace_and_harness(self) -> None:
+        self.store.record_harness_health(
+            "example",
+            "/repo",
+            Harness.GROK,
+            status=HarnessHealthStatus.READY,
+            reason_code=None,
+            source="doctor",
+            observed_at=100.0,
+            expires_at=1900.0,
+            cooldown_until=100.0,
+            consecutive_failures=0,
+        )
+
+        health = self.store.harness_health(
+            "example",
+            "/repo",
+            (Harness.GROK, Harness.CODEX),
+        )
+
+        self.assertEqual(
+            health[Harness.GROK],
+            {
+                "status": "ready",
+                "reason_code": None,
+                "source": "doctor",
+                "observed_at": 100.0,
+                "expires_at": 1900.0,
+                "cooldown_until": 100.0,
+                "consecutive_failures": 0,
+                "probe_lease_until": None,
+            },
+        )
+        self.assertNotIn(Harness.CODEX, health)
+
+    def test_harness_probe_lease_deduplicates_concurrent_refreshes(self) -> None:
+        first = self.store.claim_harness_probe(
+            "example",
+            "/repo",
+            Harness.GROK,
+            now=100.0,
+            lease_seconds=40,
+            probe_token="first",
+        )
+        concurrent = self.store.claim_harness_probe(
+            "example",
+            "/repo",
+            Harness.GROK,
+            now=101.0,
+            lease_seconds=40,
+            probe_token="concurrent",
+        )
+        expired = self.store.claim_harness_probe(
+            "example",
+            "/repo",
+            Harness.GROK,
+            now=141.0,
+            lease_seconds=40,
+            probe_token="successor",
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(concurrent)
+        self.assertTrue(expired)
+
+    def test_stale_probe_owner_cannot_release_or_overwrite_successor(self) -> None:
+        self.assertTrue(
+            self.store.claim_harness_probe(
+                "example",
+                "/repo",
+                Harness.GROK,
+                now=100.0,
+                lease_seconds=10,
+                probe_token="stale",
+            )
+        )
+        self.assertTrue(
+            self.store.claim_harness_probe(
+                "example",
+                "/repo",
+                Harness.GROK,
+                now=111.0,
+                lease_seconds=10,
+                probe_token="successor",
+            )
+        )
+
+        stale_release = self.store.release_harness_probe(
+            "example",
+            "/repo",
+            Harness.GROK,
+            probe_token="stale",
+        )
+        stale_record = self.store.record_harness_health(
+            "example",
+            "/repo",
+            Harness.GROK,
+            status=HarnessHealthStatus.DEGRADED,
+            reason_code="herdr_timeout",
+            source="preflight",
+            observed_at=112.0,
+            expires_at=112.0,
+            cooldown_until=412.0,
+            consecutive_failures=1,
+            probe_token="stale",
+        )
+        successor_record = self.store.record_harness_health(
+            "example",
+            "/repo",
+            Harness.GROK,
+            status=HarnessHealthStatus.READY,
+            reason_code=None,
+            source="preflight",
+            observed_at=113.0,
+            expires_at=1913.0,
+            cooldown_until=113.0,
+            consecutive_failures=0,
+            probe_token="successor",
+        )
+        health = self.store.harness_health(
+            "example",
+            "/repo",
+            (Harness.GROK,),
+        )[Harness.GROK]
+
+        self.assertFalse(stale_release)
+        self.assertFalse(stale_record)
+        self.assertTrue(successor_record)
+        self.assertEqual(health["status"], "ready")
+        self.assertIsNone(health["probe_lease_until"])
+
     def test_migrates_v1_jobs_and_receipts_to_current_schema(self) -> None:
         path = Path(self.temporary.name) / "v1.db"
         connection = sqlite3.connect(path)
@@ -385,8 +517,11 @@ class StoreTests(unittest.TestCase):
             receipt_columns = {
                 row[1] for row in migrated_connection.execute("PRAGMA table_info(receipts)")
             }
+            health_columns = {
+                row[1] for row in migrated_connection.execute("PRAGMA table_info(harness_health)")
+            }
 
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         self.assertEqual(migrated[0]["placement"], PlacementTarget.TAB.value)
         self.assertIsNone(migrated[0]["task_verified"])
         self.assertIsNone(migrated[0]["agent_settled"])
@@ -404,6 +539,15 @@ class StoreTests(unittest.TestCase):
         self.assertIn("task_verified", receipt_columns)
         self.assertIn("error_summary", receipt_columns)
         self.assertIn("correlation_id", receipt_columns)
+        self.assertIn("probe_lease_token", health_columns)
+        with sqlite3.connect(path) as migrated_connection:
+            health_tables = {
+                row[0]
+                for row in migrated_connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        self.assertIn("harness_health", health_tables)
 
 
 def _job(

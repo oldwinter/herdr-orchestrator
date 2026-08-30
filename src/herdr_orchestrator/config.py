@@ -73,6 +73,27 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             minimum=10,
             maximum=3600,
         ),
+        readiness_ttl_seconds=_optional_integer(
+            coordinator_raw,
+            "readiness_ttl_seconds",
+            default=1800,
+            minimum=60,
+            maximum=86400,
+        ),
+        readiness_cooldown_seconds=_optional_integer(
+            coordinator_raw,
+            "readiness_cooldown_seconds",
+            default=300,
+            minimum=30,
+            maximum=3600,
+        ),
+        readiness_probe_timeout_seconds=_optional_integer(
+            coordinator_raw,
+            "readiness_probe_timeout_seconds",
+            default=30,
+            minimum=5,
+            maximum=300,
+        ),
     )
     if coordinator.lease_seconds < coordinator.agent_timeout_seconds + 90:
         raise ConfigError("lease_seconds_must_cover_agent_timeout")

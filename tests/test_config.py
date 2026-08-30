@@ -53,6 +53,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.standardized_delivery.wayfinder, WayfinderMode.AUTO)
         self.assertEqual(config.standardized_delivery.max_parallel, 3)
         self.assertEqual(config.standardized_delivery.review_repair_rounds, 2)
+        self.assertEqual(config.coordinator.readiness_ttl_seconds, 1800)
+        self.assertEqual(config.coordinator.readiness_cooldown_seconds, 300)
+        self.assertEqual(config.coordinator.readiness_probe_timeout_seconds, 30)
 
     def test_loads_grok_only_research_workflow(self) -> None:
         config = load_workflow(REPO_ROOT / "workflows/grok-research.toml")

@@ -19,6 +19,9 @@
 | `lease_seconds` | 30–86400 | running lease |
 | `max_attempts` | 1–10 | 总 claim 次数 |
 | `agent_timeout_seconds` | 10–3600 | 单次完整派发 deadline，包含 topology provisioning、agent 启动、prompt、settlement 与 receipt 验证 |
+| `readiness_ttl_seconds` | 60–86400，默认 1800 | `ready` 证据可用于自动路由的最长时间 |
+| `readiness_cooldown_seconds` | 30–3600，默认 300 | probe 或 dispatch 失败后再次刷新同一 harness 前的冷却时间 |
+| `readiness_probe_timeout_seconds` | 5–300，默认 30 | 自动选择前真实 readiness probe 的有界 timeout |
 
 `lease_seconds` 必须至少比 `agent_timeout_seconds` 长 90 秒，为 agent 启动、Herdr 控制请求和收据提交留出窗口，防止同一任务在旧 turn 尚未结束时被重复 claim。
 
@@ -93,7 +96,11 @@ planner 默认建议关闭，明确配置 `enabled = true` 才会运行。
 
 planner 的 `output_file` 必须位于 workflow workspace 内或其 `.orchestrator` runtime 路径，且不能指向已跟踪的 prompt 或源码。
 
-`harness = "auto"` 时，coordinator 按 `droid → grok → codex → claude → hermes → pi` 的固定优先级，从候选 worker 中选择本机 executable 存在的 harness。显式主控可以不在 worker 候选池中，但必须有 catalog profile 和可用 CLI。
+`harness = "auto"` 时，coordinator 按 `droid → grok → codex → claude → hermes → pi`
+的固定优先级，从候选 worker 中选择拥有 fresh `ready` 证据的 harness。未知或过期证据会在
+上述 timeout 内刷新；认证、模型、runtime 或 executable 失败会从自动候选中排除并进入
+冷却。显式主控可以不在 worker 候选池中，但必须有 catalog profile、可用 CLI 和 fresh
+`ready` 证据；失败时不会静默回退到其他 harness。
 
 `run` 与 `enqueue` 可用 `--controller-harness` 和可重复的 `--worker-harness` 临时覆盖这些默认值。`enqueue --harness auto` 或省略 `--harness` 时，主控读取候选池 compact catalog 并输出严格的单 harness JSON；显式 `--harness` 则跳过这次路由 turn。
 

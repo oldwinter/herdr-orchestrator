@@ -14,6 +14,13 @@ class Harness(StrEnum):
     HERMES = "hermes"
 
 
+class HarnessHealthStatus(StrEnum):
+    UNKNOWN = "unknown"
+    READY = "ready"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+
+
 class JobState(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -66,6 +73,9 @@ class CoordinatorConfig:
     lease_seconds: int
     max_attempts: int
     agent_timeout_seconds: int
+    readiness_ttl_seconds: int
+    readiness_cooldown_seconds: int
+    readiness_probe_timeout_seconds: int
 
 
 @dataclass(frozen=True, slots=True)

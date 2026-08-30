@@ -15,6 +15,17 @@ job and receipt, projects it to the dashboard, and uses it in structured records
 Observability failures never alter queue state. Files are local runtime state and are ignored by
 Git. Prompts and terminal output are never telemetry fields.
 
+Readiness-aware routing adds bounded local signals:
+
+- `harness_health_observed` and `harness_health_transition`, with harness, status, stable reason,
+  source, and failure count only;
+- `harness_readiness_eligible`, a numeric 0/1 metric;
+- `harness_candidates_evaluated` and `harness_selected`, with candidate names, exclusion reason
+  codes, role, and selection mode.
+
+Raw probe output, provider summaries, prompts, terminal output, credentials, and environment
+values are not fields in these records.
+
 ## Data handling
 
 All telemetry passes through central sanitization before local persistence or export. Keys

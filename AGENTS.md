@@ -29,7 +29,9 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 
 标准交付入口是 `.agents/skills/standardized-delivery/SKILL.md`；`matt-workflow` 与 `wayfinder-delivery` 只是别名。阶段、artifact、退出码和恢复读 `docs/standardized-delivery.md`。
 
-示例 workflow 里 planner 默认关闭。主控与 worker 候选可在 TOML 或 CLI `--controller-harness` / `--worker-harness` 指定；未指定主控时按 `droid → grok → codex → claude → hermes → pi` 选本机已安装 CLI。
+示例 workflow 里 planner 默认关闭。主控与 worker 候选可在 TOML 或 CLI
+`--controller-harness` / `--worker-harness` 指定；未指定主控时按
+`droid → grok → codex → claude → hermes → pi` 从 fresh `ready` 候选中选择。
 
 ## 能力
 

@@ -76,6 +76,12 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 just status
 ```
 
+`status` 的 `harness_health` 是按当前 workflow/workspace 隔离的 bounded projection。
+重点看 `status`、`eligible`、`reason_code`、`source`、`age_seconds`、`expires_at` 和
+`cooldown_until`；这里不会包含 prompt、terminal transcript 或 provider 原始错误。
+pending job 还会有 additive `availability_reason`；当其目标 harness 当前不 eligible 时，
+该字段直接引用同一 stable reason code，其他 job 为 `null`。
+
 用 doctor 的 repeatable filter 收窄单一 harness；JSON 包含 compact summary、readiness 总耗时
 和 provision/turn/receipt phase timings：
 
@@ -83,6 +89,12 @@ just status
 just doctor --harness droid
 just doctor --harness droid --harness codex
 ```
+
+成功或失败的 targeted doctor 会把同一份结构化结果写入 durable readiness registry。
+`ready` 只在 `readiness_ttl_seconds` 内可参与自动路由；失败在
+`readiness_cooldown_seconds` 内不会被高频重复 probe。显式选择不健康 harness 会返回
+`harness_unavailable:<harness>:<reason_code>`；全部 worker 被排除且仍有 pending job 时，
+drain 返回 `worker_pool_unavailable`，任务 attempt 保持不变。
 
 再读取结构化 agent 状态：
 
@@ -123,6 +135,15 @@ herdr integration status
 | `task_receipt_missing` | 声明的输出前缀或非空文件不存在 | 按 attempt 失败处理 |
 | `task_receipt_ambiguous` | output-prefix 与 prompt 独立行重合，无法证明 authorship | 按 attempt 失败处理 |
 | `task_receipt_stale` | file receipt 在当前 turn 前后未改变 | 按 attempt 失败处理 |
+
+上述错误对 readiness 的影响分层处理：
+
+- `agent_auth_failed`、`agent_auth_required`、`agent_model_invalid`、executable/runtime
+  unavailable 为 `unavailable`；
+- `herdr_timeout`、`agent_turn_not_observed`、`agent_provider_failed` 等可恢复 runtime
+  失败为 `degraded`；
+- `agent_blocked` 和 `task_receipt_*` 是 task-level 结果，不会把已工作的 harness
+  标记为不健康。
 
 ## 收口检查
 

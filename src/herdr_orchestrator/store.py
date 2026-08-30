@@ -13,6 +13,7 @@ from herdr_orchestrator.model import (
     ClaimedJob,
     DispatchOutcome,
     Harness,
+    HarnessHealthStatus,
     JobState,
     NewJob,
     PlacementTarget,
@@ -21,7 +22,7 @@ from herdr_orchestrator.model import (
 )
 from herdr_orchestrator.observability import sanitize
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class StoreError(RuntimeError):
@@ -131,6 +132,21 @@ class Store:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS harness_health (
+                    workflow TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason_code TEXT,
+                    source TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    cooldown_until REAL NOT NULL,
+                    consecutive_failures INTEGER NOT NULL,
+                    probe_lease_until REAL,
+                    probe_lease_token TEXT,
+                    PRIMARY KEY(workflow, workspace, harness)
+                );
                 """)
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
@@ -146,6 +162,9 @@ class Store:
                 if version == 3:
                     self._migrate_v3_to_v4(connection)
                     version = 4
+                if version == 4:
+                    self._migrate_v4_to_v5(connection)
+                    version = 5
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
 
@@ -178,6 +197,26 @@ class Store:
         connection.execute("ALTER TABLE jobs ADD COLUMN correlation_id TEXT")
         connection.execute("ALTER TABLE receipts ADD COLUMN correlation_id TEXT")
         connection.execute("UPDATE schema_meta SET version = 4")
+
+    def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS harness_health (
+                workflow TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason_code TEXT,
+                source TEXT NOT NULL,
+                observed_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                cooldown_until REAL NOT NULL,
+                consecutive_failures INTEGER NOT NULL,
+                probe_lease_until REAL,
+                probe_lease_token TEXT,
+                PRIMARY KEY(workflow, workspace, harness)
+            )
+            """)
+        connection.execute("UPDATE schema_meta SET version = 5")
 
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
@@ -233,6 +272,176 @@ class Store:
         if row is None:
             return None
         return int(row["id"]), Harness(str(row["harness"]))
+
+    def record_harness_health(
+        self,
+        workflow: str,
+        workspace: str,
+        harness: Harness,
+        *,
+        status: HarnessHealthStatus,
+        reason_code: str | None,
+        source: str,
+        observed_at: float,
+        expires_at: float,
+        cooldown_until: float,
+        consecutive_failures: int,
+        probe_token: str | None = None,
+    ) -> bool:
+        with self._connect() as connection:
+            if probe_token is not None:
+                cursor = connection.execute(
+                    """
+                    UPDATE harness_health
+                    SET status = ?, reason_code = ?, source = ?, observed_at = ?,
+                        expires_at = ?, cooldown_until = ?, consecutive_failures = ?,
+                        probe_lease_until = NULL, probe_lease_token = NULL
+                    WHERE workflow = ? AND workspace = ? AND harness = ?
+                      AND probe_lease_token = ?
+                    """,
+                    (
+                        status.value,
+                        reason_code,
+                        source,
+                        observed_at,
+                        expires_at,
+                        cooldown_until,
+                        consecutive_failures,
+                        workflow,
+                        workspace,
+                        harness.value,
+                        probe_token,
+                    ),
+                )
+                return cursor.rowcount == 1
+            connection.execute(
+                """
+                INSERT INTO harness_health(
+                    workflow, workspace, harness, status, reason_code, source,
+                    observed_at, expires_at, cooldown_until, consecutive_failures,
+                    probe_lease_until, probe_lease_token
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                ON CONFLICT(workflow, workspace, harness) DO UPDATE SET
+                    status = excluded.status,
+                    reason_code = excluded.reason_code,
+                    source = excluded.source,
+                    observed_at = excluded.observed_at,
+                    expires_at = excluded.expires_at,
+                    cooldown_until = excluded.cooldown_until,
+                    consecutive_failures = excluded.consecutive_failures,
+                    probe_lease_until = NULL,
+                    probe_lease_token = NULL
+                """,
+                (
+                    workflow,
+                    workspace,
+                    harness.value,
+                    status.value,
+                    reason_code,
+                    source,
+                    observed_at,
+                    expires_at,
+                    cooldown_until,
+                    consecutive_failures,
+                ),
+            )
+        return True
+
+    def harness_health(
+        self,
+        workflow: str,
+        workspace: str,
+        harnesses: Iterable[Harness],
+    ) -> dict[Harness, dict[str, object]]:
+        requested = set(harnesses)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT harness, status, reason_code, source, observed_at, expires_at,
+                       cooldown_until, consecutive_failures, probe_lease_until
+                FROM harness_health
+                WHERE workflow = ? AND workspace = ?
+                """,
+                (workflow, workspace),
+            ).fetchall()
+        result: dict[Harness, dict[str, object]] = {}
+        for row in rows:
+            harness = Harness(str(row["harness"]))
+            if harness not in requested:
+                continue
+            result[harness] = {
+                "status": str(row["status"]),
+                "reason_code": row["reason_code"],
+                "source": str(row["source"]),
+                "observed_at": float(row["observed_at"]),
+                "expires_at": float(row["expires_at"]),
+                "cooldown_until": float(row["cooldown_until"]),
+                "consecutive_failures": int(row["consecutive_failures"]),
+                "probe_lease_until": (
+                    float(row["probe_lease_until"])
+                    if row["probe_lease_until"] is not None
+                    else None
+                ),
+            }
+        return result
+
+    def claim_harness_probe(
+        self,
+        workflow: str,
+        workspace: str,
+        harness: Harness,
+        *,
+        now: float,
+        lease_seconds: int,
+        probe_token: str,
+    ) -> bool:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO harness_health(
+                    workflow, workspace, harness, status, reason_code, source,
+                    observed_at, expires_at, cooldown_until, consecutive_failures,
+                    probe_lease_until, probe_lease_token
+                )
+                VALUES (?, ?, ?, ?, NULL, 'none', 0, 0, 0, 0, ?, ?)
+                ON CONFLICT(workflow, workspace, harness) DO UPDATE SET
+                    probe_lease_until = excluded.probe_lease_until,
+                    probe_lease_token = excluded.probe_lease_token
+                WHERE harness_health.probe_lease_until IS NULL
+                   OR harness_health.probe_lease_until <= ?
+                """,
+                (
+                    workflow,
+                    workspace,
+                    harness.value,
+                    HarnessHealthStatus.UNKNOWN.value,
+                    now + lease_seconds,
+                    probe_token,
+                    now,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def release_harness_probe(
+        self,
+        workflow: str,
+        workspace: str,
+        harness: Harness,
+        *,
+        probe_token: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE harness_health
+                SET probe_lease_until = NULL, probe_lease_token = NULL
+                WHERE workflow = ? AND workspace = ? AND harness = ?
+                  AND probe_lease_token = ?
+                """,
+                (workflow, workspace, harness.value, probe_token),
+            )
+        return cursor.rowcount == 1
 
     def claim(
         self,

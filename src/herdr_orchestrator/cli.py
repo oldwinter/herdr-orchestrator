@@ -27,7 +27,7 @@ from herdr_orchestrator.delivery import (
 )
 from herdr_orchestrator.delivery_protocol import DeliveryArtifactError
 from herdr_orchestrator.git_workspace import GitWorkspaceError
-from herdr_orchestrator.herdr import HerdrTransport, doctor_agent_name, smoke_agent_name
+from herdr_orchestrator.herdr import HerdrTransport, smoke_agent_name
 from herdr_orchestrator.model import (
     AgentState,
     DispatchContext,
@@ -41,7 +41,9 @@ from herdr_orchestrator.model import (
     WayfinderMode,
     WorkflowConfig,
 )
+from herdr_orchestrator.observability import Observability
 from herdr_orchestrator.protocol import TransportError
+from herdr_orchestrator.readiness import HarnessHealthRegistry, probe_harness_readiness
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.store import Store, StoreError
 from herdr_orchestrator.tracker import TrackerError
@@ -167,10 +169,19 @@ def build_parser() -> argparse.ArgumentParser:
 def _command_doctor(config: WorkflowConfig, args: argparse.Namespace) -> int:
     if not 5 <= args.probe_timeout_seconds <= 300:
         raise ValueError("doctor_probe_timeout_out_of_range")
+    store = Store(config.state_db)
     return doctor(
         config,
         probe_timeout_seconds=args.probe_timeout_seconds,
         selected_harnesses=getattr(args, "harness", None),
+        health_registry=HarnessHealthRegistry(
+            config,
+            store,
+            observability=Observability(
+                config.state_db.parent / "observability",
+                config.name,
+            ),
+        ),
     )
 
 
@@ -309,11 +320,33 @@ def _command_status(config: WorkflowConfig, args: argparse.Namespace) -> int:
     del args
     store = Store(config.state_db)
     store.initialize()
+    harnesses = tuple(
+        dict.fromkeys(
+            (
+                *(worker.harness for worker in config.workers),
+                *((config.planner.harness,) if config.planner.harness is not None else ()),
+            )
+        )
+    )
+    health = HarnessHealthRegistry(
+        config,
+        store,
+    ).projection(harnesses)
+    health_by_harness = {str(row["harness"]): row for row in health}
+    jobs = store.jobs(config.name)
+    for job in jobs:
+        row = health_by_harness.get(str(job["harness"]))
+        job["availability_reason"] = (
+            row["reason_code"]
+            if job["state"] == JobState.PENDING.value and row is not None and not row["eligible"]
+            else None
+        )
     print(
         json.dumps(
             {
                 "counts": store.status_counts(config.name),
-                "jobs": store.jobs(config.name),
+                "harness_health": health,
+                "jobs": jobs,
                 "workflow": config.name,
             },
             indent=2,
@@ -445,6 +478,7 @@ def doctor(
     readiness_probe: ReadinessProbe | None = None,
     probe_timeout_seconds: int = 30,
     selected_harnesses: list[str] | None = None,
+    health_registry: HarnessHealthRegistry | None = None,
 ) -> int:
     current_environ = os.environ if environ is None else environ
     probe = readiness_probe or probe_harness_readiness
@@ -472,6 +506,12 @@ def doctor(
             probe_timeout_seconds,
         )
         checks.extend(harness_checks)
+        if health_registry is not None:
+            health_registry.record_probe(
+                harness,
+                harness_checks[-1],
+                source="doctor",
+            )
         duration_ms = harness_checks[-1].get("duration_ms")
         if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
             readiness_ms += duration_ms
@@ -645,59 +685,6 @@ def _harness_readiness(
             "error_code": "readiness_probe_failed",
             "error_summary": " ".join(str(exc).split())[:300] or None,
         }
-
-
-def probe_harness_readiness(
-    workflow: WorkflowConfig,
-    harness: Harness,
-    timeout_seconds: int,
-    *,
-    transport: HerdrTransport | None = None,
-) -> Mapping[str, object]:
-    active_transport = transport or HerdrTransport(workflow.name, workflow.workspace)
-    name = doctor_agent_name(workflow.name, harness)
-    prefix = f"HERDR-DOCTOR-OK harness={harness.value}"
-    started = time.monotonic()
-    try:
-        outcome = active_transport.dispatch(
-            harness,
-            (
-                "Read-only readiness probe. Do not modify files or external state. "
-                f"Reply with exactly this line: {prefix}"
-            ),
-            timeout_seconds=timeout_seconds,
-            agent_name=name,
-            context=DispatchContext(
-                placement=PlacementTarget.TAB,
-                title=f"doctor-{harness.value}",
-                task_key=f"doctor-{harness.value}",
-                receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, prefix),
-            ),
-        )
-    finally:
-        active_transport.close_created_agent(name)
-    status_by_error = {
-        "agent_auth_failed": "auth_required",
-        "agent_auth_required": "auth_required",
-        "agent_model_invalid": "model_invalid",
-        "herdr_timeout": "timeout",
-        "timeout": "timeout",
-        "prompt_acceptance_timeout": "timeout",
-        "agent_provider_failed": "error",
-        "herdr_unavailable": "unavailable",
-        "not_in_herdr": "unavailable",
-    }
-    if outcome.state in {AgentState.IDLE, AgentState.DONE} and outcome.task_verified is True:
-        status = "ready"
-    else:
-        status = status_by_error.get(outcome.error_code or "", "error")
-    return {
-        "status": status,
-        "error_code": outcome.error_code,
-        "error_summary": outcome.error_summary,
-        "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
-        "phase_timings_ms": outcome.phase_timings_ms or {},
-    }
 
 
 def smoke(

@@ -11,24 +11,28 @@ from dataclasses import replace
 from pathlib import Path
 
 from herdr_orchestrator.config import load_workflow
-from herdr_orchestrator.delivery import DeliveryEscalation, StandardizedDelivery
+from herdr_orchestrator.delivery import DeliveryError, DeliveryEscalation, StandardizedDelivery
 from herdr_orchestrator.model import (
     AgentState,
     DispatchOutcome,
     Harness,
     WayfinderMode,
 )
+from herdr_orchestrator.readiness import HarnessHealthRegistry
+from herdr_orchestrator.store import Store
 from herdr_orchestrator.tracker import LocalMarkdownTracker
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ScriptedDeliveryDispatcher:
-    def __init__(self) -> None:
+    def __init__(self, route_harness: Harness = Harness.DROID) -> None:
         self.lock = threading.Lock()
         self.active_implementations = 0
         self.max_active_implementations = 0
         self.prompts: list[str] = []
+        self.harnesses: list[Harness] = []
+        self.route_harness = route_harness
 
     def dispatch(
         self,
@@ -41,6 +45,7 @@ class ScriptedDeliveryDispatcher:
     ) -> DispatchOutcome:
         with self.lock:
             self.prompts.append(prompt)
+            self.harnesses.append(harness)
         if "Create one accepted specification" in prompt:
             _artifact_path(prompt).write_text(
                 json.dumps(_delivery_plan()),
@@ -48,7 +53,7 @@ class ScriptedDeliveryDispatcher:
             )
         elif "受限 harness router" in prompt:
             _artifact_path(prompt).write_text(
-                json.dumps({"harness": "droid"}),
+                json.dumps({"harness": self.route_harness.value}),
                 encoding="utf-8",
             )
         elif "Implement exactly one accepted delivery ticket" in prompt:
@@ -273,6 +278,136 @@ class FlakyArtifactDispatcher:
 
 
 class StandardizedDeliveryTests(unittest.TestCase):
+    def test_unavailable_delivery_pools_include_per_harness_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                base.standardized_delivery,
+                artifact_root=root / ".orchestrator/deliveries",
+                tracker_root=root / ".scratch/delivery",
+            )
+            config = replace(
+                base,
+                state_db=root / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            controller_health = HarnessHealthRegistry(
+                config,
+                Store(config.state_db),
+                probe=lambda workflow, harness, timeout: {
+                    "status": "model_invalid",
+                    "error_code": "agent_model_invalid",
+                    "error_summary": None,
+                },
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+
+            with self.assertRaisesRegex(
+                DeliveryError,
+                "controller_harness_unavailable:"
+                "droid=agent_model_invalid,grok=agent_model_invalid",
+            ):
+                StandardizedDelivery(
+                    config,
+                    dispatcher=ScriptedDeliveryDispatcher(),
+                    tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                    worker_harnesses=(Harness.DROID, Harness.GROK),
+                    health_registry=controller_health,
+                )
+
+            worker_health = HarnessHealthRegistry(
+                config,
+                Store(config.state_db),
+                probe=lambda workflow, harness, timeout: (
+                    {"status": "ready", "error_code": None, "error_summary": None}
+                    if harness is Harness.GROK
+                    else {
+                        "status": "model_invalid",
+                        "error_code": "agent_model_invalid",
+                        "error_summary": None,
+                    }
+                ),
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 401.0,
+            )
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.GROK,
+                worker_harnesses=(Harness.DROID,),
+                health_registry=worker_health,
+            )
+
+            with self.assertRaisesRegex(
+                DeliveryError,
+                "worker_harness_unavailable:droid=agent_model_invalid",
+            ):
+                delivery._select_worker(
+                    "Implement readiness",
+                    "Use the eligible worker pool.",
+                    "unavailable-worker",
+                )
+
+    def test_worker_routing_uses_the_ready_controller_and_worker_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                base.standardized_delivery,
+                artifact_root=root / ".orchestrator/deliveries",
+                tracker_root=root / ".scratch/delivery",
+            )
+            config = replace(
+                base,
+                state_db=root / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            store = Store(config.state_db)
+            health = HarnessHealthRegistry(
+                config,
+                store,
+                probe=lambda workflow, harness, timeout: (
+                    {
+                        "status": "ready",
+                        "error_code": None,
+                        "error_summary": None,
+                    }
+                    if harness is Harness.GROK
+                    else {
+                        "status": "timeout",
+                        "error_code": "herdr_timeout",
+                        "error_summary": None,
+                    }
+                ),
+                executable_finder=lambda command: f"/bin/{command}",
+                clock=lambda: 100.0,
+            )
+            dispatcher = ScriptedDeliveryDispatcher(route_harness=Harness.GROK)
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=dispatcher,
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                worker_harnesses=(Harness.DROID, Harness.GROK),
+                health_registry=health,
+            )
+            delivery._run_root = delivery_config.artifact_root / "health-routing"
+            delivery._run_root.mkdir(parents=True)
+
+            selected = delivery._select_worker(
+                "Implement readiness",
+                "Use the eligible worker pool.",
+                "health-routing",
+            )
+
+        self.assertEqual(delivery.controller, Harness.GROK)
+        self.assertEqual(selected, Harness.GROK)
+        self.assertEqual(dispatcher.harnesses, [Harness.GROK])
+        self.assertIn('"harness": "grok"', dispatcher.prompts[0])
+        self.assertNotIn('"harness": "droid"', dispatcher.prompts[0])
+
     def test_runs_parallel_frontier_then_final_two_axis_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary) / "repository"

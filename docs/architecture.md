@@ -43,6 +43,15 @@ budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。普�
 `blocked`；人工审查后可用显式 `resume --response-file` 回答原 agent。resume 必须匹配已记录的
 agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提问仍保持 blocked。
 
+SQLite schema v5 另外保存按 `workflow + canonical workspace + harness` 隔离的 bounded
+readiness 证据：`unknown`、`ready`、`degraded`、`unavailable`、稳定 reason code、
+观测来源、TTL、cooldown、连续失败数和 probe lease。它不保存原始 prompt、terminal
+transcript、credential 或完整 provider 错误。probe lease 使用事务 compare-and-set，
+同一 scope 的并发 selector 不会重复执行同一个 readiness probe；随机 owner token
+同时 fence release 和结果写入，过期 owner 不能清除或覆盖 successor lease。过期的
+`ready` 证据在 projection 中回到 `unknown/readiness_expired`，不能仅凭持久化的旧状态
+继续路由。
+
 ### Coordinator
 
 - 一次最多 claim `max_parallel` 个任务；
@@ -59,13 +68,24 @@ agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提
 - `unknown`、timeout 和协议错误按失败与重试策略处理。
 - 对必须写 strict JSON 的 turn，settled 后目标 artifact 缺失会在同一已 ready agent 上仅重发
   一次；artifact handshake 防止 startup lifecycle 变化被误认成任务完成。
+- 自动 controller、worker pool、planner/router catalog 与 standardized delivery 只使用
+  fresh `ready` 候选。`degraded`/`unavailable` worker 的 pending job 不被 claim，也不增加
+  attempt；cooldown 后新 probe 或后续成功 dispatch 可恢复 eligibility。
+- `run_until_idle` 把剩余 drain deadline 同时传给 readiness refresh；多个候选 probe 共享
+  这一个 budget，不会各自重新获得完整 probe timeout。
+- 显式 harness 选择 fail closed，稳定错误形如
+  `harness_unavailable:<harness>:<reason_code>`，不静默切换到其他 harness。
+- task receipt 缺失、真实 task-level blocked 不污染 harness readiness；认证/模型等静态
+  失败为 `unavailable`，timeout/provider 等可恢复 runtime 失败为 `degraded`。
 
-`run_once` 输出保留兼容的顶层本波计数，并新增 `claimed`、`batch` 和结束时全局 `queue`。
+`run_once` 输出保留兼容的顶层本波计数，并新增 `claimed`、`batch`、结束时全局 `queue`
+和 privacy-safe `harness_health`。
 `run_until_idle` 在有界 timeout 内重复 replica-limited wave，且把剩余 deadline 传给每个
 dispatch，直到当前 worker pool 没有 pending/running/blocked。blocked 会立即返回
 `idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
 `queue_idle` 明确区分所选 pool 和全局 queue；pool 外任务不会造成假死，也不会被误报为
-全局排空。
+全局排空。若 pool 内仍有 pending job，但当前没有 eligible worker，则立即返回
+`idle=false`、`reason=worker_pool_unavailable`，而不是误报 queue idle。
 
 ### Execution topology
 
@@ -138,6 +158,8 @@ manager 只对当前 Herdr session 可见。
 - workflow 的 `[[workers]]` 决定本次可被选择的 harness 子集；
 - `[planner].worker_harnesses` 或 CLI override 可以进一步收窄候选池；
 - planner prompt 和输出 schema 只暴露该子集，且只注入 compact catalog，不注入完整 Markdown；
+- readiness registry 在每次 planner/router turn 前进一步过滤候选；不健康 harness 的 metadata
+  不进入该 turn；
 - planner 为每个子任务输出 `harness`；
 - job 被 claim 后，coordinator 才读取该 harness 的 `.md` profile；
 - 完整 profile 与 task packet 一起注入 worker，未选中的 profile 不进入该 turn；
@@ -201,7 +223,8 @@ planner 只能选择当前 workflow catalog 中的 harness。任务 dispatch 时
 
 主控 harness 与 worker harness 是两个独立选择：
 
-- 主控可由 TOML 或 CLI 明确指定；未指定时，coordinator 从候选池中按固定优先级选择已安装 CLI；
+- 主控可由 TOML 或 CLI 明确指定；未指定时，coordinator 从拥有 fresh `ready` 证据的候选池
+  中按固定优先级选择；
 - planner 为一批子任务选择 worker；
 - 直接 enqueue 未指定 worker 时，主控执行一次受限 router turn，只能写 `{"harness":"..."}`；
 - 显式 worker 直接入队，不启动 router turn；

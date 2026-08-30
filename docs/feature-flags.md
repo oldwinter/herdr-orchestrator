@@ -11,6 +11,10 @@ Each flag must:
 3. include operator configuration in `.env.example` and `docs/observability.md`;
 4. be removed from code, tests, examples, and docs in the same change when retired.
 
+Harness-readiness events reuse these existing exporter gates. They do not add an independent
+feature flag or lifecycle row; with all flags false they remain local under
+`.orchestrator/observability/`.
+
 | Flag | Owner | Introduced | Review by | Exit condition |
 | --- | --- | --- | --- | --- |
 | `sentry_export` | `@oldwinter` | 2026-08-25 | 2026-11-25 | Remove if no operator enables Sentry |

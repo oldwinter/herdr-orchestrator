@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
@@ -58,16 +59,19 @@ from herdr_orchestrator.model import (
     WayfinderMode,
     WorkflowConfig,
 )
+from herdr_orchestrator.observability import Observability
 from herdr_orchestrator.planner import (
     PlannerOutputError,
     load_worker_selection,
     worker_selection_prompt,
 )
 from herdr_orchestrator.protocol import TransportError
+from herdr_orchestrator.readiness import HarnessHealthRegistry
 from herdr_orchestrator.selection import (
     effective_worker_harnesses,
     select_controller_harness,
 )
+from herdr_orchestrator.store import Store
 from herdr_orchestrator.tracker import DeliveryTracker, tracker_from_config
 
 MAX_WAYFINDER_DECISIONS = 100
@@ -190,19 +194,28 @@ class StandardizedDelivery:
         controller_harness: Harness | None = None,
         controller_auto: bool = False,
         worker_harnesses: Iterable[Harness] | None = None,
+        health_registry: HarnessHealthRegistry | None = None,
     ) -> None:
         self.config = config
+        uses_default_dispatcher = dispatcher is None
         self.dispatcher = dispatcher or HerdrDeliveryDispatcher(config)
         self.tracker = tracker or tracker_from_config(config.standardized_delivery)
         self.controller_override = controller_harness
         self.controller_auto = controller_auto
         self.worker_harnesses = effective_worker_harnesses(config, worker_harnesses)
-        self.controller = select_controller_harness(
-            config,
-            worker_harnesses=self.worker_harnesses,
-            override=controller_harness,
-            force_auto=controller_auto,
+        self.health_registry = health_registry or (
+            HarnessHealthRegistry(
+                config,
+                Store(config.state_db),
+                observability=Observability(
+                    config.state_db.parent / "observability",
+                    config.name,
+                ),
+            )
+            if uses_default_dispatcher
+            else None
         )
+        self.controller = self._select_controller()
         self._goal = ""
         self._run_root = Path()
         self._ledger_lock = threading.Lock()
@@ -653,7 +666,10 @@ class StandardizedDelivery:
         )
 
     def _select_worker(self, title: str, prompt: str, dedupe_key: str) -> Harness:
-        profiles = self._worker_profiles()
+        eligible_workers = self._eligible_worker_harnesses()
+        if not eligible_workers:
+            raise DeliveryError(self._unavailable_error("worker_harness_unavailable"))
+        profiles = self._worker_profiles(eligible_workers)
         digest = hashlib.sha256(f"{self.config.name}\0delivery\0{dedupe_key}".encode()).hexdigest()[
             :12
         ]
@@ -667,7 +683,7 @@ class StandardizedDelivery:
                     f"Title: {title}\n\nPrompt:\n{prompt}",
                     output,
                     render_compact_catalog(profiles),
-                    self.worker_harnesses,
+                    eligible_workers,
                 ),
                 output,
                 role=f"route-{digest[:5]}",
@@ -675,7 +691,7 @@ class StandardizedDelivery:
         try:
             selected = load_worker_selection(
                 output,
-                allowed_harnesses=self.worker_harnesses,
+                allowed_harnesses=eligible_workers,
             )
         except PlannerOutputError as exc:
             raise DeliveryError(str(exc)) from exc
@@ -735,6 +751,7 @@ class StandardizedDelivery:
             timeout_seconds=self.config.coordinator.agent_timeout_seconds,
             agent_name=agent_name,
         )
+        self._record_health(workspace, harness, outcome)
         for proxy_round in range(MAX_PROXY_ROUNDS):
             if outcome.state is not AgentState.BLOCKED:
                 return outcome
@@ -786,6 +803,7 @@ class StandardizedDelivery:
                 decision.response,
                 timeout_seconds=self.config.coordinator.agent_timeout_seconds,
             )
+            self._record_health(workspace, harness, outcome)
         raise DeliveryError("principal_proxy_rounds_exhausted")
 
     def _run_proxy_decision(
@@ -811,6 +829,7 @@ class StandardizedDelivery:
                 timeout_seconds=self.config.coordinator.agent_timeout_seconds,
                 agent_name=name,
             )
+            self._record_health(self.config.workspace, self.controller, outcome)
             if outcome.state is AgentState.BLOCKED:
                 raise DeliveryEscalation("principal_proxy_controller_blocked")
             _require_success(outcome, "principal_proxy")
@@ -822,10 +841,64 @@ class StandardizedDelivery:
             )
         raise DeliveryError("delivery_artifact_missing: principal_proxy")
 
-    def _worker_profiles(self) -> tuple[HarnessProfile, ...]:
-        return tuple(
-            profile_for_harness(self.config.profiles, harness) for harness in self.worker_harnesses
+    def _select_controller(self) -> Harness:
+        requested = (
+            None
+            if self.controller_auto
+            else (self.controller_override or self.config.planner.harness)
         )
+        if requested is not None:
+            if self.health_registry is not None:
+                try:
+                    self.health_registry.require(requested)
+                except ValueError as exc:
+                    raise DeliveryError(str(exc)) from exc
+            return requested
+        eligible_workers = self._eligible_worker_harnesses()
+        if not eligible_workers:
+            raise DeliveryError(self._unavailable_error("controller_harness_unavailable"))
+        return select_controller_harness(
+            self.config,
+            worker_harnesses=eligible_workers,
+            force_auto=True,
+        )
+
+    def _eligible_worker_harnesses(self) -> tuple[Harness, ...]:
+        if self.health_registry is None:
+            return self.worker_harnesses
+        return self.health_registry.eligible(self.worker_harnesses)
+
+    def _worker_profiles(
+        self,
+        harnesses: Iterable[Harness] | None = None,
+    ) -> tuple[HarnessProfile, ...]:
+        return tuple(
+            profile_for_harness(self.config.profiles, harness)
+            for harness in (self.worker_harnesses if harnesses is None else harnesses)
+        )
+
+    def _record_health(
+        self,
+        workspace: Path,
+        harness: Harness,
+        outcome: DispatchOutcome,
+    ) -> None:
+        if self.health_registry is not None:
+            with suppress(Exception):
+                self.health_registry.record_dispatch(
+                    harness,
+                    outcome,
+                    workspace=workspace,
+                )
+
+    def _unavailable_error(self, code: str) -> str:
+        if self.health_registry is None:
+            return code
+        reasons = ",".join(
+            f"{row['harness']}={row['reason_code']}"
+            for row in self.health_registry.projection(self.worker_harnesses)
+        )
+        return f"{code}:{reasons}"
 
     def _record(self, event: str, details: dict[str, object]) -> None:
         row = {
