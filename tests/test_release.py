@@ -204,10 +204,25 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("--provenance", workflow)
         self.assertNotIn("NODE_AUTH_TOKEN", workflow)
         self.assertIn("actions/checkout@11d5960a326750d5838078e36cf38b85af677262", workflow)
-        self.assertIn("actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020", workflow)
-        self.assertIn(
-            "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
-            workflow,
+        self.assertEqual(
+            workflow.count("actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"),
+            3,
+        )
+        self.assertEqual(
+            workflow.count("actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"),
+            1,
+        )
+        self.assertEqual(
+            workflow.count("astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"),
+            1,
+        )
+        self.assertEqual(
+            workflow.count("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"),
+            1,
+        )
+        self.assertEqual(
+            workflow.count("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"),
+            1,
         )
         self.assertIn("npm install --global rust-just@1.57.0", workflow)
         self.assertNotIn("actions/checkout@v4", workflow)

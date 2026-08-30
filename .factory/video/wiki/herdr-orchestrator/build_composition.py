@@ -211,6 +211,7 @@ BODIES = {
 CSS = r"""
 @font-face{font-family:Geist;src:url("./assets/fonts/Geist-Light.woff2") format("woff2");font-weight:300}
 @font-face{font-family:"Geist Mono";src:url("./assets/fonts/GeistMono-Regular.woff2") format("woff2");font-weight:400}
+@font-face{font-family:"Noto Sans CJK SC";src:local("Noto Sans CJK SC")}
 :root{--bg:#000;--surface:#161413;--border:#342f2d;--gray:#9b8e87;--muted:#cbc5c2;--white:#fff;--orange:#ee6018;--light:#f2f0f0}
 *{box-sizing:border-box}html,body{margin:0;width:1280px;height:720px;overflow:hidden;background:#000;color:var(--white);font-family:Geist,"Noto Sans CJK SC",sans-serif;font-weight:300}
 body:before{content:"";position:fixed;inset:0;opacity:.24;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:32px 32px;pointer-events:none}
