@@ -72,7 +72,7 @@ AUTH_REQUIRED_FAILURE = re.compile(
 AUTH_FAILURE = re.compile(
     r"(?im)(?:"
     r"\bAPI\s+Error:\s*(?:401|403)\b"
-    r"|^\s*(?:Error:\s*)?(?:HTTP\s+)?(?:401\s+Unauthorized|403\s+Forbidden)\b"
+    r"|^\s*(?:Error:\s*)?(?:HTTP\s+)?(?:401\s+Unauthorized|403\s+Forbidden|(?:401|403)\s+status\s+code)\b"
     r"|^\s*(?:Authentication|Authorization)\s+failed\b"
     r"|^\s*(?:Error:\s*)?(?:invalid|expired)\s+"
     r"(?:API[ -]?key|access\s+token|credentials?)\b"
