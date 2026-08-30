@@ -99,3 +99,17 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 - 保持配置 schema、SQLite migration 和 receipt 向后兼容。
 - CLI 输出应适合 automation，失败必须给稳定错误码或明确原因。
 - 修改后运行最小相关 unittest，收口前运行 `just check`。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in this repository's GitHub Issues; pull requests are not a request surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles map directly to same-named GitHub labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses a single-context domain documentation layout. See `docs/agents/domain.md`.
