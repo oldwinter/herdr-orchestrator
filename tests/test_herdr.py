@@ -2230,6 +2230,71 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(outcome.error_code, "agent_auth_failed")
         self.assertEqual(outcome.state, AgentState.UNKNOWN)
 
+    def test_reports_generic_provider_403_in_settled_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "idle",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "pi",
+                                "agent_status": "done",
+                                "pane_id": "w1:p9",
+                                "state_change_seq": 2,
+                            }
+                        }
+                    ),
+                    subprocess.CompletedProcess(
+                        ["herdr"],
+                        0,
+                        "Error: 403 status code (no body)",
+                        "",
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                runner=runner,
+                sleeper=lambda _: None,
+                settled_confirmation_polls=0,
+            )
+
+            outcome = transport.dispatch(Harness.PI, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.error_code, "agent_auth_failed")
+        self.assertEqual(outcome.error_summary, "Error: 403 status code")
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+
     def test_responds_to_blocked_agent_and_waits_for_settlement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
