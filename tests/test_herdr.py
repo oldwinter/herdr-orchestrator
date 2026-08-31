@@ -325,18 +325,30 @@ class HerdrTransportTests(unittest.TestCase):
     def test_rejects_reusable_agent_from_another_herdr_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
-            runner = FakeRunner([
-                _result({"agent": {
-                    "agent": "droid", "agent_status": "idle",
-                    "cwd": str(workspace), "foreground_cwd": str(workspace),
-                    "interactive_ready": True, "workspace_id": "w2",
-                    "pane_id": "w2:p9", "state_change_seq": 1,
-                }}),
-            ])
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "droid",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "workspace_id": "w2",
+                                "pane_id": "w2:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                ]
+            )
             transport = HerdrTransport(
-                "example", workspace,
+                "example",
+                workspace,
                 environ={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"},
-                runner=runner, settled_confirmation_polls=0,
+                runner=runner,
+                settled_confirmation_polls=0,
                 inspect_runtime_errors=False,
             )
 
@@ -2391,7 +2403,8 @@ class HerdrTransportTests(unittest.TestCase):
             workspace = Path(temporary)
             runner = FakeRunner([])
             transport = HerdrTransport(
-                "example", workspace,
+                "example",
+                workspace,
                 environ={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"},
                 runner=runner,
             )
