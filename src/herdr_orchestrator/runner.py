@@ -147,7 +147,15 @@ class Coordinator:
         prompt = prompt_file.read_text(encoding="utf-8").strip()
         if not prompt:
             raise ValueError("prompt_file_empty")
-        existing = self.store.existing_job(self.config.name, dedupe_key)
+        existing = self.store.existing_job_for_enqueue(
+            self.config.name,
+            dedupe_key,
+            title=title,
+            prompt=prompt,
+            harness=harness,
+            placement=placement,
+            receipt=receipt,
+        )
         if existing is not None:
             job_id, existing_harness = existing
             return job_id, False, existing_harness
@@ -215,11 +223,13 @@ class Coordinator:
                     outcome = future.result()
                 except Exception:
                     outcome = DispatchOutcome(
-                        agent_name=f"failed-{job.harness.value}",
+                        agent_name=job.agent_name,
                         state=AgentState.UNKNOWN,
                         member_reused=False,
                         pane_id=None,
                         error_code="dispatcher_unhandled_error",
+                        placement=job.placement,
+                        correlation_id=job.correlation_id,
                     )
                 state = self.store.record_outcome(job, outcome)
                 results[state.value] += 1
@@ -779,12 +789,11 @@ class Coordinator:
         planner = self.config.planner
         if not planner.enabled:
             return
-        metadata_key = f"planner_last_attempt:{self.config.name}"
-        now = time.time()
-        last_attempt = self.store.metadata_float(metadata_key)
-        if last_attempt is not None and now - last_attempt < planner.interval_seconds:
+        if not self.store.reserve_planner_run(
+            self.config.name,
+            planner.interval_seconds,
+        ):
             return
-        self.store.set_metadata_float(metadata_key, now)
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)
         planner.output_file.unlink(missing_ok=True)
         controller = self._controller_harness()

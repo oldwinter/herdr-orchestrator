@@ -6,6 +6,7 @@ import uuid
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from herdr_orchestrator.model import (
@@ -26,6 +27,18 @@ SCHEMA_VERSION = 4
 
 class StoreError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizedOutcome:
+    state: JobState
+    available_at: float
+    observed_at: float
+    error_code: str | None
+    error_summary: str | None
+    agent_settled: bool
+    task_verified: bool | None
+    correlation_id: str
 
 
 def _nullable_bool(value: object) -> bool | None:
@@ -65,6 +78,282 @@ def _receipt_from_row(row: sqlite3.Row) -> TaskReceipt | None:
         ReceiptKind(str(row["receipt_kind"])),
         str(row["receipt_value"]),
     )
+
+
+def _job_contract_matches(row: sqlite3.Row, job: NewJob) -> bool:
+    return all(
+        (
+            row["title"] == job.title,
+            row["harness"] == job.harness.value,
+            row["prompt"] == job.prompt,
+            row["placement"] == (job.placement.value if job.placement is not None else None),
+            row["receipt_kind"] == (job.receipt.kind.value if job.receipt is not None else None),
+            row["receipt_value"] == (job.receipt.value if job.receipt is not None else None),
+        )
+    )
+
+
+def _partial_job_contract_matches(
+    row: sqlite3.Row,
+    *,
+    title: str,
+    prompt: str,
+    harness: Harness | None,
+    placement: PlacementTarget | None,
+    receipt: TaskReceipt | None,
+) -> bool:
+    return all(
+        (
+            row["title"] == title,
+            row["prompt"] == prompt,
+            harness is None or row["harness"] == harness.value,
+            placement is None or row["placement"] == placement.value,
+            row["receipt_kind"] == (receipt.kind.value if receipt is not None else None),
+            row["receipt_value"] == (receipt.value if receipt is not None else None),
+        )
+    )
+
+
+def _insert_attempt_receipt(
+    connection: sqlite3.Connection,
+    *,
+    job_id: int,
+    attempt: int,
+    state: JobState,
+    agent_name: str,
+    agent_state: AgentState,
+    member_reused: bool,
+    pane_id: str | None,
+    error_code: str | None,
+    placement: str | None,
+    execution_path: str | None,
+    herdr_workspace_id: str | None,
+    agent_settled: bool | None,
+    task_verified: bool | None,
+    error_summary: str | None,
+    correlation_id: str | None,
+    observed_at: float,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO receipts(
+            job_id, attempt, state, agent_name, agent_state,
+            member_reused, pane_id, error_code, placement,
+            execution_path, herdr_workspace_id, agent_settled,
+            task_verified, error_summary, correlation_id, observed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            attempt,
+            state.value,
+            agent_name,
+            agent_state.value,
+            int(member_reused),
+            pane_id,
+            error_code,
+            placement,
+            execution_path,
+            herdr_workspace_id,
+            (int(agent_settled) if agent_settled is not None else None),
+            (int(task_verified) if task_verified is not None else None),
+            error_summary,
+            correlation_id,
+            observed_at,
+        ),
+    )
+
+
+def _coalesce_row_value(
+    row: sqlite3.Row,
+    fallback: sqlite3.Row | None,
+    key: str,
+) -> object:
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        value = None
+    if value is not None:
+        return value
+    if fallback is None:
+        return None
+    try:
+        return fallback[key]
+    except (IndexError, KeyError):
+        return None
+
+
+def _record_expired_attempt(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    state: JobState,
+    observed_at: float,
+) -> None:
+    job_id = int(row["id"])
+    attempt = int(row["attempts"])
+    existing = connection.execute(
+        """
+        SELECT 1 FROM receipts
+        WHERE job_id = ? AND attempt = ? AND error_code = 'lease_expired'
+        LIMIT 1
+        """,
+        (job_id, attempt),
+    ).fetchone()
+    if existing is not None:
+        return
+    latest = connection.execute(
+        """
+        SELECT agent_name, member_reused, pane_id, placement,
+               execution_path, herdr_workspace_id, agent_settled,
+               task_verified, error_summary, correlation_id
+        FROM receipts
+        WHERE job_id = ? AND attempt = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (job_id, attempt),
+    ).fetchone()
+    agent_value = _coalesce_row_value(row, latest, "agent_name")
+    agent_name = str(agent_value or "unknown")
+    member_reused_value = _coalesce_row_value(row, latest, "member_reused")
+    member_reused = bool(_nullable_bool(member_reused_value))
+    placement_value = _coalesce_row_value(row, latest, "placement")
+    execution_path_value = _coalesce_row_value(row, latest, "execution_path")
+    workspace_value = _coalesce_row_value(row, latest, "herdr_workspace_id")
+    pane_value = _coalesce_row_value(row, latest, "pane_id")
+    settled_value = _coalesce_row_value(row, latest, "agent_settled")
+    verified_value = _coalesce_row_value(row, latest, "task_verified")
+    summary_value = _coalesce_row_value(row, latest, "error_summary")
+    correlation_value = _coalesce_row_value(row, latest, "correlation_id")
+    _insert_attempt_receipt(
+        connection,
+        job_id=job_id,
+        attempt=attempt,
+        state=state,
+        agent_name=agent_name,
+        agent_state=AgentState.UNKNOWN,
+        member_reused=member_reused,
+        pane_id=str(pane_value) if pane_value is not None else None,
+        error_code="lease_expired",
+        placement=str(placement_value) if placement_value is not None else None,
+        execution_path=(str(execution_path_value) if execution_path_value is not None else None),
+        herdr_workspace_id=(str(workspace_value) if workspace_value is not None else None),
+        agent_settled=_nullable_bool(settled_value),
+        task_verified=_nullable_bool(verified_value),
+        error_summary=(
+            _bounded_error_summary(str(summary_value)) if summary_value is not None else None
+        ),
+        correlation_id=str(correlation_value) if correlation_value is not None else None,
+        observed_at=observed_at,
+    )
+
+
+_SETTLED_AGENT_STATES = frozenset({AgentState.IDLE, AgentState.DONE})
+
+
+def _agent_is_settled(outcome: DispatchOutcome) -> bool:
+    return (
+        outcome.agent_settled
+        if outcome.agent_settled is not None
+        else outcome.state in _SETTLED_AGENT_STATES
+    )
+
+
+def _effective_error_code(job: ClaimedJob, outcome: DispatchOutcome) -> str | None:
+    if outcome.error_code is not None:
+        return outcome.error_code
+    if job.receipt is not None and outcome.task_verified is not True:
+        return "task_receipt_missing"
+    if outcome.task_verified is False:
+        return "task_receipt_invalid"
+    if outcome.state in _SETTLED_AGENT_STATES and not _agent_is_settled(outcome):
+        return "agent_not_settled"
+    if outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
+        return "agent_not_settled"
+    return None
+
+
+def _dispatch_state(job: ClaimedJob, outcome: DispatchOutcome, error_code: str | None) -> JobState:
+    if error_code is None and outcome.state in _SETTLED_AGENT_STATES:
+        return JobState.SUCCEEDED
+    if outcome.state is AgentState.BLOCKED:
+        return JobState.BLOCKED
+    if job.attempt < job.max_attempts:
+        return JobState.PENDING
+    return JobState.FAILED
+
+
+def _resume_error_code(outcome: DispatchOutcome) -> str | None:
+    if outcome.state is AgentState.BLOCKED:
+        return "agent_blocked"
+    if outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
+        return "agent_not_settled"
+    return None
+
+
+def _normalize_outcome(
+    job: ClaimedJob,
+    outcome: DispatchOutcome,
+    *,
+    resume: bool,
+) -> _NormalizedOutcome:
+    now = time.time()
+    error_code = _effective_error_code(job, outcome)
+    if resume:
+        state = (
+            JobState.SUCCEEDED
+            if error_code is None and outcome.state in _SETTLED_AGENT_STATES
+            else JobState.BLOCKED
+        )
+        if error_code is None:
+            error_code = _resume_error_code(outcome)
+        available_at = now
+    else:
+        state = _dispatch_state(job, outcome, error_code)
+        available_at = (
+            now + min(60, 2 ** max(0, job.attempt - 1)) if state is JobState.PENDING else now
+        )
+    return _NormalizedOutcome(
+        state=state,
+        available_at=available_at,
+        observed_at=now,
+        error_code=error_code,
+        error_summary=_bounded_error_summary(outcome.error_summary),
+        agent_settled=_agent_is_settled(outcome),
+        task_verified=outcome.task_verified,
+        correlation_id=outcome.correlation_id or job.correlation_id,
+    )
+
+
+def _validate_owned_attempt(
+    row: sqlite3.Row | None,
+    job: ClaimedJob,
+    outcome_correlation: str,
+    expected_state: JobState,
+    now: float,
+    *,
+    require_fence: bool,
+) -> str:
+    if row is None:
+        raise StoreError("job_not_found")
+    lease_until = row["lease_until"]
+    if (
+        row["state"] != expected_state.value
+        or int(row["attempts"]) != job.attempt
+        or lease_until is None
+        or float(lease_until) <= now
+    ):
+        raise StoreError("job_lease_lost")
+    persisted_correlation = row["correlation_id"]
+    if require_fence and (not job.correlation_id or not persisted_correlation):
+        raise StoreError("job_lease_lost")
+    if job.correlation_id and persisted_correlation != job.correlation_id:
+        raise StoreError("job_lease_lost")
+    expected_correlation = str(persisted_correlation or job.correlation_id or "")
+    if outcome_correlation and outcome_correlation != expected_correlation:
+        raise StoreError("job_lease_lost")
+    return expected_correlation
 
 
 class Store:
@@ -198,7 +487,7 @@ class Store:
 
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
-        with self._connect() as connection:
+        with self._transaction() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO jobs(
@@ -230,12 +519,49 @@ class Store:
                     raise StoreError("job_id_missing")
                 return cursor.lastrowid, True
             row = connection.execute(
-                "SELECT id FROM jobs WHERE workflow = ? AND dedupe_key = ?",
+                """
+                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value
+                FROM jobs WHERE workflow = ? AND dedupe_key = ?
+                """,
                 (job.workflow, job.dedupe_key),
             ).fetchone()
             if row is None:
                 raise StoreError("dedupe_lookup_failed")
+            if not _job_contract_matches(row, job):
+                raise StoreError("dedupe_contract_conflict")
             return int(row["id"]), False
+
+    def existing_job_for_enqueue(
+        self,
+        workflow: str,
+        dedupe_key: str,
+        *,
+        title: str,
+        prompt: str,
+        harness: Harness | None,
+        placement: PlacementTarget | None,
+        receipt: TaskReceipt | None,
+    ) -> tuple[int, Harness] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value
+                FROM jobs WHERE workflow = ? AND dedupe_key = ?
+                """,
+                (workflow, dedupe_key),
+            ).fetchone()
+        if row is None:
+            return None
+        if not _partial_job_contract_matches(
+            row,
+            title=title,
+            prompt=prompt,
+            harness=harness,
+            placement=placement,
+            receipt=receipt,
+        ):
+            raise StoreError("dedupe_contract_conflict")
+        return int(row["id"]), Harness(str(row["harness"]))
 
     def existing_job(
         self,
@@ -298,10 +624,28 @@ class Store:
         workflow: str,
         now: float,
     ) -> None:
+        rows = connection.execute(
+            """
+            SELECT * FROM jobs
+            WHERE workflow = ? AND state = ? AND lease_until <= ?
+              AND attempts >= max_attempts
+            """,
+            (workflow, JobState.RUNNING.value, now),
+        ).fetchall()
+        for row in rows:
+            _record_expired_attempt(
+                connection,
+                row,
+                state=JobState.FAILED,
+                observed_at=now,
+            )
         connection.execute(
             """
             UPDATE jobs
-            SET state = ?, error_code = 'lease_expired', lease_until = NULL, updated_at = ?
+            SET state = ?, error_code = 'lease_expired', lease_until = NULL,
+                execution_path = NULL, herdr_workspace_id = NULL,
+                agent_settled = NULL, task_verified = NULL, error_summary = NULL,
+                updated_at = ?
             WHERE workflow = ? AND state = ? AND lease_until <= ? AND attempts >= max_attempts
             """,
             (JobState.FAILED.value, now, workflow, JobState.RUNNING.value, now),
@@ -386,6 +730,13 @@ class Store:
         )
         if agent_name is None:
             return None
+        if row["state"] == JobState.RUNNING.value:
+            _record_expired_attempt(
+                connection,
+                row,
+                state=JobState.PENDING,
+                observed_at=now,
+            )
         attempt = int(row["attempts"]) + 1
         correlation_id = uuid.uuid4().hex
         connection.execute(
@@ -425,61 +776,38 @@ class Store:
         )
 
     def record_outcome(self, job: ClaimedJob, outcome: DispatchOutcome) -> JobState:
-        now = time.time()
-        error_code = outcome.error_code
-        if job.receipt is not None and outcome.task_verified is not True and error_code is None:
-            error_code = "task_receipt_missing"
-        elif outcome.task_verified is False and error_code is None:
-            error_code = "task_receipt_invalid"
-        agent_settled = (
-            outcome.agent_settled
-            if outcome.agent_settled is not None
-            else outcome.state in {AgentState.IDLE, AgentState.DONE}
+        normalized = _normalize_outcome(job, outcome, resume=False)
+        return self._persist_outcome(
+            job,
+            outcome,
+            normalized,
+            expected_state=JobState.RUNNING,
+            require_fence=False,
         )
-        if (
-            error_code is None
-            and outcome.state in {AgentState.IDLE, AgentState.DONE}
-            and not agent_settled
-        ):
-            error_code = "agent_not_settled"
-        if error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
-            state = JobState.SUCCEEDED
-            available_at = now
-        elif outcome.state is AgentState.BLOCKED:
-            state = JobState.BLOCKED
-            available_at = now
-        elif job.attempt < job.max_attempts:
-            state = JobState.PENDING
-            available_at = now + min(60, 2 ** max(0, job.attempt - 1))
-        else:
-            state = JobState.FAILED
-            available_at = now
 
-        if error_code is None and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
-            error_code = "agent_not_settled"
-        error_summary = _bounded_error_summary(outcome.error_summary)
-        correlation_id = outcome.correlation_id or job.correlation_id
-
+    def _persist_outcome(
+        self,
+        job: ClaimedJob,
+        outcome: DispatchOutcome,
+        normalized: _NormalizedOutcome,
+        *,
+        expected_state: JobState,
+        require_fence: bool,
+    ) -> JobState:
         with self._transaction() as connection:
             row = connection.execute(
                 "SELECT state, attempts, lease_until, correlation_id FROM jobs WHERE id = ?",
                 (job.job_id,),
             ).fetchone()
-            if row is None:
-                raise StoreError("job_not_found")
-            if (
-                row["state"] != JobState.RUNNING.value
-                or int(row["attempts"]) != job.attempt
-                or row["lease_until"] is None
-                or float(row["lease_until"]) <= now
-            ):
-                raise StoreError("job_lease_lost")
-            persisted_correlation = row["correlation_id"]
-            if job.correlation_id and persisted_correlation != job.correlation_id:
-                raise StoreError("job_lease_lost")
-            expected_correlation = str(persisted_correlation or job.correlation_id or "")
-            if correlation_id and correlation_id != expected_correlation:
-                raise StoreError("job_lease_lost")
+            expected_correlation = _validate_owned_attempt(
+                row,
+                job,
+                normalized.correlation_id,
+                expected_state,
+                time.time(),
+                require_fence=require_fence,
+            )
+            correlation_id = expected_correlation or normalized.correlation_id
             connection.execute(
                 """
                 UPDATE jobs
@@ -490,54 +818,48 @@ class Store:
                 WHERE id = ?
                 """,
                 (
-                    state.value,
-                    available_at,
+                    normalized.state.value,
+                    normalized.available_at,
                     outcome.agent_name,
-                    error_code,
+                    normalized.error_code,
                     outcome.execution_path,
                     outcome.herdr_workspace_id,
-                    int(agent_settled),
-                    (int(outcome.task_verified) if outcome.task_verified is not None else None),
-                    error_summary,
-                    correlation_id,
-                    now,
-                    job.job_id,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO receipts(
-                    job_id, attempt, state, agent_name, agent_state,
-                    member_reused, pane_id, error_code, placement,
-                    execution_path, herdr_workspace_id, agent_settled,
-                    task_verified, error_summary, correlation_id, observed_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job.job_id,
-                    job.attempt,
-                    state.value,
-                    outcome.agent_name,
-                    outcome.state.value,
-                    int(outcome.member_reused),
-                    outcome.pane_id,
-                    error_code,
+                    int(normalized.agent_settled),
                     (
-                        outcome.placement.value
-                        if outcome.placement is not None
-                        else job.placement.value
+                        int(normalized.task_verified)
+                        if normalized.task_verified is not None
+                        else None
                     ),
-                    outcome.execution_path,
-                    outcome.herdr_workspace_id,
-                    int(agent_settled),
-                    (int(outcome.task_verified) if outcome.task_verified is not None else None),
-                    error_summary,
+                    normalized.error_summary,
                     correlation_id,
-                    now,
+                    normalized.observed_at,
+                    job.job_id,
                 ),
             )
-        return state
+            _insert_attempt_receipt(
+                connection,
+                job_id=job.job_id,
+                attempt=job.attempt,
+                state=normalized.state,
+                agent_name=outcome.agent_name,
+                agent_state=outcome.state,
+                member_reused=outcome.member_reused,
+                pane_id=outcome.pane_id,
+                error_code=normalized.error_code,
+                placement=(
+                    outcome.placement.value
+                    if outcome.placement is not None
+                    else job.placement.value
+                ),
+                execution_path=outcome.execution_path,
+                herdr_workspace_id=outcome.herdr_workspace_id,
+                agent_settled=normalized.agent_settled,
+                task_verified=normalized.task_verified,
+                error_summary=normalized.error_summary,
+                correlation_id=correlation_id or None,
+                observed_at=normalized.observed_at,
+            )
+        return normalized.state
 
     def status_counts(
         self,
@@ -631,110 +953,14 @@ class Store:
         job: ClaimedJob,
         outcome: DispatchOutcome,
     ) -> JobState:
-        now = time.time()
-        error_code = outcome.error_code
-        if job.receipt is not None and outcome.task_verified is not True and error_code is None:
-            error_code = "task_receipt_missing"
-        elif outcome.task_verified is False and error_code is None:
-            error_code = "task_receipt_invalid"
-        agent_settled = (
-            outcome.agent_settled
-            if outcome.agent_settled is not None
-            else outcome.state in {AgentState.IDLE, AgentState.DONE}
+        normalized = _normalize_outcome(job, outcome, resume=True)
+        return self._persist_outcome(
+            job,
+            outcome,
+            normalized,
+            expected_state=JobState.BLOCKED,
+            require_fence=True,
         )
-        if (
-            error_code is None
-            and outcome.state in {AgentState.IDLE, AgentState.DONE}
-            and not agent_settled
-        ):
-            error_code = "agent_not_settled"
-        if error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
-            state = JobState.SUCCEEDED
-        else:
-            state = JobState.BLOCKED
-        if error_code is None and outcome.state is AgentState.BLOCKED:
-            error_code = "agent_blocked"
-        elif error_code is None and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
-            error_code = "agent_not_settled"
-        error_summary = _bounded_error_summary(outcome.error_summary)
-        correlation_id = outcome.correlation_id or job.correlation_id
-
-        with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT state, attempts, lease_until, correlation_id FROM jobs WHERE id = ?",
-                (job.job_id,),
-            ).fetchone()
-            if row is None:
-                raise StoreError("job_not_found")
-            if (
-                row["state"] != JobState.BLOCKED.value
-                or int(row["attempts"]) != job.attempt
-                or row["lease_until"] is None
-                or float(row["lease_until"]) <= now
-            ):
-                raise StoreError("job_lease_lost")
-            persisted_correlation = row["correlation_id"]
-            if job.correlation_id and persisted_correlation != job.correlation_id:
-                raise StoreError("job_lease_lost")
-            expected_correlation = str(persisted_correlation or job.correlation_id or "")
-            if correlation_id and correlation_id != expected_correlation:
-                raise StoreError("job_lease_lost")
-            connection.execute(
-                """
-                UPDATE jobs
-                SET state = ?, available_at = ?, lease_until = NULL, agent_name = ?,
-                    error_code = ?, execution_path = ?, herdr_workspace_id = ?,
-                    agent_settled = ?, task_verified = ?, error_summary = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    state.value,
-                    now,
-                    outcome.agent_name,
-                    error_code,
-                    outcome.execution_path,
-                    outcome.herdr_workspace_id,
-                    int(agent_settled),
-                    (int(outcome.task_verified) if outcome.task_verified is not None else None),
-                    error_summary,
-                    now,
-                    job.job_id,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO receipts(
-                    job_id, attempt, state, agent_name, agent_state,
-                    member_reused, pane_id, error_code, placement,
-                    execution_path, herdr_workspace_id, agent_settled,
-                    task_verified, error_summary, correlation_id, observed_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job.job_id,
-                    job.attempt,
-                    state.value,
-                    outcome.agent_name,
-                    outcome.state.value,
-                    int(outcome.member_reused),
-                    outcome.pane_id,
-                    error_code,
-                    (
-                        outcome.placement.value
-                        if outcome.placement is not None
-                        else job.placement.value
-                    ),
-                    outcome.execution_path,
-                    outcome.herdr_workspace_id,
-                    int(agent_settled),
-                    (int(outcome.task_verified) if outcome.task_verified is not None else None),
-                    error_summary,
-                    expected_correlation or None,
-                    now,
-                ),
-            )
-        return state
 
     def retry_failed(
         self,
@@ -894,6 +1120,37 @@ class Store:
                 """,
                 (key, str(value), now),
             )
+
+    def reserve_planner_run(
+        self,
+        workflow: str,
+        interval_seconds: int,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        observed_at = time.time() if now is None else now
+        key = f"planner_last_attempt:{workflow}"
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    last_attempt = float(row["value"])
+                except (TypeError, ValueError) as exc:
+                    raise StoreError(f"metadata_invalid_float: {key}") from exc
+                if observed_at - last_attempt < interval_seconds:
+                    return False
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE
+                SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, str(observed_at), observed_at),
+            )
+        return True
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
