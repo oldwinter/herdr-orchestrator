@@ -57,6 +57,16 @@ class TopologyTests(unittest.TestCase):
 
         self.assertIsNone(placement)
 
+    def test_hybrid_does_not_match_write_signal_inside_word(self) -> None:
+        placement = static_placement(
+            PlacementMode.HYBRID,
+            "Prefix audit",
+            "Review the existing behavior.",
+            supports_worktree=True,
+        )
+
+        self.assertEqual(placement, PlacementTarget.PANE)
+
     def test_controller_decision_is_strict_and_git_aware(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "topology.json"
@@ -98,6 +108,30 @@ class TopologyTests(unittest.TestCase):
                 "topology_worktree_requires_git",
             ):
                 load_topology_decision(output, supports_worktree=False)
+
+    def test_rejects_duplicate_controller_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "topology.json"
+            output.write_text(
+                '{"placement":"pane","placement":"worktree","rationale":"Ambiguous."}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                TopologyDecisionError,
+                "topology_output_duplicate_key",
+            ):
+                load_topology_decision(output, supports_worktree=True)
+
+    def test_rejects_unreadable_controller_output(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self.assertRaisesRegex(
+                TopologyDecisionError,
+                "topology_output_unreadable",
+            ),
+        ):
+            load_topology_decision(Path(temporary), supports_worktree=True)
 
     def test_display_label_truncates_without_hash_suffix(self) -> None:
         label = short_display_label(

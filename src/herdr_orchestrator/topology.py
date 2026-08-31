@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 from herdr_orchestrator.model import PlacementMode, PlacementTarget
 
@@ -58,11 +59,11 @@ def static_placement(
         return _validate_worktree(PlacementTarget(mode.value), supports_worktree)
 
     content = f"{title}\n{prompt}".casefold()
-    if any(signal in content for signal in HARD_READ_ONLY_SIGNALS):
+    if any(_contains_signal(content, signal) for signal in HARD_READ_ONLY_SIGNALS):
         return PlacementTarget.PANE
-    if any(signal in content for signal in WRITE_SIGNALS):
+    if any(_contains_signal(content, signal) for signal in WRITE_SIGNALS):
         return PlacementTarget.WORKTREE if supports_worktree else PlacementTarget.TAB
-    if any(signal in content for signal in READ_SIGNALS):
+    if any(_contains_signal(content, signal) for signal in READ_SIGNALS):
         return PlacementTarget.PANE
     return None
 
@@ -112,9 +113,14 @@ def load_topology_decision(
     supports_worktree: bool,
 ) -> PlacementTarget:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
     except FileNotFoundError as exc:
         raise TopologyDecisionError("topology_output_missing") from exc
+    except (OSError, UnicodeError) as exc:
+        raise TopologyDecisionError("topology_output_unreadable") from exc
     except json.JSONDecodeError as exc:
         raise TopologyDecisionError("topology_output_invalid_json") from exc
     if not isinstance(payload, dict) or set(payload) != PLACEMENT_KEYS:
@@ -153,3 +159,18 @@ def _validate_worktree(
     if target is PlacementTarget.WORKTREE and not supports_worktree:
         raise TopologyDecisionError("topology_worktree_requires_git")
     return target
+
+
+def _contains_signal(content: str, signal: str) -> bool:
+    if not signal.isascii():
+        return signal in content
+    return re.search(rf"(?<!\w){re.escape(signal)}", content) is not None
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise TopologyDecisionError("topology_output_duplicate_key")
+        payload[key] = value
+    return payload
