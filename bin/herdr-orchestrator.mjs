@@ -28,6 +28,11 @@ import {
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HARNESSES = ["droid", "grok", "codex", "pi", "claude", "hermes"];
 const MANAGER_HARNESSES = ["grok", "codex", "claude"];
+const DOCTOR_PROBE_TIMEOUT_OPTION = "--probe-timeout-seconds";
+const DOCTOR_PROBE_TIMEOUT_SECONDS = 30;
+const DOCTOR_PROBE_TIMEOUT_MAX_SECONDS = 300;
+const DOCTOR_PROCESS_OVERHEAD_MS = 90_000;
+const DOCTOR_PROCESS_TIMEOUT_ENV = "HERDR_ORCHESTRATOR_DOCTOR_TIMEOUT_MS";
 const WORKFLOW_OPTION_PREFIXES = [
   "--w",
   "--wo",
@@ -523,6 +528,43 @@ function commandExists(command) {
   return result.status === 0;
 }
 
+function doctorProcessTimeoutMs(rest) {
+  let probeTimeoutSeconds = DOCTOR_PROBE_TIMEOUT_SECONDS;
+  for (let index = 0; index < rest.length; index += 1) {
+    const value = rest[index];
+    if (
+      value.length > 2
+      && DOCTOR_PROBE_TIMEOUT_OPTION.startsWith(value)
+      && index + 1 < rest.length
+    ) {
+      probeTimeoutSeconds = Number(rest[index + 1]);
+      index += 1;
+      continue;
+    }
+    const [option, inlineValue] = value.split("=", 2);
+    if (
+      option.length > 2
+      && DOCTOR_PROBE_TIMEOUT_OPTION.startsWith(option)
+      && inlineValue !== undefined
+    ) {
+      probeTimeoutSeconds = Number(inlineValue);
+    }
+  }
+  if (!Number.isInteger(probeTimeoutSeconds) || probeTimeoutSeconds <= 0) {
+    probeTimeoutSeconds = DOCTOR_PROBE_TIMEOUT_SECONDS;
+  }
+  probeTimeoutSeconds = Math.min(probeTimeoutSeconds, DOCTOR_PROBE_TIMEOUT_MAX_SECONDS);
+  const maximum = (
+    HARNESSES.length * probeTimeoutSeconds * 1_000
+    + DOCTOR_PROCESS_OVERHEAD_MS
+  );
+  const requested = Number(process.env[DOCTOR_PROCESS_TIMEOUT_ENV]);
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.min(Math.floor(requested), maximum);
+  }
+  return maximum;
+}
+
 function rejectWorkflowOverride(rest) {
   for (const value of rest) {
     const option = value.split("=", 1)[0];
@@ -709,6 +751,7 @@ function doctor(options) {
       {
         cwd: project,
         encoding: "utf8",
+        timeout: doctorProcessTimeoutMs(options.rest),
         env: {
           ...process.env,
           PYTHONPATH: join(PACKAGE_ROOT, "src"),
@@ -716,7 +759,12 @@ function doctor(options) {
       },
     );
     if (result.error) {
-      runtime = { error: result.error.message, ok: false };
+      runtime = {
+        error: result.error.code === "ETIMEDOUT"
+          ? "runtime_doctor_timeout"
+          : result.error.message,
+        ok: false,
+      };
     } else {
       try {
         const parsed = JSON.parse(result.stdout);

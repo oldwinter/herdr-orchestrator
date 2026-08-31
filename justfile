@@ -47,13 +47,15 @@ security:
     @uv run detect-secrets-hook --baseline .secrets.baseline $(git ls-files --cached --others --exclude-standard)
     @uv run bandit -q -r src -ll -f json -o .orchestrator/quality/bandit.json
     @uv run pip-audit --local --format json --output .orchestrator/quality/pip-audit.json
+    @npm audit --package-lock-only
+    @npm audit --package-lock-only --prefix packages/herdr-manager
 
 build-metrics:
     @uv run python scripts/build_metrics.py --output .orchestrator/quality/build.json
 
 profile-tests:
     @mkdir -p .orchestrator/quality
-    @PYTHONPATH=src uv run python -m cProfile -o .orchestrator/quality/tests.pstats -m pytest tests/test_protocol.py -q
+    @PYTHONPATH=src uv run python -c 'import cProfile, pytest; profiler = cProfile.Profile(); status = profiler.runcall(pytest.main, ["tests/test_protocol.py", "-q"]); profiler.dump_stats(".orchestrator/quality/tests.pstats"); raise SystemExit(status)'
 
 quality-summary:
     @uv run python scripts/quality_summary.py --output .orchestrator/quality/summary.md

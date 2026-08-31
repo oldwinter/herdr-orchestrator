@@ -20,7 +20,7 @@
     "README.md"
   ],
   "dependencies": {
-    "herdr-orchestrator": "^0.1.6"
+    "herdr-orchestrator": "0.1.6"
   },
   "engines": {
     "node": ">=20"

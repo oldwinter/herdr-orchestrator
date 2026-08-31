@@ -64,8 +64,10 @@ class DistributionCliTests(unittest.TestCase):
     def test_manager_runtime_dependency_is_exact_and_locked(self) -> None:
         metadata = json.loads((MANAGER_PACKAGE / "package.json").read_text(encoding="utf-8"))
         dependency = metadata["dependencies"]["herdr-orchestrator"]
+        runtime = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
 
         self.assertRegex(dependency, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(dependency, runtime["version"])
         lock_path = MANAGER_PACKAGE / "package-lock.json"
         self.assertTrue(lock_path.is_file())
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -78,9 +80,12 @@ class DistributionCliTests(unittest.TestCase):
 
     def test_npm_dependency_audit_covers_both_package_lockfiles(self) -> None:
         security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         self.assertIn("npm audit --package-lock-only", security)
         self.assertIn("packages/herdr-manager", security)
+        self.assertIn("npm audit --package-lock-only", justfile)
+        self.assertIn("npm audit --package-lock-only --prefix packages/herdr-manager", justfile)
 
     def test_missing_option_value_returns_a_stable_cli_error(self) -> None:
         result = self._run("install", "--project")
