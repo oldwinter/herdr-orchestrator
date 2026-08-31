@@ -37,7 +37,9 @@ The npm package has no runtime npm dependencies. Its executable:
 5. writes an ownership manifest with a SHA-256 hash for every managed file;
 6. adds installer-managed roots to this repository's Git-local `info/exclude` without editing
    a tracked `.gitignore` or hiding an unmanaged Skill;
-7. carries the Python package and invokes it with its packaged `src/` on `PYTHONPATH`.
+7. records the prior and desired inventories in a transaction journal before it changes a
+   managed file, the ownership manifest, or the Git exclude block;
+8. carries the Python package and invokes it with its packaged `src/` on `PYTHONPATH`.
 
 Setup commands reject options they do not define.
 
@@ -84,6 +86,7 @@ independently installed Skill remains untouched.
 | Path | Ownership |
 | --- | --- |
 | `.herdr-orchestrator/manifest.json` | Installer ownership and content hashes |
+| `.herdr-orchestrator/install-journal.json` | Active install, upgrade, or uninstall transaction |
 | `.herdr-orchestrator/workflows/` | Portable project-relative workflow and prompts |
 | `.herdr-orchestrator/profiles/` | Profiles for selected harnesses |
 | `.herdr-orchestrator/manager/` | Fixed policy workspace for a manual manager session |
@@ -105,6 +108,30 @@ Managed files changed by the user are preserved on reinstall, upgrade, and unins
 partial reconciliation returns exit code `1` and reports those paths in `preserved`.
 Manifest entries are restricted to the roots above, and symlinked managed paths are rejected.
 
+## Installer recovery
+
+Install, upgrade, and uninstall write `.herdr-orchestrator/install-journal.json` before
+their first owned mutation. The journal records the transaction ID, package version, selected
+harnesses, Skill choice, prior and desired inventories, endpoint digests, ordered operations,
+desired replacement bytes, and durable progress.
+
+Each regular-file replacement uses a temporary file in the target directory. The installer
+flushes the temporary file, renames it over the validated target, and flushes the directory.
+It rejects symlinks and non-regular targets before planning and again during replay. The
+ownership manifest is the last semantic operation, after managed files and the Git exclude
+block match the desired inventory.
+
+The next install, upgrade, or uninstall finishes an active transaction before it performs
+normal ownership classification. Replay checks the complete inventory before it writes. Every
+participant must match either its recorded prior digest or its desired digest. If a path
+matches neither endpoint, the command exits with
+`installer_recovery_conflict: <path>`. It leaves both the journal and the conflicting bytes
+unchanged.
+
+Recovery always moves forward to the journal's desired inventory. Desired replacement bytes
+are stored in the journal, so a newer package can finish a transaction written by an older
+package before it plans its own update.
+
 ## Diagnostics
 
 ```bash
@@ -113,7 +140,8 @@ npx --yes herdr-orchestrator doctor --project .
 
 `doctor` returns one JSON document with:
 
-- `installation`: missing or modified managed files;
+- `installation`: the package inventory, ownership-manifest claims, actual file digests, the
+  managed Git exclude block, and any active journal;
 - `runtime`: Python, Herdr, Git, profile checks, and a bounded real readiness turn for every
   selected harness;
 - top-level `ok`: true only when both layers are healthy.
@@ -122,6 +150,8 @@ Exit code `1` means the installation or runtime needs attention. In particular, 
 must run inside a Herdr pane with the expected `HERDR_*` environment. A harness readiness
 status is one of `ready`, `auth_required`, `model_invalid`, `timeout`, `unavailable`, or
 `error`; an executable in `PATH` alone is not ready. Doctor closes only probe agents it created.
+Doctor never replays an installer transaction. An active journal makes installation health
+false and remains available for the next install, upgrade, or uninstall command.
 
 ## Manual manager
 
@@ -242,7 +272,10 @@ catalog. Unchanged profiles that are no longer selected are removed. Modified fi
 reported and retained.
 
 Uninstall removes the manifest after processing it. User-modified managed files remain in
-place and are listed in the JSON result; they are no longer managed after that point.
+place and are listed in the JSON result; they are no longer managed after that point. Uninstall
+first finishes any older active transaction, then journals its own removals. Repeating uninstall
+after journal retirement is safe: the command does not claim or remove bytes when no ownership
+manifest exists, and it reports any bytes left under managed roots as `preserved`.
 
 ## Automated npm releases
 

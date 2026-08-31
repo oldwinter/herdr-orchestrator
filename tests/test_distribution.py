@@ -243,6 +243,250 @@ class DistributionCliTests(unittest.TestCase):
                 ["droid"],
             )
 
+    def test_install_recovers_after_interruption_at_journal_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            interrupted_environment = os.environ.copy()
+            interrupted_environment.update(
+                {
+                    "NODE_ENV": "test",
+                    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION": "2",
+                }
+            )
+
+            interrupted = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                env=interrupted_environment,
+            )
+
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            journal_path = project / ".herdr-orchestrator/install-journal.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            self.assertEqual(journal["schema_version"], 1)
+            self.assertEqual(journal["package"], "herdr-orchestrator")
+            self.assertRegex(
+                journal["transaction_id"],
+                r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-" r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            )
+            self.assertEqual(journal["package_version"], __version__)
+            self.assertEqual(journal["harnesses"], ["droid"])
+            self.assertTrue(journal["install_skill"])
+            self.assertGreater(len(journal["prior_inventory"]), 0)
+            self.assertEqual(
+                set(journal["prior_inventory"]),
+                set(journal["desired_inventory"]),
+            )
+            self.assertGreater(len(journal["operations"]), 0)
+            self.assertEqual(journal["progress"]["completed_operations"], 0)
+            self.assertFalse(
+                (project / ".herdr-orchestrator/workflows/multi-harness.toml").exists()
+            )
+
+            resumed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertFalse(journal_path.exists())
+            self.assertTrue(
+                (project / ".herdr-orchestrator/workflows/multi-harness.toml").is_file()
+            )
+            self.assertTrue((project / ".herdr-orchestrator/manifest.json").is_file())
+
+    def test_uninstall_reconciles_an_interrupted_install_before_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            interrupted_environment = os.environ.copy()
+            interrupted_environment.update(
+                {
+                    "NODE_ENV": "test",
+                    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION": "2",
+                }
+            )
+            interrupted = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                env=interrupted_environment,
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+
+            uninstall = self._run("uninstall", "--project", str(project))
+
+            self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+            self.assertFalse((project / ".herdr-orchestrator/install-journal.json").exists())
+            self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
+            self.assertFalse(
+                (project / ".herdr-orchestrator/workflows/multi-harness.toml").exists()
+            )
+
+    def test_uninstall_recovers_after_interruption_at_journal_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+            manifest = project / ".herdr-orchestrator/manifest.json"
+            interrupted_environment = os.environ.copy()
+            interrupted_environment.update(
+                {
+                    "NODE_ENV": "test",
+                    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION": "2",
+                }
+            )
+
+            interrupted = self._run(
+                "uninstall",
+                "--project",
+                str(project),
+                env=interrupted_environment,
+            )
+
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            journal_path = project / ".herdr-orchestrator/install-journal.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            self.assertEqual(journal["command"], "uninstall")
+            self.assertEqual(journal["harnesses"], ["droid"])
+            self.assertTrue(workflow.is_file())
+            self.assertTrue(manifest.is_file())
+
+            resumed = self._run("uninstall", "--project", str(project))
+
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertFalse(journal_path.exists())
+            self.assertFalse(workflow.exists())
+            self.assertFalse(manifest.exists())
+
+    def test_uninstall_is_idempotent_after_journal_retirement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            first = self._run("uninstall", "--project", str(project))
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            second = self._run("uninstall", "--project", str(project))
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            payload = json.loads(second.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["preserved"], [])
+            self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
+
+    def test_doctor_reports_an_active_journal_without_replaying_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            interrupted_environment = os.environ.copy()
+            interrupted_environment.update(
+                {
+                    "NODE_ENV": "test",
+                    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION": "2",
+                }
+            )
+            interrupted = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                env=interrupted_environment,
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            journal_path = project / ".herdr-orchestrator/install-journal.json"
+            before = journal_path.read_bytes()
+
+            doctor = self._run("doctor", "--project", str(project))
+
+            self.assertEqual(doctor.returncode, 1, doctor.stderr)
+            installation = json.loads(doctor.stdout)["installation"]
+            self.assertFalse(installation["ok"])
+            self.assertFalse(installation["manifest"])
+            self.assertTrue(installation["journal"]["active"])
+            self.assertEqual(installation["journal"]["command"], "install")
+            self.assertEqual(installation["journal"]["conflicts"], [])
+            self.assertEqual(journal_path.read_bytes(), before)
+            self.assertFalse(
+                (project / ".herdr-orchestrator/workflows/multi-harness.toml").exists()
+            )
+
+    def test_recovery_conflict_preserves_the_journal_and_user_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            interrupted_environment = os.environ.copy()
+            interrupted_environment.update(
+                {
+                    "NODE_ENV": "test",
+                    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION": "2",
+                }
+            )
+            interrupted = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                env=interrupted_environment,
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            journal_path = project / ".herdr-orchestrator/install-journal.json"
+            journal_before = journal_path.read_bytes()
+            journal = json.loads(journal_before)
+            operation = next(
+                item for item in journal["operations"] if item["target"]["scope"] == "project"
+            )
+            relative_path = operation["target"]["path"]
+            conflicted_path = project / relative_path
+            conflicted_path.parent.mkdir(parents=True, exist_ok=True)
+            conflicted_path.write_bytes(b"user bytes outside both journal endpoints\n")
+
+            resumed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(resumed.returncode, 2)
+            self.assertEqual(
+                resumed.stderr.strip(),
+                f"installer_recovery_conflict: {relative_path}",
+            )
+            self.assertEqual(
+                conflicted_path.read_bytes(),
+                b"user bytes outside both journal endpoints\n",
+            )
+            self.assertEqual(journal_path.read_bytes(), journal_before)
+            self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
+
     def test_manager_requires_a_herdr_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -852,6 +1096,100 @@ class DistributionCliTests(unittest.TestCase):
         self.assertEqual(installation["installed_version"], "0.0.0")
         self.assertEqual(installation["runtime_version"], __version__)
 
+    def test_doctor_compares_package_manifest_bytes_and_git_exclude(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            commands = root / "bin"
+            commands.mkdir()
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            fake_python = commands / "python"
+            fake_python.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '{\"ok\":false,\"checks\":[]}'\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PYTHON"] = str(fake_python)
+
+            healthy = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env=environment,
+            )
+
+            self.assertEqual(healthy.returncode, 1, healthy.stderr)
+            healthy_installation = json.loads(healthy.stdout)["installation"]
+            self.assertTrue(healthy_installation["ok"])
+            self.assertEqual(healthy_installation["package_missing"], [])
+            self.assertEqual(healthy_installation["package_modified"], [])
+            self.assertEqual(healthy_installation["manifest_missing"], [])
+            self.assertEqual(healthy_installation["manifest_extra"], [])
+            self.assertEqual(healthy_installation["manifest_mismatched"], [])
+            self.assertTrue(healthy_installation["git_exclude"]["ok"])
+
+            manifest_path = project / ".herdr-orchestrator/manifest.json"
+            original_manifest = manifest_path.read_text(encoding="utf-8")
+            manifest = json.loads(original_manifest)
+            workflow_path = ".herdr-orchestrator/workflows/multi-harness.toml"
+            del manifest["files"][workflow_path]
+            manifest_path.write_text(
+                f"{json.dumps(manifest, indent=2)}\n",
+                encoding="utf-8",
+            )
+            missing_claim = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env=environment,
+            )
+
+            self.assertEqual(missing_claim.returncode, 1, missing_claim.stderr)
+            missing_installation = json.loads(missing_claim.stdout)["installation"]
+            self.assertFalse(missing_installation["ok"])
+            self.assertEqual(missing_installation["manifest_missing"], [workflow_path])
+            self.assertEqual(missing_installation["package_missing"], [])
+            manifest_path.write_text(original_manifest, encoding="utf-8")
+
+            exclude = project / ".git/info/exclude"
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8").replace(
+                    "/.orchestrator/",
+                    "/.orchestrator-tampered/",
+                ),
+                encoding="utf-8",
+            )
+            damaged_exclude = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env=environment,
+            )
+
+            self.assertEqual(damaged_exclude.returncode, 1, damaged_exclude.stderr)
+            damaged_installation = json.loads(damaged_exclude.stdout)["installation"]
+            self.assertFalse(damaged_installation["ok"])
+            self.assertFalse(damaged_installation["git_exclude"]["ok"])
+            self.assertEqual(
+                damaged_installation["git_exclude"]["status"],
+                "modified",
+            )
+
     def test_install_keeps_a_real_git_worktree_status_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -1216,6 +1554,81 @@ class DistributionCliTests(unittest.TestCase):
             self.assertIn("managed_path_symlink", install.stderr)
             self.assertFalse((outside / ".gitignore").exists())
 
+    def test_install_rejects_a_non_regular_managed_target_before_journaling(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            target = project / ".orchestrator/.gitignore"
+            target.mkdir(parents=True)
+
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(install.returncode, 2)
+            self.assertEqual(
+                install.stderr.strip(),
+                "managed_path_not_regular: .orchestrator/.gitignore",
+            )
+            self.assertFalse((project / ".herdr-orchestrator/install-journal.json").exists())
+            self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "permission errors require a non-root user")
+    def test_upgrade_recovers_after_a_target_directory_write_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            profiles = project / ".herdr-orchestrator/profiles/harnesses"
+            existing_profile = profiles / "droid.toml"
+            existing_bytes = existing_profile.read_bytes()
+            profiles.chmod(0o500)
+            try:
+                failed = self._run(
+                    "upgrade",
+                    "--project",
+                    str(project),
+                    "--harness",
+                    "droid",
+                    "--harness",
+                    "codex",
+                )
+            finally:
+                profiles.chmod(0o700)
+
+            self.assertEqual(failed.returncode, 2)
+            self.assertIn("EACCES", failed.stderr)
+            journal = project / ".herdr-orchestrator/install-journal.json"
+            self.assertTrue(journal.is_file())
+            self.assertEqual(existing_profile.read_bytes(), existing_bytes)
+
+            recovered = self._run(
+                "upgrade",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                "--harness",
+                "codex",
+            )
+
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertFalse(journal.exists())
+            self.assertTrue((profiles / "codex.toml").is_file())
+
     def test_upgrade_reconciles_the_selected_harness_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -1367,6 +1780,300 @@ class DistributionCliTests(unittest.TestCase):
             self.assertTrue((project / ".herdr-orchestrator/manager/AGENTS.md").is_file())
             self.assertTrue((project / ".herdr-orchestrator/manager/CLAUDE.md").is_file())
             self.assertTrue((project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file())
+
+    def test_packed_installer_recovers_after_every_durable_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package_directory = root / "package"
+            extracted = root / "extracted"
+            package_directory.mkdir()
+            extracted.mkdir()
+            packed = subprocess.run(
+                [
+                    "npm",
+                    "pack",
+                    "--silent",
+                    "--pack-destination",
+                    str(package_directory),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(packed.returncode, 0, packed.stderr)
+            tarball = package_directory / packed.stdout.strip().splitlines()[-1]
+            with tarfile.open(tarball) as archive:
+                packaged_files = set(archive.getnames())
+                archive.extractall(extracted, filter="data")
+            self.assertIn("package/bin/installer-journal.mjs", packaged_files)
+            packed_cli = extracted / "package/bin/herdr-orchestrator.mjs"
+
+            def initialize_project(project: Path) -> None:
+                initialized = subprocess.run(
+                    ["git", "init", "--quiet", str(project)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(initialized.returncode, 0, initialized.stderr)
+                exclude = project / ".git/info/exclude"
+                with exclude.open("a", encoding="utf-8") as stream:
+                    stream.write("# caller-owned exclude\n/caller-cache/\n")
+
+            def run_cli(
+                project: Path,
+                arguments: list[str],
+                *,
+                interrupt_after: int | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                environment = os.environ.copy()
+                if interrupt_after is not None:
+                    environment.update(
+                        {
+                            "NODE_ENV": "test",
+                            "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION": str(
+                                interrupt_after
+                            ),
+                        }
+                    )
+                return subprocess.run(
+                    ["node", str(packed_cli), *arguments, "--project", str(project)],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                    timeout=30,
+                )
+
+            def setup_project(project: Path, operation: str) -> None:
+                initialize_project(project)
+                if operation in {"upgrade", "uninstall"}:
+                    installed = run_cli(
+                        project,
+                        ["install", "--harness", "droid"],
+                    )
+                    self.assertEqual(installed.returncode, 0, installed.stderr)
+
+            def operation_arguments(operation: str) -> list[str]:
+                if operation == "install":
+                    return ["install", "--harness", "droid"]
+                if operation == "upgrade":
+                    return [
+                        "upgrade",
+                        "--harness",
+                        "droid",
+                        "--harness",
+                        "codex",
+                    ]
+                return ["uninstall"]
+
+            def snapshot(project: Path) -> dict[str, object]:
+                files: dict[str, str] = {}
+                directories: list[str] = []
+                for root_name in (
+                    ".herdr-orchestrator",
+                    ".orchestrator",
+                    ".agents/skills/herdr-orchestrator",
+                ):
+                    managed_root = project / root_name
+                    if not managed_root.exists():
+                        continue
+                    directories.append(root_name)
+                    for path in sorted(managed_root.rglob("*")):
+                        relative_path = path.relative_to(project).as_posix()
+                        if path.is_dir():
+                            directories.append(relative_path)
+                        elif path.is_symlink():
+                            files[relative_path] = f"symlink:{os.readlink(path)}"
+                        else:
+                            files[relative_path] = hashlib.sha256(path.read_bytes()).hexdigest()
+                exclude = project / ".git/info/exclude"
+                return {
+                    "directories": sorted(set(directories)),
+                    "exclude": exclude.read_bytes(),
+                    "files": files,
+                }
+
+            mutation_counts: dict[str, int] = {}
+            for operation in ("install", "upgrade", "uninstall"):
+                with self.subTest(operation=operation):
+                    expected_project = root / f"expected-{operation}"
+                    setup_project(expected_project, operation)
+                    expected_run = run_cli(
+                        expected_project,
+                        operation_arguments(operation),
+                    )
+                    self.assertEqual(expected_run.returncode, 0, expected_run.stderr)
+                    expected_snapshot = snapshot(expected_project)
+
+                    for interrupt_after in range(1, 161):
+                        project = root / f"{operation}-{interrupt_after}"
+                        setup_project(project, operation)
+                        interrupted = run_cli(
+                            project,
+                            operation_arguments(operation),
+                            interrupt_after=interrupt_after,
+                        )
+                        if interrupted.returncode != 86:
+                            self.assertEqual(
+                                interrupted.returncode,
+                                0,
+                                interrupted.stderr,
+                            )
+                            self.assertEqual(snapshot(project), expected_snapshot)
+                            mutation_counts[operation] = interrupt_after - 1
+                            break
+
+                        recovered = run_cli(
+                            project,
+                            operation_arguments(operation),
+                        )
+                        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                        self.assertEqual(
+                            snapshot(project),
+                            expected_snapshot,
+                            f"{operation} failed to converge after mutation " f"{interrupt_after}",
+                        )
+                    else:
+                        self.fail(f"{operation} exceeded the mutation-matrix bound")
+
+            self.assertGreater(mutation_counts["install"], 20)
+            self.assertGreater(mutation_counts["upgrade"], 4)
+            self.assertGreater(mutation_counts["uninstall"], 15)
+
+    def test_current_package_finishes_an_older_package_transaction_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package_directory = root / "packages"
+            current_directory = root / "current"
+            older_directory = root / "older"
+            package_directory.mkdir()
+            current_directory.mkdir()
+            older_directory.mkdir()
+            packed = subprocess.run(
+                [
+                    "npm",
+                    "pack",
+                    "--silent",
+                    "--pack-destination",
+                    str(package_directory),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(packed.returncode, 0, packed.stderr)
+            tarball = package_directory / packed.stdout.strip().splitlines()[-1]
+            with tarfile.open(tarball) as archive:
+                archive.extractall(current_directory, filter="data")
+            with tarfile.open(tarball) as archive:
+                archive.extractall(older_directory, filter="data")
+            current_package = current_directory / "package"
+            older_package = older_directory / "package"
+            older_metadata_path = older_package / "package.json"
+            older_metadata = json.loads(older_metadata_path.read_text(encoding="utf-8"))
+            older_metadata["version"] = "0.1.5"
+            older_metadata_path.write_text(
+                f"{json.dumps(older_metadata, indent=2)}\n",
+                encoding="utf-8",
+            )
+            older_manager = older_package / "manager/AGENTS.md"
+            older_manager.write_text(
+                f"{older_manager.read_text(encoding='utf-8')}\nOLDER PACKAGE BYTES\n",
+                encoding="utf-8",
+            )
+            current_cli = current_package / "bin/herdr-orchestrator.mjs"
+            older_cli = older_package / "bin/herdr-orchestrator.mjs"
+
+            def initialize_project(project: Path) -> None:
+                initialized = subprocess.run(
+                    ["git", "init", "--quiet", str(project)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(initialized.returncode, 0, initialized.stderr)
+
+            def run_cli(
+                cli: Path,
+                project: Path,
+                *,
+                interrupt_after: int | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                environment = os.environ.copy()
+                if interrupt_after is not None:
+                    environment.update(
+                        {
+                            "NODE_ENV": "test",
+                            "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION": str(
+                                interrupt_after
+                            ),
+                        }
+                    )
+                return subprocess.run(
+                    [
+                        "node",
+                        str(cli),
+                        "install",
+                        "--project",
+                        str(project),
+                        "--harness",
+                        "droid",
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                    timeout=30,
+                )
+
+            probe = root / "probe"
+            initialize_project(probe)
+            published = run_cli(older_cli, probe, interrupt_after=2)
+            self.assertEqual(published.returncode, 86, published.stderr)
+            probe_journal = json.loads(
+                (probe / ".herdr-orchestrator/install-journal.json").read_text(encoding="utf-8")
+            )
+            manager_operation = next(
+                index
+                for index, operation in enumerate(probe_journal["operations"])
+                if operation["target"].get("path") == ".herdr-orchestrator/manager/AGENTS.md"
+            )
+            manager_target_mutation = 4 + manager_operation * 4
+
+            project = root / "project"
+            initialize_project(project)
+            interrupted = run_cli(
+                older_cli,
+                project,
+                interrupt_after=manager_target_mutation,
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            active_journal = json.loads(
+                (project / ".herdr-orchestrator/install-journal.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(active_journal["package_version"], "0.1.5")
+            installed_manager = project / ".herdr-orchestrator/manager/AGENTS.md"
+            self.assertIn("OLDER PACKAGE BYTES", installed_manager.read_text(encoding="utf-8"))
+
+            recovered = run_cli(current_cli, project)
+
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertFalse((project / ".herdr-orchestrator/install-journal.json").exists())
+            manifest = json.loads(
+                (project / ".herdr-orchestrator/manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["version"], __version__)
+            self.assertEqual(
+                installed_manager.read_bytes(),
+                (current_package / "manager/AGENTS.md").read_bytes(),
+            )
 
     def test_packed_herdr_manager_package_runs_outside_the_source_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
