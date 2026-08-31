@@ -9,7 +9,7 @@ from typing import Any
 
 SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 TICKET_ID = re.compile(r"\d{2,3}\Z")
-COMMIT = re.compile(r"[0-9a-f]{7,64}\Z")
+COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 class DeliveryArtifactError(ValueError):
@@ -462,6 +462,8 @@ def load_review_verdict(
     _exact_keys(payload, {"accepted", "dismissed", "rationale"}, "review_verdict")
     accepted = _string_list(payload, "accepted", 200, 40, "review_verdict")
     dismissed = _string_list(payload, "dismissed", 200, 40, "review_verdict")
+    if len(set(accepted)) != len(accepted) or len(set(dismissed)) != len(dismissed):
+        raise DeliveryArtifactError("review_verdict_duplicate")
     if set(accepted) & set(dismissed):
         raise DeliveryArtifactError("review_verdict_overlap")
     if set(accepted) | set(dismissed) != set(candidates):
@@ -524,9 +526,23 @@ def _review_findings(payload: dict[str, Any], key: str) -> tuple[ReviewFinding, 
 def _load_object(path: Path, artifact: str) -> dict[str, Any]:
     if not path.is_file():
         raise DeliveryArtifactError(f"{artifact}_missing")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise DeliveryArtifactError(f"{artifact}_duplicate_key")
+            result[key] = value
+        return result
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=unique_object,
+        )
+    except DeliveryArtifactError:
+        raise
+    except ValueError as exc:
         raise DeliveryArtifactError(f"{artifact}_invalid_json") from exc
     if not isinstance(payload, dict):
         raise DeliveryArtifactError(f"{artifact}_invalid_shape")

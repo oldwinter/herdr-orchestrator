@@ -150,8 +150,12 @@ class DeliveryProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "verdict.json"
             path.write_text(
-                '{"accepted":[],"accepted":["standards:1"],'
-                '"dismissed":[],"rationale":"valid"}',
+                """{
+                    "accepted": [],
+                    "accepted": ["standards:1"],
+                    "dismissed": [],
+                    "rationale": "valid"
+                }""",
                 encoding="utf-8",
             )
 
@@ -165,6 +169,20 @@ class DeliveryProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "verdict.json"
             path.write_bytes(b"\xff")
+
+            with self.assertRaisesRegex(
+                DeliveryArtifactError,
+                "review_verdict_invalid_json",
+            ):
+                load_review_verdict(path, candidates=())
+
+    def test_oversized_json_integer_is_reported_as_invalid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "verdict.json"
+            path.write_text(
+                '{"accepted":' + "9" * 5_000 + ',"dismissed":[],"rationale":"valid"}',
+                encoding="utf-8",
+            )
 
             with self.assertRaisesRegex(
                 DeliveryArtifactError,
