@@ -377,9 +377,7 @@ class CliTests(unittest.TestCase):
         config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
         config = replace(
             config,
-            workers=tuple(
-                worker for worker in config.workers if worker.harness is Harness.CODEX
-            ),
+            workers=tuple(worker for worker in config.workers if worker.harness is Harness.CODEX),
         )
 
         with (

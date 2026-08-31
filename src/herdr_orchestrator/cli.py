@@ -705,14 +705,18 @@ def smoke(
     *,
     selected_harnesses: list[str] | None = None,
 ) -> int:
+    selected = list(dict.fromkeys(selected_harnesses or ()))
+    enabled = {worker.harness.value for worker in workflow.workers}
+    unavailable = [harness for harness in selected if harness not in enabled]
+    if unavailable:
+        raise ValueError(f"smoke_harness_not_enabled: {','.join(unavailable)}")
+    workers = [
+        worker for worker in workflow.workers if not selected or worker.harness.value in selected
+    ]
     transport = HerdrTransport(workflow.name, workflow.workspace)
     failures: list[dict[str, str]] = []
     results: list[dict[str, object]] = []
     created_names: list[str] = []
-    selected = set(selected_harnesses or ())
-    workers = [
-        worker for worker in workflow.workers if not selected or worker.harness.value in selected
-    ]
     try:
         for worker in workers:
             harness = worker.harness
