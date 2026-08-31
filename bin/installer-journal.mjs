@@ -3,9 +3,11 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -16,16 +18,15 @@ import { TextDecoder } from "node:util";
 
 export const INSTALLER_JOURNAL_RELATIVE_PATH =
   ".herdr-orchestrator/install-journal.json";
-const INSTALLER_JOURNAL_TEMPORARY_RELATIVE_PATH =
-  ".herdr-orchestrator/.install-journal.json.tmp";
 
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 const TRANSACTION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const TEST_INTERRUPT_ENV =
-  "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION";
-
-let durableMutationCount = 0;
+const JOURNAL_TEMPORARY_PATTERN =
+  /^\.install-journal\.([0-9a-f-]{36})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.tmp$/;
+const TEST_ADAPTER = Symbol.for(
+  "herdr-orchestrator.installer-test-adapter.v1",
+);
 
 function sha256(content) {
   return createHash("sha256").update(content).digest("hex");
@@ -120,15 +121,20 @@ function targetLabel(target) {
   return target.scope === "project" ? target.path : `git-exclude:${target.path}`;
 }
 
-function durableMutation(label) {
-  durableMutationCount += 1;
-  if (process.env.NODE_ENV !== "test") {
-    return;
+function durableMutation(label, mutationPath = null) {
+  const adapter = globalThis[TEST_ADAPTER];
+  if (typeof adapter?.durableMutation === "function") {
+    adapter.durableMutation({
+      label,
+      path: mutationPath,
+    });
   }
-  const requested = Number(process.env[TEST_INTERRUPT_ENV]);
-  if (Number.isInteger(requested) && requested > 0 && requested === durableMutationCount) {
-    process.stderr.write(`installer_test_interruption: ${label}\n`);
-    process.exit(86);
+}
+
+function beforeJournalClaim() {
+  const adapter = globalThis[TEST_ADAPTER];
+  if (typeof adapter?.beforeJournalClaim === "function") {
+    adapter.beforeJournalClaim();
   }
 }
 
@@ -141,6 +147,39 @@ function fsyncDirectory(path) {
   }
 }
 
+function ensureDirectoryDurable(path) {
+  try {
+    const status = lstatSync(path);
+    if (status.isSymbolicLink() || !status.isDirectory()) {
+      throw new Error(`installer_directory_invalid: ${path}`);
+    }
+    return;
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  const parent = dirname(path);
+  if (parent === path) {
+    throw new Error(`installer_directory_not_found: ${path}`);
+  }
+  ensureDirectoryDurable(parent);
+  try {
+    mkdirSync(path);
+  } catch (error) {
+    if (error.code !== "EEXIST") {
+      throw error;
+    }
+    const status = lstatSync(path);
+    if (status.isSymbolicLink() || !status.isDirectory()) {
+      throw new Error(`installer_directory_invalid: ${path}`);
+    }
+    return;
+  }
+  fsyncDirectory(parent);
+  durableMutation(`directory:created:${path}`);
+}
+
 function writeAll(descriptor, content) {
   let offset = 0;
   while (offset < content.length) {
@@ -149,6 +188,21 @@ function writeAll(descriptor, content) {
       throw new Error("installer_write_stalled");
     }
     offset += written;
+  }
+}
+
+function replacementMode(path) {
+  try {
+    const status = lstatSync(path);
+    if (status.isSymbolicLink() || !status.isFile()) {
+      throw new Error(`installer_target_not_regular: ${path}`);
+    }
+    return status.mode & 0o7777;
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return 0o666;
+    }
+    throw error;
   }
 }
 
@@ -168,28 +222,27 @@ function assertJournalTargetSafe(path) {
   }
 }
 
-function atomicReplace(path, content, temporaryPath, label) {
-  const parent = dirname(path);
-  mkdirSync(parent, { recursive: true });
+function createDurableTemporary(path, content, mode, label) {
   let descriptor;
-  let temporaryReady = false;
+  let created = false;
+  let ready = false;
   try {
-    descriptor = openSync(temporaryPath, "wx", 0o666);
+    descriptor = openSync(path, "wx", mode);
+    created = true;
     writeAll(descriptor, content);
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
-    temporaryReady = true;
+    ready = true;
     durableMutation(`temporary:${label}`);
-    renameSync(temporaryPath, path);
-    fsyncDirectory(parent);
   } catch (error) {
     if (descriptor !== undefined) {
       closeSync(descriptor);
     }
-    if (!temporaryReady) {
+    if (created && !ready) {
       try {
-        unlinkSync(temporaryPath);
+        unlinkSync(path);
+        fsyncDirectory(dirname(path));
       } catch (cleanupError) {
         if (cleanupError.code !== "ENOENT") {
           throw cleanupError;
@@ -198,7 +251,36 @@ function atomicReplace(path, content, temporaryPath, label) {
     }
     throw error;
   }
-  durableMutation(label);
+}
+
+function atomicReplace(path, content, temporaryPath, label) {
+  const parent = dirname(path);
+  ensureDirectoryDurable(parent);
+  let temporaryCreated = false;
+  try {
+    createDurableTemporary(
+      temporaryPath,
+      content,
+      replacementMode(path),
+      label,
+    );
+    temporaryCreated = true;
+    renameSync(temporaryPath, path);
+    fsyncDirectory(parent);
+  } catch (error) {
+    if (temporaryCreated) {
+      try {
+        unlinkSync(temporaryPath);
+        fsyncDirectory(parent);
+      } catch (cleanupError) {
+        if (cleanupError.code !== "ENOENT") {
+          throw cleanupError;
+        }
+      }
+    }
+    throw error;
+  }
+  durableMutation(label, path);
 }
 
 function assertProjectTargetSafe(project, relativePath) {
@@ -456,35 +538,54 @@ function journalPath(project) {
   return join(project, INSTALLER_JOURNAL_RELATIVE_PATH);
 }
 
-function journalTemporaryPath(project) {
-  return join(project, INSTALLER_JOURNAL_TEMPORARY_RELATIVE_PATH);
+function journalContent(journal) {
+  return Buffer.from(`${JSON.stringify(serializeJournal(journal), null, 2)}\n`);
 }
 
-function cleanupJournalTemporary(project) {
-  const path = journalTemporaryPath(project);
+function journalTemporaryPath(project, transactionId) {
+  return join(
+    dirname(journalPath(project)),
+    `.install-journal.${transactionId}.${process.pid}.${randomUUID()}.tmp`,
+  );
+}
+
+function listJournalTemporaries(project) {
+  const directory = dirname(journalPath(project));
+  let names;
   try {
-    const status = lstatSync(path);
-    if (status.isSymbolicLink()) {
-      throw new Error("installer_journal_temporary_symlink");
-    }
-    if (!status.isFile()) {
-      throw new Error("installer_journal_temporary_not_regular");
-    }
-    unlinkSync(path);
-    fsyncDirectory(dirname(path));
-    durableMutation("journal:temporary:cleaned");
+    names = readdirSync(directory);
   } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
+    if (error.code === "ENOENT") {
+      return [];
     }
+    throw error;
   }
+  return names.flatMap((name) => {
+    const match = JOURNAL_TEMPORARY_PATTERN.exec(name);
+    if (
+      match === null
+      || !TRANSACTION_ID_PATTERN.test(match[1])
+      || !TRANSACTION_ID_PATTERN.test(match[3])
+    ) {
+      return [];
+    }
+    return [{
+      path: join(directory, name),
+      pid: Number(match[2]),
+      transactionId: match[1],
+    }];
+  });
 }
 
 function persistJournal(project, journal, label) {
   const path = journalPath(project);
   assertJournalTargetSafe(path);
-  const content = Buffer.from(`${JSON.stringify(serializeJournal(journal), null, 2)}\n`);
-  atomicReplace(path, content, journalTemporaryPath(project), label);
+  atomicReplace(
+    path,
+    journalContent(journal),
+    journalTemporaryPath(project, journal.transaction_id),
+    label,
+  );
 }
 
 function readJournalAtPath(path) {
@@ -506,19 +607,159 @@ function readJournalAtPath(path) {
   }
 }
 
-function readJournal(project, { cleanTemporary = false } = {}) {
-  if (cleanTemporary) {
-    cleanupJournalTemporary(project);
-  }
+function readPublishedJournal(project) {
   return readJournalAtPath(journalPath(project));
 }
 
-function preflightEndpoints(project, journal, context) {
+function readOwnedJournalTemporary(temporary) {
+  let journal;
+  try {
+    journal = readJournalAtPath(temporary.path);
+  } catch {
+    throw new Error(
+      `installer_journal_temporary_conflict: ${basename(temporary.path)}`,
+    );
+  }
+  if (
+    journal === null
+    || journal.transaction_id !== temporary.transactionId
+  ) {
+    throw new Error(
+      `installer_journal_temporary_conflict: ${basename(temporary.path)}`,
+    );
+  }
+  return journal;
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") {
+      return false;
+    }
+    if (error.code === "EPERM") {
+      return true;
+    }
+    throw error;
+  }
+}
+
+function removeOwnedJournalTemporary(temporary) {
+  unlinkSync(temporary.path);
+  fsyncDirectory(dirname(temporary.path));
+  durableMutation(
+    `journal:temporary:removed:${temporary.transactionId}`,
+  );
+}
+
+function assertOriginalInventory(project, journal, context) {
   const conflicts = [];
+  for (const item of Object.values(journal.prior_inventory)) {
+    const actual = observeTarget(project, item.target, context);
+    if (!stateMatches(actual, item.state)) {
+      conflicts.push(targetLabel(item.target));
+    }
+  }
+  if (conflicts.length > 0) {
+    throw new Error(
+      `installer_recovery_conflict: ${conflicts.sort().join(",")}`,
+    );
+  }
+}
+
+function recoverPublishedJournal(project, context) {
+  let journal = readPublishedJournal(project);
+  const temporaries = listJournalTemporaries(project);
+  if (journal !== null) {
+    for (const temporary of temporaries) {
+      const candidate = readOwnedJournalTemporary(temporary);
+      if (processIsAlive(temporary.pid)) {
+        throw new Error("installer_transaction_active");
+      }
+      if (candidate.transaction_id !== journal.transaction_id) {
+        removeOwnedJournalTemporary(temporary);
+        continue;
+      }
+      removeOwnedJournalTemporary(temporary);
+    }
+    return journal;
+  }
+  if (temporaries.length === 0) {
+    return null;
+  }
+  if (temporaries.some((temporary) => processIsAlive(temporary.pid))) {
+    throw new Error("installer_transaction_active");
+  }
+  if (temporaries.length !== 1) {
+    throw new Error("installer_journal_temporary_conflict: multiple");
+  }
+  const temporary = temporaries[0];
+  journal = readOwnedJournalTemporary(temporary);
+  assertOriginalInventory(project, journal, context);
+  try {
+    linkSync(temporary.path, journalPath(project));
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      throw new Error("installer_transaction_active");
+    }
+    throw error;
+  }
+  fsyncDirectory(dirname(journalPath(project)));
+  durableMutation("journal:published:recovered", journalPath(project));
+  removeOwnedJournalTemporary(temporary);
+  return journal;
+}
+
+function publishInitialJournal(project, journal) {
+  const path = journalPath(project);
+  const parent = dirname(path);
+  ensureDirectoryDurable(parent);
+  assertJournalTargetSafe(path);
+  const temporary = {
+    path: journalTemporaryPath(project, journal.transaction_id),
+    pid: process.pid,
+    transactionId: journal.transaction_id,
+  };
+  let created = false;
+  try {
+    createDurableTemporary(
+      temporary.path,
+      journalContent(journal),
+      0o666,
+      "journal:published",
+    );
+    created = true;
+    try {
+      linkSync(temporary.path, path);
+    } catch (error) {
+      if (error.code === "EEXIST") {
+        throw new Error("installer_transaction_active");
+      }
+      throw error;
+    }
+    fsyncDirectory(parent);
+    durableMutation("journal:published", path);
+  } finally {
+    if (created && existsSync(temporary.path)) {
+      removeOwnedJournalTemporary(temporary);
+    }
+  }
+}
+
+function inspectEndpoints(project, journal, context) {
+  const conflicts = [];
+  const states = {};
   for (const [key, item] of Object.entries(journal.prior_inventory)) {
     const actual = observeTarget(project, item.target, context);
     const desired = journal.desired_inventory[key].state;
-    if (!stateMatches(actual, item.state) && !stateMatches(actual, desired)) {
+    if (stateMatches(actual, desired)) {
+      states[key] = "desired";
+    } else if (stateMatches(actual, item.state)) {
+      states[key] = "original";
+    } else {
+      states[key] = "conflict";
       conflicts.push(targetLabel(item.target));
     }
   }
@@ -538,8 +779,16 @@ function preflightEndpoints(project, journal, context) {
       conflicts.push(`temporary:${targetLabel(operation.target)}`);
     }
   }
+  return {
+    conflicts: conflicts.sort(),
+    states,
+  };
+}
+
+function preflightEndpoints(project, journal, context) {
+  const { conflicts } = inspectEndpoints(project, journal, context);
   if (conflicts.length > 0) {
-    throw new Error(`installer_recovery_conflict: ${conflicts.sort().join(",")}`);
+    throw new Error(`installer_recovery_conflict: ${conflicts.join(",")}`);
   }
 }
 
@@ -566,7 +815,10 @@ function applyOperation(project, journal, operation, context) {
     if (temporary.kind === "regular") {
       renameSync(temporaryPath, path);
       fsyncDirectory(dirname(path));
-      durableMutation(`target:${operation.id}:${targetLabel(operation.target)}`);
+      durableMutation(
+        `target:${operation.id}:${targetLabel(operation.target)}`,
+        path,
+      );
       return;
     }
     const content = decodeDesiredContent(operation);
@@ -602,10 +854,35 @@ function verifyDesiredInventory(project, journal, context) {
   }
 }
 
+function verifyDesiredInventoryBeforeManifest(project, journal, context) {
+  const conflicts = [];
+  for (const item of Object.values(journal.desired_inventory)) {
+    if (
+      item.target.scope === "project"
+      && item.target.path === ".herdr-orchestrator/manifest.json"
+    ) {
+      continue;
+    }
+    const actual = observeTarget(project, item.target, context);
+    if (!stateMatches(actual, item.state)) {
+      conflicts.push(targetLabel(item.target));
+    }
+  }
+  if (conflicts.length > 0) {
+    throw new Error(`installer_recovery_conflict: ${conflicts.sort().join(",")}`);
+  }
+}
+
 function completeJournal(project, journal, context) {
   preflightEndpoints(project, journal, context);
   for (let index = 0; index < journal.operations.length; index += 1) {
     const operation = journal.operations[index];
+    if (
+      operation.target.scope === "project"
+      && operation.target.path === ".herdr-orchestrator/manifest.json"
+    ) {
+      verifyDesiredInventoryBeforeManifest(project, journal, context);
+    }
     applyOperation(project, journal, operation, context);
     if (journal.progress.completed_operations < index + 1) {
       journal.progress.completed_operations = index + 1;
@@ -649,67 +926,91 @@ export function observeInstallerTarget(project, target, context) {
 
 export function reconcileInstallerJournal(context) {
   const project = resolve(context.project);
-  const journal = readJournal(project, { cleanTemporary: true });
+  const normalizedContext = contextWithDefaults(context);
+  const journal = recoverPublishedJournal(project, normalizedContext);
   if (journal === null) {
     return { active: false, recovered: false };
   }
   return {
     active: true,
-    ...completeJournal(project, journal, contextWithDefaults(context)),
+    ...completeJournal(project, journal, normalizedContext),
   };
 }
 
 export function inspectInstallerJournal(context) {
   const project = resolve(context.project);
-  const journal = readJournal(project);
+  const temporaries = listJournalTemporaries(project);
+  let journal = readPublishedJournal(project);
+  let publication = "published";
+  const journalTemporaryConflicts = [];
+  if (journal === null && temporaries.length > 0) {
+    publication = "temporary";
+    try {
+      journal = readOwnedJournalTemporary(temporaries[0]);
+    } catch {
+      journalTemporaryConflicts.push(
+        `journal-temporary:${basename(temporaries[0].path)}`,
+      );
+    }
+  }
   if (journal === null) {
-    const temporaryJournal = readJournalAtPath(journalTemporaryPath(project));
-    if (temporaryJournal !== null) {
+    if (journalTemporaryConflicts.length > 0) {
       return {
         active: true,
-        command: temporaryJournal.command,
-        conflicts: [],
-        package_version: temporaryJournal.package_version,
-        progress: { ...temporaryJournal.progress },
-        publication: "temporary",
-        states: {},
-        transaction_id: temporaryJournal.transaction_id,
+        conflicts: journalTemporaryConflicts,
+        invalid: true,
+        publication,
       };
     }
     return { active: false };
   }
-  const states = {};
-  const conflicts = [];
   const normalizedContext = contextWithDefaults(context);
-  for (const [key, item] of Object.entries(journal.prior_inventory)) {
-    const actual = observeTarget(project, item.target, normalizedContext);
-    const desired = journal.desired_inventory[key].state;
-    let status = "conflict";
-    if (stateMatches(actual, desired)) {
-      status = "desired";
-    } else if (stateMatches(actual, item.state)) {
-      status = "original";
-    } else {
-      conflicts.push(targetLabel(item.target));
+  for (const temporary of temporaries) {
+    try {
+      const candidate = readOwnedJournalTemporary(temporary);
+      if (candidate.transaction_id !== journal.transaction_id) {
+        journalTemporaryConflicts.push(
+          `journal-temporary:${basename(temporary.path)}`,
+        );
+      }
+    } catch {
+      journalTemporaryConflicts.push(
+        `journal-temporary:${basename(temporary.path)}`,
+      );
     }
-    states[key] = status;
   }
+  if (temporaries.length > 1 && publication === "temporary") {
+    journalTemporaryConflicts.push("journal-temporary:multiple");
+  }
+  const inspection = inspectEndpoints(project, journal, normalizedContext);
   return {
     active: true,
     command: journal.command,
-    conflicts: conflicts.sort(),
+    conflicts: [
+      ...inspection.conflicts,
+      ...journalTemporaryConflicts,
+    ].sort(),
+    desired_inventory: journal.desired_inventory,
+    harnesses: [...journal.harnesses],
+    install_skill: journal.install_skill,
+    journal_temporaries: temporaries.map((item) => basename(item.path)).sort(),
     package_version: journal.package_version,
     progress: { ...journal.progress },
-    states,
+    publication,
+    states: inspection.states,
     transaction_id: journal.transaction_id,
   };
 }
 
 export function runInstallerTransaction(spec) {
   const project = resolve(spec.project);
-  if (readJournal(project, { cleanTemporary: true }) !== null) {
-    throw new Error("installer_journal_active");
+  if (
+    readPublishedJournal(project) !== null
+    || listJournalTemporaries(project).length > 0
+  ) {
+    throw new Error("installer_transaction_active");
   }
+  beforeJournalClaim();
   const transactionId = randomUUID();
   const priorInventory = {};
   const desiredInventory = {};
@@ -793,7 +1094,6 @@ export function runInstallerTransaction(spec) {
       transaction_id: null,
     };
   }
-  mkdirSync(dirname(journalPath(project)), { recursive: true });
-  persistJournal(project, journal, "journal:published");
+  publishInitialJournal(project, journal);
   return completeJournal(project, journal, normalizedContext);
 }

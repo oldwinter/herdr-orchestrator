@@ -132,6 +132,10 @@ Recovery always moves forward to the journal's desired inventory. Desired replac
 are stored in the journal, so a newer package can finish a transaction written by an older
 package before it plans its own update.
 
+Only one setup process can publish a new journal. Concurrent install, upgrade, or uninstall
+commands stop with `installer_transaction_active` after another process claims the transaction;
+the losing process does not change managed targets.
+
 ## Diagnostics
 
 ```bash

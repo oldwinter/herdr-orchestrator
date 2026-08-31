@@ -49,7 +49,14 @@ const WORKFLOW_OPTION_PREFIXES = [
   "--workflow",
 ];
 const GIT_EXCLUDE_BEGIN = "# BEGIN herdr-orchestrator managed paths";
+const GIT_EXCLUDE_BEGIN_WITH_SEPARATOR =
+  "# BEGIN herdr-orchestrator managed paths separator-owned";
 const GIT_EXCLUDE_END = "# END herdr-orchestrator managed paths";
+const GIT_EXCLUDE_BEGIN_BYTES = Buffer.from(GIT_EXCLUDE_BEGIN);
+const GIT_EXCLUDE_BEGIN_WITH_SEPARATOR_BYTES = Buffer.from(
+  GIT_EXCLUDE_BEGIN_WITH_SEPARATOR,
+);
+const GIT_EXCLUDE_END_BYTES = Buffer.from(GIT_EXCLUDE_END);
 const WORKER_NAMES = {
   droid: "operations",
   grok: "grok-build",
@@ -248,19 +255,30 @@ function gitEnvironment() {
 }
 
 function removeManagedExcludeBlock(content) {
-  const start = content.indexOf(GIT_EXCLUDE_BEGIN);
+  const start = content.indexOf(GIT_EXCLUDE_BEGIN_BYTES);
   if (start < 0) {
     return content;
   }
-  const endMarker = content.indexOf(GIT_EXCLUDE_END, start);
+  const endMarker = content.indexOf(GIT_EXCLUDE_END_BYTES, start);
   if (endMarker < 0) {
     throw new Error("git_exclude_marker_invalid");
   }
-  let end = endMarker + GIT_EXCLUDE_END.length;
-  if (content[end] === "\n") {
+  const ownsSeparator = content.subarray(
+    start,
+    start + GIT_EXCLUDE_BEGIN_WITH_SEPARATOR_BYTES.length,
+  ).equals(GIT_EXCLUDE_BEGIN_WITH_SEPARATOR_BYTES);
+  if (ownsSeparator && (start === 0 || content[start - 1] !== 0x0a)) {
+    throw new Error("git_exclude_marker_invalid");
+  }
+  let end = endMarker + GIT_EXCLUDE_END_BYTES.length;
+  if (content[end] === 0x0a) {
     end += 1;
   }
-  return `${content.slice(0, start)}${content.slice(end)}`;
+  const removalStart = ownsSeparator ? start - 1 : start;
+  return Buffer.concat([
+    content.subarray(0, removalStart),
+    content.subarray(end),
+  ]);
 }
 
 function assertGitExcludeSafe(project, path) {
@@ -315,12 +333,17 @@ function assertGitExcludeSafe(project, path) {
   }
 }
 
-function renderGitExcludeBlock(includeSkill) {
+function renderGitExcludeBlock(includeSkill, ownsSeparator = false) {
   const paths = ["/.herdr-orchestrator/", "/.orchestrator/"];
   if (includeSkill) {
     paths.push("/.agents/skills/herdr-orchestrator/");
   }
-  return `${GIT_EXCLUDE_BEGIN}\n${paths.join("\n")}\n${GIT_EXCLUDE_END}\n`;
+  const begin = ownsSeparator
+    ? GIT_EXCLUDE_BEGIN_WITH_SEPARATOR
+    : GIT_EXCLUDE_BEGIN;
+  return Buffer.from(
+    `${begin}\n${paths.join("\n")}\n${GIT_EXCLUDE_END}\n`,
+  );
 }
 
 function buildDesiredFiles(harnesses, installSkill) {
@@ -374,13 +397,19 @@ function desiredLocalGitExclude(project, path, includeSkill) {
     };
   }
   assertGitExcludeSafe(project, path);
-  const current = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const current = existsSync(path) ? readFileSync(path) : Buffer.alloc(0);
   const withoutManaged = removeManagedExcludeBlock(current);
-  const separator = withoutManaged.length > 0 && !withoutManaged.endsWith("\n") ? "\n" : "";
+  const ownsSeparator = (
+    withoutManaged.length > 0
+    && withoutManaged[withoutManaged.length - 1] !== 0x0a
+  );
+  const separator = ownsSeparator ? Buffer.from("\n") : Buffer.alloc(0);
   return {
-    content: Buffer.from(
-      `${withoutManaged}${separator}${renderGitExcludeBlock(includeSkill)}`,
-    ),
+    content: Buffer.concat([
+      withoutManaged,
+      separator,
+      renderGitExcludeBlock(includeSkill, ownsSeparator),
+    ]),
     status: "managed",
   };
 }
@@ -495,10 +524,10 @@ function unownedLocalExcludeStatus(path) {
   if (path === null || !existsSync(path)) {
     return "unavailable";
   }
-  const content = readFileSync(path, "utf8");
+  const content = readFileSync(path);
   return (
-    content.includes(GIT_EXCLUDE_BEGIN)
-    || content.includes(GIT_EXCLUDE_END)
+    content.includes(GIT_EXCLUDE_BEGIN_BYTES)
+    || content.includes(GIT_EXCLUDE_END_BYTES)
   ) ? "retained" : "removed";
 }
 
@@ -524,15 +553,15 @@ function desiredUninstallGitExclude(
     ".herdr-orchestrator/manifest.json",
     ".herdr-orchestrator/install-journal.json",
   ]);
-  const current = readFileSync(path, "utf8");
+  const current = readFileSync(path);
   if (managedRootsHaveRemainingEntries(project, roots, ignoredPaths)) {
     return {
-      content: Buffer.from(current),
+      content: current,
       status: "retained",
     };
   }
   return {
-    content: Buffer.from(removeManagedExcludeBlock(current)),
+    content: removeManagedExcludeBlock(current),
     status: "removed",
   };
 }
@@ -927,6 +956,26 @@ function managerLight(options) {
   }
 }
 
+function inspectJournalGitExclude(journal) {
+  const entry = Object.entries(journal.desired_inventory ?? {}).find(
+    ([, item]) => item.target.scope === "git-exclude",
+  );
+  if (entry === undefined) {
+    return {
+      available: false,
+      ok: true,
+      status: "unavailable",
+    };
+  }
+  const [key] = entry;
+  const status = journal.states[key] ?? "conflict";
+  return {
+    available: true,
+    ok: status === "desired",
+    status,
+  };
+}
+
 function inspectInstallation(project) {
   const manifestPath = join(project, ".herdr-orchestrator/manifest.json");
   assertNoSymlink(project, ".herdr-orchestrator/manifest.json");
@@ -939,7 +988,19 @@ function inspectInstallation(project) {
     gitExcludePath: localExcludePath,
     project,
   });
-  if (!existsSync(manifestPath)) {
+  const manifest = existsSync(manifestPath) ? loadManifest(project) : null;
+  const selection = (
+    journal.active
+    && Array.isArray(journal.harnesses)
+    && typeof journal.install_skill === "boolean"
+  ) ? {
+      harnesses: journal.harnesses,
+      installSkill: journal.install_skill,
+    } : manifest === null ? null : {
+      harnesses: manifest.harnesses,
+      installSkill: previousSkillPreference(manifest),
+    };
+  if (selection === null) {
     return {
       git_exclude: {
         available: localExcludePath !== null,
@@ -958,10 +1019,9 @@ function inspectInstallation(project) {
       package_modified: [],
     };
   }
-  const manifest = loadManifest(project);
   const missing = [];
   const modified = [];
-  for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
+  for (const [relativePath, expectedHash] of Object.entries(manifest?.files ?? {})) {
     assertNoSymlink(project, relativePath);
     const target = join(project, relativePath);
     if (!existsSync(target)) {
@@ -971,12 +1031,12 @@ function inspectInstallation(project) {
     }
   }
   const desiredFiles = buildDesiredFiles(
-    manifest.harnesses,
-    previousSkillPreference(manifest),
+    selection.harnesses,
+    selection.installSkill,
   );
-  const unmanagedFiles = manifest.unmanaged_files ?? {};
+  const unmanagedFiles = manifest?.unmanaged_files ?? {};
   const declaredFiles = {
-    ...manifest.files,
+    ...(manifest?.files ?? {}),
     ...unmanagedFiles,
   };
   const packageMissing = [];
@@ -1001,24 +1061,25 @@ function inspectInstallation(project) {
   const manifestExtra = Object.keys(declaredFiles).filter(
     (relativePath) => !desiredFiles.has(relativePath),
   );
-  const managesSkill = Object.keys(manifest.files).some((relativePath) =>
-    relativePath.startsWith(".agents/skills/herdr-orchestrator/")
+  const managesSkill = Object.keys(manifest?.files ?? {}).some(
+    (relativePath) =>
+      relativePath.startsWith(".agents/skills/herdr-orchestrator/"),
   );
-  const gitExclude = inspectLocalGitExclude(
-    project,
-    localExcludePath,
-    managesSkill,
-  );
+  const gitExclude = journal.active
+    ? inspectJournalGitExclude(journal)
+    : inspectLocalGitExclude(project, localExcludePath, managesSkill);
   const runtimeVersion = packageVersion();
-  const versionSkew = manifest.version !== runtimeVersion;
+  const versionSkew = manifest !== null && manifest.version !== runtimeVersion;
   return {
     git_exclude: gitExclude,
     journal,
-    manifest: true,
+    manifest: manifest !== null,
     manifest_extra: manifestExtra.sort(),
     manifest_mismatched: manifestMismatched.sort(),
     manifest_missing: manifestMissing.sort(),
-    missing: missing.sort(),
+    missing: manifest === null
+      ? [".herdr-orchestrator/manifest.json"]
+      : missing.sort(),
     modified: modified.sort(),
     ok: (
       missing.length === 0
@@ -1031,13 +1092,16 @@ function inspectInstallation(project) {
       && gitExclude.ok
       && !versionSkew
       && !journal.active
+      && manifest !== null
     ),
     package_missing: packageMissing.sort(),
     package_modified: packageModified.sort(),
     unmanaged: Object.keys(unmanagedFiles).sort(),
-    installed_version: manifest.version,
+    ...(manifest === null ? {} : {
+      installed_version: manifest.version,
+      version: manifest.version,
+    }),
     runtime_version: runtimeVersion,
-    version: manifest.version,
     version_skew: versionSkew,
   };
 }
