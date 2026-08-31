@@ -45,17 +45,16 @@ def _python_references(
         aliases: set[str] = set()
         module_aliases: set[str] = set()
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.ImportFrom)
-                and node.module
-                and node.module.endswith("feature_flags")
+            if isinstance(node, ast.ImportFrom) and (
+                (node.level == 0 and node.module == "herdr_orchestrator.feature_flags")
+                or (node.level > 0 and node.module == "feature_flags")
             ):
                 for alias in node.names:
                     if alias.name == "FeatureFlag":
                         aliases.add(alias.asname or alias.name)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name.endswith(".feature_flags"):
+                    if alias.name == "herdr_orchestrator.feature_flags":
                         module_aliases.add(alias.asname or alias.name)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute):
@@ -230,7 +229,6 @@ def policy_failures(root: Path | None = None) -> list[str]:
             failures.append(f"{flag.value}: no test reference")
     for removed in sorted(set(lifecycle_values) - declared_values):
         failures.append(f"{removed}: lifecycle row has no declared flag")
-
     return failures
 
 
