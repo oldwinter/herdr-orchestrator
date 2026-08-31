@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import re
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
-from subprocess import CompletedProcess
 from typing import Protocol
 
 from herdr_orchestrator.catalog import (
@@ -34,6 +32,7 @@ from herdr_orchestrator.delivery_prompts import (
 from herdr_orchestrator.delivery_protocol import (
     AuthorityCategory,
     DecisionTicket,
+    DeliveryArtifactError,
     DeliveryPlan,
     DeliveryTicket,
     FindingSeverity,
@@ -42,14 +41,20 @@ from herdr_orchestrator.delivery_protocol import (
     ReviewReport,
     TicketReceipt,
     WayfinderMap,
+    append_artifact_text,
+    exclusive_file_claim,
     load_delivery_plan,
     load_proxy_decision,
     load_review_axis,
     load_review_verdict,
     load_ticket_receipt,
+    load_tracker_publication,
     load_wayfinder_map,
     load_wayfinder_resolution,
     load_wayfinder_route,
+    map_payload,
+    validate_artifact_path,
+    write_artifact_text,
 )
 from herdr_orchestrator.git_workspace import GitWorkspace, GitWorkspaceError, Worktree
 from herdr_orchestrator.herdr import HerdrTransport
@@ -61,6 +66,7 @@ from herdr_orchestrator.model import (
     WayfinderMode,
     WorkflowConfig,
 )
+from herdr_orchestrator.observability import sanitize
 from herdr_orchestrator.planner import (
     PlannerOutputError,
     load_worker_selection,
@@ -74,6 +80,7 @@ from herdr_orchestrator.selection import (
 from herdr_orchestrator.tracker import (
     DeliveryTracker,
     TrackerTicket,
+    contains_high_confidence_secret,
     tracker_from_config,
 )
 
@@ -87,6 +94,9 @@ SENSITIVE_QUESTION = re.compile(
 
 class DeliveryError(RuntimeError):
     pass
+
+
+_delivery_run_claim = partial(exclusive_file_claim, error_type=DeliveryError)
 
 
 class DeliveryEscalation(DeliveryError):
@@ -216,12 +226,19 @@ class StandardizedDelivery:
         self._previous_state: dict[str, object] = {}
 
     def run(self, goal_file: Path) -> DeliveryResult:
-        goal_path = goal_file.expanduser().resolve()
+        goal_path = _safe_delivery_path(goal_file)
         if not goal_path.is_file():
             raise DeliveryError(f"delivery_goal_not_found: {goal_path}")
         goal = goal_path.read_text(encoding="utf-8").strip()
         if not goal:
             raise DeliveryError("delivery_goal_empty")
+        if (
+            self.config.standardized_delivery.tracker_backend.value == "github"
+            and contains_high_confidence_secret(goal)
+        ):
+            raise DeliveryError(
+                "delivery_secret_material_rejected: remove secret material before retry"
+            )
         self._goal = goal
         delivery_config = self.config.standardized_delivery
         run_id = hashlib.sha256(
@@ -237,14 +254,19 @@ class StandardizedDelivery:
                 f"{','.join(harness.value for harness in self.worker_harnesses)}"
             ).encode()
         ).hexdigest()[:12]
-        self._run_root = self.config.standardized_delivery.artifact_root / run_id
+        self._run_root = _safe_delivery_path(
+            self.config.standardized_delivery.artifact_root / run_id,
+            root=self.config.standardized_delivery.artifact_root,
+        )
         self._run_root.mkdir(parents=True, exist_ok=True)
+        _safe_delivery_path(self._run_root, root=self.config.standardized_delivery.artifact_root)
         self._previous_state = {}
         with _delivery_run_claim(self._run_root / "run.lock"):
             return self._run_claimed(run_id)
 
     def _run_claimed(self, run_id: str) -> DeliveryResult:
         if (state_path := self._run_root / "state.json").is_file():
+            _safe_delivery_path(state_path, root=self._run_root)
             try:
                 state = json.loads(state_path.read_text(encoding="utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -416,6 +438,8 @@ class StandardizedDelivery:
             _validate_worktree_clean(git, ticket_worktree.path)
             if git.head(ticket_worktree) != receipt.commit:
                 raise DeliveryError(f"delivery_result_ticket_commit_mismatch: {ticket.ticket_id}")
+            if not git.is_ancestor(ticket_worktree.path, base_commit, receipt.commit):
+                raise DeliveryError(f"delivery_result_ticket_commit_diverged: {ticket.ticket_id}")
             if not _git_succeeds(
                 git,
                 integration.path,
@@ -443,6 +467,13 @@ class StandardizedDelivery:
                 raise DeliveryError("delivery_result_review_gate_failed")
 
     def _publish_tracker(self, plan: DeliveryPlan) -> dict[str, TrackerTicket]:
+        if (
+            self.config.standardized_delivery.tracker_backend.value == "github"
+            and contains_high_confidence_secret(plan)
+        ):
+            raise DeliveryError(
+                "delivery_secret_material_rejected: remove secret material before retry"
+            )
         path = self._run_root / "tracker-publication.json"
         if path.is_file():
             references = self._restore_tracker_publication(path, plan)
@@ -475,25 +506,15 @@ class StandardizedDelivery:
         path: Path,
         plan: DeliveryPlan,
     ) -> dict[str, TrackerTicket]:
+        _safe_delivery_path(path, root=self._run_root)
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise DeliveryError("delivery_tracker_publication_invalid") from exc
-        tickets = payload.get("tickets") if isinstance(payload, dict) else None
-        spec_url = payload.get("spec_url") if isinstance(payload, dict) else None
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != {"backend", "spec_url", "tickets"}
-            or payload["backend"] != self.config.standardized_delivery.tracker_backend.value
-            or (spec_url is not None and (not isinstance(spec_url, str) or not spec_url.strip()))
-            or not isinstance(tickets, dict)
-            or set(tickets) != {ticket.ticket_id for ticket in plan.tickets}
-            or any(
-                not isinstance(key, str) or not isinstance(value, str) or not value.strip()
-                for key, value in tickets.items()
+            spec_url, tickets = load_tracker_publication(
+                path,
+                backend=self.config.standardized_delivery.tracker_backend.value,
+                ticket_ids={ticket.ticket_id for ticket in plan.tickets},
             )
-        ):
-            raise DeliveryError("delivery_tracker_publication_invalid")
+        except DeliveryArtifactError as exc:
+            raise DeliveryError("delivery_tracker_publication_invalid") from exc
         if not hasattr(self.tracker, "references"):
             raise DeliveryError("delivery_tracker_publication_unrestorable")
         references = {key: TrackerTicket(key, value) for key, value in tickets.items()}
@@ -554,13 +575,14 @@ class StandardizedDelivery:
                 raise DeliveryError("wayfinder_decision_limit")
             selected = _first_decision_frontier(map_)
             resolution_path = self._run_root / "wayfinder" / f"resolution-{selected.ticket_id}.json"
+            _safe_delivery_path(resolution_path, root=self._run_root)
             resolution_path.parent.mkdir(parents=True, exist_ok=True)
             self._dispatch_artifact(
                 self.config.workspace,
                 self.controller,
                 wayfinder_resolve_prompt(
                     self._goal,
-                    json.dumps(_map_payload(map_), ensure_ascii=False, indent=2),
+                    json.dumps(map_payload(map_), ensure_ascii=False, indent=2),
                     selected,
                     resolution_path,
                 ),
@@ -590,7 +612,7 @@ class StandardizedDelivery:
                 not_yet_specified=resolution.not_yet_specified,
                 out_of_scope=resolution.out_of_scope,
             )
-            _write_json(map_path, _map_payload(map_))
+            _write_json(map_path, map_payload(map_))
             self._record(
                 "wayfinder_decision_resolved",
                 {
@@ -615,6 +637,13 @@ class StandardizedDelivery:
                 role="plan",
             )
         plan = load_delivery_plan(output)
+        if (
+            self.config.standardized_delivery.tracker_backend.value == "github"
+            and contains_high_confidence_secret(plan)
+        ):
+            raise DeliveryError(
+                "delivery_secret_material_rejected: remove secret material before retry"
+            )
         self._record(
             "delivery_plan_accepted",
             {
@@ -764,6 +793,8 @@ class StandardizedDelivery:
             _validate_worktree_clean(git, worktree.path)
             if git.head(worktree) != receipt.commit:
                 raise DeliveryError(f"ticket_receipt_commit_mismatch: {ticket.ticket_id}")
+            if not git.is_ancestor(worktree.path, integration.base_commit, receipt.commit):
+                raise DeliveryError(f"ticket_commit_diverged: {ticket.ticket_id}")
             if _git_succeeds(
                 git,
                 integration.path,
@@ -790,6 +821,7 @@ class StandardizedDelivery:
         )
         _validate_worktree_clean(git, worktree.path)
         receipt_file = self._run_root / "receipts" / f"ticket-{ticket.ticket_id}.json"
+        _safe_delivery_path(receipt_file, root=self._run_root)
         receipt_file.parent.mkdir(parents=True, exist_ok=True)
         if receipt_file.is_file():
             receipt = load_ticket_receipt(receipt_file, ticket)
@@ -961,6 +993,7 @@ class StandardizedDelivery:
 
     def _repair_attempts(self) -> int:
         path = self._run_root / "repair-state.json"
+        _safe_delivery_path(path, root=self._run_root)
         if not path.is_file():
             return 0
         try:
@@ -980,6 +1013,7 @@ class StandardizedDelivery:
 
     def _repair_inflight(self) -> tuple[int, str] | None:
         path = self._run_root / "repair-state.json"
+        _safe_delivery_path(path, root=self._run_root)
         if not path.is_file():
             return None
         try:
@@ -1007,6 +1041,7 @@ class StandardizedDelivery:
 
     def _delivery_base_commit(self, git: GitWorkspace) -> str:
         path = self._run_root / "git-base.json"
+        _safe_delivery_path(path, root=self._run_root)
         repository = str(self.config.workspace.resolve())
         if path.is_file():
             try:
@@ -1046,6 +1081,7 @@ class StandardizedDelivery:
         _validate_worktree_clean(git, integration.path)
         head_before = git.validate_commit(integration)
         review_root = self._run_root / "reviews" / f"round-{round_number}"
+        _safe_delivery_path(review_root, root=self._run_root)
         review_root.mkdir(parents=True, exist_ok=True)
         standards_file = review_root / "standards.json"
         spec_file = review_root / "spec.json"
@@ -1110,6 +1146,7 @@ class StandardizedDelivery:
             :12
         ]
         output = self._run_root / "routes" / f"{digest}.json"
+        _safe_delivery_path(output, root=self._run_root)
         output.parent.mkdir(parents=True, exist_ok=True)
         if not output.is_file():
             self._dispatch_artifact(
@@ -1146,6 +1183,7 @@ class StandardizedDelivery:
         *,
         role: str,
     ) -> None:
+        _safe_delivery_path(output_file, root=self._run_root)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.unlink(missing_ok=True)
         for attempt in range(ARTIFACT_PROMPT_ATTEMPTS):
@@ -1247,6 +1285,7 @@ class StandardizedDelivery:
         *,
         proxy_round: int,
     ) -> None:
+        _safe_delivery_path(decision_file, root=self._run_root)
         decision_file.parent.mkdir(parents=True, exist_ok=True)
         decision_file.unlink(missing_ok=True)
         name = _agent_name(
@@ -1283,13 +1322,16 @@ class StandardizedDelivery:
         row = {
             "event": event,
             "observed_at": time.time(),
-            "details": details,
+            "details": sanitize(details),
         }
         with self._ledger_lock:
             path = self._run_root / "decision-ledger.jsonl"
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
-                handle.write("\n")
+            append_artifact_text(
+                path,
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n",
+                root=self._run_root,
+                error_type=DeliveryError,
+            )
 
     def _write_state(self, status: str, *, stage: str, **details: str) -> None:
         _write_json(
@@ -1328,74 +1370,43 @@ def _require_success(outcome: DispatchOutcome, role: str) -> None:
         )
 
 
+def _safe_delivery_path(path: Path, *, root: Path | None = None) -> Path:
+    try:
+        return validate_artifact_path(path, root=root)
+    except DeliveryArtifactError as exc:
+        raise DeliveryError("delivery_artifact_path_invalid") from exc
+
+
 def _validate_worktree_ownership(
     git: GitWorkspace,
     expected_path: Path,
     worktree: Worktree,
 ) -> None:
-    expected = expected_path.resolve()
-    if expected_path.is_symlink() or worktree.path.resolve() != expected or not expected.is_dir():
-        raise DeliveryError("delivery_worktree_ownership_invalid")
-    repository_common = _git_path(git, git.repository, "rev-parse", "--git-common-dir")
-    worktree_common = _git_path(git, expected, "rev-parse", "--git-common-dir")
-    worktree_root = Path(_git_output(git, expected, "rev-parse", "--show-toplevel")).resolve()
-    branch = _git_output(git, expected, "branch", "--show-current")
-    if (
-        worktree_common != repository_common
-        or worktree_root != expected
-        or branch != worktree.branch
-    ):
-        raise DeliveryError("delivery_worktree_ownership_invalid")
-    if _git_output(git, git.repository, "rev-parse", worktree.branch) != _git_output(
-        git, expected, "rev-parse", "HEAD"
-    ):
-        raise DeliveryError("delivery_worktree_ownership_invalid")
+    try:
+        git.validate_ownership(expected_path, worktree)
+    except GitWorkspaceError as exc:
+        raise DeliveryError(str(exc)) from exc
 
 
 def _validate_worktree_clean(git: GitWorkspace, path: Path) -> None:
-    process = _git_result(git, path, "status", "--porcelain")
-    if process.returncode != 0 or process.stdout.strip():
-        raise DeliveryError(f"delivery_worktree_dirty: {path}")
-
-
-def _git_path(git: GitWorkspace, cwd: Path, *args: str) -> Path:
-    return (cwd / Path(_git_output(git, cwd, *args))).resolve()
+    try:
+        git.validate_clean(path)
+    except GitWorkspaceError as exc:
+        raise DeliveryError(str(exc)) from exc
 
 
 def _git_output(git: GitWorkspace, cwd: Path, *args: str) -> str:
-    process = _git_result(git, cwd, *args)
-    if process.returncode != 0 or not process.stdout.strip():
-        raise DeliveryError("delivery_git_query_failed")
-    return process.stdout.strip()
+    try:
+        return git.output(cwd, *args)
+    except GitWorkspaceError as exc:
+        raise DeliveryError(str(exc)) from exc
 
 
 def _git_succeeds(git: GitWorkspace, cwd: Path, *args: str) -> bool:
-    return _git_result(git, cwd, *args).returncode == 0
-
-
-def _git_result(git: GitWorkspace, cwd: Path, *args: str) -> CompletedProcess[str]:
     try:
-        return git._git(cwd, *args, check=False)
+        return git.succeeds(cwd, *args)
     except GitWorkspaceError as exc:
         raise DeliveryError("delivery_git_query_failed") from exc
-
-
-@contextmanager
-def _delivery_run_claim(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        handle = path.open("a+", encoding="utf-8")
-    except OSError as exc:
-        raise DeliveryError("delivery_run_claim_unavailable") from exc
-    with handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise DeliveryError("delivery_run_active") from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _agent_name(role: str, workspace: Path, harness: Harness) -> str:
@@ -1418,37 +1429,16 @@ def _controller_agent_name(
     return f"hd-control-{harness.value}-{digest}"
 
 
-def _map_payload(map_: WayfinderMap) -> dict[str, object]:
-    return {
-        "destination": map_.destination,
-        "notes": list(map_.notes),
-        "decisions": [
-            {
-                "id": ticket.ticket_id,
-                "title": ticket.title,
-                "question": ticket.question,
-                "kind": ticket.kind,
-                "blocked_by": list(ticket.blocked_by),
-                "resolution": ticket.resolution,
-            }
-            for ticket in map_.decisions
-        ],
-        "not_yet_specified": list(map_.not_yet_specified),
-        "out_of_scope": list(map_.out_of_scope),
-    }
-
-
 def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
+    write_artifact_text(
+        path,
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        error_type=DeliveryError,
     )
-    temporary.replace(path)
 
 
 def _load_completed_result(path: Path, run_id: str) -> DeliveryResult | None:
+    _safe_delivery_path(path)
     if not path.is_file():
         return None
     try:

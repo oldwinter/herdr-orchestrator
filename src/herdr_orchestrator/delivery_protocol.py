@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
+import os
 import re
+import stat
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -14,6 +21,177 @@ COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 class DeliveryArtifactError(ValueError):
     pass
+
+
+def validate_artifact_path(path: Path, *, root: Path | None = None) -> Path:
+    if not isinstance(path, Path):
+        raise DeliveryArtifactError("artifact_path_invalid")
+    try:
+        candidate = path if path.is_absolute() else path.absolute()
+        declared_root = None if root is None else root.absolute()
+        if ".." in candidate.parts:
+            raise DeliveryArtifactError("artifact_path_escape")
+        if declared_root is not None and not candidate.is_relative_to(declared_root):
+            raise DeliveryArtifactError("artifact_path_invalid")
+        _reject_symlink_chain(candidate)
+        resolved = candidate.resolve(strict=False)
+        if declared_root is not None and not resolved.is_relative_to(
+            declared_root.resolve(strict=False)
+        ):
+            raise DeliveryArtifactError("artifact_path_invalid")
+        return candidate
+    except DeliveryArtifactError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DeliveryArtifactError("artifact_path_invalid") from exc
+
+
+def _reject_symlink_chain(path: Path) -> None:
+    current = Path(path.anchor) if path.anchor else Path()
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise DeliveryArtifactError("artifact_path_invalid") from exc
+        if stat.S_ISLNK(mode):
+            raise DeliveryArtifactError("artifact_path_invalid")
+
+
+def read_artifact_text(path: Path, artifact: str, *, root: Path | None = None) -> str:
+    try:
+        candidate = validate_artifact_path(path, root=root)
+        descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError as exc:
+        raise DeliveryArtifactError(f"{artifact}_missing") from exc
+    except DeliveryArtifactError as exc:
+        raise DeliveryArtifactError(f"{artifact}_path_invalid") from exc
+    except OSError as exc:
+        raise DeliveryArtifactError(f"{artifact}_unreadable") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise DeliveryArtifactError(f"{artifact}_unreadable")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            return stream.read()
+    except DeliveryArtifactError:
+        raise
+    except FileNotFoundError as exc:
+        raise DeliveryArtifactError(f"{artifact}_missing") from exc
+    except UnicodeDecodeError as exc:
+        raise DeliveryArtifactError(f"{artifact}_invalid_json") from exc
+    except OSError as exc:
+        raise DeliveryArtifactError(f"{artifact}_unreadable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def write_artifact_text(
+    path: Path,
+    content: str,
+    *,
+    root: Path | None = None,
+    error_type: type[Exception] = DeliveryArtifactError,
+) -> None:
+    temporary: Path | None = None
+    try:
+        candidate = validate_artifact_path(path, root=root)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        validate_artifact_path(candidate, root=root)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=candidate.parent,
+            prefix=f".{candidate.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+        validate_artifact_path(temporary, root=root)
+        validate_artifact_path(candidate, root=root)
+        os.replace(temporary, candidate)
+        temporary = None
+    except DeliveryArtifactError as exc:
+        raise error_type("delivery_artifact_path_invalid") from exc
+    except (OSError, UnicodeError) as exc:
+        raise error_type("delivery_artifact_write_failed") from exc
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+
+
+def append_artifact_text(
+    path: Path,
+    content: str,
+    *,
+    root: Path | None = None,
+    error_type: type[Exception] = DeliveryArtifactError,
+) -> None:
+    descriptor = -1
+    try:
+        candidate = validate_artifact_path(path, root=root)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        validate_artifact_path(candidate, root=root)
+        descriptor = os.open(
+            candidate,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("artifact is not a regular file")
+        with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(content)
+    except DeliveryArtifactError as exc:
+        raise error_type("delivery_artifact_path_invalid") from exc
+    except (OSError, UnicodeError) as exc:
+        raise error_type("delivery_artifact_write_failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+@contextmanager
+def exclusive_file_claim(
+    path: Path,
+    *,
+    error_type: type[Exception] = DeliveryArtifactError,
+) -> Iterator[None]:
+    descriptor = -1
+    try:
+        candidate = validate_artifact_path(path)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate = validate_artifact_path(candidate)
+        descriptor = os.open(
+            candidate,
+            os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("lock is not a regular file")
+        handle = os.fdopen(descriptor, "a+", encoding="utf-8")
+        descriptor = -1
+    except DeliveryArtifactError as exc:
+        raise error_type("delivery_artifact_path_invalid") from exc
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise error_type("delivery_run_claim_unavailable") from exc
+    with handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise error_type("delivery_run_active") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class ProxyAction(StrEnum):
@@ -144,6 +322,50 @@ class ReviewVerdict:
     accepted: tuple[str, ...]
     dismissed: tuple[str, ...]
     rationale: str
+
+
+def map_payload(map_: WayfinderMap) -> dict[str, object]:
+    return {
+        "destination": map_.destination,
+        "notes": list(map_.notes),
+        "decisions": [
+            {
+                "id": ticket.ticket_id,
+                "title": ticket.title,
+                "question": ticket.question,
+                "kind": ticket.kind,
+                "blocked_by": list(ticket.blocked_by),
+                "resolution": ticket.resolution,
+            }
+            for ticket in map_.decisions
+        ],
+        "not_yet_specified": list(map_.not_yet_specified),
+        "out_of_scope": list(map_.out_of_scope),
+    }
+
+
+def load_tracker_publication(
+    path: Path,
+    *,
+    backend: str,
+    ticket_ids: set[str],
+) -> tuple[str | None, dict[str, str]]:
+    payload = _load_object(path, "tracker_publication")
+    tickets = payload.get("tickets")
+    spec_url = payload.get("spec_url")
+    if (
+        set(payload) != {"backend", "spec_url", "tickets"}
+        or payload["backend"] != backend
+        or (spec_url is not None and (not isinstance(spec_url, str) or not spec_url.strip()))
+        or not isinstance(tickets, dict)
+        or set(tickets) != ticket_ids
+        or any(
+            not isinstance(key, str) or not isinstance(value, str) or not value.strip()
+            for key, value in tickets.items()
+        )
+    ):
+        raise DeliveryArtifactError("tracker_publication_invalid")
+    return spec_url, dict(tickets)
 
 
 def load_wayfinder_route(path: Path) -> WayfinderRoute:
@@ -524,8 +746,7 @@ def _review_findings(payload: dict[str, Any], key: str) -> tuple[ReviewFinding, 
 
 
 def _load_object(path: Path, artifact: str) -> dict[str, Any]:
-    if not path.is_file():
-        raise DeliveryArtifactError(f"{artifact}_missing")
+    text = read_artifact_text(path, artifact)
 
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -537,12 +758,12 @@ def _load_object(path: Path, artifact: str) -> dict[str, Any]:
 
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            text,
             object_pairs_hook=unique_object,
         )
     except DeliveryArtifactError:
         raise
-    except ValueError as exc:
+    except (UnicodeDecodeError, ValueError) as exc:
         raise DeliveryArtifactError(f"{artifact}_invalid_json") from exc
     if not isinstance(payload, dict):
         raise DeliveryArtifactError(f"{artifact}_invalid_shape")

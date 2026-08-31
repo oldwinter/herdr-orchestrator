@@ -47,6 +47,8 @@ Success requires:
 
 The coordinator merges validated ticket branches into an isolated integration branch,
 updates the tracker, closes the ticket, and computes the next frontier. It never uses stash.
+Before a merge, the ticket commit must descend from the integration worktree's expected base
+commit. Divergent ticket history fails closed.
 After a restart, the coordinator reconstructs the completed frontier from validated receipts and
 ticket commits already reachable from integration. It closes recovered tickets before claiming
 the next frontier.
@@ -70,6 +72,9 @@ at least one check, and carry the full commit SHA. A review verdict must place e
 finding in exactly one of `accepted` or `dismissed`; either list may be empty when appropriate.
 Only `escalate` is valid for `secret` and `production` proxy categories, and every other proxy
 action needs a non-empty response.
+
+Every decision-ledger detail passes through the same bounded secret, path, and prompt sanitizer
+used for runtime evidence. The ledger never stores a raw rationale or prompt.
 
 ### Final review and repair
 
@@ -110,6 +115,8 @@ The default writes:
 ```
 
 Closing a ticket checks every criterion and adds its commit/check receipt.
+The tracker rejects a symlink or a path that resolves outside `tracker_root` before reading or
+writing a local artifact.
 
 ### GitHub Issues
 
@@ -124,10 +131,18 @@ github_repository = "owner/repo"
 The explicit run authorizes creation of one spec issue and its ticket issues, followed by
 ticket updates and closure. It does not authorize push, pull requests, branch merges,
 releases, or deployment.
+Before a GitHub call, the coordinator rejects deterministic high-confidence secret material in
+the goal or accepted plan with `delivery_secret_material_rejected`. The error contains no secret,
+and the goal guard runs before model dispatch. Direct `GithubTracker.publish` calls apply the
+same guard before creating an issue. Local Markdown publication keeps its existing compatibility.
 
 ## Runtime artifacts and recovery
 
 Each goal maps deterministically to `<artifact_root>/<run-id>/`:
+
+The coordinator rechecks every path component before reading or writing delivery artifacts,
+runtime directories, or worktree paths. A symlink or a resolved path outside the declared
+artifact root fails closed.
 
 | Artifact | Meaning |
 | --- | --- |
