@@ -140,6 +140,16 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(TransportError, "herdr_invalid_response"):
             run_json(_return_process(process), Command(["herdr"], Path("/tmp"), 10))
 
+    def test_normalizes_json_decoder_limit_errors(self) -> None:
+        oversized = '{"result":{"value":' + ("9" * 5000) + "}}"
+        process = subprocess.CompletedProcess(["herdr"], 0, oversized, "")
+
+        with self.assertRaisesRegex(TransportError, "herdr_invalid_response"):
+            run_json(_return_process(process), Command(["herdr"], Path("/tmp"), 10))
+
+        stderr = '{"error":{"details":' + ("9" * 5000) + "}}"
+        self.assertEqual(parse_error_code(stderr), "herdr_command_failed")
+
     def test_normalizes_non_text_process_output(self) -> None:
         process = subprocess.CompletedProcess(["herdr"], 0, None, "")
 
