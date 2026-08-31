@@ -136,14 +136,19 @@ class ObservabilityTests(unittest.TestCase):
         opener = MagicMock()
         opener.return_value.__enter__.return_value = object()
         with tempfile.TemporaryDirectory() as temporary:
-            telemetry = Observability(Path(temporary), "example", environ=environ)
+            telemetry = Observability(
+                Path(temporary),
+                f"example at {private_path}",
+                environ=environ,
+            )
             with patch("herdr_orchestrator.observability.urllib.request.urlopen", opener):
                 telemetry.event(
-                    "dispatch_finished",
-                    correlation_id="trace-2",
+                    f'dispatch_finished prompt="{prompt}"',
+                    correlation_id=f"trace-2 pane_id={pane_id}",
                     fields={
                         "password": "[TEST-PASSWORD]",  # pragma: allowlist secret
                         "summary": f'prompt="{prompt}" at {private_path} pane {pane_id}',
+                        "nested": {"api_key": "nested-export-secret"},  # pragma: allowlist secret
                     },
                 )
                 telemetry.alert(
@@ -159,6 +164,7 @@ class ObservabilityTests(unittest.TestCase):
         self.assertTrue(all(prompt.encode() not in request.data for request in requests))
         self.assertTrue(all(private_path.encode() not in request.data for request in requests))
         self.assertTrue(all(pane_id.encode() not in request.data for request in requests))
+        self.assertTrue(all(b"nested-export-secret" not in request.data for request in requests))
 
     def test_local_persistence_sanitizes_the_entire_record(self) -> None:
         private_path = "/srv/private/customer-alpha/job.txt"
@@ -181,7 +187,7 @@ class ObservabilityTests(unittest.TestCase):
                 },
             )
             telemetry.metric(
-                f"dispatch_duration token=secret-value",
+                "dispatch_duration token=secret-value",
                 1.25,
                 correlation_id=f"trace-1 at {private_path}",
                 fields={"nested": {"api_key": "metric-api-secret"}},  # pragma: allowlist secret
