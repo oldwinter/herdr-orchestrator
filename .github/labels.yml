@@ -19,6 +19,12 @@
 - name: type:maintenance
   color: 5319e7
   description: Repository maintenance
+- name: breaking-change
+  color: b60205
+  description: Backward-incompatible change
+- name: skip-changelog
+  color: cfd3d7
+  description: Exclude from generated changelog
 - name: security
   color: ee0701
   description: Security or dependency risk

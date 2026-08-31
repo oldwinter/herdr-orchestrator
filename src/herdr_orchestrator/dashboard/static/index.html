@@ -23,7 +23,7 @@
           </div>
         </div>
         <div class="connection" aria-live="polite">
-          <span id="connection-dot" class="connection-dot"></span>
+          <span id="connection-dot" class="connection-dot" aria-hidden="true"></span>
           <div>
             <strong id="connection-label">Connecting</strong>
             <span id="last-updated">Waiting for first snapshot</span>
@@ -32,7 +32,7 @@
       </header>
 
       <main>
-        <section id="source-warning" class="source-warning is-hidden" aria-live="polite"></section>
+        <section id="source-warning" class="source-warning is-hidden" role="status" aria-live="polite"></section>
 
         <section class="metrics" aria-label="Workflow summary">
           <article class="metric metric-primary">
@@ -74,7 +74,7 @@
               <h2>Herdr topology</h2>
             </div>
             <div class="topology-heading-actions">
-              <span id="topology-count" class="quiet-badge">0 nodes</span>
+              <span id="topology-count" class="quiet-badge" data-compact="0 nodes">0 nodes</span>
               <div class="topology-controls" role="group" aria-label="Topology viewport controls">
                 <button id="topology-zoom-out" class="icon-button" type="button" aria-label="Zoom out" title="Zoom out">−</button>
                 <button id="topology-fit" class="icon-button" type="button" aria-label="Fit topology" title="Fit topology">⌂</button>
@@ -94,9 +94,12 @@
               class="topology-canvas"
               tabindex="0"
               role="application"
-              aria-label="Interactive Herdr topology"
+              aria-label="Interactive Herdr topology (read-only)"
+              aria-describedby="topology-a11y"
+              aria-keyshortcuts="+ - 0 Home ArrowRight ArrowLeft ArrowDown ArrowUp Enter Space Escape"
+              aria-busy="true"
             ></div>
-            <div id="topology-empty" class="topology-empty">Waiting for Herdr…</div>
+            <div id="topology-empty" class="topology-empty" role="status" aria-live="polite">Waiting for Herdr…</div>
             <div id="topology-inspector" class="topology-inspector is-hidden" aria-live="polite"></div>
           </div>
           <div id="topology-a11y" class="sr-only" aria-live="polite"></div>
@@ -111,7 +114,7 @@
               </div>
               <span id="job-total" class="quiet-badge">0 jobs</span>
             </div>
-            <div id="kanban" class="kanban" role="region" tabindex="0" aria-label="Work in flight board">
+            <div id="kanban" class="kanban" role="region" tabindex="0" aria-label="Work in flight board" aria-busy="true">
               <div class="empty-state">Loading queue state…</div>
             </div>
           </article>
@@ -125,8 +128,8 @@
                 </div>
                 <span id="attention-count" class="quiet-badge">0</span>
               </div>
-              <div id="attention-list" class="attention-list">
-                <div class="empty-state compact">No active alerts</div>
+              <div id="attention-list" class="attention-list" role="region" tabindex="0" aria-label="Active alerts" aria-busy="true">
+                <div class="empty-state compact">Loading alerts…</div>
               </div>
             </article>
 
@@ -141,8 +144,8 @@
             </div>
             <span class="quiet-badge">latest 100 events</span>
           </div>
-          <div id="timeline" class="timeline">
-            <div class="empty-state compact">No lifecycle events yet</div>
+          <div id="timeline" class="timeline" aria-busy="true">
+            <div class="empty-state compact">Loading lifecycle…</div>
           </div>
         </section>
       </main>

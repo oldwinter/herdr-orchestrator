@@ -23,6 +23,9 @@ Selected Markdown profile ── dynamic load ────┤
 ### Workflow loader
 
 解析 TOML，所有相对路径都相对于 workflow 文件所在目录。未知 harness、重复 worker、越界 timeout 和不存在的 prompt 都 fail closed。
+Workflow TOML 是本地控制面的可信输入。为兼容共享运行状态和 tracker 部署，`state_db` 与
+`tracker_root` 可以位于 workspace 外部。`worktree_root`、planner 的 `prompt_file` 与
+`output_file`，以及 delivery 的 `artifact_root` 受 workspace 和 runtime 路径约束。
 
 ### Durable store
 
@@ -62,8 +65,8 @@ agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提
 
 `run_once` 输出保留兼容的顶层本波计数，并新增 `claimed`、`batch` 和结束时全局 `queue`。
 `run_until_idle` 在有界 timeout 内重复 replica-limited wave，且把剩余 deadline 传给每个
-dispatch，直到当前 worker pool 没有 pending/running/blocked。blocked 会立即返回
-`idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
+dispatch。在没有 blocked job 时，它持续运行到当前 worker pool 没有 pending/running。
+blocked 会立即返回 `idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
 `queue_idle` 明确区分所选 pool 和全局 queue；pool 外任务不会造成假死，也不会被误报为
 全局排空。
 
@@ -167,7 +170,8 @@ manager 只对当前 Herdr session 可见。
   `working` 就继续等待，未前进则返回 phase-specific `prompt_acceptance_timeout`；
 - `agent_prompt_stalled` 且仍停在原 idle sequence 时最多重发两次 Enter；仍没有 lifecycle
   变化则快速返回 `agent_turn_not_observed`，不占满整个 agent timeout；
-- 每个 harness 使用独立后台 tab 和 full-size root pane，始终 `--no-focus`，避免多 agent 连续 split 后 TUI 过窄；
+- `tab` 与 `worktree` placement 使用独立后台 tab 和 full-size root pane。`pane` placement
+  复用本批次 tab，并 split 当前面积最大的 pane。创建和 split 命令都使用 `--no-focus`；
 - transport 通过独立 Herdr layout adapter provision tab、批次 pane 或原生 worktree，
   并从 JSON response 读取 workspace/tab/pane ID；
 - 所有 CLI 结果按 JSON schema 读取，不预测 pane ID；
@@ -181,7 +185,7 @@ manager 只对当前 Herdr session 可见。
 
 ### Planner
 
-planner 是可选输入源，不是调度器。启用后，它只能把以下 JSON 写到配置的 runtime 路径：
+planner 是可选输入源，不是调度器。启用后，coordinator 只接受 planner 写入配置 runtime 路径的以下 JSON。planner 进程仍使用所选 harness 的工具，这个输入约束不是安全沙箱：
 
 ```json
 {
@@ -196,7 +200,11 @@ planner 是可选输入源，不是调度器。启用后，它只能把以下 JS
 }
 ```
 
-coordinator 校验 harness、字段长度、任务数量和去重键后才入队。JSON 不接受 shell command 字段。
+coordinator 校验 harness、字段长度、任务数量和去重键后才入队。JSON 拒绝 `command`、`argv`
+等字段，也不把模型提交的 shell 交给 coordinator。这个校验只约束输入数据形状，不提供
+进程或工具沙箱。planner 使用所选 harness 的最高自动化参数运行；六个 harness 没有共同的
+可移植 no-tools 模式，被攻陷的 harness 仍可能使用自身工具。prompt policy 不能改变这一点。
+worktree 只隔离 checkout，不是安全沙箱。
 planner 只能选择当前 workflow catalog 中的 harness。任务 dispatch 时 coordinator 动态加载所选 harness 的完整 profile。
 
 主控 harness 与 worker harness 是两个独立选择：

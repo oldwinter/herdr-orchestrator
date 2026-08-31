@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -92,6 +93,93 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "planner_output_must_be"):
                 load_workflow(workflow)
 
+    def test_rejects_planner_prompt_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside_prompt = root.parent / "planner-outside.md"
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            outside_prompt.write_text("outside", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    'prompt_file = "prompt.md"',
+                    f'prompt_file = "{outside_prompt.as_posix()}"',
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "planner_prompt_must_be_in_workspace"):
+                load_workflow(workflow)
+
+    def test_accepts_absolute_planner_prompt_inside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prompt = root / "prompt.md"
+            prompt.write_text("task", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    'prompt_file = "prompt.md"',
+                    f'prompt_file = "{prompt.as_posix()}"',
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_workflow(workflow)
+
+        self.assertEqual(config.planner.prompt_file, prompt)
+
+    def test_preserves_external_state_and_tracker_roots_for_trusted_workflows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root.parent / "shared-workflow-state"
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    'state_db = ".orchestrator/state.db"',
+                    f'state_db = "{(outside / "state.db").as_posix()}"',
+                )
+                + (
+                    "\n[standardized_delivery]\n"
+                    f'tracker_root = "{(outside / "tracker").as_posix()}"\n'
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_workflow(workflow)
+
+        self.assertEqual(config.state_db, outside / "state.db")
+        self.assertEqual(config.standardized_delivery.tracker_root, outside / "tracker")
+
+    def test_constrains_worktree_and_delivery_artifact_roots_to_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+
+            worktree_workflow = root / "worktree.toml"
+            worktree_workflow.write_text(
+                _minimal_workflow() + '\n[placement]\nworktree_root = "../outside-worktrees"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ConfigError,
+                "placement_worktree_root_must_be_in_workspace_runtime",
+            ):
+                load_workflow(worktree_workflow)
+
+            artifact_workflow = root / "artifact.toml"
+            artifact_workflow.write_text(
+                _minimal_workflow()
+                + '\n[standardized_delivery]\nartifact_root = "../outside-artifacts"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ConfigError,
+                "delivery_artifact_root_must_be_in_workspace_runtime",
+            ):
+                load_workflow(artifact_workflow)
+
     def test_requires_lease_to_cover_agent_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -181,6 +269,87 @@ review_repair_rounds = 1
         self.assertEqual(config.standardized_delivery.wayfinder, WayfinderMode.NEVER)
         self.assertEqual(config.standardized_delivery.max_parallel, 2)
         self.assertEqual(config.standardized_delivery.review_repair_rounds, 1)
+
+    def test_trims_optional_configuration_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    'name = "worker"\nharness = "droid"',
+                    'name = "worker"\nharness = "droid"\nplacement = " pane "',
+                )
+                + """
+[placement]
+mode = " hybrid "
+worktree_root = " .orchestrator/worktrees "
+
+[standardized_delivery]
+tracker_backend = " local-markdown "
+wayfinder = " auto "
+""",
+                encoding="utf-8",
+            )
+
+            config = load_workflow(workflow)
+
+        self.assertEqual(config.placement.mode, PlacementMode.HYBRID)
+        self.assertEqual(config.placement.worktree_root, root / ".orchestrator/worktrees")
+        self.assertEqual(config.workers[0].placement, PlacementTarget.PANE)
+        self.assertEqual(
+            config.standardized_delivery.tracker_backend,
+            TrackerBackend.LOCAL_MARKDOWN,
+        )
+        self.assertEqual(config.standardized_delivery.wayfinder, WayfinderMode.AUTO)
+
+    def test_rejects_invalid_workflow_encoding_as_config_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = root / "workflow.toml"
+            workflow.write_bytes(b"schema_version = 1\n\xff")
+
+            with self.assertRaisesRegex(ConfigError, "workflow_invalid_encoding"):
+                load_workflow(workflow)
+
+    def test_rejects_invalid_path_values_as_config_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+
+            with self.assertRaisesRegex(ConfigError, "workflow_path_invalid"):
+                load_workflow(Path("bad\x00workflow.toml"))
+
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    'state_db = ".orchestrator/state.db"',
+                    'state_db = "bad\\u0000path"',
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "path_invalid"):
+                load_workflow(workflow)
+
+    def test_rejects_invalid_profile_encoding_as_config_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            profiles = root / "profiles"
+            shutil.copytree(REPO_ROOT / "profiles/harnesses", profiles)
+            (profiles / "droid.toml").write_bytes(b"\xff")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    str(REPO_ROOT / "profiles/harnesses"),
+                    str(profiles),
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "profile_invalid_encoding"):
+                load_workflow(workflow)
 
 
 def _minimal_workflow(

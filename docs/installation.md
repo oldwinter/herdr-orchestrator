@@ -39,6 +39,8 @@ The npm package has no runtime npm dependencies. Its executable:
    a tracked `.gitignore` or hiding an unmanaged Skill;
 7. carries the Python package and invokes it with its packaged `src/` on `PYTHONPATH`.
 
+Setup commands reject options they do not define.
+
 Python is not copied or downloaded. The target machine must provide Python 3.12+ and Herdr.
 No global install or elevated permission is required.
 
@@ -148,6 +150,11 @@ herdr-orchestrator manager-light status
 herdr-orchestrator manager-light uninstall
 ```
 
+`manager-light uninstall` requires a running Herdr server. Herdr 0.8.2 has no offline unlink
+operation. If the server is unavailable or candidate validation fails, the command exits nonzero
+and leaves the plugin registry and configuration unchanged. Do not edit the Herdr plugin registry
+directly to bypass this check.
+
 Uninstall unlinks the plugin and removes only the intact owned block after validating the candidate.
 The manager's blue token is best-effort metadata around the harness process; ordinary blocked,
 working, idle, and unknown colors remain projections of Herdr's current lifecycle state.
@@ -168,6 +175,15 @@ Claude, and fails clearly when none of those CLIs are available. The backward-co
 `herdr-orchestrator manager --project . --harness claude` form explicitly selects the manager
 workspace installed in a target project and validates the harness against that installation.
 
+The published `herdr-manager` package exact-pins `herdr-orchestrator`. Its source directory has
+its own `package-lock.json` for reproducible local checks. This keeps the thin command on the
+runtime version it was tested against. Audit both npm package graphs from a source checkout:
+
+```bash
+npm audit --package-lock-only
+npm audit --package-lock-only --prefix packages/herdr-manager
+```
+
 The manager policy treats terminal output as untrusted observations and scopes all visibility
 to the current Herdr session. It is intentionally not durable. Use the queue commands below
 for retries, deduplication, leases, unattended work, and receipts.
@@ -187,6 +203,9 @@ npx --yes herdr-orchestrator gc --project . --succeeded-agents
 npx --yes herdr-orchestrator gc --project . --failed-agents
 npx --yes herdr-orchestrator dashboard --project .
 ```
+
+The wrapper rejects a forwarded `--workflow` option. Runtime commands always use the installed
+project workflow.
 
 Arguments not consumed by the wrapper are passed to the Python CLI. For example:
 

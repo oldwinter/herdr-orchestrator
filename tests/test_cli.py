@@ -373,6 +373,21 @@ class CliTests(unittest.TestCase):
         self.assertIs(context.receipt.kind, ReceiptKind.OUTPUT_PREFIX)
         self.assertIn(context.receipt.value, prompt)
 
+    def test_smoke_rejects_harness_without_enabled_worker(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        config = replace(
+            config,
+            workers=tuple(worker for worker in config.workers if worker.harness is Harness.CODEX),
+        )
+
+        with (
+            patch("herdr_orchestrator.cli.HerdrTransport") as transport,
+            self.assertRaisesRegex(ValueError, "smoke_harness_not_enabled: pi"),
+        ):
+            smoke(config, selected_harnesses=["pi"])
+
+        transport.assert_not_called()
+
     def test_deliver_is_explicit_and_accepts_bounded_overrides(self) -> None:
         args = build_parser().parse_args(
             [

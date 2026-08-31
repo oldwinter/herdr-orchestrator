@@ -1,15 +1,56 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_script(name: str):
+    path = REPO_ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"quality_{name}", path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"unable to load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+build_metrics = _load_script("build_metrics")
+quality_summary = _load_script("quality_summary")
+test_stability = _load_script("test_stability")
+
 RELEASE_PLAN = REPO_ROOT / "scripts/npm-release-plan.mjs"
 CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yml"
+
+
+def _workflow_run_block(workflow: str, step_name: str) -> str:
+    lines = workflow.splitlines()
+    marker = f"      - name: {step_name}"
+    try:
+        step_start = lines.index(marker)
+    except ValueError as error:
+        raise AssertionError(f"workflow step missing: {step_name}") from error
+    run_start = next(
+        (index for index in range(step_start + 1, len(lines)) if lines[index] == "        run: |"),
+        None,
+    )
+    if run_start is None:
+        raise AssertionError(f"workflow step has no literal run block: {step_name}")
+    body: list[str] = []
+    for line in lines[run_start + 1 :]:
+        if line.startswith("      - ") or line and not line.startswith("        "):
+            break
+        body.append(line[10:] if line.startswith("          ") else "")
+    return "\n".join(body)
 
 
 class NpmReleasePlanTests(unittest.TestCase):
@@ -164,7 +205,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             workflow.count("runs-on: [self-hosted, Linux, X64, herdr-orchestrator]"),
             1,
         )
-        self.assertEqual(workflow.count("runs-on: ubuntu-latest"), 4)
+        self.assertEqual(workflow.count("runs-on: ubuntu-latest"), 5)
         self.assertIn("release-plan:", workflow)
         self.assertIn(
             "orchestrator_publish: ${{ steps.orchestrator.outputs.publish }}",
@@ -233,6 +274,362 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         ignore_rules = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
 
         self.assertIn(".env", ignore_rules)
+
+    def test_release_note_labels_exist_in_the_local_manifest(self) -> None:
+        release = (REPO_ROOT / ".github/release.yml").read_text(encoding="utf-8")
+        labels = (REPO_ROOT / ".github/labels.yml").read_text(encoding="utf-8")
+
+        self.assertIn("skip-changelog", labels)
+        self.assertIn("breaking-change", labels)
+        self.assertIn("skip-changelog", release)
+        self.assertIn("breaking-change", release)
+
+    def test_release_publish_and_github_release_are_separate_least_privilege_jobs(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name != 'push' || "
+            "github.ref != 'refs/heads/main' }}",
+            workflow,
+        )
+        publish_start = workflow.index("  publish:\n")
+        release_start = workflow.index("  github-release:\n")
+        publish_job = workflow[publish_start:release_start]
+        release_job = workflow[release_start:]
+        self.assertIn("runs-on: ubuntu-latest", publish_job)
+        self.assertIn("permissions:\n      contents: read\n      id-token: write", publish_job)
+        self.assertNotIn("contents: write", publish_job)
+        self.assertIn("permissions:\n      contents: write", release_job)
+        self.assertNotIn("id-token: write", release_job)
+        self.assertIn("needs: [release-plan, publish]", release_job)
+        self.assertIn("always()", release_job)
+        self.assertIn("!cancelled()", release_job)
+        self.assertIn("needs.publish.result == 'success'", release_job)
+        self.assertIn("needs.publish.result == 'skipped'", release_job)
+
+    def test_two_attempt_release_model_completes_after_partial_publish(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        publish = _workflow_run_block(workflow, "Publish package versions")
+        verify = _workflow_run_block(workflow, "Verify package versions")
+        self.assertIn("npm publish --access public", publish)
+        self.assertIn("npm publish --access public ./packages/herdr-manager", publish)
+        self.assertIn('npm view "$name@$version" version', verify)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            state = root / "registry.txt"
+            state.write_text("", encoding="utf-8")
+            npm = fake_bin / "npm"
+            npm.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import pathlib\n"
+                "import sys\n"
+                "state = pathlib.Path(os.environ['REGISTRY_STATE'])\n"
+                "versions = set(filter(None, state.read_text().splitlines()))\n"
+                "args = sys.argv[1:]\n"
+                "if args[:1] == ['publish']:\n"
+                "    package = (\n"
+                "        'example-package@1.2.0' if len(args) == 3 else 'herdr-manager@0.2.0'\n"
+                "    )\n"
+                "    if (\n"
+                "        os.environ.get('FAIL_MANAGER') == '1'\n"
+                "        and package.startswith('herdr-manager@')\n"
+                "    ):\n"
+                "        raise SystemExit(17)\n"
+                "    versions.add(package)\n"
+                "    state.write_text('\\n'.join(sorted(versions)) + '\\n')\n"
+                "    raise SystemExit(0)\n"
+                "if args[:1] == ['view'] and len(args) == 3 and args[2] == 'version':\n"
+                "    package = args[1]\n"
+                "    if package in versions:\n"
+                "        print(package.rsplit('@', 1)[1])\n"
+                "        raise SystemExit(0)\n"
+                "    raise SystemExit(1)\n"
+                "raise SystemExit(19)\n",
+                encoding="utf-8",
+            )
+            npm.chmod(0o755)
+            script = "\n".join((publish, verify))
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "REGISTRY_STATE": str(state),
+                "ORCHESTRATOR_PUBLISH": "true",
+                "MANAGER_PUBLISH": "true",
+                "ORCHESTRATOR_NAME": "example-package",
+                "ORCHESTRATOR_VERSION": "1.2.0",
+                "MANAGER_NAME": "herdr-manager",
+                "MANAGER_VERSION": "0.2.0",
+                "FAIL_MANAGER": "1",
+            }
+            first = subprocess.run(
+                ["bash", "-eu", "-c", script],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertNotEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(
+                state.read_text(encoding="utf-8").splitlines(), ["example-package@1.2.0"]
+            )
+
+            environment.update(
+                {
+                    "ORCHESTRATOR_PUBLISH": "false",
+                    "MANAGER_PUBLISH": "true",
+                    "FAIL_MANAGER": "0",
+                }
+            )
+            second = subprocess.run(
+                ["bash", "-eu", "-c", script],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(
+                state.read_text(encoding="utf-8").splitlines(),
+                ["example-package@1.2.0", "herdr-manager@0.2.0"],
+            )
+
+            environment.update(
+                {
+                    "ORCHESTRATOR_PUBLISH": "false",
+                    "MANAGER_PUBLISH": "false",
+                }
+            )
+            no_op = subprocess.run(
+                ["bash", "-eu", "-c", script],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(no_op.returncode, 0, no_op.stderr)
+
+    def test_github_release_model_is_idempotent_across_retries(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        release = _workflow_run_block(workflow, "Ensure GitHub release exists")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            state = root / "release.txt"
+            gh = fake_bin / "gh"
+            gh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import pathlib\n"
+                "import sys\n"
+                "state = pathlib.Path(os.environ['RELEASE_STATE'])\n"
+                "args = sys.argv[1:]\n"
+                "if args[:2] == ['release', 'view']:\n"
+                "    raise SystemExit(0 if state.is_file() else 1)\n"
+                "if args[:2] == ['release', 'create']:\n"
+                "    state.write_text('created', encoding='utf-8')\n"
+                "    if os.environ.get('FAIL_CREATE_ONCE') == '1':\n"
+                "        os.environ.pop('FAIL_CREATE_ONCE', None)\n"
+                "        raise SystemExit(23)\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(19)\n",
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "RELEASE_STATE": str(state),
+                "GITHUB_REPOSITORY": "oldwinter/herdr-orchestrator",
+                "GITHUB_SHA": "ebcea06",
+                "VERSION": "1.2.0",
+                "FAIL_CREATE_ONCE": "1",
+            }
+            first = subprocess.run(
+                ["bash", "-eu", "-c", release],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertTrue(state.is_file())
+
+            second = subprocess.run(
+                ["bash", "-eu", "-c", release],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+
+
+class QualityScriptTests(unittest.TestCase):
+    def test_build_metrics_preserves_a_nonzero_pack_exit(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["npm", "pack", "--dry-run", "--json"],
+            9,
+            "",
+            "pack failed",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "build.json"
+            with (
+                patch.object(build_metrics.subprocess, "run", return_value=result),
+                patch.object(sys, "argv", ["build_metrics.py", "--output", str(output)]),
+            ):
+                status = build_metrics.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 9)
+        self.assertEqual(payload["exit_code"], 9)
+        self.assertEqual(payload["error_code"], "npm_pack_failed")
+
+    def test_build_metrics_rejects_an_empty_success_response(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["npm", "pack", "--dry-run", "--json"],
+            0,
+            "[]\n",
+            "",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "build.json"
+            with (
+                patch.object(build_metrics.subprocess, "run", return_value=result),
+                patch.object(sys, "argv", ["build_metrics.py", "--output", str(output)]),
+            ):
+                status = build_metrics.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertEqual(payload["error_code"], "npm_pack_response_invalid")
+
+    def test_test_stability_rejects_a_missing_report_and_uses_current_python(self) -> None:
+        result = subprocess.CompletedProcess([sys.executable], 0, "", "")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "stability.json"
+            with (
+                patch.object(test_stability.subprocess, "run", return_value=result) as run,
+                patch.object(
+                    sys,
+                    "argv",
+                    ["test_stability.py", "--runs", "2", "--output", str(output)],
+                ),
+            ):
+                status = test_stability.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            command = run.call_args.args[0]
+
+        self.assertEqual(status, 1)
+        self.assertEqual(command[0], sys.executable)
+        self.assertIn("-p", command)
+        self.assertIn("no:cacheprovider", command)
+        self.assertEqual(payload["executions"][0]["error_code"], "report_missing")
+
+    def test_quality_summary_propagates_failed_quality_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            quality_root = Path(temporary) / "quality"
+            quality_root.mkdir()
+            (quality_root / "coverage.json").write_text(
+                json.dumps({"totals": {"percent_covered": 82.0}}),
+                encoding="utf-8",
+            )
+            (quality_root / "stability.json").write_text(
+                json.dumps(
+                    {
+                        "runs": 2,
+                        "unstable": [],
+                        "executions": [
+                            {"exit_code": 1},
+                            {"exit_code": 1},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (quality_root / "build.json").write_text(
+                json.dumps({"exit_code": 7}),
+                encoding="utf-8",
+            )
+            (quality_root / "bandit.json").write_text(
+                json.dumps({"results": []}),
+                encoding="utf-8",
+            )
+            (quality_root / "pip-audit.json").write_text(
+                json.dumps({"dependencies": []}),
+                encoding="utf-8",
+            )
+            output = Path(temporary) / "summary.md"
+            with (
+                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
+                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
+            ):
+                status = quality_summary.main()
+
+            summary = output.read_text(encoding="utf-8")
+
+        self.assertEqual(status, 1)
+        self.assertIn("Stability: **FAILED**", summary)
+        self.assertIn("exit codes: 1", summary)
+        self.assertIn("Build: **FAILED**", summary)
+        self.assertIn("exit code 7", summary)
+
+    def test_quality_summary_rejects_missing_quality_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            quality_root = Path(temporary) / "quality"
+            quality_root.mkdir()
+            output = Path(temporary) / "summary.md"
+            with (
+                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
+                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
+            ):
+                status = quality_summary.main()
+
+            summary = output.read_text(encoding="utf-8")
+
+        self.assertEqual(status, 1)
+        self.assertIn("Coverage: **unavailable**", summary)
+        self.assertIn("Security: **unavailable**", summary)
+
+    def test_quality_summary_rejects_an_unbounded_coverage_number(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            quality_root = Path(temporary) / "quality"
+            quality_root.mkdir()
+            (quality_root / "coverage.json").write_text(
+                json.dumps({"totals": {"percent_covered": 10**1000}}),
+                encoding="utf-8",
+            )
+            output = Path(temporary) / "summary.md"
+            with (
+                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
+                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
+            ):
+                status = quality_summary.main()
+
+            summary = output.read_text(encoding="utf-8")
+
+        self.assertEqual(status, 1)
+        self.assertIn("Coverage: **unavailable**", summary)
 
 
 if __name__ == "__main__":

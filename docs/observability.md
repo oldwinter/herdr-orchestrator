@@ -4,7 +4,7 @@
 
 Each dispatch attempt receives a random correlation ID. The coordinator persists it with the
 job and receipt, projects it to the dashboard, and uses it in structured records under
-`.orchestrator/observability/`:
+`.orchestrator/telemetry/`:
 
 | File | Purpose |
 | --- | --- |
@@ -12,35 +12,47 @@ job and receipt, projects it to the dashboard, and uses it in structured records
 | `metrics.jsonl` | Dispatch duration and numeric measurements |
 | `alerts.jsonl` | Blocked, failed, and transport-error attention signals |
 
-Observability failures never alter queue state. Files are local runtime state and are ignored by
-Git. Prompts and terminal output are never telemetry fields.
+Every record has `schema_version`, `workflow`, `event`, `observed_at`, and `correlation_id`.
+Events and alerts can add sanitized `fields`. Metrics add a numeric `value` and can also add
+sanitized `fields`.
+
+Local write and exporter network failures never alter queue state. Files are local runtime state
+and are ignored by Git. Prompts and terminal output are never telemetry fields.
 
 ## Data handling
 
-All telemetry passes through central sanitization before local persistence or export. Keys
-containing authorization, cookie, credential, password, prompt, secret, session, terminal, or
-token are replaced with `[REDACTED]`. Common token shapes and secret assignments in text are
-scrubbed, whitespace is normalized, and text is bounded to 300 characters. The anonymous
-installation ID is a one-way, 16-character digest of the resolved workspace path.
+All telemetry passes through central sanitization before local persistence and export. Values under
+keys containing `api_key`, authorization, cookie, credential, password, prompt, secret, session,
+terminal, or token, as well as path or pane keys, are replaced with `[REDACTED]`. The sanitizer
+walks nested mappings and sequences. Common token, assignment, filesystem path, and Herdr pane ID
+shapes in text are scrubbed. Whitespace is normalized, text is bounded to 300 characters, nesting
+is bounded to 16 levels, and each serialized record is bounded to 64 KiB. Required schema keys
+remain present, and safe fragments of the correlation ID remain available for joining records. The
+anonymous installation ID is a one-way, 16-character digest of the resolved telemetry root's
+parent directory, which is `.orchestrator` by default.
 
 The system does not intentionally collect names, email addresses, IP addresses, prompt content,
-terminal transcripts, cookies, or credentials. Operators must not add PII to telemetry fields.
-Local files follow the operator's filesystem retention and deletion policies.
+filesystem paths, pane identifiers, terminal transcripts, cookies, or credentials. Operators must
+not add PII to telemetry fields. Local files follow the operator's filesystem retention and
+deletion policies.
 
 ## Optional exporters
 
-Every exporter is off by default and rejects malformed feature-flag values. Copy `.env.example`
-to local secret storage, provide the corresponding endpoint credential, then enable exactly one
-flag:
+Every exporter is off by default. Telemetry treats malformed feature-flag values as disabled while
+the direct feature-flag API reports a stable error. Copy `.env.example` to local secret storage,
+provide each required endpoint credential, then enable the flags that you need:
 
 | Flag | Required configuration | Destination |
 | --- | --- | --- |
-| `HERDR_FEATURE_SENTRY_EXPORT` | `SENTRY_DSN` | Sanitized error events |
+| `HERDR_FEATURE_SENTRY_EXPORT` | `SENTRY_DSN` | Sanitized lifecycle events tagged as errors |
 | `HERDR_FEATURE_POSTHOG_ANALYTICS` | `POSTHOG_API_KEY`, optional HTTPS `POSTHOG_HOST` | Sanitized lifecycle events |
 | `HERDR_FEATURE_WEBHOOK_ALERTS` | HTTPS `HERDR_ALERT_WEBHOOK_URL` | Sanitized alerts |
 
-Never commit real values. Exporters use HTTPS, a two-second timeout, and fail closed when a
-credential or endpoint is absent.
+Never commit real values. Exporters accept only bounded HTTPS endpoints without URL credentials.
+URL parsing, request construction, JSON serialization, and transport errors fail soft and never
+alter queue state. Requests use a two-second timeout. The PostHog API key is a transport credential
+and is added only to the outbound request. A telemetry field named `api_key` is redacted and is
+never persisted.
 
 ## Alert runbook
 

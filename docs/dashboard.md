@@ -20,6 +20,10 @@ just dashboard --port 9000 --poll-seconds 1
 
 Dashboard 只允许绑定 `127.0.0.1` 或 `localhost`。默认每 2 秒生成一次快照，
 浏览器通过 Server-Sent Events 异步接收；断线会自动重连。
+Dashboard 要求 `state_db` 已存在且为当前兼容 schema。它只读打开该数据库，不会创建或迁移
+状态；首次运行请先使用 `seed` 或 `enqueue` 初始化数据库。
+服务关闭时 `shutdown()` 会先唤醒并结束活动 SSE 连接，再停止监听。`shutdown()` 可以重复调用，
+也可以在服务尚未进入监听循环时调用。
 
 ## 页面
 
@@ -96,11 +100,15 @@ pane output。
 SQLite observer 使用只读连接，查询白名单列：
 
 - 不读取 `jobs.prompt`；
+- 不读取 `jobs.receipt_value` 或 `receipts.error_summary`；
 - 不读取环境变量或 secret；
-- 不读取 terminal/pane output。
+- 不读取 terminal/pane output。Job 的 `error_summary` 只是 Store 写入的有界摘要，不是完整
+  terminal transcript。
 
-Herdr observer 只保留 topology 与 lifecycle 白名单字段。HTTP 静态资源设置 CSP，
-所有接口 `Cache-Control: no-store`。服务不会监听非 loopback 地址。
+Herdr observer 只保留 topology 与 lifecycle 白名单字段。Workspace-scoped 返回行必须匹配请求
+的 workspace，pane 还必须使用已返回的 tab，并且 agent/pane 的 `cwd` 必须位于当前仓库。
+非对象响应行会令 observation fail closed。HTTP 静态资源设置 CSP，所有接口
+`Cache-Control: no-store`。服务不会监听非 loopback 地址。
 
 ## HTTP interface
 
@@ -112,3 +120,5 @@ Herdr observer 只保留 topology 与 lifecycle 白名单字段。HTTP 静态资
 | `GET /api/events` | SSE snapshot stream |
 
 Dashboard 目前不提供 POST、retry、focus 或 blocked response 操作。
+
+SSE 客户端携带超前的 `Last-Event-ID` 时，服务会在首个快照发布后重新同步，不会永久等待该 ID。

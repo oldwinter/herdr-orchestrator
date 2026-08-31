@@ -73,6 +73,10 @@ select {
   gap: var(--space-4);
 }
 
+.identity > div:last-child {
+  min-width: 0;
+}
+
 .mark {
   display: grid;
   grid-template-columns: repeat(3, 5px);
@@ -116,6 +120,7 @@ h1 {
   font-size: clamp(24px, 2.2vw, 36px);
   line-height: 1.05;
   letter-spacing: -0.04em;
+  overflow-wrap: anywhere;
 }
 
 h2 {
@@ -178,6 +183,7 @@ h2 {
   color: #ffd59f;
   background: rgba(255, 191, 105, 0.08);
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .is-hidden {
@@ -264,6 +270,11 @@ h2 {
   border-bottom: 1px solid var(--line-soft);
 }
 
+.panel-heading > div,
+.panel-heading > .quiet-badge {
+  min-width: 0;
+}
+
 .quiet-badge,
 .state-badge,
 .placement-badge,
@@ -280,6 +291,9 @@ h2 {
 .quiet-badge {
   padding: 6px 9px;
   color: var(--muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -352,6 +366,7 @@ h2 {
   font-size: 14px;
   line-height: 1.35;
   letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
 }
 
 .job-meta {
@@ -387,7 +402,7 @@ h2 {
 }
 
 .job-detail dt {
-  color: #707982;
+  color: var(--muted);
 }
 
 .job-detail dd {
@@ -403,6 +418,7 @@ h2 {
   margin-top: var(--space-2);
   color: var(--amber);
   font: 600 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
 }
 
 .error-summary {
@@ -415,12 +431,15 @@ h2 {
 .attention-list {
   display: grid;
   gap: var(--space-2);
+  min-width: 0;
   max-height: 440px;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: var(--space-3);
 }
 
 .attention-item {
+  min-width: 0;
   padding: var(--space-3);
   border: 1px solid rgba(255, 117, 109, 0.24);
   border-radius: 10px;
@@ -435,6 +454,7 @@ h2 {
 .attention-item strong,
 .attention-item span {
   display: block;
+  overflow-wrap: anywhere;
 }
 
 .attention-item strong {
@@ -492,6 +512,13 @@ h2 {
 
 .icon-button:focus-visible,
 .topology-canvas:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: -2px;
+}
+
+.kanban:focus-visible,
+.kanban-column:focus-visible,
+.attention-list:focus-visible {
   outline: 2px solid var(--signal);
   outline-offset: -2px;
 }
@@ -672,6 +699,11 @@ h2 {
 .event-copy strong,
 .event-copy span {
   display: block;
+  overflow-wrap: anywhere;
+}
+
+.event-copy {
+  min-width: 0;
 }
 
 .event-copy strong {
@@ -696,6 +728,10 @@ h2 {
 
 .empty-state.compact {
   min-height: 100px;
+}
+
+.error-state {
+  color: var(--muted-strong);
 }
 
 @media (max-width: 1180px) {
@@ -741,6 +777,17 @@ h2 {
   .topology-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .panel-heading {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .panel-heading > .quiet-badge {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: right;
   }
 
   .topology-heading-actions {

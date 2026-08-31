@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, suppress
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.herdr import replica_slot_names, worktree_agent_name
@@ -21,7 +26,7 @@ from herdr_orchestrator.model import (
     TaskReceipt,
 )
 from herdr_orchestrator.runner import Coordinator
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import Store, StoreError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -89,6 +94,43 @@ class FakeDispatcher:
 
     def close_created_agent(self, name: str) -> None:
         self.closed_created_agents.append(name)
+
+
+class PlannerDispatcher:
+    def __init__(self, output_file: Path) -> None:
+        self.output_file = output_file
+        self.calls: list[Harness] = []
+        self._lock = threading.Lock()
+
+    def dispatch(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        agent_name: str | None = None,
+        context: DispatchContext | None = None,
+    ) -> DispatchOutcome:
+        del prompt, timeout_seconds, agent_name, context
+        with self._lock:
+            self.calls.append(harness)
+        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        self.output_file.write_text('{"tasks": []}', encoding="utf-8")
+        return DispatchOutcome("planner", AgentState.DONE, False, "w1:p1")
+
+
+class ExplodingDispatcher(FakeDispatcher):
+    def dispatch(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        agent_name: str | None = None,
+        context: DispatchContext | None = None,
+    ) -> DispatchOutcome:
+        del harness, prompt, timeout_seconds, agent_name, context
+        raise RuntimeError("dispatcher exploded")
 
 
 class CleanupDispatcher(FakeDispatcher):
@@ -223,6 +265,91 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(result["queue_idle"])
         self.assertTrue(result["worker_pool_idle"])
         self.assertTrue(all(0 < timeout <= 10 for timeout in dispatcher.timeouts))
+
+    def test_dispatcher_exception_preserves_claimed_agent_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            coordinator = Coordinator(
+                config,
+                store=store,
+                dispatcher=ExplodingDispatcher({}),
+            )
+
+            result = coordinator.run_once()
+            job = store.jobs(config.name)[0]
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                receipt = connection.execute(
+                    "SELECT agent_name, error_code FROM receipts WHERE job_id = ?",
+                    (job["id"],),
+                ).fetchone()
+
+        expected_name = replica_slot_names(
+            config.name,
+            config.workspace,
+            Harness.DROID,
+            1,
+            PlacementTarget.TAB,
+        )[0]
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(job["agent_name"], expected_name)
+        self.assertEqual(receipt, (expected_name, "dispatcher_unhandled_error"))
+
+    def test_planner_reservation_is_atomic_across_coordinators(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            planner_prompt_file = root / "planner.md"
+            planner_prompt_file.write_text("Plan one task.", encoding="utf-8")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(
+                    base.planner,
+                    enabled=True,
+                    interval_seconds=60,
+                    prompt_file=planner_prompt_file,
+                    output_file=root / "plans/planner.json",
+                ),
+            )
+            stores = [Store(config.state_db), Store(config.state_db)]
+            for store in stores:
+                store.initialize()
+            dispatcher = PlannerDispatcher(config.planner.output_file)
+            coordinators = [
+                Coordinator(
+                    config,
+                    store=store,
+                    dispatcher=dispatcher,
+                    controller_harness=Harness.DROID,
+                )
+                for store in stores
+            ]
+            barrier = threading.Barrier(2)
+            metadata_float = Store.metadata_float
+
+            def delayed_metadata_float(store: Store, key: str) -> float | None:
+                value = metadata_float(store, key)
+                with suppress(threading.BrokenBarrierError):
+                    barrier.wait(timeout=2)
+                return value
+
+            with (
+                patch.object(Store, "metadata_float", delayed_metadata_float),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                futures = [
+                    executor.submit(coordinator._run_planner_if_due) for coordinator in coordinators
+                ]
+                for future in futures:
+                    future.result()
+
+        self.assertEqual(dispatcher.calls, [Harness.DROID])
 
     def test_run_until_idle_reports_blocked_instead_of_idle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -753,7 +880,7 @@ class CoordinatorTests(unittest.TestCase):
             jobs = coordinator.store.jobs(config.name)
             repeated = coordinator.enqueue_prompt_file(
                 harness=None,
-                title="Build again",
+                title="Build",
                 prompt_file=prompt_file,
                 dedupe_key="auto-route",
             )
@@ -769,6 +896,31 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotIn('"harness": "claude"', dispatcher.prompts[Harness.DROID])
         self.assertIn("Title: Build", dispatcher.prompts[Harness.DROID])
         self.assertEqual(len(dispatcher.closed_created_agents), 1)
+
+    def test_enqueue_prompt_file_rejects_changed_dedupe_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Inspect the repository.", encoding="utf-8")
+            coordinator = Coordinator(config, dispatcher=FakeDispatcher({}))
+            coordinator.enqueue_prompt_file(
+                harness=Harness.PI,
+                title="Inspect",
+                prompt_file=prompt_file,
+                dedupe_key="contract-conflict",
+            )
+
+            with self.assertRaisesRegex(StoreError, "dedupe_contract_conflict"):
+                coordinator.enqueue_prompt_file(
+                    harness=Harness.PI,
+                    title="Changed title",
+                    prompt_file=prompt_file,
+                    dedupe_key="contract-conflict",
+                )
 
     def test_auto_router_timeout_closes_controller_created_for_routing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

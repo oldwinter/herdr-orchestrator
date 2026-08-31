@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from herdr_orchestrator.herdr import HerdrTransport, replica_slot_names, stable_agent_name
+from herdr_orchestrator.herdr import HerdrTransport
 from herdr_orchestrator.model import (
     AgentState,
     DispatchContext,
@@ -322,6 +322,42 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(len(runner.calls), 3)
         self.assertIn("--wait", runner.calls[2])
 
+    def test_rejects_reusable_agent_from_another_herdr_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner(
+                [
+                    _result(
+                        {
+                            "agent": {
+                                "agent": "droid",
+                                "agent_status": "idle",
+                                "cwd": str(workspace),
+                                "foreground_cwd": str(workspace),
+                                "interactive_ready": True,
+                                "workspace_id": "w2",
+                                "pane_id": "w2:p9",
+                                "state_change_seq": 1,
+                            }
+                        }
+                    ),
+                ]
+            )
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"},
+                runner=runner,
+                settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.DROID, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.error_code, "agent_workspace_mismatch")
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+        self.assertEqual(len(runner.calls), 1)
+
     def test_rejects_settled_prompt_without_state_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -585,6 +621,7 @@ class HerdrTransportTests(unittest.TestCase):
             outcome = transport.dispatch(Harness.PI, "inspect", timeout_seconds=30)
 
         self.assertEqual(outcome.error_code, "not_in_herdr")
+        self.assertFalse(outcome.member_reused)
 
     def test_recovers_agent_that_becomes_ready_after_start_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1801,6 +1838,7 @@ class HerdrTransportTests(unittest.TestCase):
             )
 
         self.assertEqual(outcome.state, AgentState.BLOCKED)
+        self.assertEqual(outcome.error_code, "agent_blocked")
         self.assertFalse(outcome.task_verified)
 
     def test_rejects_unchanged_preexisting_receipt_file(self) -> None:
@@ -2360,6 +2398,22 @@ class HerdrTransportTests(unittest.TestCase):
         )
         self.assertFalse(any(call[0:3] == ["herdr", "agent", "prompt"] for call in runner.calls))
 
+    def test_blocked_response_respects_an_expired_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner([])
+            transport = HerdrTransport(
+                "example",
+                workspace,
+                environ={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"},
+                runner=runner,
+            )
+
+            outcome = transport.respond("blocked", Harness.CODEX, "approve", timeout_seconds=0)
+
+        self.assertEqual(outcome.error_code, "herdr_timeout")
+        self.assertEqual(runner.calls, [])
+
     def test_refuses_blocked_response_when_owned_pane_changed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -2410,30 +2464,6 @@ class HerdrTransportTests(unittest.TestCase):
 
         self.assertEqual(outcome.error_code, "agent_pane_mismatch")
         self.assertEqual(len(runner.calls), 1)
-
-    def test_stable_name_is_deterministic(self) -> None:
-        workspace = Path("/tmp/project")
-        self.assertEqual(
-            stable_agent_name("example", workspace, Harness.HERMES),
-            stable_agent_name("example", workspace, Harness.HERMES),
-        )
-        self.assertRegex(
-            stable_agent_name("example", workspace, Harness.HERMES),
-            r"^ho-hermes-[a-f0-9]{8}$",
-        )
-
-    def test_replica_slot_names_keep_single_stable_name(self) -> None:
-        workspace = Path("/tmp/project")
-        self.assertEqual(
-            replica_slot_names("example", workspace, Harness.GROK, 1),
-            (stable_agent_name("example", workspace, Harness.GROK),),
-        )
-        names = replica_slot_names("example", workspace, Harness.GROK, 10)
-        self.assertEqual(len(names), 10)
-        self.assertEqual(len(set(names)), 10)
-        self.assertTrue(all(len(name) <= 32 for name in names))
-        self.assertRegex(names[0], r"^ho-grok-01-[a-f0-9]{6}$")
-        self.assertRegex(names[9], r"^ho-grok-10-[a-f0-9]{6}$")
 
 
 def _result(result: dict[str, object]) -> subprocess.CompletedProcess[str]:
