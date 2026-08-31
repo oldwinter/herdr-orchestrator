@@ -61,6 +61,27 @@ class DistributionCliTests(unittest.TestCase):
 
         self.assertIn("PYTHONPATH=src", metadata["scripts"]["test"])
 
+    def test_manager_runtime_dependency_is_exact_and_locked(self) -> None:
+        metadata = json.loads((MANAGER_PACKAGE / "package.json").read_text(encoding="utf-8"))
+        dependency = metadata["dependencies"]["herdr-orchestrator"]
+
+        self.assertRegex(dependency, r"^\d+\.\d+\.\d+$")
+        lock_path = MANAGER_PACKAGE / "package-lock.json"
+        self.assertTrue(lock_path.is_file())
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        root = lock["packages"][""]
+        resolved = lock["packages"]["node_modules/herdr-orchestrator"]
+        self.assertEqual(root["dependencies"]["herdr-orchestrator"], dependency)
+        self.assertEqual(resolved["version"], dependency)
+        self.assertRegex(resolved["resolved"], r"^https://")
+        self.assertRegex(resolved["integrity"], r"^sha512-")
+
+    def test_npm_dependency_audit_covers_both_package_lockfiles(self) -> None:
+        security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+
+        self.assertIn("npm audit --package-lock-only", security)
+        self.assertIn("packages/herdr-manager", security)
+
     def test_missing_option_value_returns_a_stable_cli_error(self) -> None:
         result = self._run("install", "--project")
 
@@ -755,6 +776,47 @@ class DistributionCliTests(unittest.TestCase):
         payload = json.loads(doctor.stdout)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["runtime"]["error"], "runtime_doctor_invalid_output")
+
+    def test_doctor_bounds_an_interpreter_startup_hang(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            fake_python = root / "python"
+            fake_python.write_text(
+                "#!/bin/sh\n"
+                "sleep 2\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PYTHON": str(fake_python),
+                    "HERDR_ORCHESTRATOR_DOCTOR_TIMEOUT_MS": "100",
+                }
+            )
+
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env=environment,
+            )
+
+        self.assertEqual(doctor.returncode, 1, doctor.stderr)
+        payload = json.loads(doctor.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["runtime"], {"error": "runtime_doctor_timeout", "ok": False})
 
     def test_doctor_reports_wrapper_manifest_version_skew(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
