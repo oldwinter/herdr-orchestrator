@@ -33,9 +33,10 @@ migrate batches, and contract.
 
 ### Implementation and integration
 
-The coordinator claims up to `max_parallel` frontier tickets. It creates an independent git
-worktree and branch for each ticket. A selected worker receives only its full harness profile
-and the accepted plan/ticket packet.
+The coordinator takes an exclusive claim for the deterministic run directory. It pins the
+source `HEAD` before creating the integration branch. It claims up to `max_parallel` frontier
+tickets and creates an independent git worktree and branch for each ticket. A selected worker
+receives only its full harness profile and the accepted plan/ticket packet.
 
 Success requires:
 
@@ -46,6 +47,9 @@ Success requires:
 
 The coordinator merges validated ticket branches into an isolated integration branch,
 updates the tracker, closes the ticket, and computes the next frontier. It never uses stash.
+After a restart, the coordinator reconstructs the completed frontier from validated receipts and
+ticket commits already reachable from integration. It closes recovered tickets before claiming
+the next frontier.
 
 ## Prompt data and schema boundaries
 
@@ -74,7 +78,10 @@ fresh isolated agents in parallel. Their prompts prohibit delegation and recursi
 Every finding must cite a repository rule/smell hunk or specification text.
 
 The controller adjudicates every finding. Only accepted `must-fix` findings enter repair.
-After each repair commit both axes run again. The configured bound is two repair rounds.
+After each repair commit both axes run again. The default bound is two repair rounds; the
+configured value may be zero, one, or two.
+Review artifacts use 1-based round numbers. `repair-state.json` stores the number of repair
+commits, so a clean first review is `round-1` and a review after one repair is `round-2`.
 There is no “review until it eventually says clean” loop.
 
 ## Principal proxy
@@ -127,11 +134,19 @@ Each goal maps deterministically to `<artifact_root>/<run-id>/`:
 | `state.json` | Current or terminal stage |
 | `decision-ledger.jsonl` | Controller routes and decisions |
 | `delivery-plan.json` | Accepted spec, seams, and ticket DAG |
+| `git-base.json` | Pinned source repository and base commit |
+| `tracker-publication.json` | Published ticket references and GitHub spec identity |
+| `repair-state.json` | Completed repair count and any in-flight repair |
+| `run.lock` | Exclusive claim for one active coordinator |
 | `wayfinder-*.json`, `wayfinder/` | Optional decision map and resolutions |
 | `routes/` | Strict worker choices |
 | `receipts/` | Ticket acceptance and commit evidence |
 | `reviews/` | Axis reports and verdicts |
 | `worktrees/` | Ticket and integration checkouts |
+
+`state.json` records `wayfinder`, `spec-and-tickets`, `tracker-publish`, `implementation`, and
+`final-review` while the run is active. A completed run records `status=succeeded` and
+`stage=complete`. An escalation records `status=blocked`; other failures record `status=failed`.
 
 Exit codes:
 
@@ -139,5 +154,16 @@ Exit codes:
 - `2`: validation, dispatch, git, tracker, DAG, receipt, or review failure.
 - `3`: principal-proxy escalation for a protected category.
 
+`delivery_tracker_publish_interrupted` means that a GitHub publish may have changed the remote
+before its identity was saved. The coordinator stops so an operator can reconcile those issues.
+
 Failures preserve worktrees and artifacts. Inspect `state.json` and the ledger before retry.
-The command refuses conflicting local tracker artifacts rather than overwriting them.
+The command refuses conflicting local tracker artifacts rather than overwriting them. A retry
+reuses the pinned base, validates worktree ownership, and skips ticket commits already merged
+into integration. Review reports are deleted before each fresh review turn and a missing report
+is retried once on the same agent.
+
+The coordinator persists tracker identity after `publish` returns. Local Markdown and GitHub
+references can then be restored without publishing again. If a GitHub publish stops before that
+identity is persisted, the retry fails with `delivery_tracker_publish_interrupted`; reconcile
+the remote issues before starting another delivery attempt.

@@ -9,9 +9,22 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from herdr_orchestrator.config import load_workflow
-from herdr_orchestrator.delivery import DeliveryEscalation, StandardizedDelivery
+from herdr_orchestrator.delivery import (
+    DeliveryError,
+    DeliveryEscalation,
+    StandardizedDelivery,
+    _delivery_run_claim,
+)
+from herdr_orchestrator.delivery_protocol import (
+    FindingSeverity,
+    ReviewFinding,
+    ReviewReport,
+    load_delivery_plan,
+)
+from herdr_orchestrator.git_workspace import GitWorkspace, Worktree
 from herdr_orchestrator.model import (
     AgentState,
     DispatchOutcome,
@@ -272,6 +285,33 @@ class FlakyArtifactDispatcher:
         raise AssertionError("flaky artifact controller should not block")
 
 
+class SettledWithoutArtifactDispatcher:
+    def dispatch(
+        self,
+        workspace: Path,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: int,
+        agent_name: str,
+    ) -> DispatchOutcome:
+        return DispatchOutcome(agent_name, AgentState.DONE, True, "w1:p2")
+
+    def read_agent(self, workspace: Path, name: str, *, lines: int = 120) -> str:
+        raise AssertionError("settled worker should not block")
+
+    def respond(
+        self,
+        workspace: Path,
+        name: str,
+        harness: Harness,
+        response: str,
+        *,
+        timeout_seconds: int,
+    ) -> DispatchOutcome:
+        raise AssertionError("settled worker should not block")
+
+
 class StandardizedDeliveryTests(unittest.TestCase):
     def test_runs_parallel_frontier_then_final_two_axis_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -312,7 +352,24 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
             result = delivery.run(goal)
             dispatch_count = len(dispatcher.prompts)
+            state_path = result.artifact_root / "state.json"
+            state_path.write_text(
+                json.dumps({"status": "running", "stage": "final-review"}),
+                encoding="utf-8",
+            )
             repeated = delivery.run(goal)
+            reconciled_state = json.loads(state_path.read_text(encoding="utf-8"))
+            dirty = result.artifact_root / "worktrees/integration/interrupted.txt"
+            dirty.write_text("unfinished repair\n", encoding="utf-8")
+            with self.assertRaisesRegex(DeliveryError, "worktree_dirty"):
+                delivery.run(goal)
+            dirty.unlink()
+            result_path = result.artifact_root / "result.json"
+            result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+            result_payload["integration_commit"] = "f" * 40
+            result_path.write_text(json.dumps(result_payload), encoding="utf-8")
+            with self.assertRaisesRegex(DeliveryError, "integration_commit"):
+                delivery.run(goal)
 
             log = _git(
                 result.artifact_root / "worktrees/integration",
@@ -325,6 +382,8 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(repeated, result)
+        self.assertEqual(reconciled_state["status"], "succeeded")
+        self.assertEqual(reconciled_state["stage"], "complete")
         self.assertEqual(len(dispatcher.prompts), dispatch_count)
         self.assertEqual(result.tickets_completed, 3)
         self.assertEqual(result.review_rounds, 1)
@@ -476,6 +535,55 @@ class StandardizedDeliveryTests(unittest.TestCase):
             1,
         )
 
+    def test_resume_reuses_tracker_publication_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=root / ".orchestrator/deliveries",
+                tracker_root=root / ".scratch/delivery",
+            )
+            config = replace(
+                config,
+                workspace=root,
+                state_db=root / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            plan_path = delivery_config.artifact_root / "publication" / "delivery-plan.json"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(json.dumps(_delivery_plan()), encoding="utf-8")
+            plan = load_delivery_plan(plan_path)
+            first = StandardizedDelivery(
+                config,
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            first._run_root = plan_path.parent
+            published = first._publish_tracker(plan)
+            second = StandardizedDelivery(
+                config,
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            second._run_root = first._run_root
+
+            with patch.object(
+                second.tracker,
+                "publish",
+                side_effect=AssertionError("tracker publish repeated"),
+            ):
+                recovered = second._publish_tracker(plan)
+
+        self.assertEqual(
+            {key: value.reference for key, value in recovered.items()},
+            {key: value.reference for key, value in published.items()},
+        )
+
     def test_missing_artifact_retries_once_on_same_ready_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -511,6 +619,453 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
         self.assertEqual(dispatcher.calls, 2)
         self.assertIn('"event": "artifact_prompt_retried"', ledger)
+
+    def test_all_configured_repair_rounds_are_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            _git(repository, "init", "-b", "main")
+            _git(repository, "config", "user.name", "Test User")
+            _git(repository, "config", "user.email", "test@example.com")
+            (repository / "README.md").write_text("test repo\n", encoding="utf-8")
+            _git(repository, "add", "README.md")
+            _git(repository, "commit", "-m", "chore: initialize")
+
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=repository / ".orchestrator/deliveries",
+                tracker_root=repository / ".scratch/delivery",
+                review_repair_rounds=2,
+            )
+            config = replace(
+                config,
+                workspace=repository,
+                state_db=repository / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            delivery._run_root = delivery_config.artifact_root / "repair-rounds"
+            delivery._run_root.mkdir(parents=True)
+            plan_path = delivery._run_root / "delivery-plan.json"
+            plan_path.write_text(json.dumps(_delivery_plan()), encoding="utf-8")
+            plan = load_delivery_plan(plan_path)
+            git = GitWorkspace(repository, delivery._run_root, plan.slug)
+            integration = git.create_integration(git.base_commit())
+            finding = ReviewFinding(
+                severity=FindingSeverity.MUST_FIX,
+                summary="The review finding is real.",
+                evidence="README.md:1",
+                source="the accepted repository rule",
+            )
+            reports = iter(
+                (
+                    ReviewReport(standards=(finding,), spec=()),
+                    ReviewReport(standards=(finding,), spec=()),
+                    ReviewReport(standards=(), spec=()),
+                )
+            )
+            repair_commits: list[str] = []
+
+            def write_verdict(*args: object, **kwargs: object) -> None:
+                verdict_file = args[3]
+                assert isinstance(verdict_file, Path)
+                verdict_file.parent.mkdir(parents=True, exist_ok=True)
+                verdict_file.write_text(
+                    json.dumps(
+                        {
+                            "accepted": ["standards:1"],
+                            "dismissed": [],
+                            "rationale": "The citation supports the finding.",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            def repair(*args: object, **kwargs: object) -> DispatchOutcome:
+                marker = integration.path / f"repair-{len(repair_commits) + 1}.txt"
+                marker.write_text("repaired\n", encoding="utf-8")
+                _git(integration.path, "add", marker.name)
+                _git(integration.path, "commit", "-m", "fix: repair finding")
+                commit = _git(integration.path, "rev-parse", "HEAD").stdout.strip()
+                repair_commits.append(commit)
+                return DispatchOutcome("repair", AgentState.DONE, False, "w1:p2")
+
+            with (
+                patch.object(delivery, "_review", side_effect=lambda *a, **k: next(reports)),
+                patch.object(delivery, "_select_worker", return_value=Harness.DROID),
+                patch.object(delivery, "_dispatch_artifact", side_effect=write_verdict),
+                patch.object(delivery, "_dispatch_with_proxy", side_effect=repair),
+            ):
+                rounds = delivery._review_and_repair(plan, integration)
+
+        self.assertEqual(rounds, 3)
+        self.assertEqual(len(repair_commits), 2)
+
+    def test_review_does_not_reuse_stale_axis_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            _git(repository, "init", "-b", "main")
+            _git(repository, "config", "user.name", "Test User")
+            _git(repository, "config", "user.email", "test@example.com")
+            (repository / "README.md").write_text("test repo\n", encoding="utf-8")
+            _git(repository, "add", "README.md")
+            _git(repository, "commit", "-m", "chore: initialize")
+
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=repository / ".orchestrator/deliveries",
+                tracker_root=repository / ".scratch/delivery",
+            )
+            config = replace(
+                config,
+                workspace=repository,
+                state_db=repository / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=SettledWithoutArtifactDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            delivery._run_root = delivery_config.artifact_root / "stale-review"
+            delivery._run_root.mkdir(parents=True)
+            plan_path = delivery._run_root / "delivery-plan.json"
+            plan_path.write_text(json.dumps(_delivery_plan()), encoding="utf-8")
+            plan = load_delivery_plan(plan_path)
+            git = GitWorkspace(repository, delivery._run_root, plan.slug)
+            integration = git.create_integration(git.base_commit())
+            (integration.path / "implemented.txt").write_text("done\n", encoding="utf-8")
+            _git(integration.path, "add", "implemented.txt")
+            _git(integration.path, "commit", "-m", "feat: implement delivery")
+            (delivery._run_root / "git-base.json").write_text(
+                json.dumps(
+                    {
+                        "commit": _git(repository, "rev-parse", "HEAD").stdout.strip(),
+                        "repository": str(repository.resolve()),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            review_root = delivery._run_root / "reviews/round-1"
+            review_root.mkdir(parents=True)
+            (review_root / "standards.json").write_text(
+                json.dumps({"standards": []}),
+                encoding="utf-8",
+            )
+            (review_root / "spec.json").write_text(
+                json.dumps({"spec": []}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(delivery, "_select_worker", return_value=Harness.DROID),
+                self.assertRaisesRegex(DeliveryError, "delivery_artifact_missing"),
+            ):
+                delivery._review(plan, integration, 1)
+
+    def test_rejects_a_foreign_repository_at_ticket_worktree_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            _git(repository, "init", "-b", "main")
+            _git(repository, "config", "user.name", "Test User")
+            _git(repository, "config", "user.email", "test@example.com")
+            (repository / "README.md").write_text("test repo\n", encoding="utf-8")
+            _git(repository, "add", "README.md")
+            _git(repository, "commit", "-m", "chore: initialize")
+
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=repository / ".orchestrator/deliveries",
+                tracker_root=repository / ".scratch/delivery",
+            )
+            config = replace(
+                config,
+                workspace=repository,
+                state_db=repository / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            delivery._run_root = delivery_config.artifact_root / "foreign-worktree"
+            delivery._run_root.mkdir(parents=True)
+            plan_path = delivery._run_root / "delivery-plan.json"
+            plan_path.write_text(json.dumps(_delivery_plan()), encoding="utf-8")
+            plan = load_delivery_plan(plan_path)
+            git = GitWorkspace(repository, delivery._run_root, plan.slug)
+            base_commit = git.base_commit()
+            foreign = delivery._run_root / "worktrees/ticket-01"
+            foreign.mkdir(parents=True)
+            _git(foreign, "init", "-b", "ho/parallel-delivery/ticket-01")
+            _git(foreign, "config", "user.name", "Foreign User")
+            _git(foreign, "config", "user.email", "foreign@example.com")
+            (foreign / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+            _git(foreign, "add", "foreign.txt")
+            _git(foreign, "commit", "-m", "foreign commit")
+            foreign_commit = _git(foreign, "rev-parse", "HEAD").stdout.strip()
+            receipt_path = delivery._run_root / "receipts/ticket-01.json"
+            receipt_path.parent.mkdir(parents=True)
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "ticket_id": "01",
+                        "commit": foreign_commit,
+                        "acceptance": [
+                            {
+                                "criterion": "Slice 01 works.",
+                                "passed": True,
+                                "evidence": "foreign.txt exists",
+                            }
+                        ],
+                        "checks": ["foreign check"],
+                        "summary": "Foreign receipt.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(DeliveryError, "worktree_ownership"):
+                delivery._implement_ticket(
+                    plan,
+                    plan.tickets[0],
+                    Harness.DROID,
+                    Worktree(foreign, "ho/parallel-delivery/ticket-01", base_commit),
+                )
+
+    def test_interrupted_run_keeps_its_original_base_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            _git(repository, "init", "-b", "main")
+            _git(repository, "config", "user.name", "Test User")
+            _git(repository, "config", "user.email", "test@example.com")
+            (repository / "README.md").write_text("test repo\n", encoding="utf-8")
+            _git(repository, "add", "README.md")
+            _git(repository, "commit", "-m", "chore: initialize")
+            original_base = _git(repository, "rev-parse", "HEAD").stdout.strip()
+
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=repository / ".orchestrator/deliveries",
+                tracker_root=repository / ".scratch/delivery",
+                wayfinder=WayfinderMode.NEVER,
+            )
+            config = replace(
+                config,
+                workspace=repository,
+                state_db=repository / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            goal = repository / "goal.md"
+            goal.write_text("Deliver three independent slices.", encoding="utf-8")
+
+            class InterruptingDispatcher(ScriptedDeliveryDispatcher):
+                def dispatch(self, *args: object, **kwargs: object) -> DispatchOutcome:
+                    prompt = args[2]
+                    assert isinstance(prompt, str)
+                    if "Implement exactly one accepted delivery ticket" in prompt:
+                        raise RuntimeError("interrupted during implementation")
+                    return super().dispatch(*args, **kwargs)
+
+            interrupted = StandardizedDelivery(
+                config,
+                dispatcher=InterruptingDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "interrupted during implementation"):
+                interrupted.run(goal)
+
+            (repository / "later.txt").write_text("later source change\n", encoding="utf-8")
+            _git(repository, "add", "later.txt")
+            _git(repository, "commit", "-m", "feat: advance source branch")
+            advanced_head = _git(repository, "rev-parse", "HEAD").stdout.strip()
+            resumed_dispatcher = ScriptedDeliveryDispatcher()
+            resumed = StandardizedDelivery(
+                config,
+                dispatcher=resumed_dispatcher,
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+
+            result = resumed.run(goal)
+            integration = result.artifact_root / "worktrees/integration"
+            merge_base = _git(integration, "merge-base", "HEAD", advanced_head).stdout.strip()
+            review_prompts = [
+                prompt
+                for prompt in resumed_dispatcher.prompts
+                if prompt.startswith("Review the committed diff")
+            ]
+
+        self.assertEqual(merge_base, original_base)
+        self.assertNotEqual(merge_base, advanced_head)
+        self.assertTrue(review_prompts)
+        self.assertTrue(all(f"`{original_base}...HEAD`" in prompt for prompt in review_prompts))
+
+    def test_repair_budget_survives_an_interrupted_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            _git(repository, "init", "-b", "main")
+            _git(repository, "config", "user.name", "Test User")
+            _git(repository, "config", "user.email", "test@example.com")
+            (repository / "README.md").write_text("test repo\n", encoding="utf-8")
+            _git(repository, "add", "README.md")
+            _git(repository, "commit", "-m", "chore: initialize")
+
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=repository / ".orchestrator/deliveries",
+                tracker_root=repository / ".scratch/delivery",
+                review_repair_rounds=1,
+            )
+            config = replace(
+                config,
+                workspace=repository,
+                state_db=repository / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            delivery._run_root = delivery_config.artifact_root / "repair-restart"
+            delivery._run_root.mkdir(parents=True)
+            plan_path = delivery._run_root / "delivery-plan.json"
+            plan_path.write_text(json.dumps(_delivery_plan()), encoding="utf-8")
+            plan = load_delivery_plan(plan_path)
+            git = GitWorkspace(repository, delivery._run_root, plan.slug)
+            integration = git.create_integration(git.base_commit())
+            finding = ReviewFinding(
+                severity=FindingSeverity.MUST_FIX,
+                summary="The review finding is still real.",
+                evidence="README.md:1",
+                source="the accepted repository rule",
+            )
+            report = ReviewReport(standards=(finding,), spec=())
+            repair_commits: list[str] = []
+
+            def write_verdict(*args: object, **kwargs: object) -> None:
+                verdict_file = args[3]
+                assert isinstance(verdict_file, Path)
+                verdict_file.parent.mkdir(parents=True, exist_ok=True)
+                verdict_file.write_text(
+                    json.dumps(
+                        {
+                            "accepted": ["standards:1"],
+                            "dismissed": [],
+                            "rationale": "The citation supports the finding.",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            def repair(*args: object, **kwargs: object) -> DispatchOutcome:
+                marker = integration.path / f"repair-{len(repair_commits) + 1}.txt"
+                marker.write_text("repaired\n", encoding="utf-8")
+                _git(integration.path, "add", marker.name)
+                _git(integration.path, "commit", "-m", "fix: repair finding")
+                repair_commits.append(_git(integration.path, "rev-parse", "HEAD").stdout.strip())
+                return DispatchOutcome("repair", AgentState.DONE, False, "w1:p2")
+
+            review_calls = 0
+
+            def interrupt_after_repair(*args: object, **kwargs: object) -> ReviewReport:
+                nonlocal review_calls
+                review_calls += 1
+                if review_calls == 1:
+                    return report
+                raise RuntimeError("interrupted after repair")
+
+            with (
+                patch.object(
+                    delivery,
+                    "_review",
+                    side_effect=interrupt_after_repair,
+                ),
+                patch.object(delivery, "_select_worker", return_value=Harness.DROID),
+                patch.object(delivery, "_dispatch_artifact", side_effect=write_verdict),
+                patch.object(delivery, "_dispatch_with_proxy", side_effect=repair),
+                self.assertRaisesRegex(RuntimeError, "interrupted after repair"),
+            ):
+                delivery._review_and_repair(plan, integration)
+
+            resumed = StandardizedDelivery(
+                config,
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            resumed._run_root = delivery._run_root
+            resumed_repairs: list[str] = []
+
+            def resumed_repair(*args: object, **kwargs: object) -> DispatchOutcome:
+                marker = integration.path / "repair-reset.txt"
+                marker.write_text("repaired\n", encoding="utf-8")
+                _git(integration.path, "add", marker.name)
+                _git(integration.path, "commit", "-m", "fix: reset repair")
+                resumed_repairs.append(_git(integration.path, "rev-parse", "HEAD").stdout.strip())
+                return DispatchOutcome("repair", AgentState.DONE, False, "w1:p2")
+
+            with (
+                patch.object(resumed, "_review", return_value=report),
+                patch.object(resumed, "_select_worker", return_value=Harness.DROID),
+                patch.object(resumed, "_dispatch_artifact", side_effect=write_verdict),
+                patch.object(resumed, "_dispatch_with_proxy", side_effect=resumed_repair),
+                self.assertRaisesRegex(DeliveryError, "review_repair_rounds_exhausted"),
+            ):
+                resumed._review_and_repair(plan, integration)
+
+        self.assertEqual(len(repair_commits), 1)
+        self.assertEqual(len(resumed_repairs), 0)
+
+    def test_same_delivery_run_cannot_claim_its_worktrees_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "run.lock"
+
+            def claim_again() -> None:
+                with _delivery_run_claim(path):
+                    pass
+
+            with (
+                _delivery_run_claim(path),
+                self.assertRaisesRegex(
+                    DeliveryError,
+                    "delivery_run_active",
+                ),
+            ):
+                claim_again()
 
 
 def _delivery_plan() -> dict[str, object]:
