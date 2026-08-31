@@ -125,6 +125,20 @@ class TopologyTests(unittest.TestCase):
         self.assertNotIn("worktree: repository-writing", prompt)
         self.assertNotIn('"placement":"tab|pane|worktree"', prompt)
 
+    def test_controller_prompt_uses_one_valid_placement_example(self) -> None:
+        prompt = topology_decision_prompt(
+            "Task",
+            "Choose a placement.",
+            Path("topology.json"),
+            supports_worktree=True,
+        )
+
+        self.assertIn(
+            'Exact schema:\n{"placement":"pane","rationale":"..."}',
+            prompt,
+        )
+        self.assertNotIn('"placement":"tab|pane|worktree"', prompt)
+
     def test_rejects_worktree_without_git_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "topology.json"

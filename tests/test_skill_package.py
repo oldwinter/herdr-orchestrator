@@ -3,8 +3,10 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -222,6 +224,84 @@ class RepositoryCheckerTests(unittest.TestCase):
             failures = CHECK_DOCS.documentation_failures(root)
 
         self.assertEqual(failures, ["README.md: required document must be a regular file"])
+
+    def test_docs_checker_rejects_missing_paths_in_command_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "justfile").write_text(
+                "check:\n\t@true\nenqueue:\n\t@true\nrun:\n\t@true\n",
+                encoding="utf-8",
+            )
+            for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
+                (root / name).write_text("", encoding="utf-8")
+            docs = root / "docs"
+            docs.mkdir()
+            (docs / "architecture.md").write_text("", encoding="utf-8")
+            (docs / "runtime-troubleshooting.md").write_text(
+                "```bash\njust run --workflow workflows/missing-runtime.toml\n```\n",
+                encoding="utf-8",
+            )
+            (docs / "workflow-schema.md").write_text("", encoding="utf-8")
+            (root / "README.md").write_text(
+                "```bash\n"
+                "just enqueue codex review workflows/prompts/missing-review.md review-v1\n"
+                "```\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK_DOCS.documentation_failures(root)
+
+        self.assertIn(
+            "README.md: missing command path workflows/prompts/missing-review.md",
+            failures,
+        )
+        self.assertIn(
+            "runtime-troubleshooting.md: missing command path workflows/missing-runtime.toml",
+            failures,
+        )
+
+    def test_documented_workflows_are_all_tracked_examples(self) -> None:
+        workflows = sorted(
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in (REPO_ROOT / "workflows").glob("*.toml")
+        )
+        documentation = "\n".join(
+            (REPO_ROOT / name).read_text(encoding="utf-8") for name in ("README.md", "AGENTS.md")
+        )
+
+        self.assertGreater(len(workflows), 1)
+        for workflow in workflows:
+            self.assertIn(workflow, documentation)
+
+    def test_reference_generator_runs_without_installed_package_or_pythonpath(self) -> None:
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment["PYTHONNOUSERSITE"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                str(REPO_ROOT / "scripts/generate_reference.py"),
+                "--check",
+            ],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "generated CLI reference: current")
+
+    def test_generated_reference_describes_required_gc_scope(self) -> None:
+        rendered = GENERATE_REFERENCE.render()
+
+        for option in ("--succeeded-agents", "--failed-agents"):
+            self.assertIn(
+                f"| `{option}` | one of `--succeeded-agents`, `--failed-agents` |",
+                rendered,
+            )
 
     def test_feature_flag_checker_requires_executable_references_and_assignments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

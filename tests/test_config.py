@@ -93,6 +93,72 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "planner_output_must_be"):
                 load_workflow(workflow)
 
+    def test_rejects_planner_prompt_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside_prompt = root.parent / "planner-outside.md"
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            outside_prompt.write_text("outside", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    'prompt_file = "prompt.md"',
+                    f'prompt_file = "{outside_prompt.as_posix()}"',
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "planner_prompt_must_be_in_workspace"):
+                load_workflow(workflow)
+
+    def test_preserves_external_state_and_tracker_roots_for_trusted_workflows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root.parent / "shared-workflow-state"
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    'state_db = ".orchestrator/state.db"',
+                    f'state_db = "{(outside / "state.db").as_posix()}"',
+                )
+                + f'\n[standardized_delivery]\ntracker_root = "{(outside / "tracker").as_posix()}"\n',
+                encoding="utf-8",
+            )
+
+            config = load_workflow(workflow)
+
+        self.assertEqual(config.state_db, outside / "state.db")
+        self.assertEqual(config.standardized_delivery.tracker_root, outside / "tracker")
+
+    def test_constrains_worktree_and_delivery_artifact_roots_to_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+
+            worktree_workflow = root / "worktree.toml"
+            worktree_workflow.write_text(
+                _minimal_workflow() + '\n[placement]\nworktree_root = "../outside-worktrees"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ConfigError,
+                "placement_worktree_root_must_be_in_workspace_runtime",
+            ):
+                load_workflow(worktree_workflow)
+
+            artifact_workflow = root / "artifact.toml"
+            artifact_workflow.write_text(
+                _minimal_workflow()
+                + '\n[standardized_delivery]\nartifact_root = "../outside-artifacts"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ConfigError,
+                "delivery_artifact_root_must_be_in_workspace_runtime",
+            ):
+                load_workflow(artifact_workflow)
+
     def test_requires_lease_to_cover_agent_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
