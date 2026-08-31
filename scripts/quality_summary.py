@@ -4,53 +4,38 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
+import importlib.util
+import sys
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-QUALITY_ROOT = ROOT / ".orchestrator" / "quality"
+
+def _load_quality_bundle_module():
+    name = "_quality_bundle_for_summary"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).with_name("quality_bundle.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+quality_bundle = _load_quality_bundle_module()
+
 COVERAGE_THRESHOLD = 80.0
-SECURITY_STATUS_ARTIFACT = "security-status.json"
+DISPLAY_PRODUCERS = ("lint", "coverage", "stability", "security", "build", "profiling")
 
 
 @dataclass(frozen=True)
 class Artifact:
     payload: dict[str, object] | None
     error: str | None = None
-
-
-def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate_json_key")
-        result[key] = value
-    return result
-
-
-def _load_artifact(name: str) -> Artifact:
-    path = QUALITY_ROOT / name
-    if not path.is_file():
-        return Artifact(None, f"{name} missing")
-    try:
-        payload = json.loads(
-            path.read_text(encoding="utf-8"),
-            object_pairs_hook=_object_without_duplicates,
-        )
-    except (OSError, TypeError, UnicodeError, ValueError, RecursionError):
-        return Artifact(None, f"{name} invalid_json")
-    if not isinstance(payload, dict):
-        return Artifact(None, f"{name} invalid_shape")
-    return Artifact(payload)
-
-
-def load(name: str) -> dict[str, object]:
-    """Load an artifact while retaining the original helper's empty fallback."""
-    artifact = _load_artifact(name)
-    return artifact.payload or {}
 
 
 def _integer(value: object) -> bool:
@@ -224,41 +209,9 @@ def _security(artifact: Artifact, label: str) -> tuple[str, int | None, str | No
     return ("failed", count, "vulnerabilities") if count else ("passed", 0, None)
 
 
-def _security_status_failure(artifact: Artifact) -> tuple[str, str] | None:
-    if artifact.error is not None:
-        return "unavailable", artifact.error
-    assert artifact.payload is not None
-    exit_code = artifact.payload.get("exit_code")
-    if not _integer(exit_code):
-        return "unavailable", "invalid exit_code"
-    status = artifact.payload.get("status")
-    if status is not None and (not isinstance(status, str) or status not in {"passed", "failed"}):
-        return "unavailable", "invalid status"
-    if exit_code != 0:
-        return "failed", f"exit code {exit_code}"
-    if status == "failed":
-        return "failed", "reported failure"
-    return None
-
-
-def _security_line(
-    bandit: Artifact,
-    audit: Artifact,
-    status_artifact: Artifact | None = None,
-) -> tuple[str, str]:
+def _security_line(bandit: Artifact, audit: Artifact) -> tuple[str, str]:
     bandit_status, bandit_count, bandit_detail = _security(bandit, "bandit")
     audit_status, audit_count, audit_detail = _security(audit, "audit")
-    status_failure = (
-        _security_status_failure(status_artifact) if status_artifact is not None else None
-    )
-    if status_failure is not None:
-        details = ["incomplete evidence", f"{SECURITY_STATUS_ARTIFACT}: {status_failure[1]}"]
-        if bandit_status != "passed" and bandit_detail is not None:
-            details.append(f"Bandit: {bandit_detail}")
-        if audit_status != "passed" and audit_detail is not None:
-            details.append(f"pip-audit: {audit_detail}")
-        label = status_failure[0].upper() if status_failure[0] == "failed" else status_failure[0]
-        return status_failure[0], f"- Security: **{label}** ({'; '.join(details)})"
     if bandit_status == "passed" and audit_status == "passed":
         assert bandit_count is not None and audit_count is not None
         return (
@@ -282,49 +235,123 @@ def _security_line(
     return status, f"- Security: **{label}** ({'; '.join(details)})"
 
 
+def _not_verified(label: str, detail: str) -> tuple[str, str]:
+    return "not_verified", f"- {label}: **NOT VERIFIED** ({detail})"
+
+
+def _manifest_artifact(producer: object, key: str) -> Artifact:
+    for artifact in producer.artifacts:
+        if artifact.key == key and artifact.verified and artifact.payload is not None:
+            return Artifact(artifact.payload)
+    return Artifact(None, f"{key} artifact missing")
+
+
+def _render_manifest(manifest: object) -> tuple[int, str]:
+    producers = {producer.name: producer for producer in manifest.producers}
+    statuses: list[str] = []
+    lines = ["## Automated quality review", ""]
+
+    for name in DISPLAY_PRODUCERS:
+        producer = producers.get(name)
+        label = {
+            "lint": "Static analysis",
+            "coverage": "Coverage",
+            "stability": "Stability",
+            "security": "Security",
+            "build": "Build",
+            "profiling": "Profiling",
+        }[name]
+        if producer is None:
+            status, line = _not_verified(label, "producer missing")
+        elif producer.verification != "verified" or producer.outcome != "passed":
+            status, line = _not_verified(label, "producer failed")
+        elif name == "coverage":
+            status, line = _coverage(_manifest_artifact(producer, "coverage"))
+        elif name == "stability":
+            status, line = _stability(_manifest_artifact(producer, "stability"))
+        elif name == "build":
+            status, line = _build(_manifest_artifact(producer, "build"))
+        elif name == "security":
+            status, line = _security_line(
+                _manifest_artifact(producer, "bandit"),
+                _manifest_artifact(producer, "pip-audit"),
+            )
+        else:
+            status, line = "passed", f"- {label}: **verified**"
+        if status != "passed":
+            detail = line.split("(", maxsplit=1)[-1].rstrip(")") if "(" in line else status
+            status, line = _not_verified(label, detail)
+        statuses.append(status)
+        lines.append(line)
+
+    lines.extend(
+        (
+            "",
+            f"Commit: `{manifest.commit}`",
+            f"Invocation: `{manifest.invocation_id}`",
+            f"Run: `{manifest.run_id}`",
+            "",
+        )
+    )
+    return (1 if any(status != "passed" for status in statuses) else 0), "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--result", type=Path)
+    source.add_argument("--manifest", type=Path)
+    parser.add_argument("--expected-commit")
+    parser.add_argument("--expected-invocation")
+    parser.add_argument("--expected-run")
+    parser.add_argument("--expected-source")
+    parser.add_argument("--require-clean", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    coverage = _load_artifact("coverage.json")
-    stability = _load_artifact("stability.json")
-    build = _load_artifact("build.json")
-    bandit = _load_artifact("bandit.json")
-    audit = _load_artifact("pip-audit.json")
-    security_status_artifact = _load_artifact(SECURITY_STATUS_ARTIFACT)
-    if (
-        security_status_artifact.error == f"{SECURITY_STATUS_ARTIFACT} missing"
-        and os.environ.get("GITHUB_ACTIONS", "").lower() != "true"
-    ):
-        security_status_artifact = None
-    statuses: list[str] = []
-    coverage_status, coverage_line = _coverage(coverage)
-    statuses.append(coverage_status)
-    stability_status, stability_line = _stability(stability)
-    statuses.append(stability_status)
-    build_status, build_line = _build(build)
-    statuses.append(build_status)
-    security_status, security_line = _security_line(
-        bandit,
-        audit,
-        security_status_artifact,
-    )
-    statuses.append(security_status)
-    lines = [
-        "## Automated quality review",
-        "",
-        coverage_line,
-        stability_line,
-        build_line,
-        security_line,
-        "",
-        "Generated from pinned local tools. Review failures before merge.",
-        "",
-    ]
+    try:
+        if args.result is not None:
+            result = quality_bundle.load_run_result(args.result)
+            manifest = quality_bundle.load_manifest_from_result(
+                result,
+                require_clean=args.require_clean,
+            )
+        else:
+            expectations = (
+                args.expected_commit,
+                args.expected_invocation,
+                args.expected_run,
+                args.expected_source,
+            )
+            if any(value is None for value in expectations):
+                parser.error("direct --manifest requires all --expected-* identity arguments")
+            manifest = quality_bundle.load_completed_manifest(
+                args.manifest,
+                expected_commit=args.expected_commit,
+                expected_invocation_id=args.expected_invocation,
+                expected_run_id=args.expected_run,
+                expected_source_digest=args.expected_source,
+                require_clean=args.require_clean,
+            )
+    except quality_bundle.QualityBundleError as error:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            "\n".join(
+                (
+                    "## Automated quality review",
+                    "",
+                    f"- Evidence: **NOT VERIFIED** ({error})",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        print(args.output)
+        return 1
+    status, summary = _render_manifest(manifest)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text("\n".join(lines), encoding="utf-8")
+    args.output.write_text(summary, encoding="utf-8")
     print(args.output)
-    return 1 if any(status != "passed" for status in statuses) else 0
+    return status
 
 
 if __name__ == "__main__":

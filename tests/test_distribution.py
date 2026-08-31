@@ -81,11 +81,13 @@ class DistributionCliTests(unittest.TestCase):
     def test_npm_dependency_audit_covers_both_package_lockfiles(self) -> None:
         security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        quality_bundle = (REPO_ROOT / "scripts/quality_bundle.py").read_text(encoding="utf-8")
 
         self.assertIn("npm audit --package-lock-only", security)
         self.assertIn("packages/herdr-manager", security)
-        self.assertIn("npm audit --package-lock-only", justfile)
-        self.assertIn("npm audit --package-lock-only --prefix packages/herdr-manager", justfile)
+        self.assertIn("quality_bundle.py run --producer security", justfile)
+        self.assertEqual(quality_bundle.count('"--package-lock-only"'), 2)
+        self.assertIn('"packages/herdr-manager"', quality_bundle)
 
     def test_missing_option_value_returns_a_stable_cli_error(self) -> None:
         result = self._run("install", "--project")

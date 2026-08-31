@@ -27,8 +27,9 @@ just profile-tests
 `just check` is the merge gate. It enforces formatting, strict typing, naming, duplication,
 dead code, cyclomatic complexity, import boundaries, unused dependencies, repository policy,
 documentation freshness, 80% branch-aware coverage, three repeated test runs, security scans,
-and package build metrics. `just profile-tests` writes standard-library `cProfile` data to
-`.orchestrator/quality/tests.pstats` for local hot-path investigation.
+package build metrics, and profiling. It publishes one run-scoped evidence bundle. See
+[`quality-evidence.md`](quality-evidence.md) for its identity, manifest, failure, privacy, and
+artifact-location contracts.
 Pre-commit runs the fast static gates, while pre-push runs coverage:
 
 ```bash
@@ -36,5 +37,6 @@ uv run pre-commit install --install-hooks
 uv run pre-commit install --hook-type pre-push
 ```
 
-CI uses the same lockfile and commands, uploads `.orchestrator/quality`, and posts the generated
-quality summary on pull requests. Do not edit `docs/generated/cli.md`; run `just docs-generate`.
+CI uses the same locked tools, uploads one completed bundle, and posts only its bounded summary on
+pull requests. Manifest enforcement remains independent of summary generation. Do not edit
+`docs/generated/cli.md`; run `just docs-generate`.

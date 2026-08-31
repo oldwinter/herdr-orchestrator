@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      security: ${{ steps.security.outcome }}
+      security: ${{ steps.bundle.outputs.security }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -40,69 +40,77 @@ jobs:
           uv sync --locked
       - name: Compile
         run: PYTHONPATH=src uv run python -m compileall -q src tests scripts
-      - name: Static quality gates
-        id: lint
-        continue-on-error: true
-        run: just lint
-      - name: Branch-aware coverage
-        id: coverage
-        continue-on-error: true
-        run: just test-coverage
-      - name: Flaky-test detection
-        id: stability
-        continue-on-error: true
-        run: just test-stability
-      - name: Security review
-        id: security
+      - name: Collect quality bundle
+        id: quality
         continue-on-error: true
         run: |
-          mkdir -p .orchestrator/quality
-          set +e
-          just security
-          status=$?
-          result=failed
-          if test "$status" -eq 0; then result=passed; fi
-          printf '{"status":"%s","exit_code":%s}\n' "$result" "$status" \
-            > .orchestrator/quality/security-status.json
-          exit "$status"
-      - name: Package build metrics
-        id: build
+          python3 scripts/quality_bundle.py run \
+            --all \
+            --commit "$GITHUB_SHA" \
+            --invocation "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --result "$RUNNER_TEMP/quality-result.json"
+      - name: Resolve quality bundle
+        id: bundle
+        if: always()
         continue-on-error: true
-        run: just build-metrics
-      - name: Profiling evidence
-        id: profiling
-        continue-on-error: true
-        run: just profile-tests
+        env:
+          RESULT_PATH: ${{ runner.temp }}/quality-result.json
+          SUMMARY_PATH: ${{ github.workspace }}/.orchestrator/quality/summaries/${{ github.run_id }}-${{ github.run_attempt }}.md
+        run: |
+          printf 'result=%s\nsummary=%s\nsecurity=failure\nbundle=\n' \
+            "$RESULT_PATH" "$SUMMARY_PATH" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result_path = Path(os.environ["RESULT_PATH"])
+          result = json.loads(result_path.read_text(encoding="utf-8"))
+          manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+          security = next(
+              producer for producer in manifest["producers"] if producer["name"] == "security"
+          )
+          security_outcome = (
+              "success"
+              if security["outcome"] == "passed" and security["verification"] == "verified"
+              else "failure"
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              print(f"bundle={result['bundle']}", file=output)
+              print(f"security={security_outcome}", file=output)
+          PY
       - name: Generate quality review
         if: always()
-        run: just quality-summary
+        continue-on-error: true
+        env:
+          RESULT_PATH: ${{ steps.bundle.outputs.result }}
+          SUMMARY_PATH: ${{ steps.bundle.outputs.summary }}
+        run: |
+          mkdir -p "$(dirname "$SUMMARY_PATH")"
+          python3 scripts/quality_summary.py \
+            --result "$RESULT_PATH" \
+            --require-clean \
+            --output "$SUMMARY_PATH"
       - name: Upload quality evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: quality-${{ github.run_id }}
-          path: .orchestrator/quality/
+          name: quality-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.bundle.outputs.bundle }}
+            ${{ steps.bundle.outputs.summary }}
           include-hidden-files: true
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
-      - name: Enforce all outcomes
+      - name: Enforce quality manifest
         if: always()
         env:
-          BUILD: ${{ steps.build.outcome }}
-          COVERAGE: ${{ steps.coverage.outcome }}
-          LINT: ${{ steps.lint.outcome }}
-          PROFILING: ${{ steps.profiling.outcome }}
-          SECURITY: ${{ steps.security.outcome }}
-          STABILITY: ${{ steps.stability.outcome }}
+          RESULT_PATH: ${{ steps.bundle.outputs.result }}
         run: |
-          printf 'lint=%s coverage=%s stability=%s security=%s build=%s profiling=%s\n' \
-            "$LINT" "$COVERAGE" "$STABILITY" "$SECURITY" "$BUILD" "$PROFILING"
-          test "$LINT" = success
-          test "$COVERAGE" = success
-          test "$STABILITY" = success
-          test "$SECURITY" = success
-          test "$BUILD" = success
-          test "$PROFILING" = success
+          python3 scripts/quality_bundle.py enforce \
+            --result "$RESULT_PATH" \
+            --require-full \
+            --require-clean
 
   pr-review:
     if: always() && github.event_name == 'pull_request'
@@ -117,7 +125,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: quality-${{ github.run_id }}
+          name: quality-${{ github.run_id }}-${{ github.run_attempt }}
           path: quality
       - name: Post automated review
         env:
@@ -127,10 +135,11 @@ jobs:
           {
             printf '## Automated quality review\n\n'
             printf 'Overall gate: **%s**\n\n' "$RESULT"
-            if test -f quality/summary.md; then
-              tail -n +2 quality/summary.md
+            summary="$(find quality/summaries -maxdepth 1 -type f -name '*.md' -print -quit 2>/dev/null || true)"
+            if test -n "$summary"; then
+              tail -n +2 "$summary"
             else
-              printf 'Quality evidence was incomplete. Inspect the `test` job logs.\n'
+              printf 'Quality evidence was incomplete. Inspect the test job logs.\n'
             fi
           } > /tmp/quality-review.md
           gh pr comment "${{ github.event.pull_request.number }}" \

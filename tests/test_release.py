@@ -25,7 +25,6 @@ def _load_script(name: str):
 
 
 build_metrics = _load_script("build_metrics")
-quality_summary = _load_script("quality_summary")
 test_stability = _load_script("test_stability")
 
 RELEASE_PLAN = REPO_ROOT / "scripts/npm-release-plan.mjs"
@@ -198,6 +197,46 @@ class NpmReleasePlanTests(unittest.TestCase):
 
 
 class NpmReleaseWorkflowTests(unittest.TestCase):
+    def test_ci_collects_one_quality_bundle_and_enforces_it_independently(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        test_job = workflow[workflow.index("  test:\n") : workflow.index("  pr-review:\n")]
+
+        self.assertEqual(test_job.count("quality_bundle.py run"), 1)
+        self.assertIn("--all", test_job)
+        self.assertIn('--commit "$GITHUB_SHA"', test_job)
+        self.assertIn('--invocation "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"', test_job)
+        self.assertIn('--result "$RUNNER_TEMP/quality-result.json"', test_job)
+        self.assertIn("Generate quality review", test_job)
+        self.assertIn("quality_summary.py", test_job)
+        self.assertIn("--result", test_job)
+        self.assertIn("Enforce quality manifest", test_job)
+        self.assertIn("quality_bundle.py enforce", test_job)
+        self.assertLess(
+            test_job.index("Collect quality bundle"), test_job.index("Generate quality review")
+        )
+        self.assertLess(
+            test_job.index("Generate quality review"), test_job.index("Upload quality evidence")
+        )
+        self.assertLess(
+            test_job.index("Upload quality evidence"), test_job.index("Enforce quality manifest")
+        )
+        self.assertNotIn("just lint", test_job)
+        self.assertNotIn("just test-coverage", test_job)
+        self.assertNotIn("security-status.json", test_job)
+
+    def test_local_check_uses_one_explicit_bundle_manifest(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        check = justfile[justfile.index("check:\n") : justfile.index("seed:\n")]
+
+        self.assertEqual(check.count("quality_bundle.py run"), 1)
+        self.assertIn("--all", check)
+        self.assertIn("--result", check)
+        self.assertIn("quality_summary.py", check)
+        self.assertIn('quality_summary.py --result "$result"', check)
+        self.assertIn("quality_bundle.py enforce", check)
+        self.assertNotIn("just lint", check)
+        self.assertNotIn("just test-coverage", check)
+
     def test_untrusted_pr_code_uses_github_hosted_runner(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 
@@ -545,91 +584,6 @@ class QualityScriptTests(unittest.TestCase):
         self.assertIn("-p", command)
         self.assertIn("no:cacheprovider", command)
         self.assertEqual(payload["executions"][0]["error_code"], "report_missing")
-
-    def test_quality_summary_propagates_failed_quality_inputs(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            quality_root = Path(temporary) / "quality"
-            quality_root.mkdir()
-            (quality_root / "coverage.json").write_text(
-                json.dumps({"totals": {"percent_covered": 82.0}}),
-                encoding="utf-8",
-            )
-            (quality_root / "stability.json").write_text(
-                json.dumps(
-                    {
-                        "runs": 2,
-                        "unstable": [],
-                        "executions": [
-                            {"exit_code": 1},
-                            {"exit_code": 1},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (quality_root / "build.json").write_text(
-                json.dumps({"exit_code": 7}),
-                encoding="utf-8",
-            )
-            (quality_root / "bandit.json").write_text(
-                json.dumps({"results": []}),
-                encoding="utf-8",
-            )
-            (quality_root / "pip-audit.json").write_text(
-                json.dumps({"dependencies": []}),
-                encoding="utf-8",
-            )
-            output = Path(temporary) / "summary.md"
-            with (
-                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
-                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
-            ):
-                status = quality_summary.main()
-
-            summary = output.read_text(encoding="utf-8")
-
-        self.assertEqual(status, 1)
-        self.assertIn("Stability: **FAILED**", summary)
-        self.assertIn("exit codes: 1", summary)
-        self.assertIn("Build: **FAILED**", summary)
-        self.assertIn("exit code 7", summary)
-
-    def test_quality_summary_rejects_missing_quality_inputs(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            quality_root = Path(temporary) / "quality"
-            quality_root.mkdir()
-            output = Path(temporary) / "summary.md"
-            with (
-                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
-                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
-            ):
-                status = quality_summary.main()
-
-            summary = output.read_text(encoding="utf-8")
-
-        self.assertEqual(status, 1)
-        self.assertIn("Coverage: **unavailable**", summary)
-        self.assertIn("Security: **unavailable**", summary)
-
-    def test_quality_summary_rejects_an_unbounded_coverage_number(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            quality_root = Path(temporary) / "quality"
-            quality_root.mkdir()
-            (quality_root / "coverage.json").write_text(
-                json.dumps({"totals": {"percent_covered": 10**1000}}),
-                encoding="utf-8",
-            )
-            output = Path(temporary) / "summary.md"
-            with (
-                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
-                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
-            ):
-                status = quality_summary.main()
-
-            summary = output.read_text(encoding="utf-8")
-
-        self.assertEqual(status, 1)
-        self.assertIn("Coverage: **unavailable**", summary)
 
 
 if __name__ == "__main__":

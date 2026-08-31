@@ -18,47 +18,31 @@ doctor *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}} "$@"
 
 test:
-    @mkdir -p .orchestrator/quality
-    @PYTHONPATH=src uv run pytest tests --durations=0 --json-report --json-report-file=.orchestrator/quality/tests.json
+    @python3 scripts/quality_bundle.py run --producer test
 
 test-coverage:
-    @mkdir -p .orchestrator/quality
-    @PYTHONPATH=src uv run pytest tests --durations=0 --cov=herdr_orchestrator --cov-branch --cov-report=term-missing --cov-report=json:.orchestrator/quality/coverage.json --cov-fail-under=80 --json-report --json-report-file=.orchestrator/quality/tests.json
+    @python3 scripts/quality_bundle.py run --producer coverage
 
 test-stability:
-    @PYTHONPATH=src uv run python scripts/test_stability.py --runs 3 --output .orchestrator/quality/stability.json
+    @python3 scripts/quality_bundle.py run --producer stability
 
 lint:
-    @uv run ruff check src tests scripts
-    @uv run black --check src tests scripts
-    @uv run mypy
-    @uv run pylint src/herdr_orchestrator --disable=all --enable=invalid-name,duplicate-code
-    @uv run vulture src tests scripts --min-confidence 90
-    @uv run xenon --max-absolute C --max-modules B --max-average A src
-    @uv run lint-imports
-    @uv run deptry src
-    @uv run python scripts/check_repository.py
-    @uv run python scripts/check_feature_flags.py
-    @uv run python scripts/check_docs.py
-    @uv run python scripts/generate_reference.py --check
+    @python3 scripts/quality_bundle.py run --producer lint
 
 security:
-    @mkdir -p .orchestrator/quality
-    @uv run detect-secrets-hook --baseline .secrets.baseline $(git ls-files --cached --others --exclude-standard)
-    @uv run bandit -q -r src -ll -f json -o .orchestrator/quality/bandit.json
-    @uv run pip-audit --local --skip-editable --format json --output .orchestrator/quality/pip-audit.json
-    @npm audit --package-lock-only
-    @npm audit --package-lock-only --prefix packages/herdr-manager
+    @python3 scripts/quality_bundle.py run --producer security
 
 build-metrics:
-    @uv run python scripts/build_metrics.py --output .orchestrator/quality/build.json
+    @python3 scripts/quality_bundle.py run --producer build
 
 profile-tests:
-    @mkdir -p .orchestrator/quality
-    @PYTHONPATH=src uv run python -c 'import cProfile, pytest; profiler = cProfile.Profile(); status = profiler.runcall(pytest.main, ["tests/test_protocol.py", "-q"]); profiler.dump_stats(".orchestrator/quality/tests.pstats"); raise SystemExit(status)'
+    @python3 scripts/quality_bundle.py run --producer profiling
 
-quality-summary:
-    @uv run python scripts/quality_summary.py --output .orchestrator/quality/summary.md
+quality-summary result="" output="":
+    @result={{quote(result)}}; if test -z "$result"; then result="$(python3 scripts/quality_bundle.py latest-result)"; fi; output={{quote(output)}}; if test -z "$output"; then output="${result%.json}.md"; fi; python3 scripts/quality_summary.py --result "$result" --output "$output"
+
+quality-enforce result:
+    @python3 scripts/quality_bundle.py enforce --result {{quote(result)}} --require-full
 
 docs-generate:
     @uv run python scripts/generate_reference.py
@@ -70,13 +54,8 @@ docs-check:
 check:
     @uv sync --locked
     @PYTHONPATH=src {{python}} -m compileall -q src tests scripts
-    @just lint
-    @just test-coverage
-    @just test-stability
-    @just security
-    @just build-metrics
-    @just profile-tests
-    @just quality-summary
+    @mkdir -p .orchestrator/quality/results
+    @result="$(mktemp .orchestrator/quality/results/check.XXXXXX.json)"; summary="${result%.json}.md"; set +e; python3 scripts/quality_bundle.py run --all --result "$result"; collect_status=$?; python3 scripts/quality_summary.py --result "$result" --output "$summary"; summary_status=$?; python3 scripts/quality_bundle.py enforce --result "$result" --require-full; enforce_status=$?; set -e; printf 'bundle=%s summary=%s collect=%s render=%s enforce=%s\n' "$result" "$summary" "$collect_status" "$summary_status" "$enforce_status"; if test "$enforce_status" -ne 0; then exit "$enforce_status"; fi; if test "$summary_status" -ne 0; then exit "$summary_status"; fi; exit "$collect_status"
 
 seed:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator seed --workflow {{workflow}}
