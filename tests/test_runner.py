@@ -417,8 +417,14 @@ class CoordinatorTests(unittest.TestCase):
                     agent_settled=True,
                 ),
             )
+            observed: list[AttemptPhase] = []
 
-            result = Coordinator(config, store=store, dispatcher=dispatcher).run_once()
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                transition_observer=lambda transition: observed.append(transition.phase),
+            ).run_once()
 
             with closing(sqlite3.connect(config.state_db)) as connection, connection:
                 attempt = connection.execute("""
@@ -441,6 +447,75 @@ class CoordinatorTests(unittest.TestCase):
             attempt,
             (AttemptPhase.OUTCOME_COMMITTED.value, 10, 11, 12, "session-1"),
         )
+
+    def test_settled_unknown_receipt_failure_uses_retry_policy_not_attention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            dispatcher = LifecycleDispatcher(
+                config.state_db,
+                DispatchOutcome(
+                    "settled-worker",
+                    AgentState.UNKNOWN,
+                    False,
+                    "w1:p2",
+                    "task_receipt_missing",
+                    agent_settled=True,
+                ),
+            )
+            observed: list[AttemptPhase] = []
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                transition_observer=lambda transition: observed.append(transition.phase),
+            ).run_once()
+
+            job = store.jobs(config.name)[0]
+
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(job["state"], JobState.PENDING.value)
+        self.assertEqual(job["attempt_phase"], AttemptPhase.ABANDONED.value)
+        self.assertEqual(job["error_code"], "task_receipt_missing")
+        self.assertEqual(observed[-1], AttemptPhase.ABANDONED)
+
+    def test_unsettled_accepted_timeout_observer_reports_attention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            dispatcher = LifecycleDispatcher(
+                config.state_db,
+                DispatchOutcome(
+                    "working-worker",
+                    AgentState.UNKNOWN,
+                    False,
+                    "w1:p2",
+                    "herdr_timeout",
+                    agent_settled=False,
+                ),
+            )
+            observed: list[AttemptPhase] = []
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                transition_observer=lambda transition: observed.append(transition.phase),
+            ).run_once()
+
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(observed[-1], AttemptPhase.ATTENTION)
 
     def test_run_until_idle_drains_replica_limited_jobs_across_waves(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

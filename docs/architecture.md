@@ -62,6 +62,9 @@ identity 和 sequence。这个 reconciliation 不增加 attempt：
 - identity、session 或 sequence 不能证明同一 turn 时，job 保持 `blocked`，attempt phase 变为
   `attention`，并记录 `unsafe_turn_adoption`。
 
+Recovery 以持久化的最后 sequence 为起点，只接受最多 8 次 lifecycle 变化。更大的 sequence
+advance 可能属于后续 turn，因此进入 `attention`，不会被原 attempt 采用。
+
 `just status` 的 job 项包含 `current_attempt_id` 和 `attempt_phase`。`blocked` 加
 `attempt_phase=attention` 表示 operator attention，不是可直接回答的 agent 提问。
 
@@ -197,8 +200,9 @@ manager 只对当前 Herdr session 可见。
   `working` 就继续等待，未前进则返回 phase-specific `prompt_acceptance_timeout`；
 - transport 在继续下一个 side effect 前，依次持久化 `runtime_acquired`、`prompt_accepted`、
   `settled` 和 `receipt_observed`。测试 fault injector 只在 transaction commit 后中断；
-- restart recovery 只调用 `herdr agent get`。它校验 agent、pane、workspace、execution root、
-  可用的 session identity 和 sequence。recovery 没有发送 prompt、terminal text 或 Enter 的路径；
+- restart recovery 使用 `herdr agent get` 校验 agent、pane、workspace、execution root、可用的
+  session identity 和 sequence。原 turn settled 后，现有 fatal classifier 可以读取最多 80 行
+  detection output；只保留 sanitized summary。recovery 没有发送 prompt 或 terminal text 的路径；
 - `agent_prompt_stalled` 且仍停在原 idle sequence 时最多重发两次 Enter；仍没有 lifecycle
   变化则快速返回 `agent_turn_not_observed`，不占满整个 agent timeout；
 - `tab` 与 `worktree` placement 使用独立后台 tab 和 full-size root pane。`pane` placement
@@ -270,8 +274,9 @@ route -> wayfinder? -> spec + ticket DAG -> frontier worktrees
 标准交付中的 `blocked` 会读取有限 worker detection output，让独立 proxy controller
 输出严格 decision JSON，再把回答交回原 worker。最多 8 轮。deterministic guard 与
 schema 都要求 secret/production 升级。由于 Herdr 拒绝向已 blocked agent 提交普通
-`agent prompt`，response 通过受控的 pane literal text 加 agent Enter 输入，再按新的
-lifecycle sequence 等待结果；response 本身不进入 decision ledger。
+`agent prompt`，response 通过一次 `herdr pane send-text` 提交。literal text 包含结尾 newline，
+因此不存在独立的 staged-text 和 Enter side effect。提交后按新的 lifecycle sequence 等待结果；
+response 本身不进入 decision ledger。
 
 每次运行的状态、map、plan、routes、receipts、reviews、ledger 和 worktrees 保存在
 `.orchestrator/deliveries/<run-id>/`。最终产物是隔离 integration branch 与 commit，

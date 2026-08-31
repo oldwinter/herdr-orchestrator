@@ -9,6 +9,7 @@ from pathlib import Path
 
 from herdr_orchestrator.attempts import AttemptLedger, StoreError
 from herdr_orchestrator.model import (
+    AttemptPhase,
     AttemptProgress,
     ClaimedJob,
     DispatchOutcome,
@@ -486,6 +487,16 @@ class Store:
         if not recorded:
             raise StoreError("job_lease_lost")
         return state
+
+    def attempt_phase(self, attempt_id: int) -> AttemptPhase:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT phase FROM job_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            raise StoreError("current_attempt_missing")
+        return AttemptPhase(str(row["phase"]))
 
     def status_counts(
         self,

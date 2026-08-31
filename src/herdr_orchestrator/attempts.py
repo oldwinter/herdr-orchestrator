@@ -49,6 +49,18 @@ class _ResumeLease:
     runtime: AttemptRuntime
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacyOperation:
+    lease_until: object
+    phase: str
+    sequence: int
+    kind: str
+    error_code: object
+    updated_at: float
+    finished_at: float | None
+    clear_outcome: bool
+
+
 _SETTLED_AGENT_STATES = frozenset({AgentState.IDLE, AgentState.DONE})
 _PHASE_PREDECESSORS: dict[AttemptPhase, frozenset[AttemptPhase]] = {
     AttemptPhase.RUNTIME_ACQUIRED: frozenset(
@@ -340,7 +352,14 @@ class AttemptLedger:
         current, correlation, fence = AttemptLedger._legacy_identity(
             connection, job, number, latest
         )
-        operation_token = str(correlation or fence)
+        blocked_resume = bool(
+            current and job["state"] == JobState.BLOCKED.value and job["lease_until"] is not None
+        )
+        operation_token = str(
+            job["correlation_id"]
+            if blocked_resume and job["correlation_id"]
+            else correlation or fence
+        )
         AttemptLedger._insert_legacy_attempt(
             connection,
             job,
@@ -396,19 +415,10 @@ class AttemptLedger:
         fence: str,
         operation_token: str,
     ) -> None:
-        running = current and job["state"] == JobState.RUNNING.value
-        latest_error = _coalesce(latest or job, job, "error_code")
-        phase = (
-            AttemptPhase.CLAIMED.value
-            if running
-            else (
-                AttemptPhase.ABANDONED.value
-                if latest_error == "lease_expired"
-                else AttemptPhase.OUTCOME_COMMITTED.value
-            )
+        operation = AttemptLedger._legacy_operation(job, latest, receipts, current=current)
+        agent_state, member_reused, agent_settled, task_verified, error_summary = (
+            AttemptLedger._legacy_outcome_evidence(operation, latest, job)
         )
-        updated_at = float(latest["observed_at"] if latest is not None else job["updated_at"])
-        sequence = max(0, len(receipts) - 1)
         connection.execute(
             """
             INSERT INTO job_attempts(
@@ -426,26 +436,76 @@ class AttemptLedger:
                 number,
                 fence,
                 f"legacy-owner:{job['id']}:{number}",
-                job["lease_until"] if running else None,
+                operation.lease_until,
                 job["harness"],
                 str(_coalesce(latest or job, job, "agent_name") or "unknown"),
                 _coalesce(latest or job, None, "pane_id"),
                 _coalesce(latest or job, job, "herdr_workspace_id"),
                 _coalesce(latest or job, job, "execution_path"),
-                phase,
+                operation.phase,
                 operation_token,
-                sequence,
-                "dispatch" if sequence == 0 else "resume",
-                _coalesce(latest or job, None, "agent_state"),
-                _coalesce(latest or job, None, "member_reused"),
-                _coalesce(latest or job, job, "agent_settled"),
-                _coalesce(latest or job, job, "task_verified"),
-                latest_error,
-                _coalesce(latest or job, job, "error_summary"),
+                operation.sequence,
+                operation.kind,
+                agent_state,
+                member_reused,
+                agent_settled,
+                task_verified,
+                operation.error_code,
+                error_summary,
                 float(job["created_at"]),
-                updated_at,
-                None if running else updated_at,
+                operation.updated_at,
+                operation.finished_at,
             ),
+        )
+
+    @staticmethod
+    def _legacy_operation(
+        job: sqlite3.Row,
+        latest: sqlite3.Row | None,
+        receipts: list[sqlite3.Row],
+        *,
+        current: bool,
+    ) -> _LegacyOperation:
+        running = current and job["state"] == JobState.RUNNING.value
+        blocked_resume = bool(
+            current and job["state"] == JobState.BLOCKED.value and job["lease_until"] is not None
+        )
+        active = running or blocked_resume
+        error_code = None if blocked_resume else _coalesce(latest or job, job, "error_code")
+        phase = AttemptPhase.OUTCOME_COMMITTED.value
+        if active:
+            phase = AttemptPhase.CLAIMED.value
+        elif error_code == "lease_expired":
+            phase = AttemptPhase.ABANDONED.value
+        updated_at = float(latest["observed_at"] if latest is not None else job["updated_at"])
+        sequence = len(receipts) if blocked_resume else max(0, len(receipts) - 1)
+        kind = "resume" if blocked_resume or sequence > 0 else "dispatch"
+        return _LegacyOperation(
+            job["lease_until"] if active else None,
+            phase,
+            sequence,
+            kind,
+            error_code,
+            updated_at,
+            None if active else updated_at,
+            blocked_resume,
+        )
+
+    @staticmethod
+    def _legacy_outcome_evidence(
+        operation: _LegacyOperation,
+        latest: sqlite3.Row | None,
+        job: sqlite3.Row,
+    ) -> tuple[object, object, object, object, object]:
+        if operation.clear_outcome:
+            return None, None, None, None, None
+        source = latest or job
+        return (
+            _coalesce(source, None, "agent_state"),
+            _coalesce(source, None, "member_reused"),
+            _coalesce(source, job, "agent_settled"),
+            _coalesce(source, job, "task_verified"),
+            _coalesce(source, job, "error_summary"),
         )
 
     @staticmethod
@@ -782,6 +842,7 @@ class AttemptLedger:
     ) -> tuple[_NormalizedOutcome, AttemptPhase]:
         accepted_unsettled = bool(
             not resume
+            and not normalized.agent_settled
             and current_phase
             in {
                 AttemptPhase.PROMPT_ACCEPTED,
@@ -944,8 +1005,6 @@ class AttemptLedger:
             connection, workflow, job_id, now=now
         )
         recovery = AttemptLedger._can_recover_resume(attempt, phase)
-        if not recovery and attempt["operation_kind"] == "resume" and phase is AttemptPhase.CLAIMED:
-            AttemptLedger._append_expired_resume(connection, job, attempt, pane_id, now=now)
         lease = AttemptLedger._acquire_resume_attempt(
             connection,
             job,
@@ -1004,45 +1063,12 @@ class AttemptLedger:
             attempt["operation_kind"] == "resume"
             and phase
             in {
+                AttemptPhase.CLAIMED,
                 AttemptPhase.RUNTIME_ACQUIRED,
                 AttemptPhase.PROMPT_ACCEPTED,
                 AttemptPhase.SETTLED,
                 AttemptPhase.RECEIPT_OBSERVED,
             }
-        )
-
-    @staticmethod
-    def _append_expired_resume(
-        connection: sqlite3.Connection,
-        job: sqlite3.Row,
-        attempt: sqlite3.Row,
-        pane_id: str,
-        *,
-        now: float,
-    ) -> None:
-        _insert_receipt(
-            connection,
-            job_id=int(job["id"]),
-            attempt=int(attempt["attempt"]),
-            state=JobState.BLOCKED,
-            agent_name=str(attempt["agent_name"]),
-            agent_state=AgentState.UNKNOWN,
-            member_reused=True,
-            pane_id=pane_id,
-            error_code="resume_lease_expired_unaccepted",
-            placement=str(job["placement"]),
-            execution_path=_optional_text(attempt, "execution_path"),
-            herdr_workspace_id=_optional_text(attempt, "herdr_workspace_id"),
-            agent_settled=None,
-            task_verified=None,
-            error_summary=None,
-            correlation_id=_optional_text(job, "correlation_id"),
-            observed_at=now,
-            attempt_id=int(attempt["id"]),
-            fencing_token=str(attempt["fencing_token"]),
-            operation_token=str(attempt["operation_token"]),
-            operation_sequence=int(attempt["operation_sequence"]),
-            event_kind=AttemptPhase.ABANDONED.value,
         )
 
     @staticmethod

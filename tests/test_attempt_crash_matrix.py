@@ -52,6 +52,58 @@ class RuntimeInterruptDispatcher:
         raise AssertionError("the crash must stop dispatch before the prompt")
 
 
+class TerminalTransitionDispatcher:
+    def __init__(self, terminal_phase: AttemptPhase) -> None:
+        self.terminal_phase = terminal_phase
+
+    def dispatch(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        agent_name: str | None = None,
+        context: DispatchContext | None = None,
+    ) -> DispatchOutcome:
+        del harness, prompt, timeout_seconds
+        assert agent_name is not None and context is not None
+        assert context.attempt_progress is not None
+        context.attempt_progress(
+            AttemptProgress(
+                AttemptPhase.RUNTIME_ACQUIRED,
+                agent_name,
+                pane_id="w1:p2",
+                prompt_baseline_sequence=10,
+            )
+        )
+        if self.terminal_phase is AttemptPhase.ATTENTION:
+            context.attempt_progress(
+                AttemptProgress(
+                    AttemptPhase.PROMPT_ACCEPTED,
+                    agent_name,
+                    pane_id="w1:p2",
+                    prompt_accepted_sequence=11,
+                    agent_state=AgentState.WORKING,
+                )
+            )
+            return DispatchOutcome(
+                agent_name,
+                AgentState.UNKNOWN,
+                False,
+                "w1:p2",
+                "herdr_timeout",
+                agent_settled=False,
+            )
+        return DispatchOutcome(
+            agent_name,
+            AgentState.UNKNOWN,
+            False,
+            "w1:p2",
+            "provider_failed",
+            agent_settled=True,
+        )
+
+
 class PersistentAttemptDispatcher:
     def __init__(self, *, crash_before_acceptance: bool = False) -> None:
         self.state = AgentState.IDLE
@@ -280,6 +332,46 @@ def test_public_run_operation_can_interrupt_after_a_durable_transition() -> None
 
     assert phase == AttemptPhase.RUNTIME_ACQUIRED.value
     assert crash.observed == [AttemptPhase.CLAIMED, AttemptPhase.RUNTIME_ACQUIRED]
+
+
+@pytest.mark.parametrize(
+    ("terminal_phase", "job_state"),
+    ((AttemptPhase.ABANDONED, "pending"), (AttemptPhase.ATTENTION, "blocked")),
+)
+def test_terminal_crash_matrix_uses_actual_committed_phase(
+    terminal_phase: AttemptPhase,
+    job_state: str,
+) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        config = replace(
+            load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+            state_db=Path(temporary) / "state.db",
+        )
+        store = Store(config.state_db)
+        store.initialize()
+        store.enqueue(
+            NewJob(
+                config.name,
+                "Terminal crash matrix",
+                Harness.DROID,
+                "Do the task once.",
+                f"terminal-{terminal_phase.value}",
+                2,
+            )
+        )
+
+        with pytest.raises(OperationInterrupted, match=terminal_phase.value):
+            Coordinator(
+                config,
+                store=store,
+                dispatcher=TerminalTransitionDispatcher(terminal_phase),
+                transition_observer=CrashAfterTransition(terminal_phase),
+            ).run_once()
+
+        job = store.jobs(config.name)[0]
+
+    assert job["state"] == job_state
+    assert job["attempt_phase"] == terminal_phase.value
 
 
 def test_run_once_crash_matrix_converges_with_one_prompt() -> None:

@@ -246,7 +246,7 @@ class Coordinator:
                         correlation_id=job.correlation_id,
                     )
                 state = self.store.record_outcome(job, outcome)
-                self._observe_transition(job, AttemptPhase.OUTCOME_COMMITTED)
+                self._observe_transition(job, self.store.attempt_phase(job.attempt_id))
                 results[state.value] += 1
         return self._run_report(results, claimed=len(jobs))
 
@@ -434,7 +434,7 @@ class Coordinator:
                 correlation_id=job.correlation_id,
             )
         state = self.store.record_resume_outcome(job, outcome)
-        self._observe_transition(job, AttemptPhase.OUTCOME_COMMITTED)
+        self._observe_transition(job, self.store.attempt_phase(job.attempt_id))
         return {
             "job_id": job.job_id,
             "state": state.value,
@@ -664,7 +664,7 @@ class Coordinator:
         context: DispatchContext,
     ) -> DispatchOutcome:
         runtime = job.runtime
-        if runtime is None or runtime.prompt_baseline_sequence is None:
+        if runtime is None:
             return DispatchOutcome(
                 agent_name=job.agent_name,
                 state=AgentState.UNKNOWN,

@@ -998,8 +998,25 @@ class StoreTests(unittest.TestCase):
             second_resume, _ = self.store.claim_blocked_for_resume(
                 "example", claimed.job_id, lease_seconds=60
             )
+            self.store.record_resume_outcome(
+                second_resume,
+                DispatchOutcome(
+                    second_resume.agent_name,
+                    AgentState.UNKNOWN,
+                    True,
+                    "w1:p2",
+                    "lease_expired_unaccepted",
+                    correlation_id=second_resume.correlation_id,
+                ),
+            )
+        with patch("herdr_orchestrator.store.time.time", return_value=163.0):
+            third_resume, _ = self.store.claim_blocked_for_resume(
+                "example", claimed.job_id, lease_seconds=60
+            )
 
-        self.assertNotEqual(second_resume.operation_token, first_resume.operation_token)
+        self.assertTrue(second_resume.recovery)
+        self.assertEqual(second_resume.operation_token, first_resume.operation_token)
+        self.assertNotEqual(third_resume.operation_token, first_resume.operation_token)
         with closing(sqlite3.connect(self.store.path)) as connection, connection:
             history = connection.execute(
                 """
@@ -1014,7 +1031,7 @@ class StoreTests(unittest.TestCase):
                 first_resume.operation_token,
                 first_resume.operation_sequence,
                 AttemptPhase.ABANDONED.value,
-                "resume_lease_expired_unaccepted",
+                "lease_expired_unaccepted",
             ),
         )
 
@@ -1050,6 +1067,9 @@ class StoreTests(unittest.TestCase):
                 lease_seconds=30,
             )
             self.assertNotEqual(second_resume.correlation_id, first_resume.correlation_id)
+            self.assertTrue(second_resume.recovery)
+            self.assertEqual(second_resume.operation_token, first_resume.operation_token)
+            self.assertEqual(second_resume.operation_sequence, first_resume.operation_sequence)
             with self.assertRaisesRegex(StoreError, "job_lease_lost"):
                 self.store.record_resume_outcome(
                     first_resume,
@@ -1077,22 +1097,17 @@ class StoreTests(unittest.TestCase):
             [
                 claimed.correlation_id,
                 first_resume.correlation_id,
-                first_resume.correlation_id,
                 second_resume.correlation_id,
             ],
         )
         self.assertEqual(receipts[0][1:3], (claimed.operation_token, 0))
         self.assertEqual(
             receipts[1][1:5],
-            (first_resume.operation_token, 1, "abandoned", 0),
-        )
-        self.assertEqual(
-            receipts[2][1:5],
             (first_resume.operation_token, 1, "stale:outcome", 1),
         )
         self.assertEqual(
-            receipts[3][1:5],
-            (second_resume.operation_token, 2, "outcome_committed", 0),
+            receipts[2][1:5],
+            (second_resume.operation_token, 1, "outcome_committed", 0),
         )
 
     def test_resume_without_owner_fence_is_rejected_after_reclaim(self) -> None:
@@ -1604,6 +1619,63 @@ class StoreTests(unittest.TestCase):
         )
         self.assertEqual(current_attempt_id, attempts[1][0])
         self.assertEqual(receipt, (attempts[0][0], "legacy:1:1"))
+
+    def test_v4_migration_preserves_inflight_blocked_resume_for_recovery(self) -> None:
+        path = Path(self.temporary.name) / "v4-blocked-resume.db"
+        _create_schema_version(path, 4)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute("""
+                UPDATE jobs
+                SET state = 'blocked', attempts = 1, lease_until = 160,
+                    agent_name = 'legacy-worker', correlation_id = 'resume-correlation',
+                    execution_path = '/workspace', herdr_workspace_id = 'w1', updated_at = 100
+                WHERE id = 1
+                """)
+            connection.execute("""
+                UPDATE receipts
+                SET state = 'blocked', agent_name = 'legacy-worker', agent_state = 'blocked',
+                    pane_id = 'w1:p2', placement = 'tab', execution_path = '/workspace',
+                    herdr_workspace_id = 'w1', correlation_id = 'dispatch-correlation',
+                    observed_at = 90
+                WHERE job_id = 1
+                """)
+
+        migrated = Store(path)
+        migrated.initialize()
+        with closing(sqlite3.connect(path)) as connection, connection:
+            attempt = connection.execute("""
+                SELECT id, fencing_token, operation_token, operation_sequence,
+                       operation_kind, phase, lease_until, pane_id, agent_state,
+                       member_reused, agent_settled, task_verified, error_code, error_summary
+                FROM job_attempts WHERE job_id = 1
+                """).fetchone()
+
+        self.assertEqual(
+            attempt[1:],
+            (
+                "dispatch-correlation",
+                "resume-correlation",
+                1,
+                "resume",
+                AttemptPhase.CLAIMED.value,
+                160.0,
+                "w1:p2",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        restarted = Store(path)
+        with patch("herdr_orchestrator.store.time.time", return_value=161.0):
+            recovered, pane_id = restarted.claim_blocked_for_resume("example", 1, lease_seconds=60)
+        self.assertTrue(recovered.recovery)
+        self.assertEqual(recovered.operation_token, "resume-correlation")
+        self.assertEqual(recovered.fencing_token, "dispatch-correlation")
+        self.assertEqual(recovered.operation_sequence, 1)
+        self.assertEqual(pane_id, "w1:p2")
 
     def test_interrupted_migration_rolls_back_and_can_resume(self) -> None:
         path = Path(self.temporary.name) / "interrupted.db"

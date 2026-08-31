@@ -404,15 +404,7 @@ class HerdrTransport:
             run_json(
                 self.runner,
                 Command(
-                    ["herdr", "pane", "send-text", pane_id, response],
-                    self.workspace,
-                    CONTROL_TIMEOUT_SECONDS,
-                ),
-            )
-            run_json(
-                self.runner,
-                Command(
-                    ["herdr", "agent", "send-keys", name, "enter"],
+                    ["herdr", "pane", "send-text", pane_id, f"{response}\n"],
                     self.workspace,
                     CONTROL_TIMEOUT_SECONDS,
                 ),
