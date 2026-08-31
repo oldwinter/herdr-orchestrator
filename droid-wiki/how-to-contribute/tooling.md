@@ -129,7 +129,7 @@ hooks 提供提前反馈，但最终仍运行 `just check`。不要绕过 hooks 
 
 `.github/workflows/ci.yml` 在 pull request 和 main push 上运行：
 
-1. GitHub-hosted Ubuntu，Python 3.12、Node.js 24、`uv` 0.12.5、
+1. GitHub-hosted Ubuntu，Python 3.14.7、Node.js 26.8.1、`uv` 0.12.7、
    `rust-just` 1.57.0；
 2. `uv sync --locked` 与 compileall；
 3. lint、coverage、stability、security、build、profiling；
