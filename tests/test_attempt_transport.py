@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import tempfile
+from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.herdr import HerdrTransport
 from herdr_orchestrator.model import (
     AgentState,
@@ -15,13 +19,18 @@ from herdr_orchestrator.model import (
     AttemptProgress,
     AttemptRuntime,
     DispatchContext,
+    DispatchOutcome,
     Harness,
     JobState,
     NewJob,
     PlacementTarget,
+    ReceiptKind,
+    TaskReceipt,
 )
-from herdr_orchestrator.runner import OperationInterrupted
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.runner import Coordinator, OperationInterrupted
+from herdr_orchestrator.store import Store, StoreError
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeRunner:
@@ -185,6 +194,36 @@ def test_blocked_response_has_one_physical_submission_crash_window() -> None:
     ]
     assert mutations == [["herdr", "pane", "run", "w1:p9", "Approved"]]
     assert [event.phase for event in progress] == [AttemptPhase.RUNTIME_ACQUIRED]
+
+
+def test_blocked_response_timeout_without_acceptance_is_unsafe() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        runner = FakeRunner(
+            [
+                {"agent": _minimal_agent(AgentState.BLOCKED, 5)},
+                {"_error": "timeout"},
+                {"_error": "herdr_timeout"},
+            ]
+        )
+        progress: list[AttemptProgress] = []
+
+        outcome = _transport(workspace, runner).respond(
+            "blocked-worker",
+            Harness.CODEX,
+            "Approved",
+            timeout_seconds=30,
+            context=DispatchContext(
+                PlacementTarget.TAB,
+                "Resume",
+                "resume-timeout-ambiguous",
+                attempt_progress=progress.append,
+            ),
+        )
+
+    assert outcome.error_code == "unsafe_turn_adoption"
+    assert [event.phase for event in progress] == [AttemptPhase.RUNTIME_ACQUIRED]
+    assert sum(call[0:3] == ["herdr", "pane", "run"] for call in runner.calls) == 1
 
 
 def test_recovery_does_not_adopt_accepted_turn_without_turn_identity() -> None:
@@ -447,6 +486,100 @@ def test_recovery_commits_an_exact_durable_settlement() -> None:
     assert progress[0].state_change_sequence == 12
 
 
+def test_recovery_preserves_durable_verified_receipt() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        runtime = AttemptRuntime(
+            "owned-codex",
+            "w1:p2",
+            "w1",
+            str(workspace),
+            "session-1",
+            10,
+            11,
+            12,
+            AttemptPhase.RECEIPT_OBSERVED,
+            AgentState.DONE,
+            True,
+            True,
+        )
+        runner = FakeRunner([{"agent": _agent(workspace, AgentState.DONE, 12)}])
+
+        outcome = _transport(workspace, runner).recover(
+            Harness.CODEX,
+            "must not be sent",
+            timeout_seconds=30,
+            agent_name="owned-codex",
+            context=DispatchContext(
+                PlacementTarget.TAB,
+                "Recover",
+                "recover-verified-receipt",
+                receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, "TASK-OK"),
+            ),
+            runtime=runtime,
+        )
+
+    assert outcome.state is AgentState.DONE
+    assert outcome.error_code is None
+    assert outcome.task_verified is True
+    assert outcome.agent_settled is True
+
+
+def test_recovery_preserves_verified_receipt_with_settled_fatal_error() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        runtime = AttemptRuntime(
+            "owned-codex",
+            "w1:p2",
+            "w1",
+            str(workspace),
+            "session-1",
+            10,
+            11,
+            12,
+            AttemptPhase.RECEIPT_OBSERVED,
+            AgentState.DONE,
+            True,
+            True,
+        )
+        runner = FakeRunner(
+            [
+                {"agent": _agent(workspace, AgentState.DONE, 12)},
+                "API Error: 403 status code (no body)",
+            ]
+        )
+
+        outcome = HerdrTransport(
+            "example",
+            workspace,
+            environ={
+                "HERDR_ENV": "1",
+                "HERDR_PANE_ID": "w1:p1",
+                "HERDR_WORKSPACE_ID": "w1",
+            },
+            runner=runner,
+            sleeper=lambda _: None,
+            settled_confirmation_polls=0,
+            inspect_runtime_errors=True,
+        ).recover(
+            Harness.CODEX,
+            "must not be sent",
+            timeout_seconds=30,
+            agent_name="owned-codex",
+            context=DispatchContext(
+                PlacementTarget.TAB,
+                "Recover",
+                "recover-verified-fatal",
+                receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, "TASK-OK"),
+            ),
+            runtime=runtime,
+        )
+
+    assert outcome.error_code == "agent_auth_failed"
+    assert outcome.task_verified is True
+    assert outcome.agent_settled is True
+
+
 def test_recovery_without_migrated_baseline_enters_attention() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         workspace = Path(temporary)
@@ -668,6 +801,84 @@ def test_settled_fatal_recovery_follows_store_retry_policy() -> None:
     assert job["attempt_phase"] == AttemptPhase.ABANDONED.value
     assert job["error_code"] == "agent_auth_failed"
     assert job["agent_settled"] is True
+
+
+def test_resume_pane_run_timeout_reconciles_acceptance_without_rotating_operation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        config = replace(
+            load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+            workspace=workspace,
+            state_db=workspace / "state.db",
+        )
+        store = Store(config.state_db)
+        store.initialize()
+        with patch("herdr_orchestrator.store.time.time", return_value=50.0):
+            store.enqueue(
+                NewJob(
+                    config.name,
+                    "Resume timeout",
+                    Harness.CODEX,
+                    "Do the task",
+                    "resume-pane-run-timeout",
+                    1,
+                )
+            )
+            claimed = store.claim(
+                config.name,
+                limit=1,
+                lease_seconds=30,
+                slot_names={Harness.CODEX.value: ("owned-codex",)},
+            )[0]
+            store.record_outcome(
+                claimed,
+                DispatchOutcome(
+                    claimed.agent_name,
+                    AgentState.BLOCKED,
+                    False,
+                    "w1:p2",
+                    "agent_blocked",
+                    placement=PlacementTarget.TAB,
+                    execution_path=str(workspace),
+                    herdr_workspace_id="w1",
+                    correlation_id=claimed.correlation_id,
+                ),
+            )
+        runner = FakeRunner(
+            [
+                {"agent": _agent(workspace, AgentState.BLOCKED, 20)},
+                {"_error": "timeout"},
+                {"agent": _agent(workspace, AgentState.WORKING, 21)},
+                {"_error": "herdr_timeout"},
+            ]
+        )
+        coordinator = Coordinator(
+            config,
+            store=store,
+            dispatcher=_transport(workspace, runner),
+        )
+
+        with patch("herdr_orchestrator.store.time.time", return_value=100.0):
+            result = coordinator.resume_blocked(claimed.job_id, "Approved")
+        with closing(sqlite3.connect(config.state_db)) as connection, connection:
+            operation = connection.execute(
+                """
+                SELECT operation_token, operation_sequence, phase
+                FROM job_attempts WHERE id = ?
+                """,
+                (claimed.attempt_id,),
+            ).fetchone()
+        with (
+            patch("herdr_orchestrator.store.time.time", return_value=101.0),
+            pytest.raises(StoreError, match="job_not_resumable"),
+        ):
+            coordinator.resume_blocked(claimed.job_id, "Approved again")
+
+    assert result["state"] == JobState.BLOCKED.value
+    assert result["error_code"] == "herdr_timeout"
+    assert operation is not None
+    assert operation[1:] == (1, AttemptPhase.ATTENTION.value)
+    assert sum(call[0:3] == ["herdr", "pane", "run"] for call in runner.calls) == 1
 
 
 def _agent(workspace: Path, state: AgentState, sequence: int) -> dict[str, object]:

@@ -19,6 +19,8 @@ from herdr_orchestrator.model import (
     DispatchOutcome,
     Harness,
     NewJob,
+    ReceiptKind,
+    TaskReceipt,
 )
 from herdr_orchestrator.runner import Coordinator, OperationInterrupted
 from herdr_orchestrator.store import Store, StoreError
@@ -240,7 +242,7 @@ class PersistentAttemptDispatcher:
         self.sequence = max(12, self.sequence)
         if runtime.phase is not AttemptPhase.RECEIPT_OBSERVED:
             context.attempt_progress(self._progress(AttemptPhase.RECEIPT_OBSERVED, agent_name))
-        return self._outcome(agent_name)
+        return replace(self._outcome(agent_name), task_verified=runtime.task_verified)
 
     def _progress(self, phase: AttemptPhase, agent_name: str) -> AttemptProgress:
         return AttemptProgress(
@@ -354,7 +356,7 @@ class PersistentResumeDispatcher(PersistentAttemptDispatcher):
             context.attempt_progress(
                 self._resume_progress(AttemptPhase.RECEIPT_OBSERVED, agent_name)
             )
-        return self._outcome(agent_name)
+        return replace(self._outcome(agent_name), task_verified=runtime.task_verified)
 
     def _resume_progress(self, phase: AttemptPhase, name: str) -> AttemptProgress:
         return AttemptProgress(
@@ -369,6 +371,19 @@ class PersistentResumeDispatcher(PersistentAttemptDispatcher):
             agent_state=self.state,
             agent_settled=self.state is AgentState.DONE,
         )
+
+
+class VerifiedReceiptDispatcher(PersistentAttemptDispatcher):
+    def _progress(self, phase: AttemptPhase, agent_name: str) -> AttemptProgress:
+        progress = super()._progress(phase, agent_name)
+        return (
+            replace(progress, task_verified=True)
+            if phase is AttemptPhase.RECEIPT_OBSERVED
+            else progress
+        )
+
+    def _outcome(self, agent_name: str) -> DispatchOutcome:
+        return replace(super()._outcome(agent_name), task_verified=True)
 
 
 def test_public_run_operation_can_interrupt_after_a_durable_transition() -> None:
@@ -588,6 +603,56 @@ def test_dispatch_acceptance_callback_window_recovers_without_duplicate_prompt()
 def test_resume_acceptance_callback_window_recovers_without_duplicate_response() -> None:
     result = _exercise_acceptance_callback_window(resume=True)
     assert result == {"state": "blocked", "submission_count": 1}
+
+
+def test_declared_receipt_observation_crash_restarts_to_verified_success() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        config = replace(
+            load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+            state_db=Path(temporary) / "state.db",
+        )
+        config = replace(config, coordinator=replace(config.coordinator, lease_seconds=60))
+        store = Store(config.state_db)
+        store.initialize()
+        dispatcher = VerifiedReceiptDispatcher()
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 100.0)
+            store.enqueue(
+                NewJob(
+                    config.name,
+                    "Verified receipt crash",
+                    Harness.DROID,
+                    "Do the task once.",
+                    "verified-receipt-crash",
+                    2,
+                    receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, "TASK-OK"),
+                )
+            )
+            with pytest.raises(OperationInterrupted, match="receipt_observed"):
+                Coordinator(
+                    config,
+                    store=store,
+                    dispatcher=dispatcher,
+                    transition_observer=CrashAfterTransition(AttemptPhase.RECEIPT_OBSERVED),
+                ).run_once()
+        with closing(sqlite3.connect(config.state_db)) as connection, connection:
+            persisted = connection.execute(
+                "SELECT phase, task_verified FROM job_attempts"
+            ).fetchone()
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 161.0)
+            result = Coordinator(
+                config,
+                store=Store(config.state_db),
+                dispatcher=dispatcher,
+            ).run_once()
+        job = store.jobs(config.name)[0]
+
+    assert persisted == (AttemptPhase.RECEIPT_OBSERVED.value, 1)
+    assert result["succeeded"] == 1
+    assert dispatcher.prompt_count == 1
+    assert job["state"] == "succeeded"
+    assert job["task_verified"] is True
 
 
 def _exercise_run_once_crash(target: AttemptPhase) -> dict[str, object]:

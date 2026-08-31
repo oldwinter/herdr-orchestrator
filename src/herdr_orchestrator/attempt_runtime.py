@@ -18,6 +18,15 @@ from herdr_orchestrator.model import (
 from herdr_orchestrator.protocol import Command, CommandRunner, TransportError, run_json
 
 CONTROL_TIMEOUT_SECONDS = 10
+AMBIGUOUS_RESPONSE_SUBMISSION_ERRORS = frozenset(
+    {
+        "herdr_command_failed",
+        "herdr_invalid_response",
+        "herdr_timeout",
+        "herdr_unavailable",
+        "timeout",
+    }
+)
 OUTPUT_RECEIPT_UI_MARKERS = {"\u26ec", "⧬", "⏺", "•", "●", "◆", "◇", "✦"}
 
 
@@ -259,7 +268,11 @@ def recover_turn(
             error_code=(
                 "agent_blocked"
                 if state is AgentState.BLOCKED
-                else "task_receipt_recovery_unverified" if context.receipt is not None else None
+                else (
+                    "task_receipt_recovery_unverified"
+                    if context.receipt is not None and verified is not True
+                    else None
+                )
             ),
             placement=context.placement,
             execution_path=runtime.execution_path,
@@ -357,10 +370,60 @@ def _confirm_recovered_settlement(
     return state, sequence
 
 
+def submit_blocked_response(
+    host: RecoveryHost,
+    name: str,
+    pane_id: str,
+    response: str,
+    baseline_sequence: int,
+    timeout_seconds: int,
+    *,
+    on_acceptance: Callable[[Mapping[str, Any]], None] | None = None,
+) -> tuple[AgentState, int]:
+    accepted = False
+
+    def observe_acceptance(agent: Mapping[str, Any]) -> None:
+        nonlocal accepted
+        accepted = True
+        if on_acceptance is not None:
+            on_acceptance(agent)
+
+    def reconcile() -> tuple[AgentState, int]:
+        return wait_after_response(
+            host,
+            name,
+            baseline_sequence,
+            timeout_seconds,
+            on_acceptance=observe_acceptance,
+        )
+
+    try:
+        run_json(
+            host.runner,
+            Command(
+                ["herdr", "pane", "run", pane_id, response],
+                host.workspace,
+                CONTROL_TIMEOUT_SECONDS,
+            ),
+        )
+    except TransportError as submission_error:
+        if submission_error.code not in AMBIGUOUS_RESPONSE_SUBMISSION_ERRORS:
+            raise
+        try:
+            return reconcile()
+        except TransportError as reconciliation_error:
+            if accepted:
+                raise
+            raise TransportError(
+                "unsafe_turn_adoption",
+                summary=reconciliation_error.summary or submission_error.summary,
+            ) from reconciliation_error
+    return reconcile()
+
+
 def wait_after_response(
     host: RecoveryHost,
     name: str,
-    harness: Harness,
     baseline_sequence: int,
     timeout_seconds: int,
     *,
@@ -454,6 +517,7 @@ def _recovery_outcome(
         placement=context.placement,
         execution_path=runtime.execution_path,
         herdr_workspace_id=runtime.herdr_workspace_id,
+        task_verified=runtime.task_verified,
         error_summary=error_summary,
         agent_settled=agent_settled,
     )

@@ -64,6 +64,8 @@ identity、phase 和 sequence。这个 reconciliation 不增加 attempt：
   operation。因此 `prompt_accepted` 或 send/callback 模糊窗口进入 `attention`，不重发 prompt。
 - 已持久化 `settled` 或 `receipt_observed` 时，只有 live identity、terminal state 和 exact
   sequence 都未变化，coordinator 才继续提交原 durable outcome；任何偏差都进入 `attention`。
+  `receipt_observed` 的 `task_verified=true` 直接沿用，包含后续 fatal outcome，不会降级为
+  recovery-unverified。
 
 `attention` receipt 使用 `unsafe_turn_adoption`，明确表示无法证明 turn ownership，而不是普通
 agent question。
@@ -280,8 +282,9 @@ route -> wayfinder? -> spec + ticket DAG -> frontier worktrees
 输出严格 decision JSON，再把回答交回原 worker。最多 8 轮。deterministic guard 与
 schema 都要求 secret/production 升级。由于 Herdr 拒绝向已 blocked agent 提交普通
 `agent prompt`，response 通过一次 `herdr pane run` 提交；该 API 原子发送 literal text 与 Enter，
-不存在独立的 staged-text 和 Enter side effect。提交后按新的 lifecycle sequence 等待结果；
-response 本身不进入 decision ledger。
+不存在独立的 staged-text 和 Enter side effect。若 control response timeout 或不可解析，transport
+仍读取 live sequence：已接受就持久化 `prompt_accepted` 并继续等待；无法收敛则原 operation 进入
+`attention`，不会旋转 token 或重发。response 本身不进入 decision ledger。
 
 每次运行的状态、map、plan、routes、receipts、reviews、ledger 和 worktrees 保存在
 `.orchestrator/deliveries/<run-id>/`。最终产物是隔离 integration branch 与 commit，

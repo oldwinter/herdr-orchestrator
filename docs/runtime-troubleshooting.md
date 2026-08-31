@@ -58,7 +58,8 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 - stalled prompt 最多重发两次 Enter；仍无变化返回 `agent_turn_not_observed`。
 - 进入 `working` 后继续使用 workflow 的 `agent_timeout_seconds` 等待 settled。
 - principal proxy 使用一次 `pane run` 回答 blocked worker，再等待新的 lifecycle sequence；
-  普通 queue 不自动回答。
+  control response timeout 或不可解析时仍复查 live sequence。已接受但未 settled，或无法完成
+  reconciliation 时，同一 operation 进入 attention；普通 queue 不自动回答，也不旋转 token 重发。
 - 人工审查后，普通 queue 可用显式 `resume --job-id ... --response-file ...` 回答；命令验证
   原 agent、pane 与 execution workspace，并保持原 attempt。每次 resume 使用新的 operation
   token；过期且已接受但尚未 durably settled 的 response 进入 attention，不会重复发送。
@@ -72,6 +73,8 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 - recovery 用 `agent get` 验证 ownership。只有 durable `settled`/`receipt_observed` 的 terminal
   state 与 exact sequence 仍匹配时，才可继续 outcome。随后最多读取 80 行 detection output，
   只用于现有 fatal signal 分类；完整 output 不进入 SQLite、receipt 或日志摘要。
+- durable `receipt_observed` 的 `task_verified=true` 在成功和 settled fatal recovery 中都保留；
+  只有 verification 缺失或不为 true 才返回 `task_receipt_recovery_unverified`。
 - stale phase 和 outcome 会保留为 `is_stale=1` receipt。status、resume 和 GC 不读取 stale
   receipt 作为当前 identity 或 pane ownership。
 - settled output 命中登录墙、device login、provider retry exhaustion 或 invalid model 时，
@@ -138,7 +141,7 @@ herdr integration status
 | `task_receipt_stale` | file receipt 在当前 turn 前后未改变 | 按 attempt 失败处理 |
 | `lease_expired_unaccepted` | reconciliation 证明原 operation 未接受输入 | abandon 原 operation；dispatch 可按 budget 创建 replacement |
 | `unsafe_turn_adoption` | runtime identity 或 sequence 不能证明同一 accepted turn | terminal attention；不发送 replacement prompt |
-| `task_receipt_recovery_unverified` | settled recovery 缺少 durable receipt freshness baseline | terminal attention；不重复执行任务 |
+| `task_receipt_recovery_unverified` | settled recovery 的 durable verification 缺失或不为 true | terminal attention；不重复执行任务 |
 
 Herdr 0.8.2 没有 active-turn cancellation command。`unsafe_turn_adoption` 的 fencing 只保护
 SQLite current projection。它不能停止 agent，也不能撤销外部副作用。

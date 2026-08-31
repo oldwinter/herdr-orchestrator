@@ -403,18 +403,11 @@ class HerdrTransport:
                 True,
             )
             reporter.runtime_acquired(current, baseline_sequence)
-            run_json(
-                self.runner,
-                Command(
-                    ["herdr", "pane", "run", pane_id, response],
-                    self.workspace,
-                    CONTROL_TIMEOUT_SECONDS,
-                ),
-            )
-            state, settlement_sequence = attempt_runtime.wait_after_response(
+            state, settlement_sequence = attempt_runtime.submit_blocked_response(
                 self,
                 name,
-                harness,
+                pane_id,
+                response,
                 baseline_sequence,
                 timeout_seconds,
                 on_acceptance=lambda agent: reporter.prompt_accepted(

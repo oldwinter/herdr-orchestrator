@@ -812,7 +812,6 @@ class AttemptLedger:
             normalized,
             AttemptPhase(str(row["phase"])),
             outcome,
-            resume=resume,
             now=now,
         )
         AttemptLedger._commit_attempt_outcome(
@@ -854,12 +853,10 @@ class AttemptLedger:
         current_phase: AttemptPhase,
         outcome: DispatchOutcome,
         *,
-        resume: bool,
         now: float,
     ) -> tuple[_NormalizedOutcome, AttemptPhase]:
         accepted_unsettled = bool(
-            not resume
-            and not normalized.agent_settled
+            not normalized.agent_settled
             and current_phase
             in {
                 AttemptPhase.PROMPT_ACCEPTED,
