@@ -46,7 +46,7 @@ security:
     @mkdir -p .orchestrator/quality
     @uv run detect-secrets-hook --baseline .secrets.baseline $(git ls-files --cached --others --exclude-standard)
     @uv run bandit -q -r src -ll -f json -o .orchestrator/quality/bandit.json
-    @uv run pip-audit --local --format json --output .orchestrator/quality/pip-audit.json
+    @uv run pip-audit --local --skip-editable --format json --output .orchestrator/quality/pip-audit.json
     @npm audit --package-lock-only
     @npm audit --package-lock-only --prefix packages/herdr-manager
 
