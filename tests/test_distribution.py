@@ -46,6 +46,16 @@ class DistributionCliTests(unittest.TestCase):
         self.assertEqual(version.stdout.strip(), python_version)
         self.assertEqual(__version__, python_version)
 
+    def test_manager_package_homepage_targets_its_own_readme(self) -> None:
+        metadata = json.loads((MANAGER_PACKAGE / "package.json").read_text(encoding="utf-8"))
+        repository = metadata["repository"]
+        repository_url = repository["url"].removeprefix("git+").removesuffix(".git")
+
+        self.assertEqual(
+            metadata["homepage"],
+            f"{repository_url}/tree/main/{repository['directory']}#readme",
+        )
+
     def test_missing_option_value_returns_a_stable_cli_error(self) -> None:
         result = self._run("install", "--project")
 
