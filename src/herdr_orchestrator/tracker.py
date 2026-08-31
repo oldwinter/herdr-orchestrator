@@ -29,11 +29,12 @@ SECRET_TOKEN_SHAPE = re.compile(
     r"xox[baprs]-[A-Za-z0-9-]{20,}|npm_[A-Za-z0-9_]{20,}|pypi-[A-Za-z0-9_-]{20,})\b"
 )
 BEARER_TOKEN_SHAPE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}\b")
+JWT_SHAPE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
 PRIVATE_KEY_SHAPE = re.compile(r"(?i)-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----")
 SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(?:api[_-]?key|access[_-]?token|auth(?:entication)?[_-]?token|"
     r"client[_-]?secret|credential|password|private[_-]?key|secret|token)\s*[:=]\s*"
-    r"[\"']?([A-Za-z0-9_./+=:-]{4,})"
+    r"[\"']?([^\s\"']+)"
 )
 AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
 GOOGLE_API_KEY = re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")
@@ -540,6 +541,7 @@ def contains_high_confidence_secret(value: object) -> bool:
         SECRET_TOKEN_SHAPE.search(text)
         or BEARER_TOKEN_SHAPE.search(text)
         or PRIVATE_KEY_SHAPE.search(text)
+        or JWT_SHAPE.search(text)
     ):
         return True
     if AWS_ACCESS_KEY.search(text) or GOOGLE_API_KEY.search(text):
