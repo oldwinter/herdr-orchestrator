@@ -16,13 +16,25 @@ from herdr_orchestrator.feature_flags import FeatureFlag, enabled
 
 MAX_TEXT = 300
 SENSITIVE_KEY = re.compile(
-    r"(?i)(authorization|cookie|credential|password|prompt|secret|session|terminal|token)"
+    r"(?i)(authorization|cookie|credential|password|prompt|secret|session|terminal|token|"
+    r"(?:^|[_-])(?:path|pane)(?:[_-]id)?(?:$|[_-]))"
 )
 TOKEN_SHAPE = re.compile(
     r"(?i)\b(?:gh[oprsu]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|"
     r"bearer\s+[A-Za-z0-9._~+/=-]{12,})\b"
 )
-ASSIGNMENT_SHAPE = re.compile(r"(?i)\b(authorization|password|secret|token)\s*[:=]\s*\S+")
+ASSIGNMENT_SHAPE = re.compile(
+    r"(?i)\b(authorization|cookie|credential|password|prompt|secret|session|terminal|token|"
+    r"path|pane(?:[_ -]?id)?)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
+PATH_SHAPE = re.compile(
+    r"(?<![\w:/])(?:"
+    r"(?:~|\.\.?)/[^\s,;]+|"
+    r"/(?:[^\s/,;]+/)*[^\s,;]+|"
+    r"[A-Za-z]:\\(?:[^\s\\,;]+\\)*[^\s,;]+"
+    r")"
+)
+PANE_ID_SHAPE = re.compile(r"(?i)\b(?:w[\w.-]+:p[\w.-]+|pane[-_:][\w.:-]+)\b")
 
 
 def sanitize(value: object, *, key: str = "") -> object:
@@ -35,13 +47,14 @@ def sanitize(value: object, *, key: str = "") -> object:
         }
     if isinstance(value, (list, tuple)):
         return [sanitize(item) for item in value]
-    if isinstance(value, str):
-        scrubbed = TOKEN_SHAPE.sub("[REDACTED]", value)
-        scrubbed = ASSIGNMENT_SHAPE.sub(r"\1=[REDACTED]", scrubbed)
-        return " ".join(scrubbed.split())[:MAX_TEXT]
     if value is None or isinstance(value, (bool, int, float)):
         return value
-    return str(value)[:MAX_TEXT]
+    text = value if isinstance(value, str) else str(value)
+    scrubbed = TOKEN_SHAPE.sub("[REDACTED]", text)
+    scrubbed = ASSIGNMENT_SHAPE.sub(r"\1=[REDACTED]", scrubbed)
+    scrubbed = PATH_SHAPE.sub("[REDACTED]", scrubbed)
+    scrubbed = PANE_ID_SHAPE.sub("[REDACTED]", scrubbed)
+    return " ".join(scrubbed.split())[:MAX_TEXT]
 
 
 def anonymous_install_id(workspace: Path) -> str:
