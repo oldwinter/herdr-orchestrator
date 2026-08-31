@@ -208,17 +208,23 @@ def _job_attention(
 
 
 def _topology(herdr: HerdrObservation, project_label: str) -> dict[str, object]:
-    agents_by_pane = {
-        str(row["pane_id"]): row for row in herdr.agents if isinstance(row.get("pane_id"), str)
-    }
+    agents_by_pane: dict[str, list[dict[str, object]]] = {}
+    for agent in herdr.agents:
+        pane_id = agent.get("pane_id")
+        if isinstance(pane_id, str):
+            agents_by_pane.setdefault(pane_id, []).append(agent)
     panes_by_tab: dict[str, list[dict[str, object]]] = {}
     for pane in herdr.panes:
         tab_id = pane.get("tab_id")
         if not isinstance(tab_id, str):
             continue
         projected = dict(pane)
-        agent = agents_by_pane.get(str(pane.get("pane_id")))
-        projected["agent"] = dict(agent) if agent is not None else None
+        candidates = agents_by_pane.get(str(pane.get("pane_id")), [])
+        matching_agent = next(
+            (candidate for candidate in candidates if _same_topology_location(pane, candidate)),
+            None,
+        )
+        projected["agent"] = dict(matching_agent) if matching_agent is not None else None
         panes_by_tab.setdefault(tab_id, []).append(projected)
     tabs_by_workspace: dict[str, list[dict[str, object]]] = {}
     for tab in herdr.tabs:
@@ -227,7 +233,9 @@ def _topology(herdr: HerdrObservation, project_label: str) -> dict[str, object]:
         if not isinstance(workspace_id, str) or not isinstance(tab_id, str):
             continue
         projected = dict(tab)
-        projected["panes"] = panes_by_tab.get(tab_id, [])
+        projected["panes"] = [
+            pane for pane in panes_by_tab.get(tab_id, []) if _same_topology_location(tab, pane)
+        ]
         tabs_by_workspace.setdefault(workspace_id, []).append(projected)
     worktree_by_workspace = {
         str(row["open_workspace_id"]): row
@@ -282,6 +290,22 @@ def _topology(herdr: HerdrObservation, project_label: str) -> dict[str, object]:
         else []
     )
     return {"workspaces": workspaces, "projects": projects}
+
+
+def _same_topology_location(
+    left: Mapping[str, object],
+    right: Mapping[str, object],
+) -> bool:
+    for field in ("workspace_id", "tab_id"):
+        left_value = left.get(field)
+        right_value = right.get(field)
+        if (
+            isinstance(left_value, str)
+            and isinstance(right_value, str)
+            and left_value != right_value
+        ):
+            return False
+    return True
 
 
 def _timeline(

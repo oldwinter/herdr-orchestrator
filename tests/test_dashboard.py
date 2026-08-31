@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from copy import deepcopy
 from dataclasses import replace
 from http.client import HTTPConnection
 from pathlib import Path
@@ -155,6 +156,21 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(snapshot["summary"]["running"], 1)
         self.assertEqual(snapshot["summary"]["active_agents"], 1)
+        self.assertLessEqual(
+            {
+                "schema_version",
+                "workflow",
+                "generated_at",
+                "source_health",
+                "summary",
+                "jobs",
+                "attention",
+                "topology",
+                "timeline",
+            },
+            set(snapshot),
+        )
+        self.assertLessEqual({"workspaces", "projects"}, set(snapshot["topology"]))
         self.assertIn("running_agent_missing", snapshot["jobs"][0]["drift"])
         self.assertIn(
             "terminal_job_agent_working",
@@ -175,26 +191,52 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(worktree["is_linked_worktree"])
         self.assertEqual(worktree["tabs"][0]["panes"][0]["pane_id"], "w1:p2")
         self.assertEqual(snapshot["timeline"][0]["type"], "receipt")
-        self.assertGreaterEqual(snapshot["summary"]["needs_attention"], 3)
+        attention_codes = {item["code"] for item in snapshot["attention"]}
+        self.assertLessEqual(
+            {
+                "running_agent_missing",
+                "terminal_job_agent_working",
+                "lease_expired",
+                "job_stale",
+            },
+            attention_codes,
+        )
 
-    def test_topology_does_not_attach_foreign_agent_to_local_pane(self) -> None:
+    def test_topology_does_not_cross_join_foreign_entities(self) -> None:
         herdr = HerdrObservation(
             "ok",
             None,
-            ({"workspace_id": "local", "label": "local"},),
-            ({"workspace_id": "local", "tab_id": "local:t1", "label": "local"},),
-            ({"workspace_id": "local", "tab_id": "local:t1", "pane_id": "local:p1"},),
             (
+                {"workspace_id": "local", "label": "local"},
+                {"workspace_id": "foreign", "label": "foreign"},
+            ),
+            (
+                {"workspace_id": "local", "tab_id": "shared:t1", "label": "local"},
+                {"workspace_id": "foreign", "tab_id": "shared:t1", "label": "foreign"},
+            ),
+            (
+                {"workspace_id": "local", "tab_id": "shared:t1", "pane_id": "shared:p1"},
+                {"workspace_id": "foreign", "tab_id": "shared:t1", "pane_id": "shared:p1"},
+            ),
+            (
+                {
+                    "name": "local-agent",
+                    "workspace_id": "local",
+                    "tab_id": "shared:t1",
+                    "pane_id": "shared:p1",
+                    "agent_status": "idle",
+                },
                 {
                     "name": "foreign-agent",
                     "workspace_id": "foreign",
-                    "tab_id": "foreign:t1",
-                    "pane_id": "local:p1",
+                    "tab_id": "shared:t1",
+                    "pane_id": "shared:p1",
                     "agent_status": "working",
                 },
             ),
             (),
         )
+        original_herdr = deepcopy(herdr)
 
         snapshot = RuntimeProjector(
             "example",
@@ -203,8 +245,16 @@ class DashboardTests(unittest.TestCase):
             clock=lambda: 2_000.0,
         ).snapshot()
 
-        pane = snapshot["topology"]["workspaces"][0]["tabs"][0]["panes"][0]
-        self.assertIsNone(pane["agent"])
+        workspaces = {
+            workspace["workspace_id"]: workspace for workspace in snapshot["topology"]["workspaces"]
+        }
+        local_panes = workspaces["local"]["tabs"][0]["panes"]
+        foreign_panes = workspaces["foreign"]["tabs"][0]["panes"]
+        self.assertEqual(len(local_panes), 1)
+        self.assertEqual(len(foreign_panes), 1)
+        self.assertEqual(local_panes[0]["agent"]["name"], "local-agent")
+        self.assertEqual(foreign_panes[0]["agent"]["name"], "foreign-agent")
+        self.assertEqual(herdr, original_herdr)
 
     def test_herdr_observer_scopes_and_whitelists_runtime_fields(self) -> None:
         workspace = Path("/repo")
