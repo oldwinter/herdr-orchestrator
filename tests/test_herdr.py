@@ -322,6 +322,30 @@ class HerdrTransportTests(unittest.TestCase):
         self.assertEqual(len(runner.calls), 3)
         self.assertIn("--wait", runner.calls[2])
 
+    def test_rejects_reusable_agent_from_another_herdr_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner([
+                _result({"agent": {
+                    "agent": "droid", "agent_status": "idle",
+                    "cwd": str(workspace), "foreground_cwd": str(workspace),
+                    "interactive_ready": True, "workspace_id": "w2",
+                    "pane_id": "w2:p9", "state_change_seq": 1,
+                }}),
+            ])
+            transport = HerdrTransport(
+                "example", workspace,
+                environ={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"},
+                runner=runner, settled_confirmation_polls=0,
+                inspect_runtime_errors=False,
+            )
+
+            outcome = transport.dispatch(Harness.DROID, "inspect", timeout_seconds=30)
+
+        self.assertEqual(outcome.error_code, "agent_workspace_mismatch")
+        self.assertEqual(outcome.state, AgentState.UNKNOWN)
+        self.assertEqual(len(runner.calls), 1)
+
     def test_rejects_settled_prompt_without_state_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -585,6 +609,7 @@ class HerdrTransportTests(unittest.TestCase):
             outcome = transport.dispatch(Harness.PI, "inspect", timeout_seconds=30)
 
         self.assertEqual(outcome.error_code, "not_in_herdr")
+        self.assertFalse(outcome.member_reused)
 
     def test_recovers_agent_that_becomes_ready_after_start_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2359,6 +2384,21 @@ class HerdrTransportTests(unittest.TestCase):
             ["herdr", "agent", "send-keys", "blocked-worker", "enter"],
         )
         self.assertFalse(any(call[0:3] == ["herdr", "agent", "prompt"] for call in runner.calls))
+
+    def test_blocked_response_respects_an_expired_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            runner = FakeRunner([])
+            transport = HerdrTransport(
+                "example", workspace,
+                environ={"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1"},
+                runner=runner,
+            )
+
+            outcome = transport.respond("blocked", Harness.CODEX, "approve", timeout_seconds=0)
+
+        self.assertEqual(outcome.error_code, "herdr_timeout")
+        self.assertEqual(runner.calls, [])
 
     def test_refuses_blocked_response_when_owned_pane_changed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
