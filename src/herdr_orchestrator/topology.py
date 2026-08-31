@@ -147,6 +147,10 @@ def load_topology_decision(
         or "\x00" in rationale
     ):
         raise TopologyDecisionError("topology_rationale_invalid")
+    try:
+        rationale.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise TopologyDecisionError("topology_rationale_invalid") from exc
     placement = payload.get("placement")
     if not isinstance(placement, str):
         raise TopologyDecisionError("topology_placement_invalid")
@@ -245,6 +249,10 @@ def _validate_output_path(path: Path) -> None:
         or any(ord(char) < 32 or ord(char) == 127 for char in rendered)
     ):
         raise TopologyDecisionError("topology_output_path_invalid")
+    try:
+        rendered.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise TopologyDecisionError("topology_output_path_invalid") from exc
     for parent in (path, *path.parents):
         try:
             if parent.is_symlink():
@@ -258,6 +266,10 @@ def _validate_prompt_text(value: str) -> None:
         raise TopologyDecisionError("topology_prompt_invalid")
     if any((ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127 for char in value):
         raise TopologyDecisionError("topology_prompt_invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise TopologyDecisionError("topology_prompt_invalid") from exc
 
 
 def _validate_git_capability(supports_worktree: bool) -> None:

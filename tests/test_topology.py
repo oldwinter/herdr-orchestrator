@@ -265,6 +265,31 @@ class TopologyTests(unittest.TestCase):
             ):
                 load_topology_decision(output, supports_worktree=True)
 
+    def test_rejects_unencodable_controller_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "topology.json"
+            output.write_text(
+                '{"placement":"pane","rationale":"\\ud800"}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                TopologyDecisionError,
+                "topology_rationale_invalid",
+            ):
+                load_topology_decision(output, supports_worktree=True)
+
+        with self.assertRaisesRegex(
+            TopologyDecisionError,
+            "topology_prompt_invalid",
+        ):
+            topology_decision_prompt(
+                "Task\ud800",
+                "Choose a placement.",
+                Path("topology.json"),
+                supports_worktree=True,
+            )
+
     def test_display_label_truncates_without_hash_suffix(self) -> None:
         label = short_display_label(
             "Implement a very long topology decision title for this workflow",
