@@ -90,7 +90,7 @@ def run_json(
         )
     try:
         payload = json.loads(process.stdout)
-    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise TransportError("herdr_invalid_response") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
         raise TransportError("herdr_invalid_response")
@@ -119,7 +119,7 @@ def parse_error_code(stderr: object) -> str:
         return "herdr_command_failed"
     try:
         payload = json.loads(stderr)
-    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+    except (TypeError, ValueError, RecursionError):
         return "herdr_command_failed"
     if isinstance(payload, dict):
         error = payload.get("error")
