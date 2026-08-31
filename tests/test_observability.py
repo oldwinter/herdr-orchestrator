@@ -38,8 +38,12 @@ class ObservabilityTests(unittest.TestCase):
         sanitized = sanitize(
             {
                 "token": "secret-value",
+                "api_key": "api-secret",  # pragma: allowlist secret
                 "message": "Authorization: [TEST-CREDENTIAL]",
-                "nested": {"password": "unsafe"},  # pragma: allowlist secret
+                "nested": {
+                    "password": "unsafe",  # pragma: allowlist secret
+                    "items": [{"api_key": "nested-api-secret"}],  # pragma: allowlist secret
+                },
                 "raw_prompt": prompt,
                 "execution_path": private_path,
                 "pane_id": pane_id,
@@ -52,7 +56,9 @@ class ObservabilityTests(unittest.TestCase):
         )
         assert isinstance(sanitized, dict)
         self.assertEqual(sanitized["token"], "[REDACTED]")
+        self.assertEqual(sanitized["api_key"], "[REDACTED]")
         self.assertEqual(sanitized["nested"]["password"], "[REDACTED]")
+        self.assertEqual(sanitized["nested"]["items"][0]["api_key"], "[REDACTED]")
         self.assertNotIn("[TEST-CREDENTIAL]", sanitized["message"])
         self.assertEqual(sanitized["raw_prompt"], "[REDACTED]")
         self.assertEqual(sanitized["execution_path"], "[REDACTED]")
@@ -153,6 +159,91 @@ class ObservabilityTests(unittest.TestCase):
         self.assertTrue(all(prompt.encode() not in request.data for request in requests))
         self.assertTrue(all(private_path.encode() not in request.data for request in requests))
         self.assertTrue(all(pane_id.encode() not in request.data for request in requests))
+
+    def test_local_persistence_sanitizes_the_entire_record(self) -> None:
+        private_path = "/srv/private/customer-alpha/job.txt"
+        pane_id = "w9:p7"
+        prompt = "[TEST-PROMPT] keep this private"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            telemetry = Observability(
+                root,
+                f"workflow at {private_path}",
+                environ={},
+                clock=lambda: 42.0,
+            )
+            telemetry.event(
+                f'dispatch_started prompt="{prompt}" at {private_path}',
+                correlation_id=f"trace-1 pane_id={pane_id}",
+                fields={
+                    "nested": [{"api_key": "nested-api-secret"}],  # pragma: allowlist secret
+                    "visible": "keep this correlation context",
+                },
+            )
+            telemetry.metric(
+                f"dispatch_duration token=secret-value",
+                1.25,
+                correlation_id=f"trace-1 at {private_path}",
+                fields={"nested": {"api_key": "metric-api-secret"}},  # pragma: allowlist secret
+            )
+
+            event = json.loads((root / "events.jsonl").read_text())
+            metric = json.loads((root / "metrics.jsonl").read_text())
+
+        for record in (event, metric):
+            serialized = json.dumps(record)
+            self.assertNotIn(prompt, serialized)
+            self.assertNotIn(private_path, serialized)
+            self.assertNotIn(pane_id, serialized)
+            self.assertNotIn("nested-api-secret", serialized)
+            self.assertNotIn("metric-api-secret", serialized)
+        self.assertEqual(event["schema_version"], 1)
+        self.assertEqual(event["correlation_id"], "trace-1 pane_id=[REDACTED]")
+        self.assertEqual(event["fields"]["nested"][0]["api_key"], "[REDACTED]")
+        self.assertEqual(event["fields"]["visible"], "keep this correlation context")
+        self.assertEqual(metric["value"], 1.25)
+
+    def test_malformed_https_exporter_endpoint_fails_soft(self) -> None:
+        environ = {
+            "HERDR_FEATURE_WEBHOOK_ALERTS": "true",
+            "HERDR_ALERT_WEBHOOK_URL": "https://[",
+        }
+        opener = MagicMock()
+        with tempfile.TemporaryDirectory() as temporary:
+            telemetry = Observability(Path(temporary), "example", environ=environ)
+            with patch("herdr_orchestrator.observability.urllib.request.urlopen", opener):
+                telemetry.alert("dispatch_needs_attention", correlation_id="trace-4")
+        opener.assert_not_called()
+
+    def test_exporter_serialization_failure_fails_soft(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            telemetry = Observability(Path(temporary), "example", environ={})
+            with patch(
+                "herdr_orchestrator.observability.json.dumps",
+                side_effect=ValueError("cannot serialize"),
+            ):
+                telemetry._post_json("https://alerts.example.test/herdr", {"event": "test"})
+
+    def test_exporter_transport_failure_fails_soft_with_bounded_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            telemetry = Observability(Path(temporary), "example", environ={})
+            opener = MagicMock(side_effect=RuntimeError("transport unavailable"))
+            with patch("herdr_orchestrator.observability.urllib.request.urlopen", opener):
+                telemetry._post_json("https://alerts.example.test/herdr", {"event": "test"})
+        self.assertEqual(opener.call_count, 1)
+        self.assertEqual(opener.call_args.kwargs["timeout"], 2)
+
+    def test_invalid_exporter_flag_fails_closed_inside_telemetry(self) -> None:
+        environ = {
+            "HERDR_FEATURE_SENTRY_EXPORT": "maybe",
+            "SENTRY_DSN": "https://public@example.test/project",  # pragma: allowlist secret
+        }
+        opener = MagicMock()
+        with tempfile.TemporaryDirectory() as temporary:
+            telemetry = Observability(Path(temporary), "example", environ=environ)
+            with patch("herdr_orchestrator.observability.urllib.request.urlopen", opener):
+                telemetry.event("dispatch_finished", correlation_id="trace-5")
+        opener.assert_not_called()
 
     def test_exporters_fail_closed_for_missing_or_invalid_configuration(self) -> None:
         environ = {
