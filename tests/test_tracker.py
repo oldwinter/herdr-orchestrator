@@ -16,6 +16,7 @@ from herdr_orchestrator.tracker import (
     LocalMarkdownTracker,
     TrackerError,
     TrackerTicket,
+    render_spec,
 )
 
 
@@ -89,6 +90,42 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
                     ),
                 )
 
+    def test_rejects_tracker_path_escape_from_unvalidated_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "tracker"
+            with self.assertRaisesRegex(TrackerError, "local_tracker_path_invalid"):
+                LocalMarkdownTracker(root).publish(_plan(slug="../outside"))
+            self.assertFalse((Path(temporary) / "outside").exists())
+
+    def test_rejects_symlinked_tracker_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "tracker"
+            plan = _plan()
+            feature_root = root / plan.slug
+            issues_root = feature_root / "issues"
+            issues_root.mkdir(parents=True)
+            (feature_root / "spec.md").write_text(
+                render_spec(plan),
+                encoding="utf-8",
+            )
+            target = Path(temporary) / "outside.md"
+            target.write_text("untouched", encoding="utf-8")
+            (issues_root / "01-add-one-slice.md").symlink_to(target)
+
+            with self.assertRaisesRegex(TrackerError, "local_tracker_path_symlink"):
+                LocalMarkdownTracker(root).publish(plan)
+            self.assertEqual(target.read_text(encoding="utf-8"), "untouched")
+
+    def test_maps_invalid_existing_tracker_encoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "tracker"
+            plan = _plan()
+            LocalMarkdownTracker(root).publish(plan)
+            (root / plan.slug / "spec.md").write_bytes(b"\xff")
+
+            with self.assertRaisesRegex(TrackerError, "local_artifact_invalid_encoding"):
+                LocalMarkdownTracker(root).publish(plan)
+
 
 class FakeGithubRunner:
     def __init__(self, *, issue_url: str | None = None) -> None:
@@ -157,7 +194,7 @@ class GithubTrackerTests(unittest.TestCase):
         self.assertNotIn("--label", runner.calls[0])
         self.assertIn(
             "https://github.com/owner/project/issues/41",
-            " ".join(runner.calls[1]),
+            runner.body_contents[1],
         )
 
     def test_transports_multiline_bodies_through_body_files(self) -> None:
@@ -181,7 +218,10 @@ class GithubTrackerTests(unittest.TestCase):
         self.assertEqual(len(body_calls), 3)
         self.assertTrue(all("--body" not in call for call in runner.calls))
         self.assertIn("## Problem Statement\n\n", runner.body_contents[0])
-        self.assertIn("## Parent\n\nhttps://github.com/owner/project/issues/41\n\n", runner.body_contents[1])
+        self.assertIn(
+            "## Parent\n\nhttps://github.com/owner/project/issues/41\n\n",
+            runner.body_contents[1],
+        )
         self.assertIn("**Status:** completed", runner.body_contents[2])
         self.assertTrue(all("\\n" not in body for body in runner.body_contents))
 
@@ -205,8 +245,14 @@ class GithubTrackerTests(unittest.TestCase):
     def test_maps_invalid_runner_output_to_stable_tracker_errors(self) -> None:
         for stdout in (None, b"https://github.com/owner/project/issues/41\n"):
             with self.subTest(stdout=stdout):
-                def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-                    return subprocess.CompletedProcess(argv, 0, stdout, "")  # type: ignore[arg-type]
+
+                def runner(
+                    argv: list[str],
+                    *,
+                    output: object = stdout,
+                    **_: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    return subprocess.CompletedProcess(argv, 0, output, "")  # type: ignore[arg-type]
 
                 with self.assertRaisesRegex(
                     TrackerError,
@@ -219,6 +265,13 @@ class GithubTrackerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TrackerError, "github_invalid_response"):
             GithubTracker("owner/project", runner=decode_failure).publish(_plan())
+
+        class MissingStdoutRunner:
+            def __call__(self, argv: list[str], **_: object) -> object:
+                return type("Process", (), {"returncode": 0})()
+
+        with self.assertRaisesRegex(TrackerError, "github_invalid_response"):
+            GithubTracker("owner/project", runner=MissingStdoutRunner()).publish(_plan())
 
     def test_rejects_tampered_ticket_reference_before_editing(self) -> None:
         runner = FakeGithubRunner()
@@ -243,9 +296,9 @@ class GithubTrackerTests(unittest.TestCase):
             )
 
 
-def _plan() -> DeliveryPlan:
+def _plan(*, slug: str = "focused-delivery") -> DeliveryPlan:
     return DeliveryPlan(
-        slug="focused-delivery",
+        slug=slug,
         title="Focused delivery",
         problem_statement="The behavior is missing.",
         solution="Add it.",
