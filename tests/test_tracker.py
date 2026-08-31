@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from herdr_orchestrator.delivery_protocol import (
@@ -21,6 +22,18 @@ from herdr_orchestrator.tracker import (
 
 
 class LocalMarkdownTrackerTests(unittest.TestCase):
+    def test_rejects_symlinked_tracker_root_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            outside.mkdir()
+            tracker_root = root / "tracker"
+            tracker_root.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(TrackerError, "local_tracker_path_symlink"):
+                LocalMarkdownTracker(tracker_root).publish(_plan())
+            self.assertEqual(tuple(outside.iterdir()), ())
+
     def test_publishes_one_file_per_ticket_and_closes_with_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -161,6 +174,19 @@ class FakeGithubRunner:
 
 
 class GithubTrackerTests(unittest.TestCase):
+    def test_rejects_secret_material_before_creating_issue(self) -> None:
+        runner = FakeGithubRunner()
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"  # pragma: allowlist secret
+        plan = replace(
+            _plan(),
+            problem_statement=f"Configure token={secret} for the service.",
+        )
+
+        with self.assertRaisesRegex(TrackerError, "github_secret_material"):
+            GithubTracker("owner/project", runner=runner).publish(plan)
+
+        self.assertEqual(runner.calls, [])
+
     def test_creates_spec_and_tickets_then_closes_with_receipt(self) -> None:
         runner = FakeGithubRunner()
         tracker = GithubTracker("owner/project", runner=runner)

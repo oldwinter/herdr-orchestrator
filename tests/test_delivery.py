@@ -17,21 +17,25 @@ from herdr_orchestrator.delivery import (
     DeliveryEscalation,
     StandardizedDelivery,
     _delivery_run_claim,
+    _write_json,
 )
 from herdr_orchestrator.delivery_protocol import (
+    DeliveryArtifactError,
     FindingSeverity,
     ReviewFinding,
     ReviewReport,
     load_delivery_plan,
+    load_wayfinder_route,
 )
-from herdr_orchestrator.git_workspace import GitWorkspace, Worktree
+from herdr_orchestrator.git_workspace import GitWorkspace, GitWorkspaceError, Worktree
 from herdr_orchestrator.model import (
     AgentState,
     DispatchOutcome,
     Harness,
+    TrackerBackend,
     WayfinderMode,
 )
-from herdr_orchestrator.tracker import LocalMarkdownTracker
+from herdr_orchestrator.tracker import GithubTracker, LocalMarkdownTracker
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -313,6 +317,176 @@ class SettledWithoutArtifactDispatcher:
 
 
 class StandardizedDeliveryTests(unittest.TestCase):
+    def test_rejects_ticket_commit_with_divergent_history_before_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            _git(repository, "init", "-b", "main")
+            _git(repository, "config", "user.name", "Test User")
+            _git(repository, "config", "user.email", "test@example.com")
+            (repository / "README.md").write_text("base\n", encoding="utf-8")
+            _git(repository, "add", "README.md")
+            _git(repository, "commit", "-m", "chore: initialize")
+            base_commit = _git(repository, "rev-parse", "HEAD").stdout.strip()
+            ticket_path = root / "runtime" / "worktrees" / "ticket-01"
+            ticket_path.parent.mkdir(parents=True)
+            branch = "ho/delivery/ticket-01"
+            _git(repository, "worktree", "add", "-b", branch, str(ticket_path), base_commit)
+            _git(ticket_path, "checkout", "--orphan", "divergent")
+            _git(ticket_path, "rm", "-rf", ".")
+            (ticket_path / "divergent.txt").write_text("divergent\n", encoding="utf-8")
+            _git(ticket_path, "add", "divergent.txt")
+            _git(ticket_path, "commit", "-m", "feat: divergent ticket")
+            _git(ticket_path, "branch", "-M", branch)
+
+            workspace = GitWorkspace(repository, root / "runtime", "delivery")
+            ticket = Worktree(ticket_path, branch, base_commit)
+            with self.assertRaisesRegex(GitWorkspaceError, "worktree_commit_diverged"):
+                workspace.validate_commit(ticket)
+
+    def test_sanitizes_rationale_before_writing_decision_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=root / ".orchestrator/deliveries",
+                tracker_root=root / ".scratch/delivery",
+            )
+            delivery = StandardizedDelivery(
+                replace(config, standardized_delivery=delivery_config),
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            delivery._run_root = delivery_config.artifact_root / "ledger-test"
+            delivery._run_root.mkdir(parents=True)
+            secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"  # pragma: allowlist secret
+            delivery._record(
+                "principal_proxy_decided",
+                {
+                    "rationale": f"token={secret} path=/workspace/private.txt",
+                },
+            )
+            ledger = (delivery._run_root / "decision-ledger.jsonl").read_text(encoding="utf-8")
+
+        self.assertNotIn(secret, ledger)
+        self.assertNotIn("/workspace/private.txt", ledger)
+        self.assertIn("[REDACTED]", ledger)
+
+    def test_rejects_symlinked_delivery_artifact_and_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            outside.mkdir()
+            payload = {"use_wayfinder": False, "reason": "clear"}
+            target = outside / "route.json"
+            target.write_text(json.dumps(payload), encoding="utf-8")
+            artifact_root = root / "artifacts"
+            artifact_root.mkdir()
+            (artifact_root / "route.json").symlink_to(target)
+            with self.assertRaisesRegex(DeliveryArtifactError, "path"):
+                load_wayfinder_route(artifact_root / "route.json")
+
+            poisoned_run = root / "run"
+            poisoned_run.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(DeliveryError, "path"):
+                _write_json(poisoned_run / "state.json", {"status": "running"})
+            self.assertFalse((outside / "state.json").exists())
+
+    def test_rejects_github_goal_secret_before_dispatch_or_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _git(root, "init", "-b", "main")
+            _git(root, "config", "user.name", "Test User")
+            _git(root, "config", "user.email", "test@example.com")
+            (root / "README.md").write_text("base\n", encoding="utf-8")
+            _git(root, "add", "README.md")
+            _git(root, "commit", "-m", "chore: initialize")
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=root / ".orchestrator/deliveries",
+                tracker_root=root / ".scratch/delivery",
+                tracker_backend=TrackerBackend.GITHUB,
+                github_repository="owner/project",
+                wayfinder=WayfinderMode.NEVER,
+            )
+            config = replace(
+                config,
+                workspace=root,
+                state_db=root / ".orchestrator/state.db",
+                standardized_delivery=delivery_config,
+            )
+            goal = root / "goal.md"
+            goal.write_text(
+                "Use password=correct-horse-battery-staple for the integration.",
+                encoding="utf-8",
+            )
+            dispatcher = ScriptedDeliveryDispatcher()
+            runner_calls: list[list[str]] = []
+            issue_number = 40
+
+            def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                nonlocal issue_number
+                runner_calls.append(argv)
+                stdout = ""
+                if argv[1:3] == ["issue", "create"]:
+                    issue_number += 1
+                    stdout = f"https://github.com/owner/project/issues/{issue_number}\n"
+                return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+            with self.assertRaisesRegex(DeliveryError, "secret_material"):
+                StandardizedDelivery(
+                    config,
+                    dispatcher=dispatcher,
+                    tracker=GithubTracker(delivery_config.github_repository or "", runner=runner),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                ).run(goal)
+
+        self.assertEqual(dispatcher.prompts, [])
+        self.assertEqual(runner_calls, [])
+
+    def test_rejects_github_plan_secret_before_tracker_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=root / ".orchestrator/deliveries",
+                tracker_root=root / ".scratch/delivery",
+                tracker_backend=TrackerBackend.GITHUB,
+                github_repository="owner/project",
+            )
+            delivery = StandardizedDelivery(
+                replace(config, standardized_delivery=delivery_config),
+                dispatcher=ScriptedDeliveryDispatcher(),
+                tracker=GithubTracker(
+                    "owner/project",
+                    runner=lambda argv, **_: subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        "https://github.com/owner/project/issues/41\n",
+                        "",
+                    ),
+                ),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            delivery._run_root = delivery_config.artifact_root / "plan-secret"
+            delivery._run_root.mkdir(parents=True)
+            payload = _delivery_plan()
+            payload["solution"] = "Use api_key=correct-horse-battery-staple."
+            plan_path = delivery._run_root / "delivery-plan.json"
+            plan_path.write_text(json.dumps(payload), encoding="utf-8")
+            plan = load_delivery_plan(plan_path)
+
+            with self.assertRaisesRegex(DeliveryError, "secret_material"):
+                delivery._publish_tracker(plan)
+
     def test_runs_parallel_frontier_then_final_two_axis_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary) / "repository"
@@ -699,7 +873,9 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 return DispatchOutcome("repair", AgentState.DONE, False, "w1:p2")
 
             with (
-                patch.object(delivery, "_review", side_effect=lambda *a, **k: next(reports)),
+                patch.object(
+                    delivery, "_review", side_effect=lambda *_args, **_kwargs: next(reports)
+                ),
                 patch.object(delivery, "_select_worker", return_value=Harness.DROID),
                 patch.object(delivery, "_dispatch_artifact", side_effect=write_verdict),
                 patch.object(delivery, "_dispatch_with_proxy", side_effect=repair),
