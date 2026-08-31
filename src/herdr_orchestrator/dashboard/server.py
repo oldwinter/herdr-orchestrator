@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from contextlib import closing
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
@@ -137,28 +138,26 @@ def _validate_state_db(path: Path) -> None:
     if not resolved.is_file():
         raise ValueError("dashboard_state_db_not_found")
 
-    connection: sqlite3.Connection | None = None
     try:
-        connection = sqlite3.connect(
-            f"{resolved.as_uri()}?mode=ro",
-            uri=True,
-            timeout=5,
-        )
-        connection.row_factory = sqlite3.Row
-        version_row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
-        version = None if version_row is None else int(version_row["version"])
-        columns_by_table = {
-            table: {
-                str(row["name"])
-                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        with closing(
+            sqlite3.connect(
+                f"{resolved.as_uri()}?mode=ro",
+                uri=True,
+                timeout=5,
+            )
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            version_row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
+            version = None if version_row is None else int(version_row["version"])
+            columns_by_table = {
+                table: {
+                    str(row["name"])
+                    for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for table in _STATE_DB_REQUIRED_COLUMNS
             }
-            for table in _STATE_DB_REQUIRED_COLUMNS
-        }
     except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
         raise ValueError("dashboard_state_db_incompatible") from exc
-    finally:
-        if connection is not None:
-            connection.close()
 
     if version != SCHEMA_VERSION or any(
         not required.issubset(columns_by_table.get(table, set()))

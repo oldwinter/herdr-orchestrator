@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -134,7 +135,7 @@ class StoreTests(unittest.TestCase):
             ),
         )
         job = self.store.jobs("example")[0]
-        with sqlite3.connect(self.store.path) as connection:
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
             receipt = connection.execute("""
                 SELECT placement, execution_path, herdr_workspace_id, correlation_id
                 FROM receipts
@@ -175,7 +176,7 @@ class StoreTests(unittest.TestCase):
             )
 
         self.assertEqual(self.store.jobs("example")[0]["state"], JobState.RUNNING.value)
-        with sqlite3.connect(self.store.path) as connection:
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM receipts").fetchone()[0], 0)
 
     def test_outcome_after_lease_expiry_is_rejected(self) -> None:
@@ -306,7 +307,7 @@ class StoreTests(unittest.TestCase):
             ),
         )
         job = self.store.jobs("example")[0]
-        with sqlite3.connect(self.store.path) as connection:
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
             receipt_count = connection.execute(
                 "SELECT COUNT(*) FROM receipts WHERE job_id = ?",
                 (job_id,),
@@ -363,7 +364,7 @@ class StoreTests(unittest.TestCase):
                 JobState.SUCCEEDED,
             )
 
-        with sqlite3.connect(self.store.path) as connection:
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
             correlations = connection.execute(
                 "SELECT correlation_id FROM receipts WHERE job_id = ? ORDER BY id",
                 (job_id,),
@@ -547,7 +548,7 @@ class StoreTests(unittest.TestCase):
         baseline = time.time() + 1
         with patch("herdr_orchestrator.store.time.time", return_value=baseline):
             first = self.store.claim("example", limit=1, lease_seconds=30)[0]
-            with sqlite3.connect(self.store.path) as connection:
+            with closing(sqlite3.connect(self.store.path)) as connection, connection:
                 connection.execute(
                     """
                     UPDATE jobs
@@ -581,7 +582,7 @@ class StoreTests(unittest.TestCase):
             "error_summary",
         ):
             self.assertIsNone(current[field], field)
-        with sqlite3.connect(self.store.path) as connection:
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
             receipt = connection.execute(
                 """
                 SELECT attempt, state, agent_name, agent_state, member_reused, pane_id,
@@ -621,7 +622,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(self.store.claim("example", limit=1, lease_seconds=30), [])
 
         self.assertEqual(self.store.jobs("example")[0]["state"], JobState.FAILED.value)
-        with sqlite3.connect(self.store.path) as connection:
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
             receipt = connection.execute(
                 """
                 SELECT attempt, state, agent_name, agent_state, error_code,
@@ -699,7 +700,7 @@ class StoreTests(unittest.TestCase):
         store.initialize()
 
         migrated = store.jobs("example")
-        with sqlite3.connect(path) as migrated_connection:
+        with closing(sqlite3.connect(path)) as migrated_connection, migrated_connection:
             version = migrated_connection.execute("SELECT version FROM schema_meta").fetchone()[0]
             job_columns = {row[1] for row in migrated_connection.execute("PRAGMA table_info(jobs)")}
             receipt_columns = {
@@ -748,7 +749,7 @@ class StoreTests(unittest.TestCase):
                 store.initialize()
                 store.initialize()
 
-                with sqlite3.connect(path) as connection:
+                with closing(sqlite3.connect(path)) as connection, connection:
                     current_version = connection.execute(
                         "SELECT version FROM schema_meta"
                     ).fetchone()[0]
@@ -781,7 +782,7 @@ class StoreTests(unittest.TestCase):
         ):
             store.initialize()
 
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             self.assertEqual(connection.execute("SELECT version FROM schema_meta").fetchone()[0], 1)
             self.assertNotIn(
                 "placement",
@@ -789,13 +790,13 @@ class StoreTests(unittest.TestCase):
             )
 
         store.initialize()
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             self.assertEqual(connection.execute("SELECT version FROM schema_meta").fetchone()[0], 4)
 
     def test_partial_migration_state_is_reconciled_on_restart(self) -> None:
         path = Path(self.temporary.name) / "partial.db"
         _create_schema_version(path, 1)
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("ALTER TABLE jobs ADD COLUMN placement TEXT")
             connection.execute("UPDATE jobs SET placement = 'pane'")
             connection.commit()
@@ -804,7 +805,7 @@ class StoreTests(unittest.TestCase):
         store.initialize()
 
         self.assertEqual(store.jobs("example")[0]["placement"], "pane")
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             self.assertEqual(connection.execute("SELECT version FROM schema_meta").fetchone()[0], 4)
 
 

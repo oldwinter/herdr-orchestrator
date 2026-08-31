@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -283,7 +283,7 @@ class CoordinatorTests(unittest.TestCase):
 
             result = coordinator.run_once()
             job = store.jobs(config.name)[0]
-            with sqlite3.connect(store.path) as connection:
+            with closing(sqlite3.connect(store.path)) as connection, connection:
                 receipt = connection.execute(
                     "SELECT agent_name, error_code FROM receipts WHERE job_id = ?",
                     (job["id"],),

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from copy import deepcopy
 from dataclasses import replace
 from http.client import HTTPConnection
@@ -78,7 +79,7 @@ class DashboardTests(unittest.TestCase):
             base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             path = Path(temporary) / "legacy.db"
             Store(path).initialize()
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute("UPDATE schema_meta SET version = 3")
 
             config = replace(base, state_db=path)
@@ -90,7 +91,7 @@ class DashboardTests(unittest.TestCase):
                 if server is not None:
                     server.httpd.server_close()
 
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 version = connection.execute("SELECT version FROM schema_meta").fetchone()[0]
             self.assertEqual(version, 3)
 
@@ -99,7 +100,7 @@ class DashboardTests(unittest.TestCase):
             base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             path = Path(temporary) / "readonly.db"
             Store(path).initialize()
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute("PRAGMA journal_mode = DELETE")
             before = path.stat().st_mtime_ns
             path.chmod(0o444)
@@ -194,7 +195,7 @@ class DashboardTests(unittest.TestCase):
                     herdr_workspace_id="w1",
                 ),
             )
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute(
                     "UPDATE jobs SET error_summary = NULL WHERE id = ?",
                     (claimed.job_id,),
