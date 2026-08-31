@@ -218,6 +218,8 @@ class HerdrTransport:
                 state = self._prompt(name, harness, prompt, timeout_seconds)
             finally:
                 phase_timings_ms["turn_settlement"] = _elapsed_ms(turn_started)
+            if state is AgentState.BLOCKED:
+                raise TransportError("agent_blocked")
             receipt_verification_started = time.monotonic()
             task_verified: bool | None
             try:
@@ -363,6 +365,8 @@ class HerdrTransport:
                 baseline_sequence,
                 timeout_seconds,
             )
+            if state is AgentState.BLOCKED:
+                raise TransportError("agent_blocked")
             task_verified: bool | None
             if receipt is not None and state not in SETTLED_STATES:
                 task_verified = False

@@ -1826,6 +1826,7 @@ class HerdrTransportTests(unittest.TestCase):
             )
 
         self.assertEqual(outcome.state, AgentState.BLOCKED)
+        self.assertEqual(outcome.error_code, "agent_blocked")
         self.assertFalse(outcome.task_verified)
 
     def test_rejects_unchanged_preexisting_receipt_file(self) -> None:
