@@ -7,22 +7,23 @@ import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Protocol
 
 from herdr_orchestrator.catalog import (
-    execution_prompt,
     profile_for_harness,
     render_compact_catalog,
 )
+from herdr_orchestrator.delivery_journal import (
+    DeliveryEffect,
+    DeliveryEffectObservation,
+    DeliveryJournal,
+)
 from herdr_orchestrator.delivery_prompts import (
-    implementation_prompt,
     plan_prompt,
     principal_proxy_prompt,
-    repair_prompt,
-    review_verdict_prompt,
     spec_review_prompt,
     standards_review_prompt,
     wayfinder_chart_prompt,
@@ -34,28 +35,41 @@ from herdr_orchestrator.delivery_protocol import (
     DecisionTicket,
     DeliveryArtifactError,
     DeliveryPlan,
-    DeliveryTicket,
-    FindingSeverity,
     ProxyAction,
-    ReviewFinding,
+    ProxyDecision,
     ReviewReport,
-    TicketReceipt,
     WayfinderMap,
     append_artifact_text,
     exclusive_file_claim,
     load_delivery_plan,
     load_proxy_decision,
     load_review_axis,
-    load_review_verdict,
-    load_ticket_receipt,
-    load_tracker_publication,
     load_wayfinder_map,
     load_wayfinder_resolution,
     load_wayfinder_route,
     map_payload,
-    validate_artifact_path,
-    write_artifact_text,
 )
+from herdr_orchestrator.delivery_recovery import (
+    DeliveryError as DeliveryError,
+)
+from herdr_orchestrator.delivery_recovery import (
+    DeliveryRecoveryMixin,
+    DeliveryResult,
+    _agent_is_active,
+    _effect_absent,
+    _effect_conflict,
+    _effect_matched,
+    _file_sha256,
+    _finite_number,
+    _journal_payload,
+    _load_completed_result,
+    _require_success,
+    _safe_delivery_path,
+    _validate_worktree_clean,
+    _validate_worktree_ownership,
+    _write_json,
+)
+from herdr_orchestrator.delivery_repair import DeliveryRepairMixin
 from herdr_orchestrator.git_workspace import GitWorkspace, GitWorkspaceError, Worktree
 from herdr_orchestrator.herdr import HerdrTransport
 from herdr_orchestrator.model import (
@@ -72,14 +86,13 @@ from herdr_orchestrator.planner import (
     load_worker_selection,
     worker_selection_prompt,
 )
-from herdr_orchestrator.protocol import TransportError
+from herdr_orchestrator.protocol import Command, TransportError, run_json
 from herdr_orchestrator.selection import (
     effective_worker_harnesses,
     select_controller_harness,
 )
 from herdr_orchestrator.tracker import (
     DeliveryTracker,
-    TrackerTicket,
     contains_high_confidence_secret,
     tracker_from_config,
 )
@@ -87,13 +100,11 @@ from herdr_orchestrator.tracker import (
 MAX_WAYFINDER_DECISIONS = 100
 MAX_PROXY_ROUNDS = 8
 ARTIFACT_PROMPT_ATTEMPTS = 2
+DELIVERY_LEASE_GRACE_SECONDS = 30.0
+MINIMUM_DELIVERY_LEASE_SECONDS = 60.0
 SENSITIVE_QUESTION = re.compile(
     r"(?i)\b(api[ _-]?key|credential|password|secret|token|production|prod)\b"
 )
-
-
-class DeliveryError(RuntimeError):
-    pass
 
 
 _delivery_run_claim = partial(exclusive_file_claim, error_type=DeliveryError)
@@ -168,6 +179,64 @@ class HerdrDeliveryDispatcher:
             timeout_seconds=timeout_seconds,
         )
 
+    def inspect_agent(
+        self,
+        workspace: Path,
+        name: str,
+        harness: Harness,
+    ) -> DispatchOutcome | None:
+        transport = self._transport(workspace)
+        try:
+            result = run_json(
+                transport.runner,
+                Command(
+                    ["herdr", "agent", "get", name],
+                    workspace,
+                    10,
+                ),
+            )
+        except TransportError as exc:
+            if exc.code == "agent_not_found":
+                return None
+            raise
+        agent = result.get("agent")
+        if not isinstance(agent, dict):
+            raise TransportError("herdr_invalid_response")
+        state_value = agent.get("agent_status")
+        pane_id = agent.get("pane_id")
+        workspace_id = agent.get("workspace_id")
+        if (
+            agent.get("name") not in {None, name}
+            or agent.get("agent") != harness.value
+            or not isinstance(state_value, str)
+            or not isinstance(pane_id, str)
+            or not pane_id
+            or not isinstance(agent.get("interactive_ready"), bool)
+            or not agent["interactive_ready"]
+            or any(
+                not isinstance(agent.get(key), str)
+                or Path(agent[key]).resolve() != workspace.resolve()
+                for key in ("cwd", "foreground_cwd")
+            )
+            or (
+                workspace_id is not None and (not isinstance(workspace_id, str) or not workspace_id)
+            )
+        ):
+            raise TransportError("agent_identity_mismatch")
+        try:
+            state = AgentState(state_value)
+        except ValueError as exc:
+            raise TransportError("herdr_invalid_response") from exc
+        return DispatchOutcome(
+            name,
+            state,
+            True,
+            pane_id,
+            execution_path=str(workspace.resolve()),
+            herdr_workspace_id=workspace_id,
+            agent_settled=state in {AgentState.IDLE, AgentState.DONE},
+        )
+
     def _transport(self, workspace: Path) -> HerdrTransport:
         resolved = workspace.resolve()
         with self._lock:
@@ -178,26 +247,7 @@ class HerdrDeliveryDispatcher:
             return transport
 
 
-@dataclass(frozen=True, slots=True)
-class DeliveryResult:
-    run_id: str
-    status: str
-    artifact_root: Path
-    tracker_references: dict[str, str]
-    integration_branch: str
-    integration_commit: str
-    tickets_completed: int
-    review_rounds: int
-
-
-@dataclass(frozen=True, slots=True)
-class _ImplementedTicket:
-    ticket: DeliveryTicket
-    worktree: Worktree
-    receipt: TicketReceipt
-
-
-class StandardizedDelivery:
+class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
     def __init__(
         self,
         config: WorkflowConfig,
@@ -207,6 +257,7 @@ class StandardizedDelivery:
         controller_harness: Harness | None = None,
         controller_auto: bool = False,
         worker_harnesses: Iterable[Harness] | None = None,
+        lease_seconds: float | None = None,
     ) -> None:
         self.config = config
         self.dispatcher = dispatcher or HerdrDeliveryDispatcher(config)
@@ -221,9 +272,14 @@ class StandardizedDelivery:
             force_auto=controller_auto,
         )
         self._goal = ""
+        self._run_id = ""
         self._run_root = Path()
         self._ledger_lock = threading.Lock()
         self._previous_state: dict[str, object] = {}
+        self._journal: DeliveryJournal | None = None
+        if lease_seconds is not None and (not _finite_number(lease_seconds) or lease_seconds <= 0):
+            raise DeliveryError("delivery_lease_seconds_invalid")
+        self._lease_seconds = lease_seconds
 
     def run(self, goal_file: Path) -> DeliveryResult:
         goal_path = _safe_delivery_path(goal_file)
@@ -254,6 +310,7 @@ class StandardizedDelivery:
                 f"{','.join(harness.value for harness in self.worker_harnesses)}"
             ).encode()
         ).hexdigest()[:12]
+        self._run_id = run_id
         self._run_root = _safe_delivery_path(
             self.config.standardized_delivery.artifact_root / run_id,
             root=self.config.standardized_delivery.artifact_root,
@@ -261,8 +318,22 @@ class StandardizedDelivery:
         self._run_root.mkdir(parents=True, exist_ok=True)
         _safe_delivery_path(self._run_root, root=self.config.standardized_delivery.artifact_root)
         self._previous_state = {}
-        with _delivery_run_claim(self._run_root / "run.lock"):
-            return self._run_claimed(run_id)
+        lease_seconds = self._lease_seconds or max(
+            MINIMUM_DELIVERY_LEASE_SECONDS,
+            self.config.coordinator.agent_timeout_seconds + DELIVERY_LEASE_GRACE_SECONDS,
+        )
+        with DeliveryJournal.claim(
+            self._run_root,
+            run_id,
+            lease_seconds,
+            error_type=DeliveryError,
+            payload_validator=_journal_payload,
+        ) as journal:
+            self._journal = journal
+            try:
+                return self._run_claimed(run_id)
+            finally:
+                self._journal = None
 
     def _run_claimed(self, run_id: str) -> DeliveryResult:
         if (state_path := self._run_root / "state.json").is_file():
@@ -276,6 +347,7 @@ class StandardizedDelivery:
                 self._write_state("failed", stage="stopped", error="DeliveryStateInvalid")
                 raise DeliveryError("delivery_state_invalid")
             self._previous_state = state
+        self._recover_proxy_responses()
         try:
             completed_result = _load_completed_result(self._run_root / "result.json", run_id)
         except Exception as exc:
@@ -284,6 +356,7 @@ class StandardizedDelivery:
         if completed_result is not None:
             try:
                 self._validate_completed_result(completed_result)
+                self._publish_result(completed_result)
             except Exception as exc:
                 self._write_state(
                     "failed",
@@ -345,19 +418,7 @@ class StandardizedDelivery:
                 tickets_completed=tickets_completed,
                 review_rounds=review_rounds,
             )
-            _write_json(
-                self._run_root / "result.json",
-                {
-                    "run_id": result.run_id,
-                    "status": result.status,
-                    "artifact_root": str(result.artifact_root),
-                    "tracker_references": result.tracker_references,
-                    "integration_branch": result.integration_branch,
-                    "integration_commit": result.integration_commit,
-                    "tickets_completed": result.tickets_completed,
-                    "review_rounds": result.review_rounds,
-                },
-            )
+            self._publish_result(result)
             self._write_state(
                 "succeeded",
                 stage="complete",
@@ -374,164 +435,6 @@ class StandardizedDelivery:
             )
             raise
 
-    def _validate_completed_result(self, result: DeliveryResult) -> None:
-        plan = load_delivery_plan(self._run_root / "delivery-plan.json")
-        ticket_ids = {ticket.ticket_id for ticket in plan.tickets}
-        expected_branch = f"ho/{plan.slug}/integration"
-        if result.integration_branch != expected_branch:
-            raise DeliveryError("delivery_result_integration_branch_mismatch")
-        if result.tickets_completed != len(plan.tickets):
-            raise DeliveryError("delivery_result_ticket_count_mismatch")
-        if set(result.tracker_references) != ticket_ids or any(
-            not isinstance(reference, str) or not reference.strip()
-            for reference in result.tracker_references.values()
-        ):
-            raise DeliveryError("delivery_result_tracker_references_mismatch")
-        publication = {
-            key: reference.reference
-            for key, reference in self._restore_tracker_publication(
-                self._run_root / "tracker-publication.json", plan
-            ).items()
-        }
-        if publication != result.tracker_references:
-            raise DeliveryError("delivery_result_tracker_publication_mismatch")
-        repair_attempts = self._repair_attempts()
-        if self._repair_inflight() is not None:
-            raise DeliveryError("delivery_result_repair_inflight")
-        if result.review_rounds != repair_attempts + 1:
-            raise DeliveryError("delivery_result_review_rounds_invalid")
-        git = GitWorkspace(
-            self.config.workspace,
-            self._run_root,
-            plan.slug,
-        )
-        base_commit = self._delivery_base_commit(git)
-        integration = Worktree(
-            self._run_root / "worktrees" / "integration",
-            expected_branch,
-            base_commit,
-        )
-        _validate_worktree_ownership(
-            git,
-            self._run_root / "worktrees" / "integration",
-            integration,
-        )
-        _validate_worktree_clean(git, integration.path)
-        commit = git.head(integration)
-        if commit != result.integration_commit:
-            raise DeliveryError("delivery_result_integration_commit_mismatch")
-        for ticket in plan.tickets:
-            receipt = load_ticket_receipt(
-                self._run_root / "receipts" / f"ticket-{ticket.ticket_id}.json",
-                ticket,
-            )
-            ticket_worktree = Worktree(
-                self._run_root / "worktrees" / f"ticket-{ticket.ticket_id}",
-                f"ho/{plan.slug}/ticket-{ticket.ticket_id}",
-                base_commit,
-            )
-            _validate_worktree_ownership(
-                git,
-                ticket_worktree.path,
-                ticket_worktree,
-            )
-            _validate_worktree_clean(git, ticket_worktree.path)
-            if git.head(ticket_worktree) != receipt.commit:
-                raise DeliveryError(f"delivery_result_ticket_commit_mismatch: {ticket.ticket_id}")
-            if not git.is_ancestor(ticket_worktree.path, base_commit, receipt.commit):
-                raise DeliveryError(f"delivery_result_ticket_commit_diverged: {ticket.ticket_id}")
-            if not _git_succeeds(
-                git,
-                integration.path,
-                "merge-base",
-                "--is-ancestor",
-                receipt.commit,
-                result.integration_commit,
-            ):
-                raise DeliveryError(f"delivery_result_ticket_not_integrated: {ticket.ticket_id}")
-        review_root = self._run_root / "reviews" / f"round-{repair_attempts + 1}"
-        report = ReviewReport(
-            standards=load_review_axis(review_root / "standards.json", "standards"),
-            spec=load_review_axis(review_root / "spec.json", "spec"),
-        )
-        findings = _finding_map(report)
-        if findings:
-            verdict = load_review_verdict(
-                review_root / "verdict.json",
-                candidates=tuple(findings),
-            )
-            if any(
-                findings[finding_id].severity is FindingSeverity.MUST_FIX
-                for finding_id in verdict.accepted
-            ):
-                raise DeliveryError("delivery_result_review_gate_failed")
-
-    def _publish_tracker(self, plan: DeliveryPlan) -> dict[str, TrackerTicket]:
-        if (
-            self.config.standardized_delivery.tracker_backend.value == "github"
-            and contains_high_confidence_secret(plan)
-        ):
-            raise DeliveryError(
-                "delivery_secret_material_rejected: remove secret material before retry"
-            )
-        path = self._run_root / "tracker-publication.json"
-        if path.is_file():
-            references = self._restore_tracker_publication(path, plan)
-            self._record("tracker_recovered", {"tickets": sorted(references)})
-            return references
-        if self._tracker_publish_was_interrupted():
-            raise DeliveryError("delivery_tracker_publish_interrupted")
-        references = self.tracker.publish(plan)
-        expected = {ticket.ticket_id for ticket in plan.tickets}
-        if set(references) != expected or any(
-            not isinstance(reference.reference, str) or not reference.reference.strip()
-            for reference in references.values()
-        ):
-            raise DeliveryError("delivery_tracker_references_invalid")
-        spec_url = getattr(self.tracker, "spec_url", None)
-        if spec_url is not None and (not isinstance(spec_url, str) or not spec_url.strip()):
-            raise DeliveryError("delivery_tracker_publication_invalid")
-        _write_json(
-            path,
-            {
-                "backend": self.config.standardized_delivery.tracker_backend.value,
-                "spec_url": spec_url,
-                "tickets": {key: reference.reference for key, reference in references.items()},
-            },
-        )
-        return references
-
-    def _restore_tracker_publication(
-        self,
-        path: Path,
-        plan: DeliveryPlan,
-    ) -> dict[str, TrackerTicket]:
-        _safe_delivery_path(path, root=self._run_root)
-        try:
-            spec_url, tickets = load_tracker_publication(
-                path,
-                backend=self.config.standardized_delivery.tracker_backend.value,
-                ticket_ids={ticket.ticket_id for ticket in plan.tickets},
-            )
-        except DeliveryArtifactError as exc:
-            raise DeliveryError("delivery_tracker_publication_invalid") from exc
-        if not hasattr(self.tracker, "references"):
-            raise DeliveryError("delivery_tracker_publication_unrestorable")
-        references = {key: TrackerTicket(key, value) for key, value in tickets.items()}
-        self.tracker.references = references
-        if hasattr(self.tracker, "spec_url"):
-            if spec_url is None:
-                raise DeliveryError("delivery_tracker_publication_invalid")
-            self.tracker.spec_url = spec_url
-        return references
-
-    def _tracker_publish_was_interrupted(self) -> bool:
-        if self.config.standardized_delivery.tracker_backend.value != "github":
-            return False
-        return any(
-            self._previous_state.get(key) == "tracker-publish" for key in ("stage", "failed_stage")
-        )
-
     def _run_wayfinder(self) -> WayfinderMap | None:
         mode = self.config.standardized_delivery.wayfinder
         if mode is WayfinderMode.ALWAYS:
@@ -542,7 +445,7 @@ class StandardizedDelivery:
             reason = "configured_never"
         else:
             output = self._run_root / "wayfinder-route.json"
-            if not output.is_file():
+            if self._journal is not None or not output.is_file():
                 self._dispatch_artifact(
                     self.config.workspace,
                     self.controller,
@@ -560,7 +463,7 @@ class StandardizedDelivery:
         if not use_wayfinder:
             return None
         map_path = self._run_root / "wayfinder-map.json"
-        if not map_path.is_file():
+        if self._journal is not None or not map_path.is_file():
             self._dispatch_artifact(
                 self.config.workspace,
                 self.controller,
@@ -628,7 +531,7 @@ class StandardizedDelivery:
 
     def _create_plan(self, wayfinder: WayfinderMap | None) -> DeliveryPlan:
         output = self._run_root / "delivery-plan.json"
-        if not output.is_file():
+        if self._journal is not None or not output.is_file():
             self._dispatch_artifact(
                 self.config.workspace,
                 self.controller,
@@ -654,418 +557,6 @@ class StandardizedDelivery:
         )
         return plan
 
-    def _implement_plan(self, plan: DeliveryPlan) -> tuple[Worktree, int]:
-        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
-        base_commit = self._delivery_base_commit(git)
-        integration = git.create_integration(base_commit)
-        _validate_worktree_ownership(
-            git,
-            self._run_root / "worktrees" / "integration",
-            integration,
-        )
-        _validate_worktree_clean(git, integration.path)
-        if not _git_succeeds(
-            git,
-            integration.path,
-            "merge-base",
-            "--is-ancestor",
-            base_commit,
-            git.head(integration),
-        ):
-            raise DeliveryError("delivery_integration_base_mismatch")
-        completed = self._recover_integrated_tickets(git, plan, integration)
-        tickets = {ticket.ticket_id: ticket for ticket in plan.tickets}
-        completed = {
-            ticket_id
-            for ticket_id in completed
-            if set(tickets[ticket_id].blocked_by).issubset(completed)
-        }
-        for ticket_id in sorted(completed):
-            receipt = load_ticket_receipt(
-                self._run_root / "receipts" / f"ticket-{ticket_id}.json",
-                tickets[ticket_id],
-            )
-            self.tracker.close(tickets[ticket_id], receipt)
-            self._record(
-                "ticket_recovered",
-                {"ticket_id": ticket_id, "commit": receipt.commit},
-            )
-        while len(completed) < len(tickets):
-            frontier = [
-                ticket
-                for ticket in plan.tickets
-                if ticket.ticket_id not in completed and set(ticket.blocked_by).issubset(completed)
-            ]
-            if not frontier:
-                raise DeliveryError("ticket_dag_stalled")
-            selected = frontier[: self.config.standardized_delivery.max_parallel]
-            integration_head = git.head(integration)
-            routed: list[tuple[DeliveryTicket, Harness]] = [
-                (
-                    ticket,
-                    self._select_worker(
-                        f"Implement ticket {ticket.ticket_id}: {ticket.title}",
-                        ticket.what_to_build,
-                        f"{plan.slug}:ticket:{ticket.ticket_id}",
-                    ),
-                )
-                for ticket in selected
-            ]
-            prepared = [
-                (ticket, harness, git.create_ticket(ticket.ticket_id, base_commit=integration_head))
-                for ticket, harness in routed
-            ]
-            for ticket, _, worktree in prepared:
-                _validate_worktree_ownership(
-                    git,
-                    self._run_root / "worktrees" / f"ticket-{ticket.ticket_id}",
-                    worktree,
-                )
-                _validate_worktree_clean(git, worktree.path)
-            implemented: list[_ImplementedTicket] = []
-            with ThreadPoolExecutor(
-                max_workers=len(routed),
-                thread_name_prefix="delivery-ticket",
-            ) as executor:
-                futures = {
-                    executor.submit(
-                        self._implement_ticket,
-                        plan,
-                        ticket,
-                        harness,
-                        worktree,
-                    ): ticket
-                    for ticket, harness, worktree in prepared
-                }
-                for future in as_completed(futures):
-                    implemented.append(future.result())
-            implemented.sort(key=lambda item: item.ticket.ticket_id)
-            for result in implemented:
-                _validate_worktree_ownership(
-                    git,
-                    self._run_root / "worktrees" / f"ticket-{result.ticket.ticket_id}",
-                    result.worktree,
-                )
-                if not _git_succeeds(
-                    git,
-                    integration.path,
-                    "merge-base",
-                    "--is-ancestor",
-                    result.receipt.commit,
-                    git.head(integration),
-                ):
-                    git.merge(integration, result.worktree)
-                self.tracker.close(result.ticket, result.receipt)
-                completed.add(result.ticket.ticket_id)
-                self._record(
-                    "ticket_completed",
-                    {
-                        "ticket_id": result.ticket.ticket_id,
-                        "title": result.ticket.title,
-                        "commit": result.receipt.commit,
-                    },
-                )
-        return integration, len(completed)
-
-    def _recover_integrated_tickets(
-        self,
-        git: GitWorkspace,
-        plan: DeliveryPlan,
-        integration: Worktree,
-    ) -> set[str]:
-        integration_head = git.head(integration)
-        completed: set[str] = set()
-        for ticket in plan.tickets:
-            receipt_file = self._run_root / "receipts" / f"ticket-{ticket.ticket_id}.json"
-            if not receipt_file.is_file():
-                continue
-            receipt = load_ticket_receipt(receipt_file, ticket)
-            worktree = Worktree(
-                self._run_root / "worktrees" / f"ticket-{ticket.ticket_id}",
-                f"ho/{plan.slug}/ticket-{ticket.ticket_id}",
-                integration.base_commit,
-            )
-            _validate_worktree_ownership(
-                git,
-                worktree.path,
-                worktree,
-            )
-            _validate_worktree_clean(git, worktree.path)
-            if git.head(worktree) != receipt.commit:
-                raise DeliveryError(f"ticket_receipt_commit_mismatch: {ticket.ticket_id}")
-            if not git.is_ancestor(worktree.path, integration.base_commit, receipt.commit):
-                raise DeliveryError(f"ticket_commit_diverged: {ticket.ticket_id}")
-            if _git_succeeds(
-                git,
-                integration.path,
-                "merge-base",
-                "--is-ancestor",
-                receipt.commit,
-                integration_head,
-            ):
-                completed.add(ticket.ticket_id)
-        return completed
-
-    def _implement_ticket(
-        self,
-        plan: DeliveryPlan,
-        ticket: DeliveryTicket,
-        harness: Harness,
-        worktree: Worktree,
-    ) -> _ImplementedTicket:
-        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
-        _validate_worktree_ownership(
-            git,
-            self._run_root / "worktrees" / f"ticket-{ticket.ticket_id}",
-            worktree,
-        )
-        _validate_worktree_clean(git, worktree.path)
-        receipt_file = self._run_root / "receipts" / f"ticket-{ticket.ticket_id}.json"
-        _safe_delivery_path(receipt_file, root=self._run_root)
-        receipt_file.parent.mkdir(parents=True, exist_ok=True)
-        if receipt_file.is_file():
-            receipt = load_ticket_receipt(receipt_file, ticket)
-            commit = git.validate_commit(worktree)
-            if receipt.commit != commit:
-                raise DeliveryError(f"ticket_receipt_commit_mismatch: {ticket.ticket_id}")
-            return _ImplementedTicket(ticket, worktree, receipt)
-        profile = profile_for_harness(self.config.profiles, harness)
-        prompt = execution_prompt(
-            profile,
-            implementation_prompt(plan, ticket, receipt_file),
-        )
-        for attempt in range(ARTIFACT_PROMPT_ATTEMPTS):
-            outcome = self._dispatch_with_proxy(
-                worktree.path,
-                harness,
-                prompt,
-                role=f"impl-{ticket.ticket_id}",
-            )
-            _require_success(outcome, f"ticket_{ticket.ticket_id}")
-            _validate_worktree_ownership(
-                git,
-                self._run_root / "worktrees" / f"ticket-{ticket.ticket_id}",
-                worktree,
-            )
-            if receipt_file.is_file():
-                break
-            self._record(
-                "artifact_prompt_retried",
-                {
-                    "role": f"impl-{ticket.ticket_id}",
-                    "attempt": attempt + 1,
-                },
-            )
-        receipt = load_ticket_receipt(receipt_file, ticket)
-        commit = git.validate_commit(worktree)
-        if receipt.commit != commit:
-            raise DeliveryError(f"ticket_receipt_commit_mismatch: {ticket.ticket_id}")
-        return _ImplementedTicket(ticket, worktree, receipt)
-
-    def _review_and_repair(self, plan: DeliveryPlan, integration: Worktree) -> int:
-        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
-        repair_attempts = self._reconcile_repair_attempt(git, integration)
-        while True:
-            round_number = repair_attempts + 1
-            report = self._review(plan, integration, round_number)
-            findings = _finding_map(report)
-            if not findings:
-                self._record(
-                    "review_completed",
-                    {"round": round_number, "findings": 0, "accepted": []},
-                )
-                return round_number
-            verdict_file = self._run_root / "reviews" / f"round-{round_number}" / "verdict.json"
-            self._dispatch_artifact(
-                self.config.workspace,
-                self.controller,
-                review_verdict_prompt(plan, findings, verdict_file),
-                verdict_file,
-                role=f"judge-{round_number}",
-            )
-            verdict = load_review_verdict(
-                verdict_file,
-                candidates=tuple(findings),
-            )
-            accepted = {finding_id: findings[finding_id] for finding_id in verdict.accepted}
-            must_fix = {
-                finding_id: finding
-                for finding_id, finding in accepted.items()
-                if finding.severity is FindingSeverity.MUST_FIX
-            }
-            self._record(
-                "review_adjudicated",
-                {
-                    "round": round_number,
-                    "findings": len(findings),
-                    "accepted": list(verdict.accepted),
-                    "dismissed": list(verdict.dismissed),
-                    "must_fix": list(must_fix),
-                },
-            )
-            if not must_fix:
-                return round_number
-            _validate_worktree_ownership(
-                git,
-                self._run_root / "worktrees" / "integration",
-                integration,
-            )
-            repair_number, before = self._begin_repair_attempt(git, integration)
-            harness = self._select_worker(
-                f"Repair accepted review findings, round {repair_number}",
-                json.dumps(
-                    {key: finding.summary for key, finding in must_fix.items()},
-                    ensure_ascii=False,
-                ),
-                f"{plan.slug}:repair:{repair_number}",
-            )
-            profile = profile_for_harness(self.config.profiles, harness)
-            outcome = self._dispatch_with_proxy(
-                integration.path,
-                harness,
-                execution_prompt(
-                    profile,
-                    repair_prompt(plan, must_fix, repair_number),
-                ),
-                role=f"repair-{repair_number}",
-            )
-            _require_success(outcome, f"repair_{repair_number}")
-            _validate_worktree_ownership(
-                git,
-                self._run_root / "worktrees" / "integration",
-                integration,
-            )
-            after = git.validate_commit(Worktree(integration.path, integration.branch, before))
-            self._complete_repair_attempt(repair_number, after)
-            repair_attempts = repair_number
-
-    def _begin_repair_attempt(
-        self,
-        git: GitWorkspace,
-        integration: Worktree,
-    ) -> tuple[int, str]:
-        path = self._run_root / "repair-state.json"
-        attempts = self._reconcile_repair_attempt(git, integration)
-        current = git.head(integration)
-        if attempts >= self.config.standardized_delivery.review_repair_rounds:
-            raise DeliveryError("review_repair_rounds_exhausted")
-        round_number = attempts + 1
-        _write_json(
-            path,
-            {
-                "attempts": attempts,
-                "in_flight": {"round": round_number, "before": current},
-            },
-        )
-        self._record("review_repair_claimed", {"round": round_number})
-        return round_number, current
-
-    def _reconcile_repair_attempt(self, git: GitWorkspace, integration: Worktree) -> int:
-        attempts = self._repair_attempts()
-        inflight = self._repair_inflight()
-        if inflight is None:
-            return attempts
-        round_number, before = inflight
-        if round_number != attempts + 1:
-            raise DeliveryError("delivery_repair_state_invalid")
-        current = git.head(integration)
-        if current != before:
-            attempts = round_number
-            self._record(
-                "review_repair_recovered",
-                {"round": round_number, "commit": current},
-            )
-        _write_json(
-            self._run_root / "repair-state.json",
-            {"attempts": attempts, "in_flight": None},
-        )
-        return attempts
-
-    def _complete_repair_attempt(self, round_number: int, commit: str) -> None:
-        inflight = self._repair_inflight()
-        if inflight is None or inflight[0] != round_number:
-            raise DeliveryError("delivery_repair_state_invalid")
-        _write_json(
-            self._run_root / "repair-state.json",
-            {"attempts": round_number, "in_flight": None},
-        )
-        self._record("review_repaired", {"round": round_number, "commit": commit})
-
-    def _repair_attempts(self) -> int:
-        path = self._run_root / "repair-state.json"
-        _safe_delivery_path(path, root=self._run_root)
-        if not path.is_file():
-            return 0
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise DeliveryError("delivery_repair_state_invalid") from exc
-        attempts = payload.get("attempts") if isinstance(payload, dict) else None
-        if (
-            not isinstance(payload, dict)
-            or set(payload) not in ({"attempts"}, {"attempts", "in_flight"})
-            or not isinstance(attempts, int)
-            or isinstance(attempts, bool)
-            or not 0 <= attempts <= self.config.standardized_delivery.review_repair_rounds
-        ):
-            raise DeliveryError("delivery_repair_state_invalid")
-        return attempts
-
-    def _repair_inflight(self) -> tuple[int, str] | None:
-        path = self._run_root / "repair-state.json"
-        _safe_delivery_path(path, root=self._run_root)
-        if not path.is_file():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise DeliveryError("delivery_repair_state_invalid") from exc
-        inflight = payload.get("in_flight") if isinstance(payload, dict) else None
-        if isinstance(payload, dict) and "in_flight" not in payload:
-            return None
-        if inflight is None:
-            return None
-        if (
-            not isinstance(inflight, dict)
-            or set(inflight) != {"round", "before"}
-            or not isinstance(inflight["round"], int)
-            or isinstance(inflight["round"], bool)
-            or not 1
-            <= inflight["round"]
-            <= (self.config.standardized_delivery.review_repair_rounds)
-            or not isinstance(inflight["before"], str)
-            or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", inflight["before"])
-        ):
-            raise DeliveryError("delivery_repair_state_invalid")
-        return inflight["round"], inflight["before"]
-
-    def _delivery_base_commit(self, git: GitWorkspace) -> str:
-        path = self._run_root / "git-base.json"
-        _safe_delivery_path(path, root=self._run_root)
-        repository = str(self.config.workspace.resolve())
-        if path.is_file():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise DeliveryError("delivery_git_base_invalid") from exc
-            if (
-                not isinstance(payload, dict)
-                or set(payload) != {"commit", "repository"}
-                or payload["repository"] != repository
-                or not isinstance(payload["commit"], str)
-                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", payload["commit"])
-            ):
-                raise DeliveryError("delivery_git_base_invalid")
-            commit = payload["commit"]
-        else:
-            if (self._run_root / "worktrees" / "integration").exists():
-                raise DeliveryError("delivery_git_base_missing")
-            commit = git.base_commit()
-            _write_json(path, {"commit": commit, "repository": repository})
-        if _git_output(git, self.config.workspace, "cat-file", "-t", commit) != "commit":
-            raise DeliveryError("delivery_git_base_invalid")
-        return commit
-
     def _review(
         self,
         plan: DeliveryPlan,
@@ -1079,6 +570,8 @@ class StandardizedDelivery:
             integration,
         )
         _validate_worktree_clean(git, integration.path)
+        if self._journal is not None:
+            self._assert_integration_frontier(git, integration)
         head_before = git.validate_commit(integration)
         review_root = self._run_root / "reviews" / f"round-{round_number}"
         _safe_delivery_path(review_root, root=self._run_root)
@@ -1120,6 +613,11 @@ class StandardizedDelivery:
                     prompt,
                     output,
                     role=f"review-{axis}-{round_number}",
+                    journal_context={
+                        "round": round_number,
+                        "axis": axis,
+                        "integration_commit": head_before,
+                    },
                 ): axis
                 for axis, output, prompt, harness in routed
             }
@@ -1135,10 +633,60 @@ class StandardizedDelivery:
         head_after = git.validate_commit(integration)
         if head_after != head_before:
             raise DeliveryError("delivery_review_mutated_integration")
-        return ReviewReport(
+        report = ReviewReport(
             standards=load_review_axis(standards_file, "standards"),
             spec=load_review_axis(spec_file, "spec"),
         )
+        journal = self._journal
+        if journal is not None:
+            expected = {
+                "round": round_number,
+                "integration_commit": head_before,
+                "standards_sha256": _file_sha256(standards_file),
+                "spec_sha256": _file_sha256(spec_file),
+                "standards_findings": len(report.standards),
+                "spec_findings": len(report.spec),
+            }
+
+            def observe(
+                confirmation: dict[str, object] | None,
+                started: bool,
+            ) -> DeliveryEffectObservation:
+                try:
+                    current = git.validate_commit(integration)
+                    observed_report = ReviewReport(
+                        standards=load_review_axis(standards_file, "standards"),
+                        spec=load_review_axis(spec_file, "spec"),
+                    )
+                except (DeliveryArtifactError, GitWorkspaceError):
+                    return _effect_conflict()
+                if current != head_before:
+                    return _effect_conflict()
+                details = {
+                    "round": round_number,
+                    "integration_commit": current,
+                    "standards_sha256": _file_sha256(standards_file),
+                    "spec_sha256": _file_sha256(spec_file),
+                    "standards_findings": len(observed_report.standards),
+                    "spec_findings": len(observed_report.spec),
+                }
+                return _effect_matched(details)
+
+            payload = journal.reconcile(
+                DeliveryEffect(
+                    key=f"review:accept:{round_number}",
+                    kind="review.accept",
+                    intent={
+                        "round": round_number,
+                        "integration_commit": head_before,
+                    },
+                    observe=observe,
+                    apply=lambda: expected,
+                )
+            )
+            if payload != expected:
+                raise DeliveryError("delivery_recovery_conflict:review.accept")
+        return report
 
     def _select_worker(self, title: str, prompt: str, dedupe_key: str) -> Harness:
         profiles = self._worker_profiles()
@@ -1148,7 +696,7 @@ class StandardizedDelivery:
         output = self._run_root / "routes" / f"{digest}.json"
         _safe_delivery_path(output, root=self._run_root)
         output.parent.mkdir(parents=True, exist_ok=True)
-        if not output.is_file():
+        if self._journal is not None or not output.is_file():
             self._dispatch_artifact(
                 self.config.workspace,
                 self.controller,
@@ -1182,25 +730,206 @@ class StandardizedDelivery:
         output_file: Path,
         *,
         role: str,
+        journal_context: dict[str, object] | None = None,
+        use_principal_proxy: bool = True,
+        agent_name_override: str | None = None,
     ) -> None:
         _safe_delivery_path(output_file, root=self._run_root)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        output_file.unlink(missing_ok=True)
-        for attempt in range(ARTIFACT_PROMPT_ATTEMPTS):
-            outcome = self._dispatch_with_proxy(
+        journal = self._journal
+        if journal is None:
+            output_file.unlink(missing_ok=True)
+            self._run_artifact_dispatch(
                 workspace,
                 harness,
                 prompt,
+                output_file,
                 role=role,
+                use_principal_proxy=use_principal_proxy,
+                agent_name_override=agent_name_override,
             )
+            return
+        normalized_role = re.sub(r"[^a-z0-9.-]+", "-", role.lower()).strip("-")
+        operation_key = f"agent:artifact:{normalized_role}"
+        artifact = str(output_file.relative_to(self._run_root))
+        agent_name = agent_name_override or self._delivery_agent_name(
+            workspace,
+            harness,
+            role,
+        )
+        pending = journal.has_intent(operation_key)
+        prompt_sha256 = hashlib.sha256(prompt.encode()).hexdigest()
+        context = {} if journal_context is None else journal_context
+
+        def dispatch() -> dict[str, object]:
+            if not pending:
+                output_file.unlink(missing_ok=True)
+            outcome = (
+                None
+                if output_file.is_file()
+                else self._run_artifact_dispatch(
+                    workspace,
+                    harness,
+                    prompt,
+                    output_file,
+                    role=role,
+                    use_principal_proxy=use_principal_proxy,
+                    agent_name_override=agent_name,
+                )
+            )
+            return {
+                "role": role,
+                "artifact": artifact,
+                "artifact_sha256": _file_sha256(output_file),
+                "agent_name": agent_name,
+                "harness": harness.value,
+                "pane_id": None if outcome is None else outcome.pane_id,
+                "herdr_workspace_id": (None if outcome is None else outcome.herdr_workspace_id),
+                "state": "recovered" if outcome is None else outcome.state.value,
+                "prompt_sha256": prompt_sha256,
+                "context": context,
+                "use_principal_proxy": use_principal_proxy,
+            }
+
+        def observe(
+            expected: dict[str, object] | None,
+            started: bool,
+        ) -> DeliveryEffectObservation:
+            inspection_supported = False
+            inspected: DispatchOutcome | None = None
+            if started:
+                try:
+                    inspection_supported, inspected = self._inspect_delivery_agent(
+                        workspace,
+                        agent_name,
+                        harness,
+                    )
+                except TransportError:
+                    return _effect_conflict()
+                if _agent_is_active(inspected):
+                    return _effect_conflict()
+            if not output_file.is_file():
+                return _effect_absent()
+            if inspection_supported and inspected is None:
+                return _effect_conflict()
+            invariant = {
+                "role": role,
+                "artifact": artifact,
+                "artifact_sha256": _file_sha256(output_file),
+                "agent_name": agent_name,
+                "harness": harness.value,
+                "prompt_sha256": prompt_sha256,
+                "context": context,
+                "use_principal_proxy": use_principal_proxy,
+            }
+            if expected is not None:
+                if any(expected.get(key) != value for key, value in invariant.items()):
+                    return _effect_conflict()
+                return _effect_matched(expected)
+            return _effect_matched(
+                {
+                    **invariant,
+                    "pane_id": None,
+                    "herdr_workspace_id": None,
+                    "state": "recovered",
+                }
+            )
+
+        payload = journal.reconcile(
+            DeliveryEffect(
+                key=operation_key,
+                kind="agent.dispatch",
+                intent={
+                    "role": role,
+                    "artifact": artifact,
+                    "agent_name": agent_name,
+                    "harness": harness.value,
+                    "prompt_sha256": prompt_sha256,
+                    "context": context,
+                    "use_principal_proxy": use_principal_proxy,
+                },
+                observe=observe,
+                apply=dispatch,
+            )
+        )
+        if (
+            not output_file.is_file()
+            or payload.get("role") != role
+            or payload.get("artifact") != artifact
+            or payload.get("agent_name") != agent_name
+            or payload.get("harness") != harness.value
+            or payload.get("prompt_sha256") != prompt_sha256
+            or payload.get("context") != context
+            or payload.get("use_principal_proxy") != use_principal_proxy
+            or payload.get("artifact_sha256") != _file_sha256(output_file)
+        ):
+            raise DeliveryError("delivery_recovery_conflict:agent.dispatch")
+
+    def _run_artifact_dispatch(
+        self,
+        workspace: Path,
+        harness: Harness,
+        prompt: str,
+        output_file: Path,
+        *,
+        role: str,
+        use_principal_proxy: bool,
+        agent_name_override: str | None,
+    ) -> DispatchOutcome:
+        for attempt in range(ARTIFACT_PROMPT_ATTEMPTS):
+            if use_principal_proxy:
+                outcome = self._dispatch_with_proxy(
+                    workspace,
+                    harness,
+                    prompt,
+                    role=role,
+                    agent_name_override=agent_name_override,
+                )
+            else:
+                outcome = self.dispatcher.dispatch(
+                    workspace,
+                    harness,
+                    prompt,
+                    timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                    agent_name=(
+                        agent_name_override or self._delivery_agent_name(workspace, harness, role)
+                    ),
+                )
+                if outcome.state is AgentState.BLOCKED:
+                    raise DeliveryEscalation("principal_proxy_controller_blocked")
             _require_success(outcome, role)
             if output_file.is_file():
-                return
+                return outcome
             self._record(
                 "artifact_prompt_retried",
                 {"role": role, "attempt": attempt + 1},
             )
         raise DeliveryError(f"delivery_artifact_missing: {role}")
+
+    def _delivery_agent_name(
+        self,
+        workspace: Path,
+        harness: Harness,
+        role: str,
+    ) -> str:
+        if workspace.resolve() == self.config.workspace.resolve() and harness is self.controller:
+            return _controller_agent_name(
+                self.config.name,
+                workspace,
+                harness,
+            )
+        return _agent_name(role, workspace, harness)
+
+    def _inspect_delivery_agent(
+        self,
+        workspace: Path,
+        agent_name: str,
+        harness: Harness,
+    ) -> tuple[bool, DispatchOutcome | None]:
+        inspect = getattr(self.dispatcher, "inspect_agent", None)
+        if not callable(inspect):
+            return False, None
+        return True, inspect(workspace, agent_name, harness)
 
     def _dispatch_with_proxy(
         self,
@@ -1209,15 +938,13 @@ class StandardizedDelivery:
         prompt: str,
         *,
         role: str,
+        agent_name_override: str | None = None,
     ) -> DispatchOutcome:
-        if workspace.resolve() == self.config.workspace.resolve() and harness is self.controller:
-            agent_name = _controller_agent_name(
-                self.config.name,
-                workspace,
-                harness,
-            )
-        else:
-            agent_name = _agent_name(role, workspace, harness)
+        agent_name = agent_name_override or self._delivery_agent_name(
+            workspace,
+            harness,
+            role,
+        )
         outcome = self.dispatcher.dispatch(
             workspace,
             harness,
@@ -1269,14 +996,175 @@ class StandardizedDelivery:
                 AuthorityCategory.PRODUCTION,
             }:
                 raise DeliveryEscalation("principal_proxy_escalated")
-            outcome = self.dispatcher.respond(
+            outcome = self._respond_with_journal(
+                workspace,
+                agent_name,
+                harness,
+                decision,
+                question_hash=question_hash,
+                proxy_round=proxy_round + 1,
+                decision_file=decision_file,
+            )
+        raise DeliveryError("principal_proxy_rounds_exhausted")
+
+    def _respond_with_journal(
+        self,
+        workspace: Path,
+        agent_name: str,
+        harness: Harness,
+        decision: ProxyDecision,
+        *,
+        question_hash: str,
+        proxy_round: int,
+        decision_file: Path,
+    ) -> DispatchOutcome:
+        if self._journal is None:
+            return self.dispatcher.respond(
                 workspace,
                 agent_name,
                 harness,
                 decision.response,
                 timeout_seconds=self.config.coordinator.agent_timeout_seconds,
             )
-        raise DeliveryError("principal_proxy_rounds_exhausted")
+        result: DispatchOutcome | None = None
+        workspace_key = (
+            "source"
+            if workspace.resolve() == self.config.workspace.resolve()
+            else str(workspace.relative_to(self._run_root))
+        )
+        result_base: dict[str, object] = {
+            "worker": agent_name,
+            "harness": harness.value,
+            "workspace": workspace_key,
+            "question_hash": question_hash,
+            "action": decision.action.value,
+            "category": decision.category.value,
+            "proxy_round": proxy_round,
+            "decision_artifact": str(decision_file.relative_to(self._run_root)),
+        }
+
+        def details(outcome: DispatchOutcome) -> dict[str, object]:
+            return {
+                **result_base,
+                "pane_id": outcome.pane_id,
+                "herdr_workspace_id": outcome.herdr_workspace_id,
+                "settled": outcome.state in {AgentState.IDLE, AgentState.DONE},
+            }
+
+        def respond() -> dict[str, object]:
+            nonlocal result
+            result = self.dispatcher.respond(
+                workspace,
+                agent_name,
+                harness,
+                decision.response,
+                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+            )
+            _require_success(result, f"principal_proxy_response_{proxy_round}")
+            return details(result)
+
+        def observe(
+            expected: dict[str, object] | None,
+            started: bool,
+        ) -> DeliveryEffectObservation:
+            try:
+                supported, inspected = self._inspect_delivery_agent(
+                    workspace,
+                    agent_name,
+                    harness,
+                )
+            except TransportError:
+                return _effect_conflict()
+            if not supported:
+                return _effect_absent() if expected is None else _effect_matched(expected)
+            if inspected is None:
+                return _effect_conflict()
+            if inspected.state is AgentState.BLOCKED:
+                return _effect_absent()
+            if inspected.state in {AgentState.WORKING, AgentState.UNKNOWN}:
+                return _effect_conflict()
+            observed = details(inspected)
+            return _effect_matched(observed)
+
+        payload = self._journal.reconcile(
+            DeliveryEffect(
+                key=f"agent:response:{agent_name}:{question_hash}:{proxy_round}",
+                kind="agent.respond",
+                intent=result_base,
+                observe=observe,
+                apply=respond,
+            )
+        )
+        if payload.get("settled") is not True:
+            raise DeliveryError("delivery_recovery_conflict:agent.respond")
+        if result is not None:
+            return result
+        pane_id = payload.get("pane_id")
+        workspace_id = payload.get("herdr_workspace_id")
+        return DispatchOutcome(
+            agent_name,
+            AgentState.DONE,
+            True,
+            pane_id if isinstance(pane_id, str) else None,
+            herdr_workspace_id=(workspace_id if isinstance(workspace_id, str) else None),
+            agent_settled=True,
+        )
+
+    def _recover_proxy_responses(self) -> None:
+        journal = self._journal
+        if journal is None:
+            return
+        for pending in journal.pending_effects(kind="agent.respond"):
+            intent = pending.intent
+            worker = intent.get("worker")
+            harness_value = intent.get("harness")
+            workspace_value = intent.get("workspace")
+            question_hash = intent.get("question_hash")
+            proxy_round = intent.get("proxy_round")
+            artifact_value = intent.get("decision_artifact")
+            if (
+                not isinstance(worker, str)
+                or not isinstance(harness_value, str)
+                or not isinstance(workspace_value, str)
+                or not isinstance(question_hash, str)
+                or re.fullmatch(r"[0-9a-f]{12}", question_hash) is None
+                or not isinstance(proxy_round, int)
+                or isinstance(proxy_round, bool)
+                or proxy_round < 1
+                or not isinstance(artifact_value, str)
+            ):
+                raise DeliveryError("delivery_journal_invalid")
+            try:
+                harness = Harness(harness_value)
+            except ValueError as exc:
+                raise DeliveryError("delivery_journal_invalid") from exc
+            workspace = (
+                self.config.workspace
+                if workspace_value == "source"
+                else _safe_delivery_path(
+                    self._run_root / workspace_value,
+                    root=self._run_root,
+                )
+            )
+            decision_file = _safe_delivery_path(
+                self._run_root / artifact_value,
+                root=self._run_root,
+            )
+            decision = load_proxy_decision(decision_file)
+            if (
+                intent.get("action") != decision.action.value
+                or intent.get("category") != decision.category.value
+            ):
+                raise DeliveryError("delivery_recovery_conflict:agent.respond")
+            self._respond_with_journal(
+                workspace,
+                worker,
+                harness,
+                decision,
+                question_hash=question_hash,
+                proxy_round=proxy_round,
+                decision_file=decision_file,
+            )
 
     def _run_proxy_decision(
         self,
@@ -1287,31 +1175,25 @@ class StandardizedDelivery:
     ) -> None:
         _safe_delivery_path(decision_file, root=self._run_root)
         decision_file.parent.mkdir(parents=True, exist_ok=True)
-        decision_file.unlink(missing_ok=True)
         name = _agent_name(
             f"principal-proxy-{proxy_round}",
             self.config.workspace,
             self.controller,
         )
         prompt = principal_proxy_prompt(self._goal, question, decision_file)
-        for attempt in range(ARTIFACT_PROMPT_ATTEMPTS):
-            outcome = self.dispatcher.dispatch(
-                self.config.workspace,
-                self.controller,
-                prompt,
-                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-                agent_name=name,
-            )
-            if outcome.state is AgentState.BLOCKED:
-                raise DeliveryEscalation("principal_proxy_controller_blocked")
-            _require_success(outcome, "principal_proxy")
-            if decision_file.is_file():
-                return
-            self._record(
-                "artifact_prompt_retried",
-                {"role": "principal_proxy", "attempt": attempt + 1},
-            )
-        raise DeliveryError("delivery_artifact_missing: principal_proxy")
+        self._dispatch_artifact(
+            self.config.workspace,
+            self.controller,
+            prompt,
+            decision_file,
+            role=f"principal-proxy-{proxy_round}",
+            journal_context={
+                "proxy_round": proxy_round,
+                "question_hash": hashlib.sha256(question.encode()).hexdigest()[:12],
+            },
+            use_principal_proxy=False,
+            agent_name_override=name,
+        )
 
     def _worker_profiles(self) -> tuple[HarnessProfile, ...]:
         return tuple(
@@ -1352,63 +1234,6 @@ def _first_decision_frontier(map_: WayfinderMap) -> DecisionTicket:
     raise DeliveryError("wayfinder_frontier_stalled")
 
 
-def _finding_map(report: ReviewReport) -> dict[str, ReviewFinding]:
-    findings: dict[str, ReviewFinding] = {}
-    for axis, rows in (("standards", report.standards), ("spec", report.spec)):
-        for index, finding in enumerate(rows, 1):
-            findings[f"{axis}:{index}"] = finding
-    return findings
-
-
-def _require_success(outcome: DispatchOutcome, role: str) -> None:
-    if outcome.error_code is not None or outcome.state not in {
-        AgentState.IDLE,
-        AgentState.DONE,
-    }:
-        raise DeliveryError(
-            f"delivery_dispatch_failed:{role}:" f"{outcome.error_code or outcome.state.value}"
-        )
-
-
-def _safe_delivery_path(path: Path, *, root: Path | None = None) -> Path:
-    try:
-        return validate_artifact_path(path, root=root)
-    except DeliveryArtifactError as exc:
-        raise DeliveryError("delivery_artifact_path_invalid") from exc
-
-
-def _validate_worktree_ownership(
-    git: GitWorkspace,
-    expected_path: Path,
-    worktree: Worktree,
-) -> None:
-    try:
-        git.validate_ownership(expected_path, worktree)
-    except GitWorkspaceError as exc:
-        raise DeliveryError(str(exc)) from exc
-
-
-def _validate_worktree_clean(git: GitWorkspace, path: Path) -> None:
-    try:
-        git.validate_clean(path)
-    except GitWorkspaceError as exc:
-        raise DeliveryError(str(exc)) from exc
-
-
-def _git_output(git: GitWorkspace, cwd: Path, *args: str) -> str:
-    try:
-        return git.output(cwd, *args)
-    except GitWorkspaceError as exc:
-        raise DeliveryError(str(exc)) from exc
-
-
-def _git_succeeds(git: GitWorkspace, cwd: Path, *args: str) -> bool:
-    try:
-        return git.succeeds(cwd, *args)
-    except GitWorkspaceError as exc:
-        raise DeliveryError("delivery_git_query_failed") from exc
-
-
 def _agent_name(role: str, workspace: Path, harness: Harness) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "agent"
     digest = hashlib.sha256(f"{role}\0{workspace.resolve()}\0{harness.value}".encode()).hexdigest()[
@@ -1427,62 +1252,3 @@ def _controller_agent_name(
         f"{workflow_name}\0{workspace.resolve()}\0delivery-control\0{harness.value}".encode()
     ).hexdigest()[:8]
     return f"hd-control-{harness.value}-{digest}"
-
-
-def _write_json(path: Path, payload: dict[str, object]) -> None:
-    write_artifact_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        error_type=DeliveryError,
-    )
-
-
-def _load_completed_result(path: Path, run_id: str) -> DeliveryResult | None:
-    _safe_delivery_path(path)
-    if not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise DeliveryError("delivery_result_invalid_json") from exc
-    expected = {
-        "run_id",
-        "status",
-        "artifact_root",
-        "tracker_references",
-        "integration_branch",
-        "integration_commit",
-        "tickets_completed",
-        "review_rounds",
-    }
-    if not isinstance(payload, dict) or set(payload) != expected:
-        raise DeliveryError("delivery_result_invalid_shape")
-    references = payload["tracker_references"]
-    artifact_root = payload["artifact_root"]
-    if (
-        payload["run_id"] != run_id
-        or payload["status"] != "succeeded"
-        or not isinstance(references, dict)
-        or not all(
-            isinstance(key, str) and isinstance(value, str) for key, value in references.items()
-        )
-        or not isinstance(artifact_root, str)
-        or Path(artifact_root).resolve() != path.parent.resolve()
-        or not isinstance(payload["integration_branch"], str)
-        or not isinstance(payload["integration_commit"], str)
-        or not isinstance(payload["tickets_completed"], int)
-        or isinstance(payload["tickets_completed"], bool)
-        or not isinstance(payload["review_rounds"], int)
-        or isinstance(payload["review_rounds"], bool)
-    ):
-        raise DeliveryError("delivery_result_invalid")
-    return DeliveryResult(
-        run_id=run_id,
-        status="succeeded",
-        artifact_root=Path(artifact_root),
-        tracker_references=dict(references),
-        integration_branch=payload["integration_branch"],
-        integration_commit=payload["integration_commit"],
-        tickets_completed=payload["tickets_completed"],
-        review_rounds=payload["review_rounds"],
-    )
