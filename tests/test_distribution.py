@@ -56,6 +56,11 @@ class DistributionCliTests(unittest.TestCase):
             f"{repository_url}/tree/main/{repository['directory']}#readme",
         )
 
+    def test_npm_test_script_exposes_the_src_layout(self) -> None:
+        metadata = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+
+        self.assertIn("PYTHONPATH=src", metadata["scripts"]["test"])
+
     def test_missing_option_value_returns_a_stable_cli_error(self) -> None:
         result = self._run("install", "--project")
 
