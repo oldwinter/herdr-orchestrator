@@ -38,11 +38,18 @@ class ConfigError(ValueError):
 
 
 def load_workflow(path: str | Path) -> WorkflowConfig:
-    workflow_path = Path(path).expanduser().resolve()
+    try:
+        workflow_path = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ConfigError("workflow_path_invalid") from exc
     if not workflow_path.is_file():
         raise ConfigError(f"workflow_not_found: {workflow_path}")
     try:
-        raw = tomllib.loads(workflow_path.read_text(encoding="utf-8"))
+        text = workflow_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"workflow_invalid_encoding: {exc}") from exc
+    try:
+        raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"workflow_invalid_toml: {exc}") from exc
 
@@ -132,6 +139,8 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         profiles_for_workers(profiles, workers)
         if planner.harness is not None:
             profile_for_harness(profiles, planner.harness)
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"profile_invalid_encoding: {exc}") from exc
     except CatalogError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -274,8 +283,11 @@ def _load_seed_jobs(
 
 
 def _resolve_path(base: Path, value: str) -> Path:
-    candidate = Path(value).expanduser()
-    return (base / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    try:
+        candidate = Path(value).expanduser()
+        return (base / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError("path_invalid") from exc
 
 
 def _table(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -420,6 +432,7 @@ def _optional_placement(
     value = data.get(key, "auto")
     if not isinstance(value, str):
         raise ConfigError(f"{key}_must_be_placement_or_auto")
+    value = value.strip()
     if value == "auto":
         return None
     try:
@@ -451,10 +464,7 @@ def _optional_path(
     value = data.get(key, default)
     if not isinstance(value, str) or not value.strip() or len(value) > 4096:
         raise ConfigError(f"{key}_must_be_non_empty_string")
-    candidate = Path(value).expanduser()
-    if candidate.is_absolute():
-        return candidate.resolve()
-    return (workspace / candidate).resolve()
+    return _resolve_path(workspace, value.strip())
 
 
 def _enum_value[EnumValue: StrEnum](
@@ -466,6 +476,7 @@ def _enum_value[EnumValue: StrEnum](
     value = data.get(key, default.value)
     if not isinstance(value, str):
         raise ConfigError(f"{key}_must_be_string")
+    value = value.strip()
     try:
         return enum_type(value)
     except ValueError as exc:
