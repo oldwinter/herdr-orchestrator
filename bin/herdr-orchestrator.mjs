@@ -720,7 +720,12 @@ function doctor(options) {
     } else {
       try {
         const parsed = JSON.parse(result.stdout);
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        if (
+          parsed === null
+          || typeof parsed !== "object"
+          || Array.isArray(parsed)
+          || typeof parsed.ok !== "boolean"
+        ) {
           throw new Error("runtime_doctor_invalid_output");
         }
         runtime = parsed;
