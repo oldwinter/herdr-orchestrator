@@ -196,13 +196,20 @@ def test_blocked_response_has_one_physical_submission_crash_window() -> None:
     assert [event.phase for event in progress] == [AttemptPhase.RUNTIME_ACQUIRED]
 
 
-def test_blocked_response_timeout_without_acceptance_is_unsafe() -> None:
+@pytest.mark.parametrize(
+    "submission_result",
+    ({"_error": "timeout"}, {"type": "ok"}),
+    ids=("submission-timeout", "accepted-wait-timeout"),
+)
+def test_blocked_response_submission_without_acceptance_is_unsafe(
+    submission_result: dict[str, object],
+) -> None:
     with tempfile.TemporaryDirectory() as temporary:
         workspace = Path(temporary)
         runner = FakeRunner(
             [
                 {"agent": _minimal_agent(AgentState.BLOCKED, 5)},
-                {"_error": "timeout"},
+                submission_result,
                 {"_error": "herdr_timeout"},
             ]
         )

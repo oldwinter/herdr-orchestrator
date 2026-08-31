@@ -397,6 +397,22 @@ def submit_blocked_response(
             on_acceptance=observe_acceptance,
         )
 
+    def reconcile_submission(
+        submission_error: TransportError | None = None,
+    ) -> tuple[AgentState, int]:
+        try:
+            return reconcile()
+        except TransportError as reconciliation_error:
+            if accepted:
+                raise
+            raise TransportError(
+                "unsafe_turn_adoption",
+                summary=(
+                    reconciliation_error.summary
+                    or (submission_error.summary if submission_error is not None else None)
+                ),
+            ) from reconciliation_error
+
     try:
         run_json(
             host.runner,
@@ -409,16 +425,8 @@ def submit_blocked_response(
     except TransportError as submission_error:
         if submission_error.code not in AMBIGUOUS_RESPONSE_SUBMISSION_ERRORS:
             raise
-        try:
-            return reconcile()
-        except TransportError as reconciliation_error:
-            if accepted:
-                raise
-            raise TransportError(
-                "unsafe_turn_adoption",
-                summary=reconciliation_error.summary or submission_error.summary,
-            ) from reconciliation_error
-    return reconcile()
+        return reconcile_submission(submission_error)
+    return reconcile_submission()
 
 
 def wait_after_response(
