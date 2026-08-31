@@ -111,6 +111,24 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "planner_prompt_must_be_in_workspace"):
                 load_workflow(workflow)
 
+    def test_accepts_absolute_planner_prompt_inside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prompt = root / "prompt.md"
+            prompt.write_text("task", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    'prompt_file = "prompt.md"',
+                    f'prompt_file = "{prompt.as_posix()}"',
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_workflow(workflow)
+
+        self.assertEqual(config.planner.prompt_file, prompt)
+
     def test_preserves_external_state_and_tracker_roots_for_trusted_workflows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -122,7 +140,10 @@ class ConfigTests(unittest.TestCase):
                     'state_db = ".orchestrator/state.db"',
                     f'state_db = "{(outside / "state.db").as_posix()}"',
                 )
-                + f'\n[standardized_delivery]\ntracker_root = "{(outside / "tracker").as_posix()}"\n',
+                + (
+                    "\n[standardized_delivery]\n"
+                    f'tracker_root = "{(outside / "tracker").as_posix()}"\n'
+                ),
                 encoding="utf-8",
             )
 

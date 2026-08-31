@@ -119,6 +119,9 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     planner_worker_harnesses = _optional_harness_list(planner_raw, "worker_harnesses")
     if any(harness not in harnesses for harness in planner_worker_harnesses):
         raise ConfigError("planner_worker_harness_has_no_worker")
+    planner_prompt = _existing_file(base, planner_raw, "prompt_file")
+    if not planner_prompt.is_relative_to(workspace):
+        raise ConfigError("planner_prompt_must_be_in_workspace")
     planner = PlannerConfig(
         enabled=_boolean(planner_raw, "enabled"),
         harness=_optional_harness(planner_raw, "harness"),
@@ -129,7 +132,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             minimum=60,
             maximum=86400,
         ),
-        prompt_file=_existing_file(base, planner_raw, "prompt_file"),
+        prompt_file=planner_prompt,
         output_file=planner_output,
         max_tasks=_integer(planner_raw, "max_tasks", minimum=1, maximum=100),
     )

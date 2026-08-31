@@ -229,14 +229,18 @@ class RepositoryCheckerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "justfile").write_text(
-                "check:\n\t@true\nenqueue:\n\t@true\nrun:\n\t@true\n",
+                "check:\n\t@true\nenqueue:\n\t@true\nrun:\n\t@true\nstatus:\n\t@true\n",
                 encoding="utf-8",
             )
             for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
                 (root / name).write_text("", encoding="utf-8")
+            (root / "workflows/prompts").mkdir(parents=True)
             docs = root / "docs"
             docs.mkdir()
-            (docs / "architecture.md").write_text("", encoding="utf-8")
+            (docs / "architecture.md").write_text(
+                "```bash\njust status --workflow workflows/missing-architecture.toml\n```\n",
+                encoding="utf-8",
+            )
             (docs / "runtime-troubleshooting.md").write_text(
                 "```bash\njust run --workflow workflows/missing-runtime.toml\n```\n",
                 encoding="utf-8",
@@ -259,6 +263,10 @@ class RepositoryCheckerTests(unittest.TestCase):
             "runtime-troubleshooting.md: missing command path workflows/missing-runtime.toml",
             failures,
         )
+        self.assertIn(
+            "architecture.md: missing command path workflows/missing-architecture.toml",
+            failures,
+        )
 
     def test_documented_workflows_are_all_tracked_examples(self) -> None:
         workflows = sorted(
@@ -272,6 +280,18 @@ class RepositoryCheckerTests(unittest.TestCase):
         self.assertGreater(len(workflows), 1)
         for workflow in workflows:
             self.assertIn(workflow, documentation)
+
+    def test_planner_docs_separate_output_validation_from_process_isolation(self) -> None:
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        schema = (REPO_ROOT / "docs/workflow-schema.md").read_text(encoding="utf-8")
+
+        self.assertIn("`command`、`argv`", agents)
+        self.assertIn("工具沙箱", agents)
+        self.assertIn("最高自动化参数", agents)
+        self.assertIn("被攻陷的 harness 仍可能使用自身工具", agents)
+        self.assertIn("worktree 只是 checkout 隔离，不是安全沙箱", agents)
+        self.assertIn("`command`、`argv`", schema)
+        self.assertIn("工具沙箱", schema)
 
     def test_reference_generator_runs_without_installed_package_or_pythonpath(self) -> None:
         environment = os.environ.copy()
@@ -298,8 +318,12 @@ class RepositoryCheckerTests(unittest.TestCase):
         rendered = GENERATE_REFERENCE.render()
 
         for option in ("--succeeded-agents", "--failed-agents"):
+            expected = (
+                f"| `{option}` | yes, exactly one of (mutually exclusive): "
+                "`--succeeded-agents`, `--failed-agents` |"
+            )
             self.assertIn(
-                f"| `{option}` | one of `--succeeded-agents`, `--failed-agents` |",
+                expected,
                 rendered,
             )
 

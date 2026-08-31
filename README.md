@@ -2,7 +2,7 @@
 
 基于 Herdr 的本地优先多 harness 工作流控制面。
 
-它让一个确定性 coordinator 持续派发任务给 Droid、Grok Build、Codex、pi、Claude Code、Hermes 等交互式 agent，同时保留 durable queue、lease、重试、去重和收据。可选 planner agent 只负责提出结构化任务，不拥有调度与执行权限。
+它让一个确定性 coordinator 持续派发任务给 Droid、Grok Build、Codex、pi、Claude Code、Hermes 等交互式 agent，同时保留 durable queue、lease、重试、去重和收据。可选 planner agent 只向 coordinator 提交结构化任务，不拥有 queue 调度权限；planner 进程仍可使用所选 harness 的工具，也不是安全沙箱。
 
 ## Harness catalog，像 Skills 一样两级加载
 
@@ -32,7 +32,7 @@ just catalog-json
 just profile codex
 ```
 
-catalog 的真源是 `profiles/harnesses/*.toml`，完整上下文在同目录 Markdown。planner 只收到当前 workflow 启用 harness 的紧凑 catalog；任务真正 dispatch 前，coordinator 才读取所选 harness 的完整 Markdown profile 并注入 prompt。
+catalog 的真源是 `profiles/harnesses/*.toml`，完整上下文在同目录 Markdown。planner 只收到当前 workflow 启用 harness 的紧凑 catalog；任务真正 dispatch 前，coordinator 才读取所选 harness 的完整 Markdown profile 并注入 prompt。coordinator 只接受经过 schema 校验的 task JSON，并拒绝 `command`、`argv` 等字段；这不限制 planner harness 自己使用工具，也不把进程变成沙箱。
 
 ## 为什么不是让 Herdr 直接当主控
 
@@ -405,7 +405,9 @@ artifact、恢复和退出码见
 
 ## 工作流
 
-首个示例是 [`workflows/multi-harness.toml`](workflows/multi-harness.toml)。它声明：
+仓库跟踪多个声明式 workflow。默认多 harness 示例是
+[`workflows/multi-harness.toml`](workflows/multi-harness.toml)，研究示例是
+[`workflows/grok-research.toml`](workflows/grok-research.toml)。多 harness 示例声明：
 
 - coordinator 的轮询、并发、lease 和重试策略；
 - 六个 harness worker，包括 Grok Build；
@@ -421,5 +423,5 @@ artifact、恢复和退出码见
 - 不在普通 queue 模式自动回答 job approval 或需求 question UI；启动期只自动确认精确匹配的 Claude workspace trust；
 - 不自动 push、merge、发布或删除；
 - 不把 pane terminal output 当完整 transcript；
-- 不让 planner 生成并执行任意 shell command；
+- 不把 planner 输出中的 `command` 或 `argv` 字段交给 coordinator 执行；planner harness 自身的工具使用不受这个数据校验保证，worktree 也不是安全沙箱；
 - 不在 v1 内做跨机器分布式调度。

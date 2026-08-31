@@ -4,19 +4,19 @@
 
 本仓库是本地优先的多 harness 工作流控制面。它用声明式 TOML 描述工作流，由确定性 coordinator 管理 durable queue、lease、重试与收据，并通过 Herdr 承载交互式 agent。
 
-Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符合 schema 的任务，是否入队、何时调度、如何恢复由 coordinator 决定。
+Herdr 是 terminal runtime，不是推理主控。planner agent 只向 coordinator 提出符合 schema 的任务；是否入队、何时调度、如何恢复由 coordinator 决定。
 
 ## Start
 
 1. `just doctor`
 2. `just test`
 3. 阅读 `docs/architecture.md`
-4. 查看 `workflows/multi-harness.toml`
+4. 查看 `workflows/*.toml`
 5. 需要选 worker 时先跑 `just catalog`，不要一次读完所有 harness `.md`
 
 ## 工作流
 
-当前只有一个声明式工作流：`workflows/multi-harness.toml`。它声明 coordinator 策略、六个 worker、紧凑 catalog 目录、可选 planner，以及可幂等 seed 的示例任务。改 TOML 字段前读 `docs/workflow-schema.md`。
+仓库包含多个声明式工作流。`workflows/multi-harness.toml` 是多 harness 示例，`workflows/grok-research.toml` 是 Grok research 示例。每个文件都声明 coordinator 策略、worker、catalog 目录、planner 和可选 seed 任务。改 TOML 字段前读 `docs/workflow-schema.md`。
 
 仓库运行面各自独立，不要混用其状态语义：
 
@@ -73,7 +73,8 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只能提出符�
 ## 安全边界
 
 - secret 只从环境变量、keychain 或 harness 自身登录态读取。
-- planner 不得直接提交 shell 命令，只能输出受校验的 task JSON。
+- planner 输出只接受受 schema 校验的 task JSON；coordinator 拒绝 `command`、`argv` 等字段，也不执行模型提交的 shell。
+- 这个输出校验不是进程或工具沙箱。planner harness 仍按所选 harness 的最高自动化参数运行，六种 harness 没有共同的可移植 no-tools 模式；被攻陷的 harness 仍可能使用自身工具。prompt policy 也不能改变这一点。
 - planner 只能从当前 workflow 启用的紧凑 harness catalog 中选择 worker。
 - 默认任务不得 push、merge、发布、发送、删除、修改权限或触碰生产环境。
 - 标准交付模式仅在明确 Skill/CLI 触发后启用 principal proxy；规格内本地动作可自主决定，

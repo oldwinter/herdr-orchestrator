@@ -89,7 +89,6 @@ def topology_decision_prompt(
     allowed = ["tab", "pane"]
     if supports_worktree:
         allowed.append("worktree")
-    choices = "|".join(allowed)
     worktree_guidance = (
         "\n- worktree: repository-writing work that needs an isolated branch and checkout."
         if supports_worktree
@@ -114,7 +113,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{"placement":"{choices}","rationale":"..."}}
+{{"placement":"pane","rationale":"..."}}
 """.strip()
 
 
