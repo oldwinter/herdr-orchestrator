@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ WRITE_SIGNALS = (
 )
 LABEL_CHAR = re.compile(r"[^a-z0-9]+")
 PLACEMENT_KEYS = {"placement", "rationale"}
+TOPOLOGY_OUTPUT_MAX_BYTES = 32 * 1024 * 1024
 
 
 class TopologyDecisionError(ValueError):
@@ -51,6 +53,9 @@ def static_placement(
     worker_default: PlacementTarget | None = None,
     supports_worktree: bool = True,
 ) -> PlacementTarget | None:
+    if not isinstance(mode, PlacementMode):
+        raise TopologyDecisionError("topology_mode_invalid")
+    _validate_git_capability(supports_worktree)
     if override is not None:
         return _validate_worktree(override, supports_worktree)
     if worker_default is not None:
@@ -75,6 +80,10 @@ def topology_decision_prompt(
     *,
     supports_worktree: bool,
 ) -> str:
+    _validate_git_capability(supports_worktree)
+    _validate_prompt_text(title)
+    _validate_prompt_text(prompt)
+    _validate_output_path(output_file)
     allowed = ["tab", "pane"]
     if supports_worktree:
         allowed.append("worktree")
@@ -112,15 +121,12 @@ def load_topology_decision(
     *,
     supports_worktree: bool,
 ) -> PlacementTarget:
+    _validate_output_path(path)
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            _read_controller_output(path),
             object_pairs_hook=_reject_duplicate_keys,
         )
-    except FileNotFoundError as exc:
-        raise TopologyDecisionError("topology_output_missing") from exc
-    except (OSError, UnicodeError) as exc:
-        raise TopologyDecisionError("topology_output_unreadable") from exc
     except json.JSONDecodeError as exc:
         raise TopologyDecisionError("topology_output_invalid_json") from exc
     if not isinstance(payload, dict) or set(payload) != PLACEMENT_KEYS:
@@ -156,6 +162,9 @@ def _validate_worktree(
     target: PlacementTarget,
     supports_worktree: bool,
 ) -> PlacementTarget:
+    if not isinstance(target, PlacementTarget):
+        raise TopologyDecisionError("topology_placement_invalid")
+    _validate_git_capability(supports_worktree)
     if target is PlacementTarget.WORKTREE and not supports_worktree:
         raise TopologyDecisionError("topology_worktree_requires_git")
     return target
@@ -174,3 +183,48 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise TopologyDecisionError("topology_output_duplicate_key")
         payload[key] = value
     return payload
+
+
+def _read_controller_output(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise TopologyDecisionError("topology_output_missing") from exc
+    except OSError as exc:
+        raise TopologyDecisionError("topology_output_unreadable") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise TopologyDecisionError("topology_output_path_invalid")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise TopologyDecisionError("topology_output_unreadable")
+    try:
+        with path.open("rb") as stream:
+            content = stream.read(TOPOLOGY_OUTPUT_MAX_BYTES + 1)
+    except FileNotFoundError as exc:
+        raise TopologyDecisionError("topology_output_missing") from exc
+    except OSError as exc:
+        raise TopologyDecisionError("topology_output_unreadable") from exc
+    if len(content) > TOPOLOGY_OUTPUT_MAX_BYTES:
+        raise TopologyDecisionError("topology_output_too_large")
+    try:
+        return content.decode("utf-8")
+    except UnicodeError as exc:
+        raise TopologyDecisionError("topology_output_unreadable") from exc
+
+
+def _validate_output_path(path: Path) -> None:
+    if not isinstance(path, Path):
+        raise TopologyDecisionError("topology_output_path_invalid")
+    if ".." in path.parts or any(ord(char) < 32 or ord(char) == 127 for char in str(path)):
+        raise TopologyDecisionError("topology_output_path_invalid")
+
+
+def _validate_prompt_text(value: str) -> None:
+    if not isinstance(value, str):
+        raise TopologyDecisionError("topology_prompt_invalid")
+    if any((ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127 for char in value):
+        raise TopologyDecisionError("topology_prompt_invalid")
+
+
+def _validate_git_capability(supports_worktree: bool) -> None:
+    if not isinstance(supports_worktree, bool):
+        raise TopologyDecisionError("topology_git_capability_invalid")

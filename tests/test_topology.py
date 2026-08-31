@@ -47,6 +47,36 @@ class TopologyTests(unittest.TestCase):
 
         self.assertEqual(placement, PlacementTarget.TAB)
 
+    def test_rejects_untyped_placement_inputs(self) -> None:
+        with self.assertRaisesRegex(
+            TopologyDecisionError,
+            "topology_placement_invalid",
+        ):
+            static_placement(
+                PlacementMode.HYBRID,
+                "Task",
+                "Prompt",
+                override="worktree",  # type: ignore[arg-type]
+                supports_worktree=False,
+            )
+
+        with self.assertRaisesRegex(
+            TopologyDecisionError,
+            "topology_mode_invalid",
+        ):
+            static_placement("hybrid", "Task", "Prompt")  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(
+            TopologyDecisionError,
+            "topology_git_capability_invalid",
+        ):
+            static_placement(
+                PlacementMode.HYBRID,
+                "Task",
+                "Prompt",
+                supports_worktree="false",  # type: ignore[arg-type]
+            )
+
     def test_ambiguous_hybrid_task_requires_controller_decision(self) -> None:
         placement = static_placement(
             PlacementMode.HYBRID,
@@ -132,6 +162,66 @@ class TopologyTests(unittest.TestCase):
             ),
         ):
             load_topology_decision(Path(temporary), supports_worktree=True)
+
+    def test_rejects_symlinked_controller_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.json"
+            target.write_text(
+                '{"placement":"pane","rationale":"ok"}',
+                encoding="utf-8",
+            )
+            output = root / "topology.json"
+            output.symlink_to(target)
+
+            with self.assertRaisesRegex(
+                TopologyDecisionError,
+                "topology_output_path_invalid",
+            ):
+                load_topology_decision(output, supports_worktree=True)
+
+    def test_rejects_invalid_controller_output_path(self) -> None:
+        with self.assertRaisesRegex(
+            TopologyDecisionError,
+            "topology_output_path_invalid",
+        ):
+            load_topology_decision(Path("plans/../topology.json"), supports_worktree=True)
+
+    def test_rejects_oversized_controller_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "topology.json"
+            with output.open("wb") as stream:
+                stream.truncate(32 * 1024 * 1024 + 1)
+
+            with self.assertRaisesRegex(
+                TopologyDecisionError,
+                "topology_output_too_large",
+            ):
+                load_topology_decision(output, supports_worktree=True)
+
+    def test_rejects_unsafe_controller_prompt_path(self) -> None:
+        with self.assertRaisesRegex(
+            TopologyDecisionError,
+            "topology_output_path_invalid",
+        ):
+            topology_decision_prompt(
+                "Task",
+                "Choose a placement.",
+                Path("topology\nforged.json"),
+                supports_worktree=True,
+            )
+
+    def test_rejects_control_characters_in_controller_prompt(self) -> None:
+        with self.assertRaisesRegex(
+            TopologyDecisionError,
+            "topology_prompt_invalid",
+        ):
+            topology_decision_prompt(
+                "Task\x00",
+                "Choose a placement.",
+                Path("topology.json"),
+                supports_worktree=True,
+            )
 
     def test_display_label_truncates_without_hash_suffix(self) -> None:
         label = short_display_label(
