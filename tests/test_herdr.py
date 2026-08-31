@@ -2386,9 +2386,9 @@ class HerdrTransportTests(unittest.TestCase):
             [
                 "herdr",
                 "pane",
-                "send-text",
+                "run",
                 "w1:p9",
-                "Approve this local action.\n",
+                "Approve this local action.",
             ],
         )
         self.assertEqual(runner.calls[2][0:3], ["herdr", "agent", "get"])

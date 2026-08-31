@@ -43,8 +43,8 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 - startup 的单次 blocked snapshot 不是用户问题；settle 后仍 blocked 才是。
 - prompt 返回 settled snapshot 时，sequence 没有前进必须拒绝成功。
 - prompt submission 与 task execution timeout 应分开；前者应快速确认或快速失败。
-- 已 blocked agent 会拒绝普通 `agent prompt`；代理回答使用一次 `pane send-text`，并把结尾
-  newline 放在同一个 literal payload 中。之后等待新的 sequence，不能复用普通 prompt 路径。
+- 已 blocked agent 会拒绝普通 `agent prompt`；代理回答使用一次 `pane run`，由 Herdr 原子发送
+  literal text 与 Enter。之后等待新的 sequence，不能复用普通 prompt 路径。
 - retry receipt 必须保留每个 attempt，不能用最终成功覆盖第一次 timeout。
 - 后台 tab 使用 `--no-focus` 是正确行为；“当前 pane 没看到活动”不是运行证据。
 
@@ -57,17 +57,20 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
   timeout 后先复查 sequence，已前进则继续，未前进返回 `prompt_acceptance_timeout`。
 - stalled prompt 最多重发两次 Enter；仍无变化返回 `agent_turn_not_observed`。
 - 进入 `working` 后继续使用 workflow 的 `agent_timeout_seconds` 等待 settled。
-- principal proxy 使用一次带结尾 newline 的 pane literal text 回答 blocked worker，再等待新的
-  lifecycle sequence；普通 queue 不自动回答。
+- principal proxy 使用一次 `pane run` 回答 blocked worker，再等待新的 lifecycle sequence；
+  普通 queue 不自动回答。
 - 人工审查后，普通 queue 可用显式 `resume --job-id ... --response-file ...` 回答；命令验证
   原 agent、pane 与 execution workspace，并保持原 attempt。每次 resume 使用新的 operation
-  token；过期且已接受的 response 会先恢复，不会重复发送。
+  token；过期且已接受但尚未 durably settled 的 response 进入 attention，不会重复发送。
 - prompt 接受前的 `unknown`、timeout、未观察到 turn 和协议错误不会记成功，并可按 budget
   重试。prompt 接受后若 turn 仍可能运行，job 进入 `blocked`，`attempt_phase` 为 `attention`。
-- lease 过期后先恢复原 attempt。只有没有 durable runtime baseline，或 live sequence 证明输入
-  未接受时，coordinator 才 abandon 该 operation。
-- recovery 只接受相对持久化 sequence 最多 8 次 lifecycle 变化。更大的 advance 进入 attention。
-- recovery 用 `agent get` 验证 ownership。turn settled 后可以读取最多 80 行 detection output，
+- lease 过期后先恢复原 attempt。`claimed` 尚未取得 runtime，或有 durable baseline 的
+  `runtime_acquired` live snapshot 仍等于 baseline 时，coordinator 才能证明输入未接受并
+  abandon 该 operation；旧 schema 缺失 baseline 时进入 attention。
+- Herdr 0.8.2 不提供 turn identifier。`prompt_accepted` 或 sequence 已变化但 outcome 尚未
+  durably settled 时，recovery 进入 attention，不按 sequence window 猜测或采用 live turn。
+- recovery 用 `agent get` 验证 ownership。只有 durable `settled`/`receipt_observed` 的 terminal
+  state 与 exact sequence 仍匹配时，才可继续 outcome。随后最多读取 80 行 detection output，
   只用于现有 fatal signal 分类；完整 output 不进入 SQLite、receipt 或日志摘要。
 - stale phase 和 outcome 会保留为 `is_stale=1` receipt。status、resume 和 GC 不读取 stale
   receipt 作为当前 identity 或 pane ownership。

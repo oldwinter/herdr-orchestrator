@@ -112,6 +112,12 @@ def _runtime(row: sqlite3.Row) -> AttemptRuntime:
         value = row[key]
         return int(value) if value is not None else None
 
+    def boolean(key: str) -> bool | None:
+        value = row[key]
+        return bool(value) if value is not None else None
+
+    agent_state = text("agent_state")
+
     return AttemptRuntime(
         agent_name=str(row["agent_name"]),
         pane_id=text("pane_id"),
@@ -122,6 +128,9 @@ def _runtime(row: sqlite3.Row) -> AttemptRuntime:
         prompt_accepted_sequence=integer("prompt_accepted_sequence"),
         state_change_sequence=integer("last_state_change_sequence"),
         phase=AttemptPhase(str(row["phase"])),
+        agent_state=AgentState(agent_state) if agent_state is not None else None,
+        agent_settled=boolean("agent_settled"),
+        task_verified=boolean("task_verified"),
     )
 
 
@@ -358,7 +367,11 @@ class AttemptLedger:
         operation_token = str(
             job["correlation_id"]
             if blocked_resume and job["correlation_id"]
-            else correlation or fence
+            else (
+                f"legacy-resume:{job['id']}:{number}:{len(receipts)}"
+                if blocked_resume
+                else correlation or fence
+            )
         )
         AttemptLedger._insert_legacy_attempt(
             connection,
@@ -377,7 +390,7 @@ class AttemptLedger:
         if attempt is None:
             raise StoreError("attempt_backfill_failed")
         AttemptLedger._link_legacy_receipts(
-            connection, receipts, attempt, operation_token=operation_token
+            connection, receipts, attempt, fallback_operation_token=fence
         )
 
     @staticmethod
@@ -474,7 +487,11 @@ class AttemptLedger:
         error_code = None if blocked_resume else _coalesce(latest or job, job, "error_code")
         phase = AttemptPhase.OUTCOME_COMMITTED.value
         if active:
-            phase = AttemptPhase.CLAIMED.value
+            phase = (
+                AttemptPhase.RUNTIME_ACQUIRED.value
+                if blocked_resume
+                else AttemptPhase.CLAIMED.value
+            )
         elif error_code == "lease_expired":
             phase = AttemptPhase.ABANDONED.value
         updated_at = float(latest["observed_at"] if latest is not None else job["updated_at"])
@@ -514,7 +531,7 @@ class AttemptLedger:
         receipts: list[sqlite3.Row],
         attempt: sqlite3.Row,
         *,
-        operation_token: str,
+        fallback_operation_token: str,
     ) -> None:
         for operation_sequence, receipt in enumerate(receipts):
             connection.execute(
@@ -527,7 +544,7 @@ class AttemptLedger:
                 (
                     attempt["id"],
                     attempt["fencing_token"],
-                    str(receipt["correlation_id"] or operation_token),
+                    str(receipt["correlation_id"] or fallback_operation_token),
                     operation_sequence,
                     (
                         AttemptPhase.ABANDONED.value

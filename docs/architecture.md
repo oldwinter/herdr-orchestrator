@@ -55,15 +55,18 @@ phase 或 outcome 更新都比较 job、current attempt、fencing token、lease 
 token。旧 coordinator 可以追加 `is_stale=1` 的 audit receipt，但不能修改当前 job 或 attempt。
 
 `running` lease 过期时，coordinator 先在原 attempt 上轮换 lease owner，再检查持久化的 Herdr
-identity 和 sequence。这个 reconciliation 不增加 attempt：
+identity、phase 和 sequence。这个 reconciliation 不增加 attempt：
 
-- 没有 durable runtime baseline 时，旧 attempt 进入 `abandoned`；后续 claim 才创建 replacement。
-- live identity 匹配且 sequence 证明 prompt 已接受时，coordinator 等待原 turn，不重发 prompt。
-- identity、session 或 sequence 不能证明同一 turn 时，job 保持 `blocked`，attempt phase 变为
-  `attention`，并记录 `unsafe_turn_adoption`。
+- `claimed` 尚未取得 runtime，或有 durable baseline 的 `runtime_acquired` live snapshot 仍等于
+  baseline 时，旧 operation 进入 `abandoned`；后续 claim 才能创建 replacement。旧 schema
+  缺失 baseline 的 in-flight operation 不能证明未发送，因此进入 `attention`。
+- Herdr 0.8.2 不提供 turn identifier，sequence advance 不能证明 accepted live turn 仍属于原
+  operation。因此 `prompt_accepted` 或 send/callback 模糊窗口进入 `attention`，不重发 prompt。
+- 已持久化 `settled` 或 `receipt_observed` 时，只有 live identity、terminal state 和 exact
+  sequence 都未变化，coordinator 才继续提交原 durable outcome；任何偏差都进入 `attention`。
 
-Recovery 以持久化的最后 sequence 为起点，只接受最多 8 次 lifecycle 变化。更大的 sequence
-advance 可能属于后续 turn，因此进入 `attention`，不会被原 attempt 采用。
+`attention` receipt 使用 `unsafe_turn_adoption`，明确表示无法证明 turn ownership，而不是普通
+agent question。
 
 `just status` 的 job 项包含 `current_attempt_id` 和 `attempt_phase`。`blocked` 加
 `attempt_phase=attention` 表示 operator attention，不是可直接回答的 agent 提问。
@@ -71,9 +74,9 @@ advance 可能属于后续 turn，因此进入 `attention`，不会被原 attemp
 耗尽 attempt 的 `failed` job 可用显式 `retry` 在原 job id 和 `dedupe_key` 上追加有界 attempt
 budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。普通 queue 不自动回答
 `blocked`；人工审查后可用显式 `resume --response-file` 回答原 agent。resume 必须匹配已记录的
-agent 与 pane，并保持原 attempt。每个 resume 有独立 operation token 和 sequence。过期但已
-接受的 response operation 先恢复原 turn；未接受的 operation 以 `abandoned` receipt 收口后，
-下一次显式 resume 才发送 response。
+agent 与 pane，并保持原 attempt。每个 resume 有独立 operation token 和 sequence。未接受的
+operation 以 `abandoned` receipt 收口后，下一次显式 resume 才发送 response；已接受但尚未
+durably settled 的 operation 进入 `attention`，不会自动或人工重复发送。
 
 ### Coordinator
 
@@ -201,8 +204,10 @@ manager 只对当前 Herdr session 可见。
 - transport 在继续下一个 side effect 前，依次持久化 `runtime_acquired`、`prompt_accepted`、
   `settled` 和 `receipt_observed`。测试 fault injector 只在 transaction commit 后中断；
 - restart recovery 使用 `herdr agent get` 校验 agent、pane、workspace、execution root、可用的
-  session identity 和 sequence。原 turn settled 后，现有 fatal classifier 可以读取最多 80 行
-  detection output；只保留 sanitized summary。recovery 没有发送 prompt 或 terminal text 的路径；
+  session identity、terminal state 和 exact sequence。Herdr 0.8.2 不提供 turn identifier，
+  accepted live turn 不会按 sequence window 推测归属。durable settled snapshot 确认不变后，
+  fatal classifier 可以读取最多 80 行 detection output；只保留 sanitized summary。recovery
+  没有发送 prompt 或 terminal text 的路径；
 - `agent_prompt_stalled` 且仍停在原 idle sequence 时最多重发两次 Enter；仍没有 lifecycle
   变化则快速返回 `agent_turn_not_observed`，不占满整个 agent timeout；
 - `tab` 与 `worktree` placement 使用独立后台 tab 和 full-size root pane。`pane` placement
@@ -274,8 +279,8 @@ route -> wayfinder? -> spec + ticket DAG -> frontier worktrees
 标准交付中的 `blocked` 会读取有限 worker detection output，让独立 proxy controller
 输出严格 decision JSON，再把回答交回原 worker。最多 8 轮。deterministic guard 与
 schema 都要求 secret/production 升级。由于 Herdr 拒绝向已 blocked agent 提交普通
-`agent prompt`，response 通过一次 `herdr pane send-text` 提交。literal text 包含结尾 newline，
-因此不存在独立的 staged-text 和 Enter side effect。提交后按新的 lifecycle sequence 等待结果；
+`agent prompt`，response 通过一次 `herdr pane run` 提交；该 API 原子发送 literal text 与 Enter，
+不存在独立的 staged-text 和 Enter side effect。提交后按新的 lifecycle sequence 等待结果；
 response 本身不进入 decision ledger。
 
 每次运行的状态、map、plan、routes、receipts、reviews、ledger 和 worktrees 保存在
@@ -289,7 +294,7 @@ Herdr detach 不终止 coordinator 与 agent 进程，因此适合长时间运�
 - Herdr server 完整重启会终止 pane 进程；
 - harness 原生 session 是否可恢复取决于对应 Herdr integration；
 - 机器睡眠、重启或网络中断可能让任务 lease 过期。coordinator 会先 reconciliation，再决定
-  abandon、adopt 或 attention；
+  abandon、提交 durable terminal outcome 或 attention；
 - worktree、端口、数据库和 credential 仍可能跨任务共享。
 
 Herdr 0.8.2 没有 active-turn cancellation command。fencing 只阻止 stale SQLite mutation，

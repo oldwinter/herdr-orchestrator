@@ -153,7 +153,7 @@ class RecoveryDispatcher(FakeDispatcher):
         context: DispatchContext | None = None,
     ) -> DispatchOutcome:
         del harness, prompt, timeout_seconds, agent_name, context
-        raise AssertionError("accepted recovery must not dispatch another prompt")
+        raise AssertionError("recovery must not dispatch a replacement prompt")
 
     def recover(
         self,
@@ -232,57 +232,6 @@ class LifecycleDispatcher(FakeDispatcher):
                     "SELECT phase FROM job_attempts ORDER BY id DESC LIMIT 1"
                 ).fetchone()[0]
             self.persisted_phases.append(phase)
-        return self.outcome
-
-
-class BaselineRecoveryDispatcher(RecoveryDispatcher):
-    def recover(
-        self,
-        harness: Harness,
-        prompt: str,
-        *,
-        timeout_seconds: int,
-        agent_name: str,
-        context: DispatchContext,
-        runtime: AttemptRuntime,
-    ) -> DispatchOutcome:
-        self.recoveries.append((harness, prompt, runtime))
-        assert context.attempt_progress is not None
-        context.attempt_progress(
-            AttemptProgress(
-                AttemptPhase.PROMPT_ACCEPTED,
-                agent_name,
-                pane_id=runtime.pane_id,
-                herdr_workspace_id=runtime.herdr_workspace_id,
-                execution_path=runtime.execution_path,
-                agent_session_id=runtime.agent_session_id,
-                prompt_baseline_sequence=runtime.prompt_baseline_sequence,
-                prompt_accepted_sequence=11,
-                state_change_sequence=11,
-                agent_state=AgentState.WORKING,
-            )
-        )
-        context.attempt_progress(
-            AttemptProgress(
-                AttemptPhase.SETTLED,
-                agent_name,
-                pane_id=runtime.pane_id,
-                agent_state=AgentState.DONE,
-                state_change_sequence=12,
-                agent_settled=True,
-            )
-        )
-        context.attempt_progress(
-            AttemptProgress(
-                AttemptPhase.RECEIPT_OBSERVED,
-                agent_name,
-                pane_id=runtime.pane_id,
-                agent_state=AgentState.DONE,
-                state_change_sequence=12,
-                agent_settled=True,
-            )
-        )
-        del timeout_seconds
         return self.outcome
 
 
@@ -585,7 +534,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(job["agent_name"], expected_name)
         self.assertEqual(receipt, (expected_name, "dispatcher_unhandled_error"))
 
-    def test_run_once_adopts_an_accepted_expired_attempt_without_redispatch(self) -> None:
+    def test_run_once_fences_an_accepted_expired_attempt_without_redispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
@@ -630,13 +579,14 @@ class CoordinatorTests(unittest.TestCase):
             dispatcher = RecoveryDispatcher(
                 DispatchOutcome(
                     "owned-droid",
-                    AgentState.DONE,
+                    AgentState.UNKNOWN,
                     True,
                     "w1:p2",
+                    "unsafe_turn_adoption",
                     placement=PlacementTarget.TAB,
                     execution_path=str(config.workspace),
                     herdr_workspace_id="w1",
-                    agent_settled=True,
+                    agent_settled=False,
                 )
             )
             coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
@@ -646,8 +596,10 @@ class CoordinatorTests(unittest.TestCase):
 
             job = store.jobs(config.name)[0]
 
-        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["blocked"], 1)
         self.assertEqual(job["attempts"], 1)
+        self.assertEqual(job["attempt_phase"], AttemptPhase.ATTENTION.value)
+        self.assertEqual(job["error_code"], "unsafe_turn_adoption")
         self.assertEqual(len(dispatcher.recoveries), 1)
         recovered_harness, recovered_prompt, runtime = dispatcher.recoveries[0]
         self.assertEqual(recovered_harness, Harness.DROID)
@@ -679,16 +631,17 @@ class CoordinatorTests(unittest.TestCase):
                         state_change_sequence=10,
                     ),
                 )
-            dispatcher = BaselineRecoveryDispatcher(
+            dispatcher = RecoveryDispatcher(
                 DispatchOutcome(
                     first.agent_name,
-                    AgentState.DONE,
+                    AgentState.UNKNOWN,
                     True,
                     "w1:p2",
+                    "unsafe_turn_adoption",
                     placement=PlacementTarget.TAB,
                     execution_path=str(config.workspace),
                     herdr_workspace_id="w1",
-                    agent_settled=True,
+                    agent_settled=False,
                 )
             )
 
@@ -702,11 +655,11 @@ class CoordinatorTests(unittest.TestCase):
                     FROM job_attempts
                     """).fetchone()
 
-        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["blocked"], 1)
         self.assertEqual(len(dispatcher.recoveries), 1)
         self.assertEqual(
             attempt,
-            (1, AttemptPhase.OUTCOME_COMMITTED.value, 10, 11),
+            (1, AttemptPhase.ATTENTION.value, 10, None),
         )
 
     def test_planner_reservation_is_atomic_across_coordinators(self) -> None:
@@ -834,7 +787,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(response[2], "Approve this local action.")
         self.assertEqual(response[4], "w1:p2")
 
-    def test_resume_blocked_recovers_an_accepted_operation_without_resending(self) -> None:
+    def test_resume_blocked_fences_an_accepted_operation_without_resending(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
@@ -888,13 +841,14 @@ class CoordinatorTests(unittest.TestCase):
             dispatcher = ResumeRecoveryDispatcher(
                 DispatchOutcome(
                     first_resume.agent_name,
-                    AgentState.DONE,
+                    AgentState.UNKNOWN,
                     True,
                     "w1:p2",
+                    "unsafe_turn_adoption",
                     placement=PlacementTarget.TAB,
                     execution_path=str(config.workspace),
                     herdr_workspace_id="w1",
-                    agent_settled=True,
+                    agent_settled=False,
                 )
             )
             coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
@@ -904,8 +858,11 @@ class CoordinatorTests(unittest.TestCase):
                     claimed.job_id,
                     "Approve this local action.",
                 )
+            job = store.jobs(config.name)[0]
 
-        self.assertEqual(result["state"], JobState.SUCCEEDED.value)
+        self.assertEqual(result["state"], JobState.BLOCKED.value)
+        self.assertEqual(job["attempt_phase"], AttemptPhase.ATTENTION.value)
+        self.assertEqual(job["error_code"], "unsafe_turn_adoption")
         self.assertEqual(dispatcher.responses, 0)
         self.assertEqual(len(dispatcher.recoveries), 1)
         assert dispatcher.recoveries[0][2].prompt_accepted_sequence == 21

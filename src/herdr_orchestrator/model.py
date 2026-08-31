@@ -53,6 +53,9 @@ class AttemptRuntime:
     prompt_accepted_sequence: int | None
     state_change_sequence: int | None
     phase: AttemptPhase = AttemptPhase.CLAIMED
+    agent_state: AgentState | None = None
+    agent_settled: bool | None = None
+    task_verified: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

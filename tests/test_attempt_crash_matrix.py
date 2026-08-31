@@ -21,7 +21,7 @@ from herdr_orchestrator.model import (
     NewJob,
 )
 from herdr_orchestrator.runner import Coordinator, OperationInterrupted
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import Store, StoreError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -104,6 +104,60 @@ class TerminalTransitionDispatcher:
         )
 
 
+class TerminalResumeDispatcher:
+    def __init__(self, terminal_phase: AttemptPhase) -> None:
+        self.terminal_phase = terminal_phase
+
+    def respond(
+        self,
+        name: str,
+        harness: Harness,
+        response: str,
+        *,
+        timeout_seconds: int,
+        expected_pane_id: str,
+        context: DispatchContext | None,
+    ) -> DispatchOutcome:
+        del harness, response, timeout_seconds
+        assert expected_pane_id == "w1:p2"
+        assert context is not None and context.attempt_progress is not None
+        context.attempt_progress(
+            AttemptProgress(
+                AttemptPhase.RUNTIME_ACQUIRED,
+                name,
+                pane_id=expected_pane_id,
+                prompt_baseline_sequence=20,
+                agent_state=AgentState.BLOCKED,
+            )
+        )
+        if self.terminal_phase is AttemptPhase.ATTENTION:
+            context.attempt_progress(
+                AttemptProgress(
+                    AttemptPhase.PROMPT_ACCEPTED,
+                    name,
+                    pane_id=expected_pane_id,
+                    prompt_accepted_sequence=21,
+                    agent_state=AgentState.WORKING,
+                )
+            )
+            return DispatchOutcome(
+                name,
+                AgentState.UNKNOWN,
+                True,
+                expected_pane_id,
+                "unsafe_turn_adoption",
+                agent_settled=False,
+            )
+        return DispatchOutcome(
+            name,
+            AgentState.UNKNOWN,
+            True,
+            expected_pane_id,
+            "provider_failed",
+            agent_settled=True,
+        )
+
+
 class PersistentAttemptDispatcher:
     def __init__(self, *, crash_before_acceptance: bool = False) -> None:
         self.state = AgentState.IDLE
@@ -149,7 +203,7 @@ class PersistentAttemptDispatcher:
     ) -> DispatchOutcome:
         del harness, prompt, timeout_seconds
         assert context.attempt_progress is not None
-        if runtime.prompt_baseline_sequence == self.sequence and self.state is AgentState.BLOCKED:
+        if runtime.phase is AttemptPhase.CLAIMED and runtime.prompt_baseline_sequence is None:
             return DispatchOutcome(
                 agent_name,
                 AgentState.UNKNOWN,
@@ -158,8 +212,11 @@ class PersistentAttemptDispatcher:
                 "lease_expired_unaccepted",
                 correlation_id=context.correlation_id,
             )
-        assert runtime.prompt_baseline_sequence is not None
-        if self.sequence == runtime.prompt_baseline_sequence and self.state is AgentState.IDLE:
+        if (
+            runtime.phase is AttemptPhase.RUNTIME_ACQUIRED
+            and self.sequence == runtime.prompt_baseline_sequence
+            and self.state in {AgentState.IDLE, AgentState.BLOCKED}
+        ):
             return DispatchOutcome(
                 agent_name,
                 AgentState.UNKNOWN,
@@ -168,16 +225,19 @@ class PersistentAttemptDispatcher:
                 "lease_expired_unaccepted",
                 correlation_id=context.correlation_id,
             )
-        if runtime.phase in {AttemptPhase.CLAIMED, AttemptPhase.RUNTIME_ACQUIRED}:
-            context.attempt_progress(self._progress(AttemptPhase.PROMPT_ACCEPTED, agent_name))
+        if runtime.phase in {AttemptPhase.RUNTIME_ACQUIRED, AttemptPhase.PROMPT_ACCEPTED}:
+            return DispatchOutcome(
+                agent_name,
+                AgentState.UNKNOWN,
+                True,
+                runtime.pane_id,
+                "unsafe_turn_adoption",
+                correlation_id=context.correlation_id,
+                agent_settled=False,
+            )
+        assert runtime.phase in {AttemptPhase.SETTLED, AttemptPhase.RECEIPT_OBSERVED}
         self.state = AgentState.DONE
         self.sequence = max(12, self.sequence)
-        if runtime.phase in {
-            AttemptPhase.CLAIMED,
-            AttemptPhase.RUNTIME_ACQUIRED,
-            AttemptPhase.PROMPT_ACCEPTED,
-        }:
-            context.attempt_progress(self._progress(AttemptPhase.SETTLED, agent_name))
         if runtime.phase is not AttemptPhase.RECEIPT_OBSERVED:
             context.attempt_progress(self._progress(AttemptPhase.RECEIPT_OBSERVED, agent_name))
         return self._outcome(agent_name)
@@ -255,7 +315,7 @@ class PersistentResumeDispatcher(PersistentAttemptDispatcher):
     ) -> DispatchOutcome:
         del harness, prompt, timeout_seconds
         assert context.attempt_progress is not None
-        if runtime.prompt_baseline_sequence == self.sequence and self.state is AgentState.BLOCKED:
+        if runtime.phase is AttemptPhase.CLAIMED and runtime.prompt_baseline_sequence is None:
             return DispatchOutcome(
                 agent_name,
                 AgentState.UNKNOWN,
@@ -264,18 +324,32 @@ class PersistentResumeDispatcher(PersistentAttemptDispatcher):
                 "lease_expired_unaccepted",
                 correlation_id=context.correlation_id,
             )
-        if runtime.phase in {AttemptPhase.CLAIMED, AttemptPhase.RUNTIME_ACQUIRED}:
-            context.attempt_progress(
-                self._resume_progress(AttemptPhase.PROMPT_ACCEPTED, agent_name)
+        if (
+            runtime.phase is AttemptPhase.RUNTIME_ACQUIRED
+            and runtime.prompt_baseline_sequence == self.sequence
+            and self.state is AgentState.BLOCKED
+        ):
+            return DispatchOutcome(
+                agent_name,
+                AgentState.UNKNOWN,
+                True,
+                runtime.pane_id,
+                "lease_expired_unaccepted",
+                correlation_id=context.correlation_id,
             )
+        if runtime.phase in {AttemptPhase.RUNTIME_ACQUIRED, AttemptPhase.PROMPT_ACCEPTED}:
+            return DispatchOutcome(
+                agent_name,
+                AgentState.UNKNOWN,
+                True,
+                runtime.pane_id,
+                "unsafe_turn_adoption",
+                correlation_id=context.correlation_id,
+                agent_settled=False,
+            )
+        assert runtime.phase in {AttemptPhase.SETTLED, AttemptPhase.RECEIPT_OBSERVED}
         self.state = AgentState.DONE
         self.sequence = max(22, self.sequence)
-        if runtime.phase in {
-            AttemptPhase.CLAIMED,
-            AttemptPhase.RUNTIME_ACQUIRED,
-            AttemptPhase.PROMPT_ACCEPTED,
-        }:
-            context.attempt_progress(self._resume_progress(AttemptPhase.SETTLED, agent_name))
         if runtime.phase is not AttemptPhase.RECEIPT_OBSERVED:
             context.attempt_progress(
                 self._resume_progress(AttemptPhase.RECEIPT_OBSERVED, agent_name)
@@ -347,31 +421,123 @@ def test_terminal_crash_matrix_uses_actual_committed_phase(
             load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
             state_db=Path(temporary) / "state.db",
         )
-        store = Store(config.state_db)
-        store.initialize()
-        store.enqueue(
-            NewJob(
-                config.name,
-                "Terminal crash matrix",
-                Harness.DROID,
-                "Do the task once.",
-                f"terminal-{terminal_phase.value}",
-                2,
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 100.0)
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(
+                NewJob(
+                    config.name,
+                    "Terminal crash matrix",
+                    Harness.DROID,
+                    "Do the task once.",
+                    f"terminal-{terminal_phase.value}",
+                    2,
+                )
             )
+            with pytest.raises(OperationInterrupted, match=terminal_phase.value):
+                Coordinator(
+                    config,
+                    store=store,
+                    dispatcher=TerminalTransitionDispatcher(terminal_phase),
+                    transition_observer=CrashAfterTransition(terminal_phase),
+                ).run_once()
+
+        restarted_dispatcher = PersistentAttemptDispatcher()
+        restarted = Coordinator(
+            config,
+            store=Store(config.state_db),
+            dispatcher=restarted_dispatcher,
         )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 102.0)
+            restart_report = restarted.run_once()
+        job = restarted.store.jobs(config.name)[0]
 
-        with pytest.raises(OperationInterrupted, match=terminal_phase.value):
-            Coordinator(
-                config,
-                store=store,
-                dispatcher=TerminalTransitionDispatcher(terminal_phase),
-                transition_observer=CrashAfterTransition(terminal_phase),
-            ).run_once()
+    if terminal_phase is AttemptPhase.ABANDONED:
+        assert job["state"] == "succeeded"
+        assert job["attempt_phase"] == AttemptPhase.OUTCOME_COMMITTED.value
+        assert restarted_dispatcher.prompt_count == 1
+        assert restart_report["claimed"] == 1
+    else:
+        assert job["state"] == job_state
+        assert job["attempt_phase"] == terminal_phase.value
+        assert restarted_dispatcher.prompt_count == 0
+        assert restart_report["claimed"] == 0
 
-        job = store.jobs(config.name)[0]
 
-    assert job["state"] == job_state
-    assert job["attempt_phase"] == terminal_phase.value
+@pytest.mark.parametrize(
+    "terminal_phase",
+    (AttemptPhase.ABANDONED, AttemptPhase.ATTENTION),
+)
+def test_resume_terminal_crash_matrix_restarts_and_converges(
+    terminal_phase: AttemptPhase,
+) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        config = replace(
+            load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+            state_db=Path(temporary) / "state.db",
+        )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 50.0)
+            store = Store(config.state_db)
+            store.initialize()
+            job_id, _ = store.enqueue(
+                NewJob(
+                    config.name,
+                    "Resume terminal crash matrix",
+                    Harness.DROID,
+                    "Do the task once.",
+                    f"resume-terminal-{terminal_phase.value}",
+                    2,
+                )
+            )
+            claimed = store.claim(config.name, limit=1, lease_seconds=30)[0]
+            store.record_outcome(
+                claimed,
+                DispatchOutcome(
+                    claimed.agent_name,
+                    AgentState.BLOCKED,
+                    False,
+                    "w1:p2",
+                    "agent_blocked",
+                    correlation_id=claimed.correlation_id,
+                ),
+            )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 100.0)
+            with pytest.raises(OperationInterrupted, match=terminal_phase.value):
+                Coordinator(
+                    config,
+                    store=store,
+                    dispatcher=TerminalResumeDispatcher(terminal_phase),
+                    transition_observer=CrashAfterTransition(terminal_phase),
+                ).resume_blocked(job_id, "Approved")
+
+        restarted_dispatcher = PersistentResumeDispatcher()
+        restarted = Coordinator(
+            config,
+            store=Store(config.state_db),
+            dispatcher=restarted_dispatcher,
+        )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 102.0)
+            if terminal_phase is AttemptPhase.ABANDONED:
+                report = restarted.resume_blocked(job_id, "Approved")
+                assert report["state"] == "succeeded"
+                assert restarted_dispatcher.response_count == 1
+            else:
+                with pytest.raises(StoreError, match="job_not_resumable"):
+                    restarted.resume_blocked(job_id, "Approved")
+                assert restarted_dispatcher.response_count == 0
+        job = restarted.store.jobs(config.name)[0]
+
+    assert job["state"] == ("succeeded" if terminal_phase is AttemptPhase.ABANDONED else "blocked")
+    assert job["attempt_phase"] == (
+        AttemptPhase.OUTCOME_COMMITTED.value
+        if terminal_phase is AttemptPhase.ABANDONED
+        else AttemptPhase.ATTENTION.value
+    )
 
 
 def test_run_once_crash_matrix_converges_with_one_prompt() -> None:
@@ -387,7 +553,10 @@ def test_run_once_crash_matrix_converges_with_one_prompt() -> None:
     results = run_public_operation_crash_matrix(transitions, _exercise_run_once_crash)
 
     assert set(results) == set(transitions)
-    assert all(result["state"] == "succeeded" for result in results.values()), results
+    assert all(
+        result["state"] == ("blocked" if phase is AttemptPhase.PROMPT_ACCEPTED else "succeeded")
+        for phase, result in results.items()
+    ), results
     assert all(result["prompt_count"] == 1 for result in results.values())
 
 
@@ -404,18 +573,21 @@ def test_resume_crash_matrix_converges_with_one_response() -> None:
     results = run_public_operation_crash_matrix(transitions, _exercise_resume_crash)
 
     assert set(results) == set(transitions)
-    assert all(result["state"] == "succeeded" for result in results.values()), results
+    assert all(
+        result["state"] == ("blocked" if phase is AttemptPhase.PROMPT_ACCEPTED else "succeeded")
+        for phase, result in results.items()
+    ), results
     assert all(result["response_count"] == 1 for result in results.values())
 
 
 def test_dispatch_acceptance_callback_window_recovers_without_duplicate_prompt() -> None:
     result = _exercise_acceptance_callback_window(resume=False)
-    assert result == {"state": "succeeded", "submission_count": 1}
+    assert result == {"state": "blocked", "submission_count": 1}
 
 
 def test_resume_acceptance_callback_window_recovers_without_duplicate_response() -> None:
     result = _exercise_acceptance_callback_window(resume=True)
-    assert result == {"state": "succeeded", "submission_count": 1}
+    assert result == {"state": "blocked", "submission_count": 1}
 
 
 def _exercise_run_once_crash(target: AttemptPhase) -> dict[str, object]:
@@ -510,17 +682,21 @@ def _exercise_resume_crash(target: AttemptPhase) -> dict[str, object]:
                     transition_observer=CrashAfterTransition(target),
                 ).resume_blocked(job_id, "Approved")
         for observed_at in (161.0, 163.0):
-            if store.jobs(config.name)[0]["state"] == "succeeded":
-                break
             with pytest.MonkeyPatch.context() as monkeypatch:
                 monkeypatch.setattr(
                     "herdr_orchestrator.store.time.time",
                     lambda value=observed_at: value,
                 )
-                Coordinator(config, store=store, dispatcher=dispatcher).resume_blocked(
-                    job_id,
-                    "Approved",
-                )
+                try:
+                    Coordinator(config, store=store, dispatcher=dispatcher).resume_blocked(
+                        job_id,
+                        "Approved",
+                    )
+                except StoreError as exc:
+                    assert str(exc) == "job_not_resumable"
+            job = store.jobs(config.name)[0]
+            if job["state"] == "succeeded" or job["attempt_phase"] == "attention":
+                break
         return {
             "state": store.jobs(config.name)[0]["state"],
             "response_count": dispatcher.response_count,

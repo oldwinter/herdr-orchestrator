@@ -18,7 +18,6 @@ from herdr_orchestrator.model import (
 from herdr_orchestrator.protocol import Command, CommandRunner, TransportError, run_json
 
 CONTROL_TIMEOUT_SECONDS = 10
-MAX_RECOVERY_SEQUENCE_ADVANCE = 8
 OUTPUT_RECEIPT_UI_MARKERS = {"\u26ec", "⧬", "⏺", "•", "●", "◆", "◇", "✦"}
 
 
@@ -26,6 +25,7 @@ class RecoveryHost(Protocol):
     workspace: Path
     runner: CommandRunner
     sleeper: Callable[[float], None]
+    settled_confirmation_polls: int
     _dispatch_deadline: Any
 
     def check_environment(self) -> None: ...
@@ -35,9 +35,9 @@ class RecoveryHost(Protocol):
     def _confirm_stable_settlement(
         self,
         name: str,
-        state: AgentState,
+        current: Mapping[str, Any],
         deadline: float,
-    ) -> AgentState: ...
+    ) -> Mapping[str, Any]: ...
 
     def _raise_for_runtime_error(
         self,
@@ -49,12 +49,8 @@ class RecoveryHost(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _RecoveryObservation:
-    agent: Mapping[str, Any]
     state: AgentState
     sequence: int
-    baseline: int
-    accepted: int | None
-    maximum_sequence: int
 
 
 def elapsed_ms(started: float) -> int:
@@ -223,33 +219,36 @@ def recover_turn(
                 runtime,
                 state=AgentState.UNKNOWN,
                 error_code="lease_expired_unaccepted",
+                agent_settled=False,
             )
-        if runtime.phase in {AttemptPhase.CLAIMED, AttemptPhase.RUNTIME_ACQUIRED}:
-            reporter.prompt_accepted(
-                observation.agent,
-                baseline_sequence=observation.baseline,
-                accepted_sequence=observation.accepted or observation.sequence,
-            )
-        state, sequence = _wait_recovered_settlement(
+        state, sequence = _confirm_recovered_settlement(
             host,
             harness,
             runtime,
             state=observation.state,
             sequence=observation.sequence,
-            maximum_sequence=observation.maximum_sequence,
             deadline=deadline,
         )
         if state not in {AgentState.IDLE, AgentState.DONE, AgentState.BLOCKED}:
             raise TransportError("unsafe_turn_adoption")
-        state = host._confirm_stable_settlement(agent_name, state, deadline)
-        host._raise_for_runtime_error(agent_name, harness, state)
-        if runtime.phase in {
-            AttemptPhase.CLAIMED,
-            AttemptPhase.RUNTIME_ACQUIRED,
-            AttemptPhase.PROMPT_ACCEPTED,
-        }:
-            reporter.settled(state, sequence=sequence)
-        verified = None if context.receipt is None else False
+        try:
+            host._raise_for_runtime_error(agent_name, harness, state)
+        except TransportError as exc:
+            if not exc.agent_settled:
+                raise
+            return _recovery_outcome(
+                context,
+                runtime,
+                state=state,
+                error_code=exc.code,
+                error_summary=exc.summary,
+                agent_settled=True,
+            )
+        verified = (
+            None
+            if context.receipt is None
+            else runtime.task_verified if runtime.phase is AttemptPhase.RECEIPT_OBSERVED else False
+        )
         if runtime.phase is not AttemptPhase.RECEIPT_OBSERVED:
             reporter.receipt_observed(state, verified, sequence=sequence)
         return DispatchOutcome(
@@ -266,7 +265,11 @@ def recover_turn(
             execution_path=runtime.execution_path,
             herdr_workspace_id=runtime.herdr_workspace_id,
             task_verified=verified,
-            agent_settled=state in {AgentState.IDLE, AgentState.DONE},
+            agent_settled=(
+                runtime.agent_settled
+                if runtime.agent_settled is not None
+                else state in {AgentState.IDLE, AgentState.DONE}
+            ),
         )
     except TransportError as exc:
         return _recovery_outcome(
@@ -275,6 +278,7 @@ def recover_turn(
             state=AgentState.UNKNOWN,
             error_code="unsafe_turn_adoption",
             error_summary=exc.summary,
+            agent_settled=False,
         )
 
 
@@ -283,54 +287,73 @@ def _initial_recovery_observation(
     harness: Harness,
     runtime: AttemptRuntime,
 ) -> _RecoveryObservation | None:
+    if (
+        runtime.phase is AttemptPhase.CLAIMED
+        and runtime.pane_id is None
+        and runtime.execution_path is None
+        and runtime.prompt_baseline_sequence is None
+    ):
+        return None
     current = _read_agent(host, runtime.agent_name)
     _validate_runtime(current, harness, runtime)
     state = _state(current)
     baseline = runtime.prompt_baseline_sequence
-    if baseline is None:
-        if state is AgentState.BLOCKED:
+    sequence = _sequence(current)
+    if runtime.phase in {AttemptPhase.CLAIMED, AttemptPhase.RUNTIME_ACQUIRED}:
+        if baseline is None and runtime.phase is AttemptPhase.CLAIMED:
+            return None
+        if (
+            baseline is not None
+            and runtime.prompt_accepted_sequence is None
+            and sequence == baseline
+            and state
+            in {
+                AgentState.IDLE,
+                AgentState.DONE,
+                AgentState.BLOCKED,
+            }
+        ):
             return None
         raise TransportError("unsafe_turn_adoption")
-    sequence = _sequence(current)
-    accepted = runtime.prompt_accepted_sequence
-    if sequence < baseline or (accepted is not None and sequence < accepted):
+    if runtime.phase not in {AttemptPhase.SETTLED, AttemptPhase.RECEIPT_OBSERVED}:
         raise TransportError("unsafe_turn_adoption")
-    anchor = runtime.state_change_sequence or accepted or baseline
-    maximum = anchor + MAX_RECOVERY_SEQUENCE_ADVANCE
-    if sequence > maximum:
-        raise TransportError("unsafe_turn_adoption")
-    if sequence == baseline:
-        if accepted is None and state in {
+    expected_sequence = runtime.state_change_sequence
+    if (
+        expected_sequence is None
+        or sequence != expected_sequence
+        or state
+        not in {
             AgentState.IDLE,
             AgentState.DONE,
             AgentState.BLOCKED,
-        }:
-            return None
+        }
+        or (runtime.agent_state is not None and state is not runtime.agent_state)
+    ):
         raise TransportError("unsafe_turn_adoption")
-    return _RecoveryObservation(current, state, sequence, baseline, accepted, maximum)
+    return _RecoveryObservation(state, sequence)
 
 
-def _wait_recovered_settlement(
+def _confirm_recovered_settlement(
     host: RecoveryHost,
     harness: Harness,
     runtime: AttemptRuntime,
     *,
     state: AgentState,
     sequence: int,
-    maximum_sequence: int,
     deadline: float,
 ) -> tuple[AgentState, int]:
-    while state is AgentState.WORKING:
+    if state is AgentState.BLOCKED:
+        return state, sequence
+    for _ in range(host.settled_confirmation_polls):
         if time.monotonic() >= deadline:
             raise TransportError("unsafe_turn_adoption")
         host._sleep_until(0.5, deadline)
         current = _read_agent(host, runtime.agent_name)
         _validate_runtime(current, harness, runtime)
         current_sequence = _sequence(current)
-        if current_sequence < sequence or current_sequence > maximum_sequence:
+        current_state = _state(current)
+        if current_sequence != sequence or current_state is not state:
             raise TransportError("unsafe_turn_adoption")
-        sequence = current_sequence
-        state = _state(current)
     return state, sequence
 
 
@@ -342,7 +365,7 @@ def wait_after_response(
     timeout_seconds: int,
     *,
     on_acceptance: Callable[[Mapping[str, Any]], None] | None = None,
-) -> AgentState:
+) -> tuple[AgentState, int]:
     deadline = min(
         time.monotonic() + timeout_seconds,
         getattr(host._dispatch_deadline, "value", float("inf")),
@@ -359,9 +382,8 @@ def wait_after_response(
             AgentState.DONE,
             AgentState.BLOCKED,
         }:
-            state = host._confirm_stable_settlement(name, state, deadline)
-            host._raise_for_runtime_error(name, harness, state)
-            return state
+            current = host._confirm_stable_settlement(name, current, deadline)
+            return _state(current), _sequence(current)
         if time.monotonic() >= deadline:
             raise TransportError("herdr_timeout")
         host.sleeper(0.5)
@@ -421,6 +443,7 @@ def _recovery_outcome(
     state: AgentState,
     error_code: str,
     error_summary: str | None = None,
+    agent_settled: bool | None = None,
 ) -> DispatchOutcome:
     return DispatchOutcome(
         runtime.agent_name,
@@ -432,4 +455,5 @@ def _recovery_outcome(
         execution_path=runtime.execution_path,
         herdr_workspace_id=runtime.herdr_workspace_id,
         error_summary=error_summary,
+        agent_settled=agent_settled,
     )

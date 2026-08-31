@@ -226,16 +226,18 @@ class HerdrTransport:
             )
             turn_started = time.monotonic()
             try:
-                state = self._prompt(
+                settled = self._prompt(
                     name,
                     harness,
                     prompt,
                     timeout_seconds,
                     reporter=reporter,
                 )
+                state = _agent_state(settled)
             finally:
                 phase_timings_ms["turn_settlement"] = attempt_runtime.elapsed_ms(turn_started)
-            reporter.settled(state)
+            reporter.settled(state, sequence=_state_change_sequence(settled))
+            self._raise_for_runtime_error(name, harness, state)
             if state is AgentState.BLOCKED:
                 raise TransportError("agent_blocked")
             receipt_verification_started = time.monotonic()
@@ -404,12 +406,12 @@ class HerdrTransport:
             run_json(
                 self.runner,
                 Command(
-                    ["herdr", "pane", "send-text", pane_id, f"{response}\n"],
+                    ["herdr", "pane", "run", pane_id, response],
                     self.workspace,
                     CONTROL_TIMEOUT_SECONDS,
                 ),
             )
-            state = attempt_runtime.wait_after_response(
+            state, settlement_sequence = attempt_runtime.wait_after_response(
                 self,
                 name,
                 harness,
@@ -421,7 +423,8 @@ class HerdrTransport:
                     accepted_sequence=_state_change_sequence(agent),
                 ),
             )
-            reporter.settled(state)
+            reporter.settled(state, sequence=settlement_sequence)
+            self._raise_for_runtime_error(name, harness, state)
             if state is AgentState.BLOCKED:
                 raise TransportError("agent_blocked")
             task_verified: bool | None
@@ -909,7 +912,7 @@ class HerdrTransport:
         timeout_seconds: float,
         *,
         reporter: attempt_runtime.AttemptReporter,
-    ) -> AgentState:
+    ) -> Mapping[str, Any]:
         before = _agent_payload(
             run_json(
                 self.runner,
@@ -1021,9 +1024,7 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                state = self._confirm_stable_settlement(name, state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
+                return self._confirm_stable_settlement(name, stalled, deadline)
             if state is not AgentState.WORKING:
                 raise TransportError("agent_not_settled") from exc
         else:
@@ -1037,9 +1038,7 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                state = self._confirm_stable_settlement(name, state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
+                return self._confirm_stable_settlement(name, prompted, deadline)
             if state is not AgentState.WORKING:
                 raise TransportError("agent_not_settled")
 
@@ -1063,9 +1062,7 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                state = self._confirm_stable_settlement(name, state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
+                return self._confirm_stable_settlement(name, current, deadline)
             self._sleep_until(0.5, deadline)
 
     def _resubmit_enter_until_turn(
@@ -1101,11 +1098,12 @@ class HerdrTransport:
     def _confirm_stable_settlement(
         self,
         name: str,
-        state: AgentState,
+        current: Mapping[str, Any],
         deadline: float,
-    ) -> AgentState:
+    ) -> Mapping[str, Any]:
+        state = _agent_state(current)
         if state is AgentState.BLOCKED:
-            return state
+            return current
 
         confirmations = 0
         while confirmations < self.settled_confirmation_polls:
@@ -1124,12 +1122,12 @@ class HerdrTransport:
             )
             state = _agent_state(current)
             if state is AgentState.BLOCKED:
-                return state
+                return current
             if state in SETTLED_STATES:
                 confirmations += 1
             else:
                 confirmations = 0
-        return state
+        return current
 
     def _raise_for_runtime_error(
         self,
