@@ -721,6 +721,41 @@ class DistributionCliTests(unittest.TestCase):
         self.assertFalse(payload["runtime"]["ok"])
         self.assertEqual(payload["runtime"]["error"], "runtime_doctor_exit: 9")
 
+    def test_doctor_rejects_a_runtime_payload_with_a_non_boolean_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            (project / ".git").mkdir()
+            install = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            fake_python = root / "python"
+            fake_python.write_text(
+                "#!/bin/sh\n" 'printf \'%s\\n\' \'{"checks": [], "ok": "yes", "summary": {}}\'\n',
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PYTHON"] = str(fake_python)
+
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env=environment,
+            )
+
+        self.assertEqual(doctor.returncode, 1, doctor.stderr)
+        payload = json.loads(doctor.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["runtime"]["error"], "runtime_doctor_invalid_output")
+
     def test_doctor_reports_wrapper_manifest_version_skew(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
