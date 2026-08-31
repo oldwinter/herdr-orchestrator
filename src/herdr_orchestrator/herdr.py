@@ -182,6 +182,7 @@ class HerdrTransport:
         pane_id: str | None = None
         workspace_id: str | None = None
         state: AgentState | None = None
+        reused = False
         dispatch_started = time.monotonic()
         phase_timings_ms: dict[str, int] = {}
         try:
@@ -239,7 +240,7 @@ class HerdrTransport:
             return DispatchOutcome(
                 agent_name=name,
                 state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
-                member_reused=terminal is None,
+                member_reused=reused,
                 pane_id=terminal.pane_id if terminal is not None else pane_id,
                 error_code=exc.code,
                 placement=dispatch_context.placement,
@@ -298,6 +299,33 @@ class HerdrTransport:
         timeout_seconds: int,
         expected_pane_id: str | None = None,
         context: DispatchContext | None = None,
+    ) -> DispatchOutcome:
+        previous = getattr(self._dispatch_deadline, "value", None)
+        self._dispatch_deadline.value = time.monotonic() + timeout_seconds
+        try:
+            return self._respond_with_active_deadline(
+                name,
+                harness,
+                response,
+                timeout_seconds=timeout_seconds,
+                expected_pane_id=expected_pane_id,
+                context=context,
+            )
+        finally:
+            if previous is None:
+                del self._dispatch_deadline.value
+            else:
+                self._dispatch_deadline.value = previous
+
+    def _respond_with_active_deadline(
+        self,
+        name: str,
+        harness: Harness,
+        response: str,
+        *,
+        timeout_seconds: int,
+        expected_pane_id: str | None,
+        context: DispatchContext | None,
     ) -> DispatchOutcome:
         pane_id = expected_pane_id
         workspace_id: str | None = None
@@ -424,7 +452,10 @@ class HerdrTransport:
         baseline_sequence: int,
         timeout_seconds: int,
     ) -> AgentState:
-        deadline = time.monotonic() + timeout_seconds
+        deadline = min(
+            time.monotonic() + timeout_seconds,
+            getattr(self._dispatch_deadline, "value", float("inf")),
+        )
         while True:
             current = _agent_payload(
                 run_json(
@@ -576,7 +607,18 @@ class HerdrTransport:
                 raise
         else:
             agent = _agent_payload(result)
-            _validate_reusable_agent(agent, name, harness, execution_workspace)
+            expected_workspace_id = (
+                self._layout.workspace_id
+                if context.placement is not PlacementTarget.WORKTREE
+                else None
+            )
+            _validate_reusable_agent(
+                agent,
+                name,
+                harness,
+                execution_workspace,
+                expected_workspace_id=expected_workspace_id,
+            )
             if refresh_visible_label:
                 self._layout.refresh_visible_label(agent, context)
             pane_id = _non_empty_string(agent, "pane_id")
@@ -1348,12 +1390,24 @@ def _validate_reusable_agent(
     name: str,
     harness: Harness,
     workspace: Path,
+    *,
+    expected_workspace_id: str | None = None,
 ) -> None:
     live_name = agent.get("name")
     if live_name is not None and live_name != name:
         raise TransportError("agent_identity_mismatch")
     if agent.get("agent") != harness.value:
         raise TransportError("agent_identity_mismatch")
+    reported_workspace_id = agent.get("workspace_id")
+    if (
+        expected_workspace_id
+        and reported_workspace_id is not None
+        and (
+            not isinstance(reported_workspace_id, str)
+            or reported_workspace_id.strip() != expected_workspace_id
+        )
+    ):
+        raise TransportError("agent_workspace_mismatch")
     for key in ("cwd", "foreground_cwd"):
         value = agent.get(key)
         if not isinstance(value, str) or Path(value).resolve() != workspace:
