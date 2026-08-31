@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 QUALITY_ROOT = ROOT / ".orchestrator" / "quality"
 COVERAGE_THRESHOLD = 80.0
+SECURITY_STATUS_ARTIFACT = "security-status.json"
 
 
 @dataclass(frozen=True)
@@ -187,15 +189,25 @@ def _security(artifact: Artifact, label: str) -> tuple[str, int | None, str | No
             return "unavailable", None, "results missing"
         if not all(isinstance(result, dict) for result in results):
             return "unavailable", None, "results schema invalid"
-        errors = artifact.payload.get("errors", [])
+        errors = artifact.payload.get("errors")
         if not isinstance(errors, list):
-            return "unavailable", None, "errors invalid"
+            return "unavailable", None, "errors missing or invalid"
         if errors:
             return "failed", len(results), "tool errors present"
+        if not results and (
+            not isinstance(artifact.payload.get("generated_at"), str)
+            or not artifact.payload["generated_at"]
+            or not isinstance(artifact.payload.get("metrics"), dict)
+        ):
+            return "unavailable", None, "completion metadata missing"
         return ("failed", len(results), "findings") if results else ("passed", 0, None)
     dependencies = artifact.payload.get("dependencies")
     if not isinstance(dependencies, list):
         return "unavailable", None, "dependencies missing"
+    if not dependencies:
+        return "unavailable", None, "dependencies empty"
+    if not isinstance(artifact.payload.get("fixes"), list):
+        return "unavailable", None, "fixes missing or invalid"
     count = 0
     for dependency in dependencies:
         if not isinstance(dependency, dict):
@@ -212,9 +224,41 @@ def _security(artifact: Artifact, label: str) -> tuple[str, int | None, str | No
     return ("failed", count, "vulnerabilities") if count else ("passed", 0, None)
 
 
-def _security_line(bandit: Artifact, audit: Artifact) -> tuple[str, str]:
+def _security_status_failure(artifact: Artifact) -> tuple[str, str] | None:
+    if artifact.error is not None:
+        return "unavailable", artifact.error
+    assert artifact.payload is not None
+    exit_code = artifact.payload.get("exit_code")
+    if not _integer(exit_code):
+        return "unavailable", "invalid exit_code"
+    status = artifact.payload.get("status")
+    if status is not None and (not isinstance(status, str) or status not in {"passed", "failed"}):
+        return "unavailable", "invalid status"
+    if exit_code != 0:
+        return "failed", f"exit code {exit_code}"
+    if status == "failed":
+        return "failed", "reported failure"
+    return None
+
+
+def _security_line(
+    bandit: Artifact,
+    audit: Artifact,
+    status_artifact: Artifact | None = None,
+) -> tuple[str, str]:
     bandit_status, bandit_count, bandit_detail = _security(bandit, "bandit")
     audit_status, audit_count, audit_detail = _security(audit, "audit")
+    status_failure = (
+        _security_status_failure(status_artifact) if status_artifact is not None else None
+    )
+    if status_failure is not None:
+        details = ["incomplete evidence", f"{SECURITY_STATUS_ARTIFACT}: {status_failure[1]}"]
+        if bandit_status != "passed" and bandit_detail is not None:
+            details.append(f"Bandit: {bandit_detail}")
+        if audit_status != "passed" and audit_detail is not None:
+            details.append(f"pip-audit: {audit_detail}")
+        label = status_failure[0].upper() if status_failure[0] == "failed" else status_failure[0]
+        return status_failure[0], f"- Security: **{label}** ({'; '.join(details)})"
     if bandit_status == "passed" and audit_status == "passed":
         assert bandit_count is not None and audit_count is not None
         return (
@@ -233,6 +277,8 @@ def _security_line(bandit: Artifact, audit: Artifact) -> tuple[str, str]:
         details.append(f"pip-audit: {audit_detail}")
     status = "failed" if "failed" in (bandit_status, audit_status) else "unavailable"
     label = status.upper() if status == "failed" else status
+    if status == "unavailable" or "unavailable" in (bandit_status, audit_status):
+        details.insert(0, "incomplete evidence")
     return status, f"- Security: **{label}** ({'; '.join(details)})"
 
 
@@ -245,6 +291,12 @@ def main() -> int:
     build = _load_artifact("build.json")
     bandit = _load_artifact("bandit.json")
     audit = _load_artifact("pip-audit.json")
+    security_status_artifact = _load_artifact(SECURITY_STATUS_ARTIFACT)
+    if (
+        security_status_artifact.error == f"{SECURITY_STATUS_ARTIFACT} missing"
+        and os.environ.get("GITHUB_ACTIONS", "").lower() != "true"
+    ):
+        security_status_artifact = None
     statuses: list[str] = []
     coverage_status, coverage_line = _coverage(coverage)
     statuses.append(coverage_status)
@@ -252,7 +304,11 @@ def main() -> int:
     statuses.append(stability_status)
     build_status, build_line = _build(build)
     statuses.append(build_status)
-    security_status, security_line = _security_line(bandit, audit)
+    security_status, security_line = _security_line(
+        bandit,
+        audit,
+        security_status_artifact,
+    )
     statuses.append(security_status)
     lines = [
         "## Automated quality review",

@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
@@ -55,7 +55,16 @@ jobs:
       - name: Security review
         id: security
         continue-on-error: true
-        run: just security
+        run: |
+          mkdir -p .orchestrator/quality
+          set +e
+          just security
+          status=$?
+          result=failed
+          if test "$status" -eq 0; then result=passed; fi
+          printf '{"status":"%s","exit_code":%s}\n' "$result" "$status" \
+            > .orchestrator/quality/security-status.json
+          exit "$status"
       - name: Package build metrics
         id: build
         continue-on-error: true
@@ -121,7 +130,7 @@ jobs:
             if test -f quality/summary.md; then
               tail -n +2 quality/summary.md
             else
-              printf 'Quality artifacts were unavailable. Inspect the `test` job logs.\n'
+              printf 'Quality evidence was incomplete. Inspect the `test` job logs.\n'
             fi
           } > /tmp/quality-review.md
           gh pr comment "${{ github.event.pull_request.number }}" \
@@ -166,7 +175,10 @@ jobs:
     runs-on: [self-hosted, Linux, X64, herdr-orchestrator]
     timeout-minutes: 5
     outputs:
+      manager_name: ${{ steps.manager.outputs.name }}
       manager_publish: ${{ steps.manager.outputs.publish }}
+      manager_version: ${{ steps.manager.outputs.version }}
+      orchestrator_name: ${{ steps.orchestrator.outputs.name }}
       orchestrator_publish: ${{ steps.orchestrator.outputs.publish }}
       orchestrator_version: ${{ steps.orchestrator.outputs.version }}
     steps:
@@ -196,7 +208,7 @@ jobs:
     timeout-minutes: 5
     environment: npm
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -210,20 +222,76 @@ jobs:
         run: npm install --global npm@12.0.2
       - name: Install package metadata
         run: npm ci --ignore-scripts
-      - name: Publish orchestrator package
-        if: needs.release-plan.outputs.orchestrator_publish == 'true'
-        run: npm publish --access public
-      - name: Publish manager package
-        if: needs.release-plan.outputs.manager_publish == 'true'
-        run: npm publish --access public ./packages/herdr-manager
-      - name: Generate GitHub release notes
-        if: needs.release-plan.outputs.orchestrator_publish == 'true'
+      - name: Publish package versions
+        env:
+          MANAGER_NAME: ${{ needs.release-plan.outputs.manager_name }}
+          MANAGER_PUBLISH: ${{ needs.release-plan.outputs.manager_publish }}
+          MANAGER_VERSION: ${{ needs.release-plan.outputs.manager_version }}
+          ORCHESTRATOR_NAME: ${{ needs.release-plan.outputs.orchestrator_name }}
+          ORCHESTRATOR_PUBLISH: ${{ needs.release-plan.outputs.orchestrator_publish }}
+          ORCHESTRATOR_VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
+        run: |
+          if test "$ORCHESTRATOR_PUBLISH" = true; then
+            if ! npm publish --access public; then
+              printf '%s\n' 'orchestrator publish failed; registry verification will decide whether retry is needed'
+            fi
+          fi
+          if test "$MANAGER_PUBLISH" = true; then
+            if ! npm publish --access public ./packages/herdr-manager; then
+              printf '%s\n' 'manager publish failed; registry verification will decide whether retry is needed'
+            fi
+          fi
+      - name: Verify package versions
+        if: always() && !cancelled()
+        env:
+          MANAGER_NAME: ${{ needs.release-plan.outputs.manager_name }}
+          MANAGER_VERSION: ${{ needs.release-plan.outputs.manager_version }}
+          ORCHESTRATOR_NAME: ${{ needs.release-plan.outputs.orchestrator_name }}
+          ORCHESTRATOR_VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
+        run: |
+          set -eu
+          verify_version() {
+            name="$1"
+            version="$2"
+            actual="$(npm view "$name@$version" version 2>/dev/null || true)"
+            if test "$actual" != "$version"; then
+              printf 'registry version missing: %s@%s\n' "$name" "$version" >&2
+              return 1
+            fi
+          }
+          verify_version "$ORCHESTRATOR_NAME" "$ORCHESTRATOR_VERSION"
+          verify_version "$MANAGER_NAME" "$MANAGER_VERSION"
+
+  github-release:
+    if: >-
+      always() &&
+      !cancelled() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.release-plan.result == 'success' &&
+      (
+        needs.publish.result == 'success' ||
+        needs.publish.result == 'skipped'
+      )
+    needs: [release-plan, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure GitHub release exists
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
-        run: >-
-          gh release create "v$VERSION"
-          --repo "$GITHUB_REPOSITORY"
-          --target "$GITHUB_SHA"
-          --title "v$VERSION"
-          --generate-notes
+        run: |
+          set -eu
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf 'GitHub release v%s already exists\n' "$VERSION"
+          else
+            gh release create "v$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "v$VERSION" \
+              --generate-notes \
+              || gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null
+          fi

@@ -205,7 +205,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             workflow.count("runs-on: [self-hosted, Linux, X64, herdr-orchestrator]"),
             1,
         )
-        self.assertEqual(workflow.count("runs-on: ubuntu-latest"), 4)
+        self.assertEqual(workflow.count("runs-on: ubuntu-latest"), 5)
         self.assertIn("release-plan:", workflow)
         self.assertIn(
             "orchestrator_publish: ${{ steps.orchestrator.outputs.publish }}",
@@ -260,11 +260,21 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
 
         self.assertIn(".env", ignore_rules)
 
+    def test_release_note_labels_exist_in_the_local_manifest(self) -> None:
+        release = (REPO_ROOT / ".github/release.yml").read_text(encoding="utf-8")
+        labels = (REPO_ROOT / ".github/labels.yml").read_text(encoding="utf-8")
+
+        self.assertIn("skip-changelog", labels)
+        self.assertIn("breaking-change", labels)
+        self.assertIn("skip-changelog", release)
+        self.assertIn("breaking-change", release)
+
     def test_release_publish_and_github_release_are_separate_least_privilege_jobs(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn(
-            "cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}",
+            "cancel-in-progress: ${{ github.event_name != 'push' || "
+            "github.ref != 'refs/heads/main' }}",
             workflow,
         )
         publish_start = workflow.index("  publish:\n")
@@ -278,6 +288,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("id-token: write", release_job)
         self.assertIn("needs: [release-plan, publish]", release_job)
         self.assertIn("always()", release_job)
+        self.assertIn("!cancelled()", release_job)
         self.assertIn("needs.publish.result == 'success'", release_job)
         self.assertIn("needs.publish.result == 'skipped'", release_job)
 
@@ -305,8 +316,13 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
                 "versions = set(filter(None, state.read_text().splitlines()))\n"
                 "args = sys.argv[1:]\n"
                 "if args[:1] == ['publish']:\n"
-                "    package = 'example-package@1.2.0' if len(args) == 3 else 'herdr-manager@0.2.0'\n"
-                "    if os.environ.get('FAIL_MANAGER') == '1' and package.startswith('herdr-manager@'):\n"
+                "    package = (\n"
+                "        'example-package@1.2.0' if len(args) == 3 else 'herdr-manager@0.2.0'\n"
+                "    )\n"
+                "    if (\n"
+                "        os.environ.get('FAIL_MANAGER') == '1'\n"
+                "        and package.startswith('herdr-manager@')\n"
+                "    ):\n"
                 "        raise SystemExit(17)\n"
                 "    versions.add(package)\n"
                 "    state.write_text('\\n'.join(sorted(versions)) + '\\n')\n"
@@ -386,6 +402,67 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(no_op.returncode, 0, no_op.stderr)
+
+    def test_github_release_model_is_idempotent_across_retries(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        release = _workflow_run_block(workflow, "Ensure GitHub release exists")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            state = root / "release.txt"
+            gh = fake_bin / "gh"
+            gh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import pathlib\n"
+                "import sys\n"
+                "state = pathlib.Path(os.environ['RELEASE_STATE'])\n"
+                "args = sys.argv[1:]\n"
+                "if args[:2] == ['release', 'view']:\n"
+                "    raise SystemExit(0 if state.is_file() else 1)\n"
+                "if args[:2] == ['release', 'create']:\n"
+                "    state.write_text('created', encoding='utf-8')\n"
+                "    if os.environ.get('FAIL_CREATE_ONCE') == '1':\n"
+                "        os.environ.pop('FAIL_CREATE_ONCE', None)\n"
+                "        raise SystemExit(23)\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(19)\n",
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "RELEASE_STATE": str(state),
+                "GITHUB_REPOSITORY": "oldwinter/herdr-orchestrator",
+                "GITHUB_SHA": "ebcea06",
+                "VERSION": "1.2.0",
+                "FAIL_CREATE_ONCE": "1",
+            }
+            first = subprocess.run(
+                ["bash", "-eu", "-c", release],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertTrue(state.is_file())
+
+            second = subprocess.run(
+                ["bash", "-eu", "-c", release],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
 
 
 class QualityScriptTests(unittest.TestCase):

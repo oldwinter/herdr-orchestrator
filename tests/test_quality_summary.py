@@ -32,8 +32,9 @@ class QualitySummarySecurityTests(unittest.TestCase):
 
         self.assertEqual(status, 1)
         self.assertIn("Security: **unavailable**", summary)
-        self.assertNotIn("0 medium/high Bandit findings", summary)
-        self.assertNotIn("0 dependency vulnerabilities", summary)
+        self.assertIn("incomplete evidence", summary)
+        self.assertNotIn("**0** medium/high Bandit findings", summary)
+        self.assertNotIn("**0** dependency vulnerabilities", summary)
 
     def test_failed_security_artifacts_are_not_reported_as_zero(self) -> None:
         status, summary = self._run_summary(
@@ -45,8 +46,15 @@ class QualitySummarySecurityTests(unittest.TestCase):
 
         self.assertEqual(status, 1)
         self.assertIn("Security: **FAILED**", summary)
-        self.assertNotIn("0 medium/high Bandit findings", summary)
-        self.assertNotIn("0 dependency vulnerabilities", summary)
+        self.assertNotIn("**0** medium/high Bandit findings", summary)
+        self.assertNotIn("**0** dependency vulnerabilities", summary)
+
+    def test_mixed_failed_and_missing_security_evidence_is_explicit(self) -> None:
+        status, summary = self._run_summary({"bandit.json": {"exit_code": 1}})
+
+        self.assertEqual(status, 1)
+        self.assertIn("Security: **FAILED**", summary)
+        self.assertIn("incomplete evidence", summary)
 
     def test_unproven_empty_security_payloads_are_unavailable(self) -> None:
         status, summary = self._run_summary(
@@ -58,8 +66,8 @@ class QualitySummarySecurityTests(unittest.TestCase):
 
         self.assertEqual(status, 1)
         self.assertIn("Security: **unavailable**", summary)
-        self.assertNotIn("0 medium/high Bandit findings", summary)
-        self.assertNotIn("0 dependency vulnerabilities", summary)
+        self.assertNotIn("**0** medium/high Bandit findings", summary)
+        self.assertNotIn("**0** dependency vulnerabilities", summary)
 
     def test_complete_zero_finding_security_payloads_pass(self) -> None:
         status, summary = self._run_summary(
@@ -78,8 +86,8 @@ class QualitySummarySecurityTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 0, summary)
-        self.assertIn("0 medium/high Bandit findings", summary)
-        self.assertIn("0 dependency vulnerabilities", summary)
+        self.assertIn("**0** medium/high Bandit findings", summary)
+        self.assertIn("**0** dependency vulnerabilities", summary)
 
     def test_ci_requires_security_status_artifact(self) -> None:
         artifacts = {
@@ -94,8 +102,7 @@ class QualitySummarySecurityTests(unittest.TestCase):
                 "fixes": [],
             },
         }
-        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False):
-            status, summary = self._run_summary(artifacts)
+        status, summary = self._run_summary(artifacts, github_actions=True)
 
         self.assertEqual(status, 1)
         self.assertIn("Security: **unavailable**", summary)
@@ -120,9 +127,14 @@ class QualitySummarySecurityTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("Security: **FAILED**", summary)
         self.assertIn("security-status.json", summary)
-        self.assertNotIn("0 medium/high Bandit findings", summary)
+        self.assertNotIn("**0** medium/high Bandit findings", summary)
 
-    def _run_summary(self, security: dict[str, dict[str, object]]) -> tuple[int, str]:
+    def _run_summary(
+        self,
+        security: dict[str, dict[str, object]],
+        *,
+        github_actions: bool = False,
+    ) -> tuple[int, str]:
         with tempfile.TemporaryDirectory() as temporary:
             quality_root = Path(temporary) / "quality"
             quality_root.mkdir()
@@ -130,9 +142,11 @@ class QualitySummarySecurityTests(unittest.TestCase):
             for name, payload in security.items():
                 (quality_root / name).write_text(json.dumps(payload), encoding="utf-8")
             output = Path(temporary) / "summary.md"
+            environment = {"GITHUB_ACTIONS": "true" if github_actions else "false"}
             with (
                 patch.object(quality_summary, "QUALITY_ROOT", quality_root),
                 patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
+                patch.dict(os.environ, environment, clear=False),
             ):
                 status = quality_summary.main()
             return status, output.read_text(encoding="utf-8")
