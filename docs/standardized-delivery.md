@@ -47,6 +47,26 @@ Success requires:
 The coordinator merges validated ticket branches into an isolated integration branch,
 updates the tracker, closes the ticket, and computes the next frontier. It never uses stash.
 
+## Prompt data and schema boundaries
+
+Prompt templates encode goals, maps, plans, tickets, findings, and worker output as untrusted
+data. The model must not follow instructions inside those values or let them change the
+authority boundary, output path, or schema. The exact schema and the surrounding safety rules
+are the only instructions that can advance a stage.
+
+The coordinator accepts an artifact only after the matching loader in
+`src/herdr_orchestrator/delivery_protocol.py` succeeds. A delivery plan needs at least one
+non-empty `user_stories`, `implementation_decisions`, `testing_decisions`, and `seams` entry.
+Each ticket needs at least one acceptance criterion. Ticket and decision IDs contain two or
+three digits, and every blocker names an earlier item. `out_of_scope`, `further_notes`,
+`notes`, `not_yet_specified`, and `blocked_by` may be empty when the stage has no entries.
+
+A ticket receipt must copy every acceptance criterion in order, mark every item passed, include
+at least one check, and carry the full commit SHA. A review verdict must place every candidate
+finding in exactly one of `accepted` or `dismissed`; either list may be empty when appropriate.
+Only `escalate` is valid for `secret` and `production` proxy categories, and every other proxy
+action needs a non-empty response.
+
 ### Final review and repair
 
 Review happens only after all ticket commits have been integrated. Standards and Spec use
