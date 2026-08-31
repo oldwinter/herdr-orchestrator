@@ -28,6 +28,16 @@ import {
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HARNESSES = ["droid", "grok", "codex", "pi", "claude", "hermes"];
 const MANAGER_HARNESSES = ["grok", "codex", "claude"];
+const WORKFLOW_OPTION_PREFIXES = [
+  "--w",
+  "--wo",
+  "--wor",
+  "--work",
+  "--workf",
+  "--workfl",
+  "--workflo",
+  "--workflow",
+];
 const GIT_EXCLUDE_BEGIN = "# BEGIN herdr-orchestrator managed paths";
 const GIT_EXCLUDE_END = "# END herdr-orchestrator managed paths";
 const WORKER_NAMES = {
@@ -514,8 +524,11 @@ function commandExists(command) {
 }
 
 function rejectWorkflowOverride(rest) {
-  if (rest.some((value) => value === "--workflow" || value.startsWith("--workflow="))) {
-    throw new Error("workflow_option_reserved");
+  for (const value of rest) {
+    const option = value.split("=", 1)[0];
+    if (WORKFLOW_OPTION_PREFIXES.includes(option)) {
+      throw new Error("workflow_option_reserved");
+    }
   }
 }
 
