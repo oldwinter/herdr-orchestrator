@@ -798,8 +798,7 @@ class DistributionCliTests(unittest.TestCase):
             self.assertEqual(install.returncode, 0, install.stderr)
             fake_python = root / "python"
             fake_python.write_text(
-                "#!/bin/sh\n"
-                "sleep 2\n",
+                "#!/bin/sh\nsleep 2\n",
                 encoding="utf-8",
             )
             fake_python.chmod(0o755)
