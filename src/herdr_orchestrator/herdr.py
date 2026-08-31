@@ -12,9 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from herdr_orchestrator import attempt_runtime
 from herdr_orchestrator.herdr_layout import HerdrLayout, ProvisionedTerminal
 from herdr_orchestrator.model import (
     AgentState,
+    AttemptRuntime,
     DispatchContext,
     DispatchOutcome,
     Harness,
@@ -35,14 +37,12 @@ CONTROL_TIMEOUT_SECONDS = 10
 START_TIMEOUT_MS = 120_000
 START_RECOVERY_TIMEOUT_MS = 120_000
 SHELL_READY_TIMEOUT_SECONDS = 10
-AGENT_POST_START_SETTLE_SECONDS = 3
 AGENT_INTERACTIVE_READY_TIMEOUT_SECONDS = 10
 PROMPT_COMMAND_GRACE_SECONDS = 1
 PROMPT_ENTER_RETRIES = 2
 SETTLED_CONFIRMATION_POLLS = 6
 SETTLED_STATES = {AgentState.IDLE, AgentState.DONE}
 PROMPT_TIMEOUT_ERRORS = {"herdr_timeout", "timeout"}
-OUTPUT_RECEIPT_UI_MARKERS = {"\u26ec", "⧬", "⏺", "•", "●", "◆", "◇", "✦"}
 CLAUDE_WORKSPACE_TRUST_MARKERS = (
     "Accessing workspace:",
     "Quick safety check:",
@@ -202,7 +202,16 @@ class HerdrTransport:
                 )
             finally:
                 self._provision_lock.release()
-            phase_timings_ms["provision_ready"] = _elapsed_ms(provision_started)
+            phase_timings_ms["provision_ready"] = attempt_runtime.elapsed_ms(provision_started)
+            execution_path = str(self._layout.execution_workspace(dispatch_context))
+            reporter = attempt_runtime.AttemptReporter(
+                dispatch_context,
+                name,
+                pane_id,
+                workspace_id,
+                execution_path,
+                reused,
+            )
             receipt_baseline_started = time.monotonic()
             receipt_output_before = self._snapshot_output_receipt(
                 name,
@@ -212,12 +221,21 @@ class HerdrTransport:
                 dispatch_context.receipt,
                 self._layout.execution_workspace(dispatch_context),
             )
-            phase_timings_ms["receipt_baseline"] = _elapsed_ms(receipt_baseline_started)
+            phase_timings_ms["receipt_baseline"] = attempt_runtime.elapsed_ms(
+                receipt_baseline_started
+            )
             turn_started = time.monotonic()
             try:
-                state = self._prompt(name, harness, prompt, timeout_seconds)
+                state = self._prompt(
+                    name,
+                    harness,
+                    prompt,
+                    timeout_seconds,
+                    reporter=reporter,
+                )
             finally:
-                phase_timings_ms["turn_settlement"] = _elapsed_ms(turn_started)
+                phase_timings_ms["turn_settlement"] = attempt_runtime.elapsed_ms(turn_started)
+            reporter.settled(state)
             if state is AgentState.BLOCKED:
                 raise TransportError("agent_blocked")
             receipt_verification_started = time.monotonic()
@@ -235,9 +253,12 @@ class HerdrTransport:
                         file_before=receipt_file_before,
                     )
             finally:
-                phase_timings_ms["receipt_verification"] = _elapsed_ms(receipt_verification_started)
+                phase_timings_ms["receipt_verification"] = attempt_runtime.elapsed_ms(
+                    receipt_verification_started
+                )
+            reporter.receipt_observed(state, task_verified)
         except TransportError as exc:
-            phase_timings_ms["total"] = _elapsed_ms(dispatch_started)
+            phase_timings_ms["total"] = attempt_runtime.elapsed_ms(dispatch_started)
             terminal = self._created_terminals.get(name)
             return DispatchOutcome(
                 agent_name=name,
@@ -259,7 +280,7 @@ class HerdrTransport:
                 agent_settled=(exc.agent_settled or state in SETTLED_STATES),
                 phase_timings_ms=phase_timings_ms,
             )
-        phase_timings_ms["total"] = _elapsed_ms(dispatch_started)
+        phase_timings_ms["total"] = attempt_runtime.elapsed_ms(dispatch_started)
         return DispatchOutcome(
             name,
             state,
@@ -272,6 +293,34 @@ class HerdrTransport:
             agent_settled=state in SETTLED_STATES,
             phase_timings_ms=phase_timings_ms,
         )
+
+    def recover(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        agent_name: str,
+        context: DispatchContext,
+        runtime: AttemptRuntime,
+    ) -> DispatchOutcome:
+        del prompt
+        previous = getattr(self._dispatch_deadline, "value", None)
+        self._dispatch_deadline.value = time.monotonic() + timeout_seconds
+        try:
+            return attempt_runtime.recover_turn(
+                self,
+                harness,
+                timeout_seconds=timeout_seconds,
+                agent_name=agent_name,
+                context=context,
+                runtime=runtime,
+            )
+        finally:
+            if previous is None:
+                del self._dispatch_deadline.value
+            else:
+                self._dispatch_deadline.value = previous
 
     def read_agent(self, name: str, *, lines: int = 120) -> str:
         return run_text(
@@ -343,6 +392,15 @@ class HerdrTransport:
             output_before = self._snapshot_output_receipt(name, receipt)
             file_before = self._snapshot_file_receipt(receipt, execution_workspace)
             baseline_sequence = _state_change_sequence(current)
+            reporter = attempt_runtime.AttemptReporter(
+                context,
+                name,
+                pane_id,
+                workspace_id,
+                str(execution_workspace),
+                True,
+            )
+            reporter.runtime_acquired(current, baseline_sequence)
             run_json(
                 self.runner,
                 Command(
@@ -359,12 +417,19 @@ class HerdrTransport:
                     CONTROL_TIMEOUT_SECONDS,
                 ),
             )
-            state = self._wait_after_blocked_response(
+            state = attempt_runtime.wait_after_response(
+                self,
                 name,
                 harness,
                 baseline_sequence,
                 timeout_seconds,
+                on_acceptance=lambda agent: reporter.prompt_accepted(
+                    agent,
+                    baseline_sequence=baseline_sequence,
+                    accepted_sequence=_state_change_sequence(agent),
+                ),
             )
+            reporter.settled(state)
             if state is AgentState.BLOCKED:
                 raise TransportError("agent_blocked")
             task_verified: bool | None
@@ -379,6 +444,7 @@ class HerdrTransport:
                     output_before=output_before,
                     file_before=file_before,
                 )
+            reporter.receipt_observed(state, task_verified)
         except TransportError as exc:
             return DispatchOutcome(
                 agent_name=name,
@@ -448,42 +514,6 @@ class HerdrTransport:
                 execution_workspace=execution_workspace,
             )
         return current, pane_id, workspace_id, execution_workspace
-
-    def _wait_after_blocked_response(
-        self,
-        name: str,
-        harness: Harness,
-        baseline_sequence: int,
-        timeout_seconds: int,
-    ) -> AgentState:
-        deadline = min(
-            time.monotonic() + timeout_seconds,
-            getattr(self._dispatch_deadline, "value", float("inf")),
-        )
-        while True:
-            current = _agent_payload(
-                run_json(
-                    self.runner,
-                    Command(
-                        ["herdr", "agent", "get", name],
-                        self.workspace,
-                        CONTROL_TIMEOUT_SECONDS,
-                    ),
-                )
-            )
-            state = _agent_state(current)
-            sequence = _state_change_sequence(current)
-            if sequence > baseline_sequence and state in {
-                AgentState.IDLE,
-                AgentState.DONE,
-                AgentState.BLOCKED,
-            }:
-                state = self._confirm_stable_settlement(name, state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
-            if time.monotonic() >= deadline:
-                raise TransportError("herdr_timeout")
-            self.sleeper(0.5)
 
     def close_created_agent(self, name: str) -> None:
         terminal = self._created_terminals.pop(name, None)
@@ -668,7 +698,7 @@ class HerdrTransport:
                     ),
                 )
             self._sleep_until(
-                AGENT_POST_START_SETTLE_SECONDS,
+                3,
                 getattr(self._dispatch_deadline, "value", float("inf")),
             )
             started_agent = self._wait_for_interactive_agent(name, harness, pane_id)
@@ -885,6 +915,8 @@ class HerdrTransport:
         harness: Harness,
         prompt: str,
         timeout_seconds: float,
+        *,
+        reporter: attempt_runtime.AttemptReporter,
     ) -> AgentState:
         before = _agent_payload(
             run_json(
@@ -897,6 +929,21 @@ class HerdrTransport:
             )
         )
         baseline_sequence = _state_change_sequence(before)
+        reporter.runtime_acquired(before, baseline_sequence)
+        acceptance_reported = False
+
+        def report_acceptance(agent: Mapping[str, Any]) -> None:
+            nonlocal acceptance_reported
+            sequence = _state_change_sequence(agent)
+            if acceptance_reported or sequence <= baseline_sequence:
+                return
+            acceptance_reported = True
+            reporter.prompt_accepted(
+                agent,
+                baseline_sequence=baseline_sequence,
+                accepted_sequence=sequence,
+            )
+
         deadline = getattr(
             self._dispatch_deadline,
             "value",
@@ -953,7 +1000,7 @@ class HerdrTransport:
                     raise
                 raise TransportError(
                     "prompt_acceptance_timeout",
-                    summary=_prompt_acceptance_summary(
+                    summary=attempt_runtime.prompt_acceptance_summary(
                         acceptance_started,
                         baseline_sequence,
                         None,
@@ -964,7 +1011,7 @@ class HerdrTransport:
             if exc.code in PROMPT_TIMEOUT_ERRORS and sequence <= baseline_sequence:
                 raise TransportError(
                     "prompt_acceptance_timeout",
-                    summary=_prompt_acceptance_summary(
+                    summary=attempt_runtime.prompt_acceptance_summary(
                         acceptance_started,
                         sequence,
                         state,
@@ -976,6 +1023,7 @@ class HerdrTransport:
                 sequence = _state_change_sequence(stalled)
             if sequence <= baseline_sequence:
                 raise TransportError("agent_turn_not_observed") from exc
+            report_acceptance(stalled)
             if state in {
                 AgentState.IDLE,
                 AgentState.DONE,
@@ -991,6 +1039,7 @@ class HerdrTransport:
             sequence = _state_change_sequence(prompted)
             if sequence <= baseline_sequence:
                 raise TransportError("agent_turn_not_observed")
+            report_acceptance(prompted)
             if state in {
                 AgentState.IDLE,
                 AgentState.DONE,
@@ -1156,11 +1205,14 @@ class HerdrTransport:
         if receipt is None:
             return None
         if receipt.kind is ReceiptKind.OUTPUT_PREFIX:
-            if any(_line_starts_with_receipt(line, receipt.value) for line in prompt.splitlines()):
+            if any(
+                attempt_runtime.line_starts_with_receipt(line, receipt.value)
+                for line in prompt.splitlines()
+            ):
                 raise TransportError("task_receipt_ambiguous")
             output = self._read_receipt_output(name)
             if not any(
-                _line_starts_with_receipt(line, receipt.value)
+                attempt_runtime.line_starts_with_receipt(line, receipt.value)
                 for line in _lines_after_snapshot(output_before or "", output)
             ):
                 raise TransportError("task_receipt_missing")
@@ -1255,32 +1307,6 @@ def _matched_error_summary(output: str, pattern: re.Pattern[str]) -> str:
     if match is None:
         return ""
     return re.sub(r"\s+", " ", match.group(0)).strip()[:300]
-
-
-def _elapsed_ms(started: float) -> int:
-    return max(0, int((time.monotonic() - started) * 1000))
-
-
-def _line_starts_with_receipt(line: str, receipt: str) -> bool:
-    normalized = line.strip()
-    if normalized.startswith(receipt):
-        return True
-    if normalized and normalized[0] in OUTPUT_RECEIPT_UI_MARKERS:
-        return normalized[1:].lstrip().startswith(receipt)
-    return False
-
-
-def _prompt_acceptance_summary(
-    started: float,
-    state_change_sequence: int,
-    state: AgentState | None,
-) -> str:
-    elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
-    state_value = state.value if state is not None else "unobserved"
-    return (
-        f"phase=prompt_acceptance elapsed_ms={elapsed_ms} "
-        f"state={state_value} state_change_seq={state_change_sequence}"
-    )
 
 
 def _lines_after_snapshot(before: str, after: str) -> list[str]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -28,6 +29,39 @@ class AgentState(StrEnum):
     BLOCKED = "blocked"
     DONE = "done"
     UNKNOWN = "unknown"
+
+
+class AttemptPhase(StrEnum):
+    CLAIMED = "claimed"
+    RUNTIME_ACQUIRED = "runtime_acquired"
+    PROMPT_ACCEPTED = "prompt_accepted"
+    SETTLED = "settled"
+    RECEIPT_OBSERVED = "receipt_observed"
+    OUTCOME_COMMITTED = "outcome_committed"
+    ABANDONED = "abandoned"
+    ATTENTION = "attention"
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRuntime:
+    agent_name: str
+    pane_id: str | None
+    herdr_workspace_id: str | None
+    execution_path: str | None
+    agent_session_id: str | None
+    prompt_baseline_sequence: int | None
+    prompt_accepted_sequence: int | None
+    state_change_sequence: int | None
+    phase: AttemptPhase = AttemptPhase.CLAIMED
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptTransition:
+    job_id: int
+    attempt_id: int
+    attempt: int
+    operation_sequence: int
+    phase: AttemptPhase
 
 
 class PlacementMode(StrEnum):
@@ -176,6 +210,15 @@ class ClaimedJob:
     placement: PlacementTarget
     receipt: TaskReceipt | None = None
     correlation_id: str = ""
+    attempt_id: int = 0
+    fencing_token: str = ""
+    lease_owner: str = ""
+    lease_until: float = 0.0
+    operation_token: str = ""
+    operation_sequence: int = 0
+    phase: AttemptPhase = AttemptPhase.CLAIMED
+    recovery: bool = False
+    runtime: AttemptRuntime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +239,25 @@ class DispatchOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class AttemptProgress:
+    phase: AttemptPhase
+    agent_name: str
+    pane_id: str | None = None
+    herdr_workspace_id: str | None = None
+    execution_path: str | None = None
+    agent_session_id: str | None = None
+    prompt_baseline_sequence: int | None = None
+    prompt_accepted_sequence: int | None = None
+    state_change_sequence: int | None = None
+    agent_state: AgentState | None = None
+    member_reused: bool | None = None
+    agent_settled: bool | None = None
+    task_verified: bool | None = None
+    error_code: str | None = None
+    error_summary: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DispatchContext:
     placement: PlacementTarget
     title: str
@@ -204,6 +266,7 @@ class DispatchContext:
     worktree_root: Path | None = None
     receipt: TaskReceipt | None = None
     correlation_id: str = ""
+    attempt_progress: Callable[[AttemptProgress], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)

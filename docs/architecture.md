@@ -39,12 +39,38 @@ pending -> running -> succeeded
 blocked --显式 resume response--> succeeded | blocked
 ```
 
-claim 在 `BEGIN IMMEDIATE` 事务内完成。`running` 任务持有 `lease_until`；coordinator 崩溃后，lease 过期任务可再次 claim。每次 claim 增加 attempt。
+`jobs` 是 queue 的当前投影，并通过 `current_attempt_id` 指向 `job_attempts`。
+`job_attempts` 是 attempt ownership 真源。每条记录保存 immutable fencing token、lease owner、
+lease deadline、harness、agent、pane、workspace、execution root、prompt sequence、phase、error 和
+时间戳。phase 按以下顺序推进：
+
+```text
+claimed -> runtime_acquired -> prompt_accepted -> settled
+        -> receipt_observed -> outcome_committed
+        -> abandoned | attention
+```
+
+pending job 的新 claim 在 `BEGIN IMMEDIATE` 事务内创建 attempt，并增加 `jobs.attempts`。每次
+phase 或 outcome 更新都比较 job、current attempt、fencing token、lease owner 和 operation
+token。旧 coordinator 可以追加 `is_stale=1` 的 audit receipt，但不能修改当前 job 或 attempt。
+
+`running` lease 过期时，coordinator 先在原 attempt 上轮换 lease owner，再检查持久化的 Herdr
+identity 和 sequence。这个 reconciliation 不增加 attempt：
+
+- 没有 durable runtime baseline 时，旧 attempt 进入 `abandoned`；后续 claim 才创建 replacement。
+- live identity 匹配且 sequence 证明 prompt 已接受时，coordinator 等待原 turn，不重发 prompt。
+- identity、session 或 sequence 不能证明同一 turn 时，job 保持 `blocked`，attempt phase 变为
+  `attention`，并记录 `unsafe_turn_adoption`。
+
+`just status` 的 job 项包含 `current_attempt_id` 和 `attempt_phase`。`blocked` 加
+`attempt_phase=attention` 表示 operator attention，不是可直接回答的 agent 提问。
 
 耗尽 attempt 的 `failed` job 可用显式 `retry` 在原 job id 和 `dedupe_key` 上追加有界 attempt
 budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。普通 queue 不自动回答
 `blocked`；人工审查后可用显式 `resume --response-file` 回答原 agent。resume 必须匹配已记录的
-agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提问仍保持 blocked。
+agent 与 pane，并保持原 attempt。每个 resume 有独立 operation token 和 sequence。过期但已
+接受的 response operation 先恢复原 turn；未接受的 operation 以 `abandoned` receipt 收口后，
+下一次显式 resume 才发送 response。
 
 ### Coordinator
 
@@ -59,7 +85,8 @@ agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提
 - enqueue 可声明 output-prefix 或 execution-root file receipt；声明后必须验证通过才能成功。
   output-prefix 只接受当前 turn 新增且不与 prompt 独立行歧义的输出，file receipt 必须在当前
   turn 新建或改变；分别记录 `agent_settled` 与 `task_verified`；
-- `unknown`、timeout 和协议错误按失败与重试策略处理。
+- prompt 接受前的 `unknown`、timeout 和协议错误按失败与重试策略处理。prompt 接受后若 turn
+  仍可能运行，则 job 进入 `attention`，不会自动重试。
 - 对必须写 strict JSON 的 turn，settled 后目标 artifact 缺失会在同一已 ready agent 上仅重发
   一次；artifact handshake 防止 startup lifecycle 变化被误认成任务完成。
 
@@ -168,6 +195,10 @@ manager 只对当前 Herdr session 可见。
 - prompt submission 使用 Herdr 默认 `agent prompt --wait`，其内部 acceptance handshake
   仍必须观察到 `state_change_seq` 前进；command timeout 后先复查 sequence，已进入
   `working` 就继续等待，未前进则返回 phase-specific `prompt_acceptance_timeout`；
+- transport 在继续下一个 side effect 前，依次持久化 `runtime_acquired`、`prompt_accepted`、
+  `settled` 和 `receipt_observed`。测试 fault injector 只在 transaction commit 后中断；
+- restart recovery 只调用 `herdr agent get`。它校验 agent、pane、workspace、execution root、
+  可用的 session identity 和 sequence。recovery 没有发送 prompt、terminal text 或 Enter 的路径；
 - `agent_prompt_stalled` 且仍停在原 idle sequence 时最多重发两次 Enter；仍没有 lifecycle
   变化则快速返回 `agent_turn_not_observed`，不占满整个 agent timeout；
 - `tab` 与 `worktree` placement 使用独立后台 tab 和 full-size root pane。`pane` placement
@@ -252,7 +283,10 @@ Herdr detach 不终止 coordinator 与 agent 进程，因此适合长时间运�
 
 - Herdr server 完整重启会终止 pane 进程；
 - harness 原生 session 是否可恢复取决于对应 Herdr integration；
-- 机器睡眠、重启或网络中断可能让任务 lease 过期后重跑；
+- 机器睡眠、重启或网络中断可能让任务 lease 过期。coordinator 会先 reconciliation，再决定
+  abandon、adopt 或 attention；
 - worktree、端口、数据库和 credential 仍可能跨任务共享。
 
-因此任务必须可重试，或者用 `dedupe_key` 与外部系统幂等键保护副作用。默认策略不授权任何外部副作用。
+Herdr 0.8.2 没有 active-turn cancellation command。fencing 只阻止 stale SQLite mutation，
+不能撤销 agent 已产生的外部副作用。因此任务仍必须可重试，或使用外部系统幂等键保护副作用。
+默认策略不授权任何外部副作用。
