@@ -74,7 +74,8 @@ class Store:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            connection.executescript("""
+            connection.executescript(
+                """
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     version INTEGER NOT NULL
                 );
@@ -131,7 +132,9 @@ class Store:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
-                """)
+                """
+            )
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
@@ -150,34 +153,50 @@ class Store:
                     raise StoreError(f"unsupported_schema_version: {version}")
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
-        connection.execute("ALTER TABLE jobs ADD COLUMN placement TEXT")
-        connection.execute("UPDATE jobs SET placement = ?", (PlacementTarget.TAB.value,))
-        connection.execute("ALTER TABLE jobs ADD COLUMN execution_path TEXT")
-        connection.execute("ALTER TABLE jobs ADD COLUMN herdr_workspace_id TEXT")
-        connection.execute("ALTER TABLE receipts ADD COLUMN placement TEXT")
+        self._add_column_if_missing(connection, "jobs", "placement", "TEXT")
         connection.execute(
-            "UPDATE receipts SET placement = ?",
+            "UPDATE jobs SET placement = ? WHERE placement IS NULL",
             (PlacementTarget.TAB.value,),
         )
-        connection.execute("ALTER TABLE receipts ADD COLUMN execution_path TEXT")
-        connection.execute("ALTER TABLE receipts ADD COLUMN herdr_workspace_id TEXT")
+        self._add_column_if_missing(connection, "jobs", "execution_path", "TEXT")
+        self._add_column_if_missing(connection, "jobs", "herdr_workspace_id", "TEXT")
+        self._add_column_if_missing(connection, "receipts", "placement", "TEXT")
+        connection.execute(
+            "UPDATE receipts SET placement = ? WHERE placement IS NULL",
+            (PlacementTarget.TAB.value,),
+        )
+        self._add_column_if_missing(connection, "receipts", "execution_path", "TEXT")
+        self._add_column_if_missing(connection, "receipts", "herdr_workspace_id", "TEXT")
         connection.execute("UPDATE schema_meta SET version = 2")
 
     def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
-        connection.execute("ALTER TABLE jobs ADD COLUMN receipt_kind TEXT")
-        connection.execute("ALTER TABLE jobs ADD COLUMN receipt_value TEXT")
-        connection.execute("ALTER TABLE jobs ADD COLUMN agent_settled INTEGER")
-        connection.execute("ALTER TABLE jobs ADD COLUMN task_verified INTEGER")
-        connection.execute("ALTER TABLE jobs ADD COLUMN error_summary TEXT")
-        connection.execute("ALTER TABLE receipts ADD COLUMN agent_settled INTEGER")
-        connection.execute("ALTER TABLE receipts ADD COLUMN task_verified INTEGER")
-        connection.execute("ALTER TABLE receipts ADD COLUMN error_summary TEXT")
+        self._add_column_if_missing(connection, "jobs", "receipt_kind", "TEXT")
+        self._add_column_if_missing(connection, "jobs", "receipt_value", "TEXT")
+        self._add_column_if_missing(connection, "jobs", "agent_settled", "INTEGER")
+        self._add_column_if_missing(connection, "jobs", "task_verified", "INTEGER")
+        self._add_column_if_missing(connection, "jobs", "error_summary", "TEXT")
+        self._add_column_if_missing(connection, "receipts", "agent_settled", "INTEGER")
+        self._add_column_if_missing(connection, "receipts", "task_verified", "INTEGER")
+        self._add_column_if_missing(connection, "receipts", "error_summary", "TEXT")
         connection.execute("UPDATE schema_meta SET version = 3")
 
     def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
-        connection.execute("ALTER TABLE jobs ADD COLUMN correlation_id TEXT")
-        connection.execute("ALTER TABLE receipts ADD COLUMN correlation_id TEXT")
+        self._add_column_if_missing(connection, "jobs", "correlation_id", "TEXT")
+        self._add_column_if_missing(connection, "receipts", "correlation_id", "TEXT")
         connection.execute("UPDATE schema_meta SET version = 4")
+
+    @staticmethod
+    def _add_column_if_missing(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        declaration: str,
+    ) -> None:
+        columns = {
+            str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
@@ -244,6 +263,8 @@ class Store:
         slot_limits: Mapping[str, int] | None = None,
         allowed_harnesses: Iterable[Harness] | None = None,
     ) -> list[ClaimedJob]:
+        if limit <= 0:
+            return []
         now = time.time()
         lease_until = now + lease_seconds
         allowed_values = (
@@ -373,7 +394,9 @@ class Store:
             """
             UPDATE jobs
             SET state = ?, attempts = ?, lease_until = ?, agent_name = ?,
-                error_code = NULL, correlation_id = ?, updated_at = ?
+                error_code = NULL, execution_path = NULL, herdr_workspace_id = NULL,
+                agent_settled = NULL, task_verified = NULL, error_summary = NULL,
+                correlation_id = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -410,6 +433,17 @@ class Store:
             error_code = "task_receipt_missing"
         elif outcome.task_verified is False and error_code is None:
             error_code = "task_receipt_invalid"
+        agent_settled = (
+            outcome.agent_settled
+            if outcome.agent_settled is not None
+            else outcome.state in {AgentState.IDLE, AgentState.DONE}
+        )
+        if (
+            error_code is None
+            and outcome.state in {AgentState.IDLE, AgentState.DONE}
+            and not agent_settled
+        ):
+            error_code = "agent_not_settled"
         if error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
             state = JobState.SUCCEEDED
             available_at = now
@@ -425,22 +459,28 @@ class Store:
 
         if error_code is None and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
             error_code = "agent_not_settled"
-        agent_settled = (
-            outcome.agent_settled
-            if outcome.agent_settled is not None
-            else outcome.state in {AgentState.IDLE, AgentState.DONE}
-        )
         error_summary = _bounded_error_summary(outcome.error_summary)
         correlation_id = outcome.correlation_id or job.correlation_id
 
         with self._transaction() as connection:
             row = connection.execute(
-                "SELECT state, attempts FROM jobs WHERE id = ?",
+                "SELECT state, attempts, lease_until, correlation_id FROM jobs WHERE id = ?",
                 (job.job_id,),
             ).fetchone()
             if row is None:
                 raise StoreError("job_not_found")
-            if row["state"] != JobState.RUNNING.value or int(row["attempts"]) != job.attempt:
+            if (
+                row["state"] != JobState.RUNNING.value
+                or int(row["attempts"]) != job.attempt
+                or row["lease_until"] is None
+                or float(row["lease_until"]) <= now
+            ):
+                raise StoreError("job_lease_lost")
+            persisted_correlation = row["correlation_id"]
+            if job.correlation_id and persisted_correlation != job.correlation_id:
+                raise StoreError("job_lease_lost")
+            expected_correlation = str(persisted_correlation or job.correlation_id or "")
+            if correlation_id and correlation_id != expected_correlation:
                 raise StoreError("job_lease_lost")
             connection.execute(
                 """
@@ -558,14 +598,16 @@ class Store:
             placement = row["placement"]
             if not isinstance(placement, str) or not placement:
                 raise StoreError("blocked_placement_missing")
+            correlation_id = uuid.uuid4().hex
             connection.execute(
                 """
                 UPDATE jobs
-                SET lease_until = ?, updated_at = ?
+                SET lease_until = ?, correlation_id = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     now + lease_seconds,
+                    correlation_id,
                     now,
                     job_id,
                 ),
@@ -581,14 +623,8 @@ class Store:
                 max_attempts=int(row["max_attempts"]),
                 agent_name=agent_name,
                 placement=PlacementTarget(placement),
-                receipt=(
-                    TaskReceipt(
-                        ReceiptKind(str(row["receipt_kind"])),
-                        str(row["receipt_value"]),
-                    )
-                    if row["receipt_kind"] is not None and row["receipt_value"] is not None
-                    else None
-                ),
+                receipt=_receipt_from_row(row),
+                correlation_id=correlation_id,
             )
         return job, pane_id
 
@@ -603,6 +639,17 @@ class Store:
             error_code = "task_receipt_missing"
         elif outcome.task_verified is False and error_code is None:
             error_code = "task_receipt_invalid"
+        agent_settled = (
+            outcome.agent_settled
+            if outcome.agent_settled is not None
+            else outcome.state in {AgentState.IDLE, AgentState.DONE}
+        )
+        if (
+            error_code is None
+            and outcome.state in {AgentState.IDLE, AgentState.DONE}
+            and not agent_settled
+        ):
+            error_code = "agent_not_settled"
         if error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
             state = JobState.SUCCEEDED
         else:
@@ -611,21 +658,28 @@ class Store:
             error_code = "agent_blocked"
         elif error_code is None and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
             error_code = "agent_not_settled"
-        agent_settled = (
-            outcome.agent_settled
-            if outcome.agent_settled is not None
-            else outcome.state in {AgentState.IDLE, AgentState.DONE}
-        )
         error_summary = _bounded_error_summary(outcome.error_summary)
+        correlation_id = outcome.correlation_id or job.correlation_id
 
         with self._transaction() as connection:
             row = connection.execute(
-                "SELECT state, attempts FROM jobs WHERE id = ?",
+                "SELECT state, attempts, lease_until, correlation_id FROM jobs WHERE id = ?",
                 (job.job_id,),
             ).fetchone()
             if row is None:
                 raise StoreError("job_not_found")
-            if row["state"] != JobState.BLOCKED.value or int(row["attempts"]) != job.attempt:
+            if (
+                row["state"] != JobState.BLOCKED.value
+                or int(row["attempts"]) != job.attempt
+                or row["lease_until"] is None
+                or float(row["lease_until"]) <= now
+            ):
+                raise StoreError("job_lease_lost")
+            persisted_correlation = row["correlation_id"]
+            if job.correlation_id and persisted_correlation != job.correlation_id:
+                raise StoreError("job_lease_lost")
+            expected_correlation = str(persisted_correlation or job.correlation_id or "")
+            if correlation_id and correlation_id != expected_correlation:
                 raise StoreError("job_lease_lost")
             connection.execute(
                 """
@@ -655,9 +709,9 @@ class Store:
                     job_id, attempt, state, agent_name, agent_state,
                     member_reused, pane_id, error_code, placement,
                     execution_path, herdr_workspace_id, agent_settled,
-                    task_verified, error_summary, observed_at
+                    task_verified, error_summary, correlation_id, observed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -678,6 +732,7 @@ class Store:
                     int(agent_settled),
                     (int(outcome.task_verified) if outcome.task_verified is not None else None),
                     error_summary,
+                    expected_correlation or None,
                     now,
                 ),
             )
