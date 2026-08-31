@@ -8,10 +8,12 @@ from pathlib import Path
 from herdr_orchestrator.delivery_protocol import (
     AuthorityCategory,
     DeliveryArtifactError,
+    DeliveryTicket,
     ProxyAction,
     load_delivery_plan,
     load_proxy_decision,
     load_review_verdict,
+    load_ticket_receipt,
 )
 
 
@@ -100,6 +102,93 @@ class DeliveryProtocolTests(unittest.TestCase):
                     candidates=("standards:1", "spec:1"),
                 )
 
+    def test_ticket_receipt_requires_full_commit_sha(self) -> None:
+        ticket = DeliveryTicket(
+            ticket_id="01",
+            title="Implement the behavior",
+            what_to_build="Add the accepted behavior.",
+            blocked_by=(),
+            acceptance_criteria=("The behavior works.",),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.json"
+            payload = _receipt()
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            receipt = load_ticket_receipt(path, ticket)
+
+            self.assertEqual(receipt.commit, "a" * 40)
+            payload["commit"] = "abcdef1"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                DeliveryArtifactError,
+                "ticket_receipt_commit_invalid",
+            ):
+                load_ticket_receipt(path, ticket)
+
+    def test_review_verdict_rejects_duplicate_finding_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "verdict.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "accepted": ["standards:1", "standards:1"],
+                        "dismissed": [],
+                        "rationale": "the finding is valid",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                DeliveryArtifactError,
+                "review_verdict_duplicate",
+            ):
+                load_review_verdict(path, candidates=("standards:1",))
+
+    def test_rejects_duplicate_json_object_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "verdict.json"
+            path.write_text(
+                '{"accepted":[],"accepted":["standards:1"],'
+                '"dismissed":[],"rationale":"valid"}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                DeliveryArtifactError,
+                "review_verdict_duplicate_key",
+            ):
+                load_review_verdict(path, candidates=("standards:1",))
+
+    def test_invalid_utf8_is_reported_as_invalid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "verdict.json"
+            path.write_bytes(b"\xff")
+
+            with self.assertRaisesRegex(
+                DeliveryArtifactError,
+                "review_verdict_invalid_json",
+            ):
+                load_review_verdict(path, candidates=())
+
+    def test_missing_ticket_receipt_is_rejected(self) -> None:
+        ticket = DeliveryTicket(
+            ticket_id="01",
+            title="Implement the behavior",
+            what_to_build="Add the accepted behavior.",
+            blocked_by=(),
+            acceptance_criteria=("The behavior works.",),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "missing.json"
+
+            with self.assertRaisesRegex(
+                DeliveryArtifactError,
+                "ticket_receipt_missing",
+            ):
+                load_ticket_receipt(path, ticket)
+
 
 def _plan() -> dict[str, object]:
     return {
@@ -129,6 +218,22 @@ def _plan() -> dict[str, object]:
                 "acceptance_criteria": ["The second behavior works."],
             },
         ],
+    }
+
+
+def _receipt() -> dict[str, object]:
+    return {
+        "ticket_id": "01",
+        "commit": "a" * 40,
+        "acceptance": [
+            {
+                "criterion": "The behavior works.",
+                "passed": True,
+                "evidence": "The focused test passed.",
+            }
+        ],
+        "checks": ["pytest passed"],
+        "summary": "Implemented the behavior.",
     }
 
 
