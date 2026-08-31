@@ -83,6 +83,10 @@ class DistributionCliTests(unittest.TestCase):
             for override in (
                 ["--workflow", str(project / "other.toml")],
                 [f"--workflow={project / 'other.toml'}"],
+                *[
+                    [f"--{prefix}={project / 'other.toml'}"]
+                    for prefix in ("w", "wo", "wor", "work", "workf", "workfl", "workflo")
+                ],
             ):
                 with self.subTest(override=override):
                     result = self._run(
