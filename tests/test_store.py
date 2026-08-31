@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,6 +43,28 @@ class StoreTests(unittest.TestCase):
             self.store.existing_job("example", "same"),
             (first_id, Harness.CODEX),
         )
+
+    def test_enqueue_rejects_changed_dedupe_contract(self) -> None:
+        job = _job("contract")
+        job_id, created = self.store.enqueue(job)
+        self.assertTrue(created)
+
+        variants = (
+            {"title": "changed title"},
+            {"prompt": "changed prompt"},
+            {"harness": Harness.DROID},
+            {"placement": PlacementTarget.PANE},
+            {"receipt": TaskReceipt(ReceiptKind.FILE, "receipt.txt")},
+        )
+        for changes in variants:
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(StoreError, "dedupe_contract_conflict"),
+            ):
+                self.store.enqueue(replace(job, **changes))
+
+        replay_id, replay_created = self.store.enqueue(replace(job, max_attempts=9))
+        self.assertEqual((replay_id, replay_created), (job_id, False))
 
     def test_claims_only_one_job_per_harness(self) -> None:
         self.store.enqueue(_job("one", Harness.CODEX))
@@ -350,6 +373,48 @@ class StoreTests(unittest.TestCase):
             [claimed.correlation_id, second_resume.correlation_id],
         )
 
+    def test_resume_without_owner_fence_is_rejected_after_reclaim(self) -> None:
+        job_id, _ = self.store.enqueue(_job("resume-missing-fence", max_attempts=1))
+        baseline = time.time() + 1
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline):
+            claimed = self.store.claim("example", limit=1, lease_seconds=30)[0]
+            self.store.record_outcome(
+                claimed,
+                DispatchOutcome(
+                    claimed.agent_name,
+                    AgentState.BLOCKED,
+                    False,
+                    "w1:p2",
+                    "agent_blocked",
+                ),
+            )
+            first_resume, _ = self.store.claim_blocked_for_resume(
+                "example",
+                job_id,
+                lease_seconds=30,
+            )
+
+        stale_resume = replace(first_resume, correlation_id="")
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline + 31):
+            second_resume, _ = self.store.claim_blocked_for_resume(
+                "example",
+                job_id,
+                lease_seconds=30,
+            )
+            with self.assertRaisesRegex(StoreError, "job_lease_lost"):
+                self.store.record_resume_outcome(
+                    stale_resume,
+                    DispatchOutcome(stale_resume.agent_name, AgentState.DONE, True, "w1:p2"),
+                )
+
+            self.assertEqual(
+                self.store.record_resume_outcome(
+                    second_resume,
+                    DispatchOutcome(second_resume.agent_name, AgentState.DONE, True, "w1:p2"),
+                ),
+                JobState.SUCCEEDED,
+            )
+
     def test_explicit_unsettled_signal_prevents_success(self) -> None:
         self.store.enqueue(_job("unsettled", max_attempts=1))
         claimed = self.store.claim("example", limit=1, lease_seconds=60)[0]
@@ -476,6 +541,107 @@ class StoreTests(unittest.TestCase):
             "error_summary",
         ):
             self.assertIsNone(current[field], field)
+
+    def test_reclaim_records_complete_expired_attempt_receipt(self) -> None:
+        self.store.enqueue(_job("lease-receipt", max_attempts=3))
+        baseline = time.time() + 1
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline):
+            first = self.store.claim("example", limit=1, lease_seconds=30)[0]
+            with sqlite3.connect(self.store.path) as connection:
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET error_code = ?, execution_path = ?, herdr_workspace_id = ?,
+                        agent_settled = ?, task_verified = ?, error_summary = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "stale-error",
+                        "/old/path",
+                        "old-workspace",
+                        1,
+                        0,
+                        "old summary",
+                        first.job_id,
+                    ),
+                )
+                connection.commit()
+
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline + 31):
+            second = self.store.claim("example", limit=1, lease_seconds=30)[0]
+
+        self.assertEqual(second.attempt, 2)
+        current = self.store.jobs("example")[0]
+        for field in (
+            "error_code",
+            "execution_path",
+            "herdr_workspace_id",
+            "agent_settled",
+            "task_verified",
+            "error_summary",
+        ):
+            self.assertIsNone(current[field], field)
+        with sqlite3.connect(self.store.path) as connection:
+            receipt = connection.execute(
+                """
+                SELECT attempt, state, agent_name, agent_state, member_reused, pane_id,
+                       error_code, placement, execution_path, herdr_workspace_id,
+                       agent_settled, task_verified, error_summary, correlation_id
+                FROM receipts WHERE job_id = ? ORDER BY id
+                """,
+                (first.job_id,),
+            ).fetchone()
+
+        self.assertEqual(
+            receipt,
+            (
+                1,
+                JobState.PENDING.value,
+                first.agent_name,
+                AgentState.UNKNOWN.value,
+                0,
+                None,
+                "lease_expired",
+                PlacementTarget.TAB.value,
+                "/old/path",
+                "old-workspace",
+                1,
+                0,
+                "old summary",
+                first.correlation_id,
+            ),
+        )
+
+    def test_exhausted_lease_records_failed_attempt_receipt(self) -> None:
+        self.store.enqueue(_job("lease-exhausted", max_attempts=1))
+        baseline = time.time() + 1
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline):
+            first = self.store.claim("example", limit=1, lease_seconds=30)[0]
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline + 31):
+            self.assertEqual(self.store.claim("example", limit=1, lease_seconds=30), [])
+
+        self.assertEqual(self.store.jobs("example")[0]["state"], JobState.FAILED.value)
+        with sqlite3.connect(self.store.path) as connection:
+            receipt = connection.execute(
+                """
+                SELECT attempt, state, agent_name, agent_state, error_code,
+                       placement, correlation_id
+                FROM receipts WHERE job_id = ?
+                """,
+                (first.job_id,),
+            ).fetchone()
+        self.assertEqual(
+            receipt,
+            (
+                1,
+                JobState.FAILED.value,
+                first.agent_name,
+                AgentState.UNKNOWN.value,
+                "lease_expired",
+                PlacementTarget.TAB.value,
+                first.correlation_id,
+            ),
+        )
 
     def test_migrates_v1_jobs_and_receipts_to_current_schema(self) -> None:
         path = Path(self.temporary.name) / "v1.db"
