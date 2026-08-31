@@ -60,12 +60,12 @@ def subprocess_runner(
     )
 
 
-def run_json(
+def _run_command(
     runner: CommandRunner,
     command: Command,
-) -> Mapping[str, Any]:
+) -> subprocess.CompletedProcess[str]:
     try:
-        process = runner(
+        return runner(
             command.argv,
             cwd=str(command.cwd),
             timeout=command.timeout_seconds,
@@ -74,6 +74,15 @@ def run_json(
         raise TransportError("herdr_timeout") from exc
     except OSError as exc:
         raise TransportError("herdr_unavailable") from exc
+    except UnicodeDecodeError as exc:
+        raise TransportError("herdr_invalid_response") from exc
+
+
+def run_json(
+    runner: CommandRunner,
+    command: Command,
+) -> Mapping[str, Any]:
+    process = _run_command(runner, command)
     if process.returncode != 0:
         raise TransportError(
             parse_error_code(process.stderr),
@@ -81,7 +90,7 @@ def run_json(
         )
     try:
         payload = json.loads(process.stdout)
-    except json.JSONDecodeError as exc:
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TransportError("herdr_invalid_response") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
         raise TransportError("herdr_invalid_response")
@@ -94,28 +103,23 @@ def run_text(
     runner: CommandRunner,
     command: Command,
 ) -> str:
-    try:
-        process = runner(
-            command.argv,
-            cwd=str(command.cwd),
-            timeout=command.timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise TransportError("herdr_timeout") from exc
-    except OSError as exc:
-        raise TransportError("herdr_unavailable") from exc
+    process = _run_command(runner, command)
     if process.returncode != 0:
         raise TransportError(
             parse_error_code(process.stderr),
             exit_code=process.returncode,
         )
+    if not isinstance(process.stdout, str):
+        raise TransportError("herdr_invalid_response")
     return process.stdout
 
 
-def parse_error_code(stderr: str) -> str:
+def parse_error_code(stderr: object) -> str:
+    if not isinstance(stderr, (str, bytes, bytearray)):
+        return "herdr_command_failed"
     try:
         payload = json.loads(stderr)
-    except json.JSONDecodeError:
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
         return "herdr_command_failed"
     if isinstance(payload, dict):
         error = payload.get("error")
