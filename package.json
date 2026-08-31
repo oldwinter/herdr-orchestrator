@@ -39,7 +39,7 @@
   },
   "scripts": {
     "release:plan": "node scripts/npm-release-plan.mjs --package-json package.json",
-    "test": "python3 -m unittest tests.test_distribution tests.test_manager_light -v"
+    "test": "PYTHONPATH=src python3 -m unittest tests.test_distribution tests.test_manager_light -v"
   },
   "repository": {
     "type": "git",
