@@ -187,6 +187,20 @@ class TopologyTests(unittest.TestCase):
         ):
             load_topology_decision(Path("plans/../topology.json"), supports_worktree=True)
 
+    def test_rejects_symlinked_controller_output_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            output = root / "runtime" / "topology.json"
+            output.parent.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                TopologyDecisionError,
+                "topology_output_path_invalid",
+            ):
+                load_topology_decision(output, supports_worktree=True)
+
     def test_rejects_oversized_controller_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "topology.json"
@@ -222,6 +236,34 @@ class TopologyTests(unittest.TestCase):
                 Path("topology.json"),
                 supports_worktree=True,
             )
+
+    def test_rejects_nonstandard_json_constants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "topology.json"
+            output.write_text(
+                '{"placement":"pane","rationale":NaN}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                TopologyDecisionError,
+                "topology_output_invalid_json",
+            ):
+                load_topology_decision(output, supports_worktree=True)
+
+    def test_rejects_nul_in_controller_rationale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "topology.json"
+            output.write_text(
+                '{"placement":"pane","rationale":"ok\\u0000bad"}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                TopologyDecisionError,
+                "topology_rationale_invalid",
+            ):
+                load_topology_decision(output, supports_worktree=True)
 
     def test_display_label_truncates_without_hash_suffix(self) -> None:
         label = short_display_label(

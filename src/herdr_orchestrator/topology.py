@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, NoReturn
 
 from herdr_orchestrator.model import PlacementMode, PlacementTarget
 
@@ -121,18 +123,29 @@ def load_topology_decision(
     *,
     supports_worktree: bool,
 ) -> PlacementTarget:
+    _validate_git_capability(supports_worktree)
     _validate_output_path(path)
     try:
         payload = json.loads(
             _read_controller_output(path),
             object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
         )
+    except TopologyDecisionError:
+        raise
     except json.JSONDecodeError as exc:
+        raise TopologyDecisionError("topology_output_invalid_json") from exc
+    except RecursionError as exc:
         raise TopologyDecisionError("topology_output_invalid_json") from exc
     if not isinstance(payload, dict) or set(payload) != PLACEMENT_KEYS:
         raise TopologyDecisionError("topology_output_invalid_shape")
     rationale = payload.get("rationale")
-    if not isinstance(rationale, str) or not rationale.strip() or len(rationale) > 2_000:
+    if (
+        not isinstance(rationale, str)
+        or not rationale.strip()
+        or len(rationale) > 2_000
+        or "\x00" in rationale
+    ):
         raise TopologyDecisionError("topology_rationale_invalid")
     placement = payload.get("placement")
     if not isinstance(placement, str):
@@ -186,22 +199,16 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _read_controller_output(path: Path) -> str:
+    _validate_output_path(path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        metadata = path.lstat()
-    except FileNotFoundError as exc:
-        raise TopologyDecisionError("topology_output_missing") from exc
-    except OSError as exc:
-        raise TopologyDecisionError("topology_output_unreadable") from exc
-    if stat.S_ISLNK(metadata.st_mode):
-        raise TopologyDecisionError("topology_output_path_invalid")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise TopologyDecisionError("topology_output_unreadable")
-    try:
-        with path.open("rb") as stream:
+        with _open_controller_output(path, nofollow) as stream:
             content = stream.read(TOPOLOGY_OUTPUT_MAX_BYTES + 1)
     except FileNotFoundError as exc:
         raise TopologyDecisionError("topology_output_missing") from exc
-    except OSError as exc:
+    except TopologyDecisionError:
+        raise
+    except (OSError, ValueError) as exc:
         raise TopologyDecisionError("topology_output_unreadable") from exc
     if len(content) > TOPOLOGY_OUTPUT_MAX_BYTES:
         raise TopologyDecisionError("topology_output_too_large")
@@ -211,11 +218,39 @@ def _read_controller_output(path: Path) -> str:
         raise TopologyDecisionError("topology_output_unreadable") from exc
 
 
+def _open_controller_output(path: Path, nofollow: int) -> BinaryIO:
+    flags = os.O_RDONLY | nofollow
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if nofollow and exc.errno == errno.ELOOP:
+            raise TopologyDecisionError("topology_output_path_invalid") from exc
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise TopologyDecisionError("topology_output_unreadable")
+        return os.fdopen(descriptor, "rb")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def _validate_output_path(path: Path) -> None:
     if not isinstance(path, Path):
         raise TopologyDecisionError("topology_output_path_invalid")
-    if ".." in path.parts or any(ord(char) < 32 or ord(char) == 127 for char in str(path)):
+    rendered = str(path)
+    if (
+        not rendered
+        or ".." in path.parts
+        or any(ord(char) < 32 or ord(char) == 127 for char in rendered)
+    ):
         raise TopologyDecisionError("topology_output_path_invalid")
+    for parent in (path, *path.parents):
+        try:
+            if parent.is_symlink():
+                raise TopologyDecisionError("topology_output_path_invalid")
+        except OSError as exc:
+            raise TopologyDecisionError("topology_output_unreadable") from exc
 
 
 def _validate_prompt_text(value: str) -> None:
@@ -228,3 +263,7 @@ def _validate_prompt_text(value: str) -> None:
 def _validate_git_capability(supports_worktree: bool) -> None:
     if not isinstance(supports_worktree, bool):
         raise TopologyDecisionError("topology_git_capability_invalid")
+
+
+def _reject_json_constant(_value: str) -> NoReturn:
+    raise TopologyDecisionError("topology_output_invalid_json")
