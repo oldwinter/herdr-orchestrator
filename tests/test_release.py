@@ -1,13 +1,33 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_script(name: str):
+    path = REPO_ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"quality_{name}", path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"unable to load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+build_metrics = _load_script("build_metrics")
+quality_summary = _load_script("quality_summary")
+test_stability = _load_script("test_stability")
+
 RELEASE_PLAN = REPO_ROOT / "scripts/npm-release-plan.mjs"
 CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yml"
 
@@ -218,6 +238,158 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         ignore_rules = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
 
         self.assertIn(".env", ignore_rules)
+
+
+class QualityScriptTests(unittest.TestCase):
+    def test_build_metrics_preserves_a_nonzero_pack_exit(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["npm", "pack", "--dry-run", "--json"],
+            9,
+            "",
+            "pack failed",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "build.json"
+            with (
+                patch.object(build_metrics.subprocess, "run", return_value=result),
+                patch.object(sys, "argv", ["build_metrics.py", "--output", str(output)]),
+            ):
+                status = build_metrics.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 9)
+        self.assertEqual(payload["exit_code"], 9)
+        self.assertEqual(payload["error_code"], "npm_pack_failed")
+
+    def test_build_metrics_rejects_an_empty_success_response(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["npm", "pack", "--dry-run", "--json"],
+            0,
+            "[]\n",
+            "",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "build.json"
+            with (
+                patch.object(build_metrics.subprocess, "run", return_value=result),
+                patch.object(sys, "argv", ["build_metrics.py", "--output", str(output)]),
+            ):
+                status = build_metrics.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertEqual(payload["error_code"], "npm_pack_response_invalid")
+
+    def test_test_stability_rejects_a_missing_report_and_uses_current_python(self) -> None:
+        result = subprocess.CompletedProcess([sys.executable], 0, "", "")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "stability.json"
+            with (
+                patch.object(test_stability.subprocess, "run", return_value=result) as run,
+                patch.object(
+                    sys,
+                    "argv",
+                    ["test_stability.py", "--runs", "2", "--output", str(output)],
+                ),
+            ):
+                status = test_stability.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            command = run.call_args.args[0]
+
+        self.assertEqual(status, 1)
+        self.assertEqual(command[0], sys.executable)
+        self.assertIn("-p", command)
+        self.assertIn("no:cacheprovider", command)
+        self.assertEqual(payload["executions"][0]["error_code"], "report_missing")
+
+    def test_quality_summary_propagates_failed_quality_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            quality_root = Path(temporary) / "quality"
+            quality_root.mkdir()
+            (quality_root / "coverage.json").write_text(
+                json.dumps({"totals": {"percent_covered": 82.0}}),
+                encoding="utf-8",
+            )
+            (quality_root / "stability.json").write_text(
+                json.dumps(
+                    {
+                        "runs": 2,
+                        "unstable": [],
+                        "executions": [
+                            {"exit_code": 1},
+                            {"exit_code": 1},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (quality_root / "build.json").write_text(
+                json.dumps({"exit_code": 7}),
+                encoding="utf-8",
+            )
+            (quality_root / "bandit.json").write_text(
+                json.dumps({"results": []}),
+                encoding="utf-8",
+            )
+            (quality_root / "pip-audit.json").write_text(
+                json.dumps({"dependencies": []}),
+                encoding="utf-8",
+            )
+            output = Path(temporary) / "summary.md"
+            with (
+                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
+                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
+            ):
+                status = quality_summary.main()
+
+            summary = output.read_text(encoding="utf-8")
+
+        self.assertEqual(status, 1)
+        self.assertIn("Stability: **FAILED**", summary)
+        self.assertIn("exit codes: 1", summary)
+        self.assertIn("Build: **FAILED**", summary)
+        self.assertIn("exit code 7", summary)
+
+    def test_quality_summary_rejects_missing_quality_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            quality_root = Path(temporary) / "quality"
+            quality_root.mkdir()
+            output = Path(temporary) / "summary.md"
+            with (
+                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
+                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
+            ):
+                status = quality_summary.main()
+
+            summary = output.read_text(encoding="utf-8")
+
+        self.assertEqual(status, 1)
+        self.assertIn("Coverage: **unavailable**", summary)
+        self.assertIn("Security: **unavailable**", summary)
+
+    def test_quality_summary_rejects_an_unbounded_coverage_number(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            quality_root = Path(temporary) / "quality"
+            quality_root.mkdir()
+            (quality_root / "coverage.json").write_text(
+                json.dumps({"totals": {"percent_covered": 10**1000}}),
+                encoding="utf-8",
+            )
+            output = Path(temporary) / "summary.md"
+            with (
+                patch.object(quality_summary, "QUALITY_ROOT", quality_root),
+                patch.object(sys, "argv", ["quality_summary.py", "--output", str(output)]),
+            ):
+                status = quality_summary.main()
+
+            summary = output.read_text(encoding="utf-8")
+
+        self.assertEqual(status, 1)
+        self.assertIn("Coverage: **unavailable**", summary)
 
 
 if __name__ == "__main__":
