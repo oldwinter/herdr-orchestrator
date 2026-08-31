@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -77,6 +78,12 @@ function parseArguments(argv) {
       options.rest.push(value);
     }
   }
+  if (
+    ["install", "update", "upgrade", "uninstall"].includes(command)
+    && options.rest.length > 0
+  ) {
+    throw new Error(`option_unsupported: ${options.rest[0]}`);
+  }
   return options;
 }
 
@@ -99,9 +106,18 @@ function loadManifest(project) {
   if (!existsSync(path)) {
     return null;
   }
-  const manifest = JSON.parse(readFileSync(path, "utf8"));
+  let manifest;
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(path));
+    manifest = JSON.parse(text);
+  } catch {
+    throw new Error("manifest_invalid");
+  }
   if (
-    manifest.schema_version !== 1
+    manifest === null
+    || typeof manifest !== "object"
+    || Array.isArray(manifest)
+    || manifest.schema_version !== 1
     || manifest.package !== "herdr-orchestrator"
     || typeof manifest.version !== "string"
     || typeof manifest.files !== "object"
@@ -171,13 +187,26 @@ function gitExcludePath(project) {
   const result = spawnSync(
     "git",
     ["-C", project, "rev-parse", "--git-path", "info/exclude"],
-    { encoding: "utf8", timeout: 5_000 },
+    { encoding: "utf8", env: gitEnvironment(), timeout: 5_000 },
   );
   if (result.status !== 0) {
     return null;
   }
   const rendered = result.stdout.trim();
   return rendered.length > 0 ? resolve(project, rendered) : null;
+}
+
+function gitEnvironment() {
+  const environment = { ...process.env };
+  for (const name of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+  ]) {
+    delete environment[name];
+  }
+  return environment;
 }
 
 function removeManagedExcludeBlock(content) {
@@ -484,6 +513,12 @@ function commandExists(command) {
   return result.status === 0;
 }
 
+function rejectWorkflowOverride(rest) {
+  if (rest.some((value) => value === "--workflow" || value.startsWith("--workflow="))) {
+    throw new Error("workflow_option_reserved");
+  }
+}
+
 function reportManagerLight(classification) {
   const paneId = process.env.HERDR_PANE_ID;
   if (!paneId) {
@@ -638,6 +673,7 @@ function inspectInstallation(project) {
 }
 
 function doctor(options) {
+  rejectWorkflowOverride(options.rest);
   const project = resolve(options.project);
   const installation = inspectInstallation(project);
   const workflow = join(project, ".herdr-orchestrator/workflows/multi-harness.toml");
@@ -670,7 +706,19 @@ function doctor(options) {
       runtime = { error: result.error.message, ok: false };
     } else {
       try {
-        runtime = JSON.parse(result.stdout);
+        const parsed = JSON.parse(result.stdout);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("runtime_doctor_invalid_output");
+        }
+        runtime = parsed;
+        if (result.status !== 0) {
+          const status = result.status === null ? "signal" : result.status;
+          runtime = {
+            ...runtime,
+            error: runtime.error ?? `runtime_doctor_exit: ${status}`,
+            ok: false,
+          };
+        }
       } catch {
         runtime = {
           error: result.stderr.trim() || "runtime_doctor_invalid_output",
@@ -698,6 +746,7 @@ function uninstall(options) {
     relativePath.startsWith(".agents/skills/herdr-orchestrator/")
   );
   const preserved = [];
+  const removals = [];
   for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
     assertNoSymlink(project, relativePath);
     const target = join(project, relativePath);
@@ -705,10 +754,13 @@ function uninstall(options) {
       continue;
     }
     if (sha256(readFileSync(target)) === expectedHash) {
-      unlinkSync(target);
+      removals.push(relativePath);
     } else {
       preserved.push(relativePath);
     }
+  }
+  for (const relativePath of removals) {
+    unlinkSync(join(project, relativePath));
   }
   unlinkSync(manifestPath);
   for (const relativePath of [
@@ -786,6 +838,7 @@ ${workers}`;
 }
 
 function runRuntime(options) {
+  rejectWorkflowOverride(options.rest);
   const workflow = join(
     resolve(options.project),
     ".herdr-orchestrator/workflows/multi-harness.toml",

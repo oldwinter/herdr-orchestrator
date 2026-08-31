@@ -39,6 +39,8 @@ The npm package has no runtime npm dependencies. Its executable:
    a tracked `.gitignore` or hiding an unmanaged Skill;
 7. carries the Python package and invokes it with its packaged `src/` on `PYTHONPATH`.
 
+Setup commands reject options they do not define.
+
 Python is not copied or downloaded. The target machine must provide Python 3.12+ and Herdr.
 No global install or elevated permission is required.
 
@@ -187,6 +189,9 @@ npx --yes herdr-orchestrator gc --project . --succeeded-agents
 npx --yes herdr-orchestrator gc --project . --failed-agents
 npx --yes herdr-orchestrator dashboard --project .
 ```
+
+The wrapper rejects a forwarded `--workflow` option. Runtime commands always use the installed
+project workflow.
 
 Arguments not consumed by the wrapper are passed to the Python CLI. For example:
 
