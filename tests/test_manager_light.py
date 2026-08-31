@@ -173,6 +173,18 @@ class ManagerLightProjectionTests(unittest.TestCase):
             {"foreground_processes": [{"argv": ["herdr-orchestrator", "status"]}]},
             {"foreground_processes": [{"argv": ["my-herdr-manager"]}]},
             {"foreground_processes": [{"argv": ["node", "unrelated.mjs", "herdr-manager"]}]},
+            {
+                "foreground_processes": [
+                    {
+                        "argv": [
+                            "node",
+                            "unrelated.mjs",
+                            "herdr-orchestrator",
+                            "manager",
+                        ]
+                    }
+                ]
+            },
             {"foreground_processes": [{"argv": ["manager", "herdr-orchestrator"]}]},
         ]
         self.assertEqual(
@@ -183,7 +195,7 @@ class ManagerLightProjectionTests(unittest.TestCase):
                 ),
                 {"pane": pane, "cases": rejected},
             ),
-            ["absent", "absent", "absent", "absent", "absent"],
+            ["absent", "absent", "absent", "absent", "absent", "absent"],
         )
         self.assertEqual(
             run_projection(
