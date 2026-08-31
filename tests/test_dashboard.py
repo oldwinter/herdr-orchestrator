@@ -177,6 +177,35 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(snapshot["timeline"][0]["type"], "receipt")
         self.assertGreaterEqual(snapshot["summary"]["needs_attention"], 3)
 
+    def test_topology_does_not_attach_foreign_agent_to_local_pane(self) -> None:
+        herdr = HerdrObservation(
+            "ok",
+            None,
+            ({"workspace_id": "local", "label": "local"},),
+            ({"workspace_id": "local", "tab_id": "local:t1", "label": "local"},),
+            ({"workspace_id": "local", "tab_id": "local:t1", "pane_id": "local:p1"},),
+            (
+                {
+                    "name": "foreign-agent",
+                    "workspace_id": "foreign",
+                    "tab_id": "foreign:t1",
+                    "pane_id": "local:p1",
+                    "agent_status": "working",
+                },
+            ),
+            (),
+        )
+
+        snapshot = RuntimeProjector(
+            "example",
+            FakeQueueObserver(QueueObservation((), ())),
+            FakeHerdrObserver(herdr),
+            clock=lambda: 2_000.0,
+        ).snapshot()
+
+        pane = snapshot["topology"]["workspaces"][0]["tabs"][0]["panes"][0]
+        self.assertIsNone(pane["agent"])
+
     def test_herdr_observer_scopes_and_whitelists_runtime_fields(self) -> None:
         workspace = Path("/repo")
 
