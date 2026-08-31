@@ -32,6 +32,27 @@ RELEASE_PLAN = REPO_ROOT / "scripts/npm-release-plan.mjs"
 CI_WORKFLOW = REPO_ROOT / ".github/workflows/ci.yml"
 
 
+def _workflow_run_block(workflow: str, step_name: str) -> str:
+    lines = workflow.splitlines()
+    marker = f"      - name: {step_name}"
+    try:
+        step_start = lines.index(marker)
+    except ValueError as error:
+        raise AssertionError(f"workflow step missing: {step_name}") from error
+    run_start = next(
+        (index for index in range(step_start + 1, len(lines)) if lines[index] == "        run: |"),
+        None,
+    )
+    if run_start is None:
+        raise AssertionError(f"workflow step has no literal run block: {step_name}")
+    body: list[str] = []
+    for line in lines[run_start + 1 :]:
+        if line.startswith("      - ") or line and not line.startswith("        "):
+            break
+        body.append(line[10:] if line.startswith("          ") else "")
+    return "\n".join(body)
+
+
 class NpmReleasePlanTests(unittest.TestCase):
     def test_missing_registry_version_is_publishable(self) -> None:
         result, _ = self._run_plan("1.2.0", '["1.0.0", "1.1.0"]')
@@ -238,6 +259,133 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         ignore_rules = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
 
         self.assertIn(".env", ignore_rules)
+
+    def test_release_publish_and_github_release_are_separate_least_privilege_jobs(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}",
+            workflow,
+        )
+        publish_start = workflow.index("  publish:\n")
+        release_start = workflow.index("  github-release:\n")
+        publish_job = workflow[publish_start:release_start]
+        release_job = workflow[release_start:]
+        self.assertIn("runs-on: ubuntu-latest", publish_job)
+        self.assertIn("permissions:\n      contents: read\n      id-token: write", publish_job)
+        self.assertNotIn("contents: write", publish_job)
+        self.assertIn("permissions:\n      contents: write", release_job)
+        self.assertNotIn("id-token: write", release_job)
+        self.assertIn("needs: [release-plan, publish]", release_job)
+        self.assertIn("always()", release_job)
+        self.assertIn("needs.publish.result == 'success'", release_job)
+        self.assertIn("needs.publish.result == 'skipped'", release_job)
+
+    def test_two_attempt_release_model_completes_after_partial_publish(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        publish = _workflow_run_block(workflow, "Publish package versions")
+        verify = _workflow_run_block(workflow, "Verify package versions")
+        self.assertIn("npm publish --access public", publish)
+        self.assertIn("npm publish --access public ./packages/herdr-manager", publish)
+        self.assertIn('npm view "$name@$version" version', verify)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            state = root / "registry.txt"
+            state.write_text("", encoding="utf-8")
+            npm = fake_bin / "npm"
+            npm.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import pathlib\n"
+                "import sys\n"
+                "state = pathlib.Path(os.environ['REGISTRY_STATE'])\n"
+                "versions = set(filter(None, state.read_text().splitlines()))\n"
+                "args = sys.argv[1:]\n"
+                "if args[:1] == ['publish']:\n"
+                "    package = 'example-package@1.2.0' if len(args) == 3 else 'herdr-manager@0.2.0'\n"
+                "    if os.environ.get('FAIL_MANAGER') == '1' and package.startswith('herdr-manager@'):\n"
+                "        raise SystemExit(17)\n"
+                "    versions.add(package)\n"
+                "    state.write_text('\\n'.join(sorted(versions)) + '\\n')\n"
+                "    raise SystemExit(0)\n"
+                "if args[:1] == ['view'] and len(args) == 3 and args[2] == 'version':\n"
+                "    package = args[1]\n"
+                "    if package in versions:\n"
+                "        print(package.rsplit('@', 1)[1])\n"
+                "        raise SystemExit(0)\n"
+                "    raise SystemExit(1)\n"
+                "raise SystemExit(19)\n",
+                encoding="utf-8",
+            )
+            npm.chmod(0o755)
+            script = "\n".join((publish, verify))
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "REGISTRY_STATE": str(state),
+                "ORCHESTRATOR_PUBLISH": "true",
+                "MANAGER_PUBLISH": "true",
+                "ORCHESTRATOR_NAME": "example-package",
+                "ORCHESTRATOR_VERSION": "1.2.0",
+                "MANAGER_NAME": "herdr-manager",
+                "MANAGER_VERSION": "0.2.0",
+                "FAIL_MANAGER": "1",
+            }
+            first = subprocess.run(
+                ["bash", "-eu", "-c", script],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertNotEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(
+                state.read_text(encoding="utf-8").splitlines(), ["example-package@1.2.0"]
+            )
+
+            environment.update(
+                {
+                    "ORCHESTRATOR_PUBLISH": "false",
+                    "MANAGER_PUBLISH": "true",
+                    "FAIL_MANAGER": "0",
+                }
+            )
+            second = subprocess.run(
+                ["bash", "-eu", "-c", script],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(
+                state.read_text(encoding="utf-8").splitlines(),
+                ["example-package@1.2.0", "herdr-manager@0.2.0"],
+            )
+
+            environment.update(
+                {
+                    "ORCHESTRATOR_PUBLISH": "false",
+                    "MANAGER_PUBLISH": "false",
+                }
+            )
+            no_op = subprocess.run(
+                ["bash", "-eu", "-c", script],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(no_op.returncode, 0, no_op.stderr)
 
 
 class QualityScriptTests(unittest.TestCase):
