@@ -112,12 +112,10 @@ class StoreTests(unittest.TestCase):
         )
         job = self.store.jobs("example")[0]
         with sqlite3.connect(self.store.path) as connection:
-            receipt = connection.execute(
-                """
+            receipt = connection.execute("""
                 SELECT placement, execution_path, herdr_workspace_id, correlation_id
                 FROM receipts
-                """
-            ).fetchone()
+                """).fetchone()
 
         self.assertEqual(state, JobState.SUCCEEDED)
         self.assertEqual(self.store.status_counts("example")["succeeded"], 1)
@@ -482,8 +480,7 @@ class StoreTests(unittest.TestCase):
     def test_migrates_v1_jobs_and_receipts_to_current_schema(self) -> None:
         path = Path(self.temporary.name) / "v1.db"
         connection = sqlite3.connect(path)
-        connection.executescript(
-            """
+        connection.executescript("""
             CREATE TABLE schema_meta (version INTEGER NOT NULL);
             INSERT INTO schema_meta(version) VALUES (1);
             CREATE TABLE jobs (
@@ -528,8 +525,7 @@ class StoreTests(unittest.TestCase):
                 'example', 'old', 'codex', 'inspect', 'old-v1', 'pending',
                 0, 2, 1, 1, 1
             );
-            """
-        )
+            """)
         connection.commit()
         connection.close()
 
@@ -666,8 +662,7 @@ def _create_schema_version(path: Path, version: int) -> None:
     if version not in {1, 2, 3, 4}:
         raise ValueError(version)
     connection = sqlite3.connect(path)
-    connection.executescript(
-        """
+    connection.executescript("""
         CREATE TABLE schema_meta (version INTEGER NOT NULL);
         CREATE TABLE jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -704,17 +699,14 @@ def _create_schema_version(path: Path, version: int) -> None:
             value TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
-        """
-    )
+        """)
     connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (version,))
-    connection.execute(
-        """
+    connection.execute("""
         INSERT INTO jobs(
             workflow, title, harness, prompt, dedupe_key, state,
             attempts, max_attempts, available_at, created_at, updated_at
         ) VALUES ('example', 'legacy', 'codex', 'inspect', 'legacy-v1', 'pending', 0, 2, 1, 1, 1)
-        """
-    )
+        """)
     if version >= 2:
         connection.execute("ALTER TABLE jobs ADD COLUMN placement TEXT")
         connection.execute("UPDATE jobs SET placement = 'tab'")

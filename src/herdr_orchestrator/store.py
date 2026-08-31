@@ -74,8 +74,7 @@ class Store:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            connection.executescript(
-                """
+            connection.executescript("""
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     version INTEGER NOT NULL
                 );
@@ -132,8 +131,7 @@ class Store:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
-                """
-            )
+                """)
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
