@@ -76,8 +76,9 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 just status
 ```
 
-用 doctor 的 repeatable filter 收窄单一 harness；JSON 包含 compact summary、readiness 总耗时
-和 provision/turn/receipt phase timings：
+`doctor` 不是纯静态诊断。对于环境与 CLI 均可用的 harness，它会启动或复用 agent，并提交
+带 output receipt 的真实只读 readiness turn。用 repeatable filter 收窄单一 harness；
+JSON 包含 compact summary、readiness 总耗时和 provision/turn/receipt phase timings：
 
 ```bash
 just doctor --harness droid

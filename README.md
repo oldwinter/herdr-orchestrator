@@ -75,6 +75,9 @@ npx --yes herdr-orchestrator install --project .
 npx --yes herdr-orchestrator doctor --project .
 ```
 
+`doctor` 不是纯静态检查。对于环境与 CLI 均可用的 harness，它会启动或复用 agent，提交一个
+带 output receipt 的真实只读 readiness turn，并在 probe 后关闭本次创建的临时 agent。
+
 安装器默认检测本机可执行的 harness。也可显式固定：
 
 ```bash
@@ -255,11 +258,11 @@ merge、发布、发送、删除 worktree、权限变更和生产操作仍必须
 
 ```bash
 # 显式指定 worker
-just enqueue codex review docs/prompts/review.md review-docs-v1
+just enqueue codex review workflows/prompts/codex-architecture.md review-docs-v1
 just enqueue grok build workflows/prompts/grok-build-check.md build-v1
 
-# 可显式覆盖执行拓扑
-just enqueue codex build workflows/prompts/build.md build-v2 --placement worktree
+# 可显式覆盖执行拓扑，即使静态规则会为只读 review 选择 pane
+just enqueue codex review-isolated workflows/prompts/codex-architecture.md review-isolated-v1 --placement worktree
 just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v2 --placement pane
 
 # 需要内容级机器验收时声明 output 或 file receipt（二选一）

@@ -62,8 +62,8 @@ agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提
 
 `run_once` 输出保留兼容的顶层本波计数，并新增 `claimed`、`batch` 和结束时全局 `queue`。
 `run_until_idle` 在有界 timeout 内重复 replica-limited wave，且把剩余 deadline 传给每个
-dispatch，直到当前 worker pool 没有 pending/running/blocked。blocked 会立即返回
-`idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
+dispatch。在没有 blocked job 时，它持续运行到当前 worker pool 没有 pending/running。
+blocked 会立即返回 `idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
 `queue_idle` 明确区分所选 pool 和全局 queue；pool 外任务不会造成假死，也不会被误报为
 全局排空。
 
@@ -167,7 +167,8 @@ manager 只对当前 Herdr session 可见。
   `working` 就继续等待，未前进则返回 phase-specific `prompt_acceptance_timeout`；
 - `agent_prompt_stalled` 且仍停在原 idle sequence 时最多重发两次 Enter；仍没有 lifecycle
   变化则快速返回 `agent_turn_not_observed`，不占满整个 agent timeout；
-- 每个 harness 使用独立后台 tab 和 full-size root pane，始终 `--no-focus`，避免多 agent 连续 split 后 TUI 过窄；
+- `tab` 与 `worktree` placement 使用独立后台 tab 和 full-size root pane。`pane` placement
+  复用本批次 tab，并 split 当前面积最大的 pane。创建和 split 命令都使用 `--no-focus`；
 - transport 通过独立 Herdr layout adapter provision tab、批次 pane 或原生 worktree，
   并从 JSON response 读取 workspace/tab/pane ID；
 - 所有 CLI 结果按 JSON schema 读取，不预测 pane ID；
