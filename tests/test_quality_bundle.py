@@ -355,6 +355,84 @@ class QualityBundleRunTests(unittest.TestCase):
                     **_expectations(bundle.manifest_path, expected_commit=commit),
                 )
 
+    def test_nonstandard_json_constants_are_rejected_after_digest_resync(self) -> None:
+        commit = "a" * 40
+        spec = self._coverage_spec(90.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = quality_bundle.run_quality(
+                root=Path(temporary) / "quality",
+                commit=commit,
+                invocation_id="nan-coverage",
+                specs=(spec,),
+            )
+            manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+            producer = manifest["producers"][0]
+            artifact = next(item for item in producer["artifacts"] if item["key"] == "coverage")
+            path = bundle.path / artifact["path"]
+            data = path.read_bytes().replace(b"90.0", b"NaN", 1)
+            path.write_bytes(data)
+            artifact["sha256"] = hashlib.sha256(data).hexdigest()
+            (bundle.path / "producers" / "coverage" / "producer.json").write_text(
+                json.dumps(producer), encoding="utf-8"
+            )
+            bundle.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                quality_bundle.QualityBundleError, "quality_artifact_invalid"
+            ):
+                quality_bundle.load_completed_manifest(
+                    bundle.manifest_path,
+                    expected_specs=(spec,),
+                    **_expectations(bundle.manifest_path, expected_commit=commit),
+                )
+
+    def test_fuzzed_profile_bytes_are_normalized_to_quality_error(self) -> None:
+        commit = "b" * 40
+        script = (
+            "import cProfile, os; from pathlib import Path; "
+            "path = Path(os.environ['QUALITY_OUTPUT_DIR'], 'tests.pstats'); "
+            "profiler = cProfile.Profile(); profiler.runcall(sum, range(10)); "
+            "profiler.dump_stats(str(path))"
+        )
+        spec = quality_bundle.ProducerSpec(
+            name="profiling",
+            commands=(
+                quality_bundle.CommandSpec(
+                    argv=(sys.executable, "-c", script),
+                    tool="python",
+                    version_argv=(sys.executable, "--version"),
+                ),
+            ),
+            artifacts=(quality_bundle.ArtifactSpec("profile", "tests.pstats", "pstats"),),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = quality_bundle.run_quality(
+                root=Path(temporary) / "quality",
+                commit=commit,
+                invocation_id="profile-fuzz",
+                specs=(spec,),
+            )
+            manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+            producer = manifest["producers"][0]
+            artifact = next(item for item in producer["artifacts"] if item["key"] == "profile")
+            path = bundle.path / artifact["path"]
+            data = b"9" * 9731
+            path.write_bytes(data)
+            artifact["sha256"] = hashlib.sha256(data).hexdigest()
+            (bundle.path / "producers" / "profiling" / "producer.json").write_text(
+                json.dumps(producer), encoding="utf-8"
+            )
+            bundle.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                quality_bundle.QualityBundleError, "quality_artifact_invalid"
+            ):
+                quality_bundle.load_completed_manifest(
+                    bundle.manifest_path,
+                    expected_specs=(spec,),
+                    **_expectations(bundle.manifest_path, expected_commit=commit),
+                )
+
     def test_source_change_during_run_cannot_publish_verified_evidence(self) -> None:
         commit = "4" * 40
         initial = quality_bundle.SourceIdentity(commit, "1" * 64, False)

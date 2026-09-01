@@ -508,6 +508,7 @@ def _json_object(path: Path, error_code: str) -> dict[str, object]:
         payload = json.loads(
             path.read_text(encoding="utf-8"),
             object_pairs_hook=_object_without_duplicates,
+            parse_constant=_quality_storage.reject_constant,
         )
     except (OSError, TypeError, UnicodeError, ValueError, RecursionError) as error:
         raise QualityBundleError(error_code) from error

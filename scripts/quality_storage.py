@@ -36,6 +36,10 @@ def object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, obje
     return result
 
 
+def reject_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _signature(metadata: os.stat_result) -> tuple[int, int, int, int]:
     return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
 
@@ -88,7 +92,11 @@ def assert_artifact_unchanged(path: Path, snapshot: ArtifactSnapshot) -> None:
 def parse_artifact_bytes(data: bytes, parser: str) -> dict[str, object] | None:
     if parser == "json":
         try:
-            payload = json.loads(data.decode("utf-8"), object_pairs_hook=object_without_duplicates)
+            payload = json.loads(
+                data.decode("utf-8"),
+                object_pairs_hook=object_without_duplicates,
+                parse_constant=reject_constant,
+            )
         except (UnicodeError, ValueError, RecursionError) as error:
             raise QualityBundleError("quality_artifact_invalid") from error
         if not isinstance(payload, dict):
@@ -106,7 +114,7 @@ def parse_artifact_bytes(data: bytes, parser: str) -> dict[str, object] | None:
             with os.fdopen(descriptor, "wb") as output:
                 output.write(data)
             pstats.Stats(temporary)
-        except (EOFError, OSError, TypeError, ValueError) as error:
+        except Exception as error:  # pstats exposes several parser-specific exception types.
             raise QualityBundleError("quality_artifact_invalid") from error
         finally:
             with suppress(FileNotFoundError):
