@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -23,6 +25,13 @@ from herdr_orchestrator.model import StandardizedDeliveryConfig, TrackerBackend
 
 GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 GITHUB_ISSUE_NUMBER = re.compile(r"[1-9][0-9]*\Z")
+DELIVERY_RUN_ID = re.compile(r"[0-9a-f]{12}\Z")
+DELIVERY_SPEC_MARKER = re.compile(
+    r"<!-- herdr-delivery:run=([0-9a-f]{12}):nonce=([0-9a-f]{32}):kind=spec -->\Z"
+)
+DELIVERY_TICKET_MARKER = re.compile(
+    r"<!-- herdr-delivery:run=([0-9a-f]{12}):nonce=([0-9a-f]{32}):" r"ticket=(\d{2,3}) -->\Z"
+)
 SECRET_TOKEN_SHAPE = re.compile(
     r"(?i)\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
     r"sk-[A-Za-z0-9_-]{20,}|sk_(?:live|test)_[A-Za-z0-9_-]{20,}|"
@@ -62,10 +71,97 @@ class TrackerTicket:
     reference: str
 
 
-class DeliveryTracker(Protocol):
-    def publish(self, plan: DeliveryPlan) -> dict[str, TrackerTicket]: ...
+@dataclass(frozen=True, slots=True)
+class TrackerMarkers:
+    run_id: str
+    nonce: str
+    spec: str
+    tickets: tuple[tuple[str, str], ...]
 
-    def close(self, ticket: DeliveryTicket, receipt: TicketReceipt) -> None: ...
+    def ticket(self, ticket_id: str) -> str:
+        try:
+            return dict(self.tickets)[ticket_id]
+        except KeyError as exc:
+            raise TrackerError(f"tracker_marker_unknown: {ticket_id}") from exc
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "nonce": self.nonce,
+            "spec": self.spec,
+            "tickets": dict(self.tickets),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _GithubIssue:
+    url: str
+    title: str
+    body: str
+    state: str
+
+
+@dataclass(frozen=True, slots=True)
+class _GithubAdoptionEdit:
+    issue_number: str
+    body: str
+
+
+class DeliveryTracker(Protocol):
+    references: dict[str, TrackerTicket]
+
+    def publish(
+        self,
+        plan: DeliveryPlan,
+        *,
+        markers: TrackerMarkers | None = None,
+    ) -> dict[str, TrackerTicket]: ...
+
+    def close(
+        self,
+        ticket: DeliveryTicket,
+        receipt: TicketReceipt,
+        *,
+        marker: str | None = None,
+    ) -> None: ...
+
+    def adopt(
+        self,
+        plan: DeliveryPlan,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
+        require_closed: bool = False,
+    ) -> dict[str, TrackerTicket]: ...
+
+    def inspect_adoption(
+        self,
+        plan: DeliveryPlan,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt],
+        require_closed: bool = False,
+    ) -> None: ...
+
+    def observe_publication(
+        self,
+        plan: DeliveryPlan,
+        *,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
+    ) -> tuple[dict[str, TrackerTicket], str | None] | None: ...
+
+    def observe_close(
+        self,
+        ticket: DeliveryTicket,
+        receipt: TicketReceipt,
+        *,
+        marker: str,
+    ) -> bool: ...
 
 
 class ProcessRunner(Protocol):
@@ -108,7 +204,12 @@ class LocalMarkdownTracker:
             raise TrackerError("local_tracker_root_invalid") from exc
         self.references: dict[str, TrackerTicket] = {}
 
-    def publish(self, plan: DeliveryPlan) -> dict[str, TrackerTicket]:
+    def publish(
+        self,
+        plan: DeliveryPlan,
+        *,
+        markers: TrackerMarkers | None = None,
+    ) -> dict[str, TrackerTicket]:
         feature_root = _safe_tracker_path(self.root, plan.slug)
         issues_root = _safe_tracker_path(feature_root, "issues")
         try:
@@ -127,7 +228,7 @@ class LocalMarkdownTracker:
             _safe_tracker_path(path)
             if path.exists():
                 existing = _read_tracker_text(path)
-                if existing != ready_content and not _completed_ticket_matches(
+                if existing != ready_content and not _exact_completed_ticket(
                     existing,
                     ticket,
                 ):
@@ -138,7 +239,13 @@ class LocalMarkdownTracker:
         self.references = tickets
         return tickets
 
-    def close(self, ticket: DeliveryTicket, receipt: TicketReceipt) -> None:
+    def close(
+        self,
+        ticket: DeliveryTicket,
+        receipt: TicketReceipt,
+        *,
+        marker: str | None = None,
+    ) -> None:
         reference = self.references.get(ticket.ticket_id)
         if reference is None:
             raise TrackerError(f"local_ticket_unknown: {ticket.ticket_id}")
@@ -149,6 +256,122 @@ class LocalMarkdownTracker:
             raise TrackerError(f"tracker_artifact_conflict: {path}")
         if existing != completed:
             _write_tracker_text(path, completed)
+
+    def adopt(
+        self,
+        plan: DeliveryPlan,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
+        require_closed: bool = False,
+    ) -> dict[str, TrackerTicket]:
+        self.inspect_adoption(
+            plan,
+            references=references,
+            spec_url=spec_url,
+            markers=markers,
+            receipts={} if receipts is None else receipts,
+            require_closed=require_closed,
+        )
+        self.references = dict(references)
+        return dict(references)
+
+    def inspect_adoption(
+        self,
+        plan: DeliveryPlan,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt],
+        require_closed: bool = False,
+    ) -> None:
+        if spec_url is not None:
+            raise TrackerError("local_tracker_adoption_invalid")
+        feature_root = _safe_tracker_path(self.root, plan.slug)
+        expected_references: dict[str, TrackerTicket] = {}
+        if not (_safe_tracker_path(feature_root, "spec.md")).is_file() or _read_tracker_text(
+            _safe_tracker_path(feature_root, "spec.md")
+        ) != render_spec(plan):
+            raise TrackerError("local_tracker_adoption_conflict")
+        issues_root = _safe_tracker_path(feature_root, "issues")
+        for ticket in plan.tickets:
+            path = _safe_tracker_path(
+                issues_root,
+                f"{ticket.ticket_id}-{_slug(ticket.title)}.md",
+            )
+            expected_references[ticket.ticket_id] = TrackerTicket(
+                ticket.ticket_id,
+                str(path),
+            )
+            if not path.is_file():
+                raise TrackerError("local_tracker_adoption_conflict")
+            content = _read_tracker_text(path)
+            receipt = receipts.get(ticket.ticket_id)
+            completed = None if receipt is None else render_ticket(ticket, receipt=receipt)
+            if require_closed:
+                if completed is None:
+                    raise TrackerError("local_tracker_adoption_conflict")
+                expected = {completed}
+            else:
+                expected = {render_ticket(ticket)}
+                if completed is not None:
+                    expected.add(completed)
+            if content not in expected:
+                raise TrackerError("local_tracker_adoption_conflict")
+        if expected_references != references:
+            raise TrackerError("local_tracker_adoption_conflict")
+
+    def observe_publication(
+        self,
+        plan: DeliveryPlan,
+        *,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
+    ) -> tuple[dict[str, TrackerTicket], str | None] | None:
+        feature_root = _safe_tracker_path(self.root, plan.slug)
+        spec_path = _safe_tracker_path(feature_root, "spec.md")
+        issues_root = _safe_tracker_path(feature_root, "issues")
+        if not spec_path.exists() and not issues_root.exists():
+            return None
+        if not spec_path.is_file() or _read_tracker_text(spec_path) != render_spec(plan):
+            raise TrackerError("local_tracker_observation_conflict")
+        references: dict[str, TrackerTicket] = {}
+        for ticket in plan.tickets:
+            path = _safe_tracker_path(
+                issues_root,
+                f"{ticket.ticket_id}-{_slug(ticket.title)}.md",
+            )
+            if not path.is_file():
+                return None
+            body = _read_tracker_text(path)
+            expected = {render_ticket(ticket)}
+            receipt = (receipts or {}).get(ticket.ticket_id)
+            if receipt is not None:
+                expected.add(render_ticket(ticket, receipt=receipt))
+            if body not in expected:
+                raise TrackerError("local_tracker_observation_conflict")
+            references[ticket.ticket_id] = TrackerTicket(ticket.ticket_id, str(path))
+        return references, None
+
+    def observe_close(
+        self,
+        ticket: DeliveryTicket,
+        receipt: TicketReceipt,
+        *,
+        marker: str,
+    ) -> bool:
+        reference = self.references.get(ticket.ticket_id)
+        if reference is None:
+            raise TrackerError(f"local_ticket_unknown: {ticket.ticket_id}")
+        body = _read_tracker_text(_safe_tracker_path(self.root, reference.reference))
+        if body == render_ticket(ticket, receipt=receipt):
+            return True
+        if body == render_ticket(ticket):
+            return False
+        raise TrackerError(f"tracker_artifact_conflict: {reference.reference}")
 
 
 class GithubTracker:
@@ -165,14 +388,30 @@ class GithubTracker:
         self.references: dict[str, TrackerTicket] = {}
         self.spec_url: str | None = None
 
-    def publish(self, plan: DeliveryPlan) -> dict[str, TrackerTicket]:
+    def publish(
+        self,
+        plan: DeliveryPlan,
+        *,
+        markers: TrackerMarkers | None = None,
+    ) -> dict[str, TrackerTicket]:
         if contains_high_confidence_secret(plan):
             raise TrackerError(
                 "github_secret_material_rejected: remove secret material before publishing"
             )
         self.references = {}
         self.spec_url = None
-        spec_url = self._create_issue(f"[Spec] {plan.title}", render_spec(plan))
+        spec_body = render_spec(plan)
+        if markers is not None:
+            if markers != tracker_markers(markers.run_id, plan, nonce=markers.nonce):
+                raise TrackerError("github_marker_invalid")
+            spec_body = _marked_body(markers.spec, spec_body)
+            spec_url = self._find_or_create_issue(
+                f"[Spec] {plan.title}",
+                spec_body,
+                markers.spec,
+            )
+        else:
+            spec_url = self._create_issue(f"[Spec] {plan.title}", spec_body)
         self.spec_url = spec_url
         for ticket in plan.tickets:
             blocker_references: dict[str, str] = {}
@@ -185,11 +424,25 @@ class GithubTracker:
                 f"## Parent\n\n{spec_url}\n\n"
                 f"{render_ticket(ticket, blocker_references=blocker_references)}"
             )
-            url = self._create_issue(ticket.title, body)
+            if markers is not None:
+                body = _marked_body(markers.ticket(ticket.ticket_id), body)
+                url = self._find_or_create_issue(
+                    ticket.title,
+                    body,
+                    markers.ticket(ticket.ticket_id),
+                )
+            else:
+                url = self._create_issue(ticket.title, body)
             self.references[ticket.ticket_id] = TrackerTicket(ticket.ticket_id, url)
         return dict(self.references)
 
-    def close(self, ticket: DeliveryTicket, receipt: TicketReceipt) -> None:
+    def close(
+        self,
+        ticket: DeliveryTicket,
+        receipt: TicketReceipt,
+        *,
+        marker: str | None = None,
+    ) -> None:
         reference = self.references.get(ticket.ticket_id)
         if reference is None:
             raise TrackerError(f"github_ticket_unknown: {ticket.ticket_id}")
@@ -199,6 +452,25 @@ class GithubTracker:
         if issue_number is None:
             raise TrackerError(f"github_ticket_reference_invalid: {ticket.ticket_id}")
         body = f"## Parent\n\n{self.spec_url}\n\n" f"{render_ticket(ticket, receipt=receipt)}"
+        if marker is not None:
+            match = DELIVERY_TICKET_MARKER.fullmatch(marker)
+            if match is None or match.group(3) != ticket.ticket_id:
+                raise TrackerError(f"github_ticket_marker_invalid: {ticket.ticket_id}")
+            body = _marked_body(marker, body)
+            ready = _marked_body(
+                marker,
+                f"## Parent\n\n{self.spec_url}\n\n{render_ticket(ticket)}",
+            )
+            issue = self._issue(issue_number)
+            if issue.url != reference.reference or issue.title != ticket.title:
+                raise TrackerError(f"github_ticket_conflict: {ticket.ticket_id}")
+            if issue.body == body and issue.state == "CLOSED":
+                return
+            if issue.body == body and issue.state == "OPEN":
+                self._close_issue(issue_number)
+                return
+            if issue.body != ready or issue.state != "OPEN":
+                raise TrackerError(f"github_ticket_conflict: {ticket.ticket_id}")
         self._run_with_body(
             [
                 "gh",
@@ -210,6 +482,306 @@ class GithubTracker:
             ],
             body,
         )
+        self._close_issue(issue_number)
+
+    def adopt(
+        self,
+        plan: DeliveryPlan,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
+        require_closed: bool = False,
+    ) -> dict[str, TrackerTicket]:
+        receipt_map = {} if receipts is None else receipts
+        edits = self._adoption_edits(
+            plan,
+            references=references,
+            spec_url=spec_url,
+            markers=markers,
+            receipts=receipt_map,
+            require_closed=require_closed,
+        )
+        for edit in edits:
+            self._run_with_body(
+                [
+                    "gh",
+                    "issue",
+                    "edit",
+                    edit.issue_number,
+                    "--repo",
+                    self.repository,
+                ],
+                edit.body,
+            )
+        self.spec_url = spec_url
+        self.references = dict(references)
+        return dict(references)
+
+    def inspect_adoption(
+        self,
+        plan: DeliveryPlan,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt],
+        require_closed: bool = False,
+    ) -> None:
+        self._adoption_edits(
+            plan,
+            references=references,
+            spec_url=spec_url,
+            markers=markers,
+            receipts=receipts,
+            require_closed=require_closed,
+        )
+
+    def _adoption_edits(
+        self,
+        plan: DeliveryPlan,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt],
+        require_closed: bool,
+    ) -> tuple[_GithubAdoptionEdit, ...]:
+        expected_ids = {ticket.ticket_id for ticket in plan.tickets}
+        if (
+            spec_url is None
+            or _github_issue_number(self.repository, spec_url) is None
+            or set(references) != expected_ids
+            or markers != tracker_markers(markers.run_id, plan, nonce=markers.nonce)
+        ):
+            raise TrackerError("github_adoption_invalid")
+        edits: list[_GithubAdoptionEdit] = []
+        spec_edit = self._inspect_adoption_issue(
+            spec_url,
+            f"[Spec] {plan.title}",
+            render_spec(plan),
+            markers.spec,
+        )
+        if spec_edit is not None:
+            edits.append(spec_edit)
+        for ticket in plan.tickets:
+            blocker_references = {
+                blocker: references[blocker].reference for blocker in ticket.blocked_by
+            }
+            legacy_body = (
+                f"## Parent\n\n{spec_url}\n\n"
+                f"{render_ticket(ticket, blocker_references=blocker_references)}"
+            )
+            reference = references[ticket.ticket_id]
+            receipt = receipts.get(ticket.ticket_id)
+            completed_body = (
+                None
+                if receipt is None
+                else (f"## Parent\n\n{spec_url}\n\n" f"{render_ticket(ticket, receipt=receipt)}")
+            )
+            edit = self._inspect_adoption_issue(
+                reference.reference,
+                ticket.title,
+                legacy_body,
+                markers.ticket(ticket.ticket_id),
+                completed_body=completed_body,
+                require_closed=require_closed,
+            )
+            if edit is not None:
+                edits.append(edit)
+        return tuple(edits)
+
+    def _inspect_adoption_issue(
+        self,
+        reference: str,
+        title: str,
+        legacy_body: str,
+        marker: str,
+        *,
+        completed_body: str | None = None,
+        require_closed: bool = False,
+    ) -> _GithubAdoptionEdit | None:
+        issue_number = _github_issue_number(self.repository, reference)
+        if issue_number is None:
+            raise TrackerError("github_adoption_invalid")
+        issue = self._issue(issue_number)
+        marked_body = _marked_body(marker, legacy_body)
+        if issue.url != reference or issue.title != title:
+            raise TrackerError("github_adoption_conflict")
+        if not require_closed and issue.body == marked_body and issue.state == "OPEN":
+            return None
+        if not require_closed and issue.body == legacy_body and issue.state == "OPEN":
+            return _GithubAdoptionEdit(issue_number, marked_body)
+        if completed_body is not None:
+            marked_completed = _marked_body(marker, completed_body)
+            completed_states = {"CLOSED"} if require_closed else {"OPEN", "CLOSED"}
+            if issue.body == marked_completed and issue.state in completed_states:
+                return None
+            if issue.body == completed_body and issue.state in completed_states:
+                return _GithubAdoptionEdit(issue_number, marked_completed)
+        raise TrackerError("github_adoption_conflict")
+
+    def observe_publication(
+        self,
+        plan: DeliveryPlan,
+        *,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
+    ) -> tuple[dict[str, TrackerTicket], str | None] | None:
+        spec = self._find_marked_issue(markers.spec)
+        if spec is None:
+            return None
+        if (
+            spec.title != f"[Spec] {plan.title}"
+            or spec.body != _marked_body(markers.spec, render_spec(plan))
+            or spec.state != "OPEN"
+        ):
+            raise TrackerError("github_marker_conflict")
+        references: dict[str, TrackerTicket] = {}
+        for ticket in plan.tickets:
+            issue = self._find_marked_issue(markers.ticket(ticket.ticket_id))
+            if issue is None:
+                return None
+            blocker_references = {
+                blocker: references[blocker].reference for blocker in ticket.blocked_by
+            }
+            ready = _marked_body(
+                markers.ticket(ticket.ticket_id),
+                f"## Parent\n\n{spec.url}\n\n"
+                f"{render_ticket(ticket, blocker_references=blocker_references)}",
+            )
+            receipt = (receipts or {}).get(ticket.ticket_id)
+            completed = (
+                None
+                if receipt is None
+                else _marked_body(
+                    markers.ticket(ticket.ticket_id),
+                    f"## Parent\n\n{spec.url}\n\n{render_ticket(ticket, receipt=receipt)}",
+                )
+            )
+            exact_state = (issue.body == ready and issue.state == "OPEN") or (
+                completed is not None and issue.body == completed and issue.state == "CLOSED"
+            )
+            if issue.title != ticket.title or not exact_state:
+                raise TrackerError("github_marker_conflict")
+            references[ticket.ticket_id] = TrackerTicket(ticket.ticket_id, issue.url)
+        return references, spec.url
+
+    def observe_close(
+        self,
+        ticket: DeliveryTicket,
+        receipt: TicketReceipt,
+        *,
+        marker: str,
+    ) -> bool:
+        reference = self.references.get(ticket.ticket_id)
+        if reference is None or self.spec_url is None:
+            raise TrackerError(f"github_ticket_unknown: {ticket.ticket_id}")
+        issue_number = _github_issue_number(self.repository, reference.reference)
+        if issue_number is None:
+            raise TrackerError(f"github_ticket_reference_invalid: {ticket.ticket_id}")
+        issue = self._issue(issue_number)
+        ready = _marked_body(
+            marker,
+            f"## Parent\n\n{self.spec_url}\n\n{render_ticket(ticket)}",
+        )
+        completed = _marked_body(
+            marker,
+            f"## Parent\n\n{self.spec_url}\n\n{render_ticket(ticket, receipt=receipt)}",
+        )
+        if issue.url != reference.reference or issue.title != ticket.title:
+            raise TrackerError(f"github_ticket_conflict: {ticket.ticket_id}")
+        if issue.body == completed and issue.state == "CLOSED":
+            return True
+        if issue.body in {ready, completed} and issue.state == "OPEN":
+            return False
+        raise TrackerError(f"github_ticket_conflict: {ticket.ticket_id}")
+
+    def _find_or_create_issue(self, title: str, body: str, marker: str) -> str:
+        issue = self._find_marked_issue(marker)
+        if issue is None:
+            return self._create_issue(title, body)
+        if issue.title != title or issue.body != body or issue.state != "OPEN":
+            raise TrackerError("github_marker_conflict")
+        return issue.url
+
+    def _find_marked_issue(self, marker: str) -> _GithubIssue | None:
+        match = DELIVERY_SPEC_MARKER.fullmatch(marker) or DELIVERY_TICKET_MARKER.fullmatch(marker)
+        if match is None:
+            raise TrackerError("github_marker_invalid")
+        nonce = match.group(2)
+        process = self._run(
+            [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                self.repository,
+                "--state",
+                "all",
+                "--search",
+                f'"{nonce}" in:body',
+                "--limit",
+                "1000",
+                "--json",
+                "url,title,body,state",
+            ]
+        )
+        payload = self._json_output(process)
+        if not isinstance(payload, list):
+            raise TrackerError("github_invalid_response")
+        matches: list[_GithubIssue] = []
+        for row in payload:
+            issue = self._parse_issue(row)
+            if marker in issue.body.splitlines():
+                matches.append(issue)
+        if len(matches) > 1:
+            raise TrackerError("github_marker_conflict")
+        return matches[0] if matches else None
+
+    def _issue(self, issue_number: str) -> _GithubIssue:
+        process = self._run(
+            [
+                "gh",
+                "issue",
+                "view",
+                issue_number,
+                "--repo",
+                self.repository,
+                "--json",
+                "url,title,body,state",
+            ]
+        )
+        return self._parse_issue(self._json_output(process))
+
+    def _parse_issue(self, payload: object) -> _GithubIssue:
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("url"), str)
+            or not isinstance(payload.get("title"), str)
+            or not isinstance(payload.get("body"), str)
+            or payload.get("state") not in {"OPEN", "CLOSED"}
+            or _github_issue_number(self.repository, payload["url"]) is None
+        ):
+            raise TrackerError("github_invalid_response")
+        return _GithubIssue(
+            url=payload["url"],
+            title=payload["title"],
+            body=payload["body"],
+            state=payload["state"],
+        )
+
+    @staticmethod
+    def _json_output(process: subprocess.CompletedProcess[str]) -> object:
+        try:
+            if not isinstance(process.stdout, str):
+                raise TrackerError("github_invalid_response")
+            return json.loads(process.stdout)
+        except (json.JSONDecodeError, TypeError, UnicodeError) as exc:
+            raise TrackerError("github_invalid_response") from exc
+
+    def _close_issue(self, issue_number: str) -> None:
         self._run(
             [
                 "gh",
@@ -300,6 +872,59 @@ def tracker_from_config(config: StandardizedDeliveryConfig) -> DeliveryTracker:
     if config.github_repository is None:
         raise TrackerError("github_repository_required")
     return GithubTracker(config.github_repository)
+
+
+def tracker_markers(
+    run_id: str,
+    plan: DeliveryPlan,
+    *,
+    nonce: str | None = None,
+) -> TrackerMarkers:
+    if DELIVERY_RUN_ID.fullmatch(run_id) is None:
+        raise TrackerError("tracker_run_id_invalid")
+    publication_nonce = secrets.token_hex(16) if nonce is None else nonce
+    if re.fullmatch(r"[0-9a-f]{32}", publication_nonce) is None:
+        raise TrackerError("tracker_nonce_invalid")
+    return TrackerMarkers(
+        run_id=run_id,
+        nonce=publication_nonce,
+        spec=(f"<!-- herdr-delivery:run={run_id}:nonce={publication_nonce}:" "kind=spec -->"),
+        tickets=tuple(
+            (
+                ticket.ticket_id,
+                f"<!-- herdr-delivery:run={run_id}:nonce={publication_nonce}:"
+                f"ticket={ticket.ticket_id} -->",
+            )
+            for ticket in plan.tickets
+        ),
+    )
+
+
+def tracker_markers_from_payload(
+    payload: object,
+    plan: DeliveryPlan,
+) -> TrackerMarkers:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"run_id", "nonce", "spec", "tickets"}
+        or not isinstance(payload.get("run_id"), str)
+        or not isinstance(payload.get("nonce"), str)
+        or not isinstance(payload.get("spec"), str)
+        or not isinstance(payload.get("tickets"), dict)
+    ):
+        raise TrackerError("tracker_marker_invalid")
+    markers = tracker_markers(
+        payload["run_id"],
+        plan,
+        nonce=payload["nonce"],
+    )
+    if payload != markers.payload():
+        raise TrackerError("tracker_marker_invalid")
+    return markers
+
+
+def _marked_body(marker: str, body: str) -> str:
+    return f"{marker}\n\n{body}"
 
 
 def _safe_tracker_path(root: Path, *parts: str) -> Path:
@@ -510,16 +1135,27 @@ def _write_once_or_match(path: Path, content: str) -> None:
     _write_tracker_text(path, content)
 
 
-def _completed_ticket_matches(content: str, ticket: DeliveryTicket) -> bool:
-    blockers = ", ".join(ticket.blocked_by) if ticket.blocked_by else "None — can start immediately"
-    required = {
-        f"# {ticket.ticket_id} — {ticket.title}",
-        f"**What to build:** {ticket.what_to_build}",
-        f"**Blocked by:** {blockers}",
-        "**Status:** completed",
-        *(f"- [x] {criterion}" for criterion in ticket.acceptance_criteria),
-    }
-    return required.issubset(set(content.splitlines()))
+def _exact_completed_ticket(content: str, ticket: DeliveryTicket) -> bool:
+    prefix = [
+        (
+            "**Status:** completed"
+            if line == "**Status:** ready-for-agent"
+            else line.replace("- [ ] ", "- [x] ", 1) if line.startswith("- [ ] ") else line
+        )
+        for line in render_ticket(ticket).splitlines()
+    ]
+    lines = content.splitlines()
+    tail = lines[len(prefix) :]
+    return (
+        lines[: len(prefix)] == prefix
+        and len(tail) == 6
+        and tail[:3] == ["", "## Completion receipt", ""]
+        and re.fullmatch(r"- Commit: `[^`\r\n]+`", tail[3]) is not None
+        and tail[4].startswith("- Checks: ")
+        and tail[4] != "- Checks: "
+        and tail[5].startswith("- Summary: ")
+        and tail[5] != "- Summary: "
+    )
 
 
 def _slug(value: str) -> str:
