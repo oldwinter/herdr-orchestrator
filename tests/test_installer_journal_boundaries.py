@@ -729,6 +729,63 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             self.assertEqual(converged.returncode, 0, converged.stderr)
             self.assertFalse(journal.exists())
 
+    def test_uninstall_does_not_scan_an_unmanaged_skill_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            barrier = root / "uninstall-skill-root-barrier"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                "--skip-skill",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            exclude = project / ".git/info/exclude"
+            caller = project / ".agents/skills/herdr-orchestrator/caller-owned.txt"
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_UNINSTALL_TRANSACTION_BARRIER"] = str(barrier)
+            process = subprocess.Popen(
+                [
+                    *self._node_command(environment),
+                    "uninstall",
+                    "--project",
+                    str(project),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not list(barrier.glob("*.ready")) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(list(barrier.glob("*.ready")))
+                self.assertIsNone(process.poll())
+                caller.parent.mkdir(parents=True, exist_ok=True)
+                caller.write_bytes(b"caller bytes\n")
+            finally:
+                barrier.mkdir(parents=True, exist_ok=True)
+                (barrier / "release").write_text("", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=30)
+
+            self.assertEqual(process.returncode, 0, f"{stderr}\n{stdout}")
+            self.assertEqual(json.loads(stdout)["preserved"], [])
+            self.assertTrue(caller.is_file())
+            self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
+            self.assertNotIn(b"herdr-orchestrator:begin", exclude.read_bytes())
+
     def test_legacy_uninstall_retries_when_no_preserved_project_target_remains(
         self,
     ) -> None:

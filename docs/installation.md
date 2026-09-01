@@ -169,6 +169,10 @@ Install, upgrade, and uninstall bind each planning observation to the transactio
 If a managed file, manifest, or Git exclude changes while the plan is being assembled, the
 command stops with `installer_state_changed: <path>` before publishing a journal or mutating
 the changed bytes.
+Mode-aware uninstall also rescans managed roots after publishing its journal and before each
+coupled mutation. A newly unjournaled path is reported as `installer_recovery_conflict:
+git-exclude:<path>` and leaves the journal and Git exclude in place until that caller entry is
+resolved.
 
 One owner claim remains next to the journal until the transaction finishes. If the owner
 process is running, concurrent install, upgrade, or uninstall commands stop with

@@ -957,13 +957,35 @@ function listLiveManagedEntries(project, journal) {
     }
   };
   const roots = [".herdr-orchestrator", ".orchestrator"];
-  if ([...known].some((path) => path.startsWith(".agents/skills/herdr-orchestrator/"))) {
+  if (journal.install_skill) {
     roots.push(".agents/skills/herdr-orchestrator");
   }
   for (const root of roots) {
     visit(root);
   }
   return entries.sort();
+}
+
+function normalUninstallManagedRootConflict(project, journal) {
+  if (journal.command !== "uninstall" || isLegacyModeJournal(journal)) {
+    return null;
+  }
+  const hasGitExcludeParticipant = Object.values(journal.prior_inventory)
+    .some((item) => item.target.scope === "git-exclude");
+  if (!hasGitExcludeParticipant) {
+    return null;
+  }
+  const unjournaled = listLiveManagedEntries(project, journal);
+  return unjournaled.length === 0
+    ? null
+    : unjournaled.map((path) => `git-exclude:${path}`).join(",");
+}
+
+function assertNormalUninstallManagedRoots(project, journal) {
+  const conflict = normalUninstallManagedRootConflict(project, journal);
+  if (conflict !== null) {
+    throw new Error(`installer_recovery_conflict: ${conflict}`);
+  }
 }
 
 function legacyExcludeCouplingAssessment(
@@ -973,6 +995,9 @@ function legacyExcludeCouplingAssessment(
   preservedTargets,
 ) {
   if (journal.command !== "uninstall") {
+    return { conflict: null, frozen: false };
+  }
+  if (!isLegacyModeJournal(journal)) {
     return { conflict: null, frozen: false };
   }
   const hasGitExcludeParticipant = Object.values(journal.prior_inventory)
@@ -986,9 +1011,6 @@ function legacyExcludeCouplingAssessment(
       conflict: unjournaled.map((path) => `git-exclude:${path}`).join(","),
       frozen: false,
     };
-  }
-  if (!isLegacyModeJournal(journal)) {
-    return { conflict: null, frozen: false };
   }
   const projectKeys = [...preservedTargets].filter((key) => {
     const item = journal.prior_inventory[key];
@@ -1421,10 +1443,12 @@ function completeJournal(project, journal, context, owner) {
       `installer_recovery_conflict: ${legacyProjectPreserved.join(",")}`,
     );
   }
+  assertNormalUninstallManagedRoots(project, journal);
   preflightEndpoints(project, journal, context, preservedTargets);
   assertLegacyExcludeCoupling(project, journal, context, preservedTargets);
   for (let index = 0; index < journal.operations.length; index += 1) {
     const operation = journal.operations[index];
+    assertNormalUninstallManagedRoots(project, journal);
     if (operation.target.scope === "git-exclude") {
       assertLegacyExcludeCoupling(project, journal, context, preservedTargets);
     }
@@ -1445,6 +1469,7 @@ function completeJournal(project, journal, context, owner) {
       persistJournal(project, journal);
     }
   }
+  assertNormalUninstallManagedRoots(project, journal);
   verifyDesiredInventory(project, journal, context, preservedTargets);
   const retainedPreservedTargets = new Set();
   for (const key of preservedTargets) {
@@ -1668,6 +1693,10 @@ export function inspectInstallerJournal(context) {
     normalizedContext,
     preservedTargets,
   );
+  const normalUninstallConflict = normalUninstallManagedRootConflict(
+    project,
+    journal,
+  );
   const recoveryConflicts = journal.progress.recovery_conflict === undefined
     ? []
     : [`journal-recovery:${journal.progress.recovery_conflict}`];
@@ -1678,6 +1707,7 @@ export function inspectInstallerJournal(context) {
       ...inspection.conflicts,
       ...legacyProjectConflicts,
       ...(legacyExcludeConflict === null ? [] : [legacyExcludeConflict]),
+      ...(normalUninstallConflict === null ? [] : [normalUninstallConflict]),
       ...recoveryConflicts,
       ...journalTemporaryConflicts,
     ].sort(),

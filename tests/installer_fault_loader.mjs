@@ -64,6 +64,13 @@ function __faultPauseAfterUninstallExcludePlanning() {
   }
 }
 
+function __faultPauseBeforeUninstallTransaction() {
+  const barrier = process.env.HERDR_ORCHESTRATOR_TEST_UNINSTALL_TRANSACTION_BARRIER;
+  if (barrier) {
+    __faultWaitAtBarrier(barrier);
+  }
+}
+
 function __faultOperationId(temporaryPath) {
   return /-(operation-[1-9][0-9]*)\.tmp$/.exec(temporaryPath)?.[1] ?? null;
 }
@@ -345,6 +352,16 @@ function instrumentCli(source) {
       "  const removalSet = new Set(removals);\n",
       "  const removalSet = new Set(removals);\n"
         + "  __faultPauseAfterUninstallExcludePlanning();\n",
+    );
+    result = replaceExact(
+      result,
+      "  runInstallerTransaction({\n"
+        + "    ...journalContext,\n"
+        + "    command: \"uninstall\",\n",
+      "  __faultPauseBeforeUninstallTransaction();\n"
+        + "  runInstallerTransaction({\n"
+        + "    ...journalContext,\n"
+        + "    command: \"uninstall\",\n",
     );
   }
   return `${shebang}${TEST_RUNTIME}\n${result}`;
