@@ -106,12 +106,12 @@ class CompletionProtocolTests(unittest.TestCase):
 
         for status in CompletionStatus:
             with self.subTest(status=status.value):
-                secret = "ghp_" + "abcdefghijklmnopqrstuvwxyz"
+                opaque_value = "ghp_" + "abcdefghijklmnopqrstuvwxyz"
                 result = parse_structured_completion(
                     "",
                     _envelope(
                         status=status.value,
-                        evidence_summary=f"tests passed token={secret}",
+                        evidence_summary=f"tests passed token={opaque_value}",
                     ),
                     identity,
                 )
