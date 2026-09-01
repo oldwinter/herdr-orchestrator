@@ -114,6 +114,16 @@ def _validate_coverage(payload: dict[str, object], key: str) -> None:
         ):
             _invalid()
         for name, value in totals.items():
+            if name.endswith("_display"):
+                if not _text(value):
+                    _invalid()
+                try:
+                    display = float(value)
+                except (TypeError, ValueError):
+                    _invalid()
+                if not isfinite(display) or not 0 <= display <= 100:
+                    _invalid()
+                continue
             if not _finite_nonnegative(value) or ("percent" in name and value > 100):
                 _invalid()
         for file_payload in files.values():
