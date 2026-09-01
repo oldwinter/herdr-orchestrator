@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Protocol
 
 from herdr_orchestrator.model import Harness, WorkflowConfig
@@ -154,7 +155,7 @@ def inspect_readiness_environment(
 
 
 def resolve_build_identity(
-    workspace: object,
+    workspace: Path,
     package_version: str,
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
@@ -438,7 +439,7 @@ def _parse_probe_result(
     if status is not expected_status:
         return _invalid_entry(harness, attempt, observed_at)
     timings = ReadinessPhaseTimings.parse(raw.get("phase_timings_ms", {}))
-    if timings is None:
+    if timings is None or timings.total is None:
         return _invalid_entry(harness, attempt, observed_at)
     raw_timestamp = raw.get("observed_at")
     if raw_timestamp is not None:

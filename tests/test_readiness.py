@@ -107,6 +107,11 @@ class ReadinessMatrixTests(unittest.TestCase):
                 ReadinessErrorCode.READINESS_RESULT_INVALID,
             ),
             (
+                {"status": "ready", "error_code": None, "phase_timings_ms": {}},
+                ReadinessStatus.ERROR,
+                ReadinessErrorCode.READINESS_RESULT_INVALID,
+            ),
+            (
                 {"status": "provider-private-status", "error_code": "raw-private-code"},
                 ReadinessStatus.ERROR,
                 ReadinessErrorCode.READINESS_RESULT_INVALID,
