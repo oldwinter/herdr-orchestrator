@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
@@ -20,7 +21,9 @@ from herdr_orchestrator.harness_health import (
     HarnessHealthStatus,
     HealthSource,
 )
+from herdr_orchestrator.herdr import doctor_agent_name, smoke_agent_name
 from herdr_orchestrator.model import AgentState, DispatchOutcome, Harness, NewJob
+from herdr_orchestrator.observability import Observability
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.selection import select_controller_harness
 from herdr_orchestrator.store import Store
@@ -431,6 +434,90 @@ class HarnessHealthTests(unittest.TestCase):
                     use_principal_proxy=False,
                     agent_name_override=None,
                 )
+
+    def test_drain_refreshes_share_the_global_deadline(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(
+                NewJob(
+                    workflow=config.name,
+                    title="deadline",
+                    harness=Harness.DROID,
+                    prompt="task",
+                    dedupe_key="health-deadline",
+                    max_attempts=2,
+                )
+            )
+            calls: list[Harness] = []
+
+            def probe(_workflow, harness, _timeout):
+                calls.append(harness)
+                time.sleep(1.2)
+                return {"status": "ready"}
+
+            class Dispatcher:
+                def dispatch(self, harness, prompt, **kwargs):
+                    del prompt, kwargs
+                    return DispatchOutcome(
+                        f"{harness.value}-worker",
+                        AgentState.DONE,
+                        False,
+                        "pane",
+                        agent_settled=True,
+                    )
+
+            health = HarnessHealth(store, config, probe=probe)
+            started = time.monotonic()
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=Dispatcher(),
+                health=health,
+                readiness_probe=probe,
+            ).run_until_idle(timeout_seconds=6)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 3)
+            self.assertEqual(calls, [Harness.DROID])
+            self.assertTrue(result["idle"])
+
+    def test_health_telemetry_has_no_prompt_or_terminal_material(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            telemetry = root / "telemetry"
+            health = HarnessHealth(
+                Store(config.state_db),
+                config,
+                observability=Observability(telemetry, config.name, clock=lambda: 100.0),
+                clock=lambda: 100.0,
+            )
+            health.record_probe(
+                Harness.DROID,
+                {
+                    "status": "ready",
+                    "prompt": "secret prompt must not persist",
+                    "terminal_output": "secret transcript",
+                },
+            )
+            health.snapshot((Harness.DROID,), refresh=False)
+            events = (telemetry / "events.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("secret prompt", events)
+            self.assertNotIn("secret transcript", events)
+            self.assertIn("harness_health_changed", events)
+
+    def test_probe_names_include_workspace_identity(self) -> None:
+        workspace_a = Path("/workspace/a")
+        workspace_b = Path("/workspace/b")
+        self.assertNotEqual(
+            doctor_agent_name("example", Harness.DROID, workspace_a),
+            doctor_agent_name("example", Harness.DROID, workspace_b),
+        )
+        self.assertNotEqual(
+            smoke_agent_name("example", Harness.DROID, workspace_a),
+            smoke_agent_name("example", Harness.DROID, workspace_b),
+        )
 
 
 if __name__ == "__main__":
