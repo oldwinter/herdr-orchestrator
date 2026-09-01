@@ -326,7 +326,7 @@ fencing token，原始 prompt、planner 或 router 不能覆盖这些字段。
 多条任务需要多波。普通运行优先使用：
 
 ```bash
-just run-until-idle --drain-timeout-seconds 3600
+just run-until-idle --drain-timeout-seconds 86400
 
 # failed job 原 id / dedupe_key 保持不变，只追加一次 attempt budget
 just retry 42 --extra-attempts 1

@@ -76,7 +76,7 @@ flowchart TD
 | `max_parallel` | integer，1–16 | 无 | 单个 wave 最多 claim 的 job 数 |
 | `lease_seconds` | integer，30–86400 | 无 | running lease |
 | `max_attempts` | integer，1–10 | 无 | 新 job 的总 attempt budget |
-| `agent_timeout_seconds` | integer，10–3600 | 无 | 单次完整 dispatch deadline |
+| `agent_timeout_seconds` | integer，10–86400 | 无 | 单次完整 dispatch deadline。到期后 coordinator 停止等待并记 `herdr_timeout`，不会杀死已在跑的 Herdr agent |
 
 跨字段约束：`lease_seconds >= agent_timeout_seconds + 90`。这 90 秒窗口用于 topology provisioning、Herdr 控制与 receipt 提交，避免旧 turn 尚未结束时 lease 已被重新 claim。
 
