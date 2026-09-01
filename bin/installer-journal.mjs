@@ -14,7 +14,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 
 export const INSTALLER_JOURNAL_RELATIVE_PATH =
@@ -471,6 +471,10 @@ function validateJournal(value) {
     || !isPlainObject(value.progress)
     || !Number.isInteger(value.progress.completed_operations)
     || !["applying", "verified"].includes(value.progress.phase)
+    || (
+      value.progress.recovery_conflict !== undefined
+      && !["legacy_exclude_coupling"].includes(value.progress.recovery_conflict)
+    )
   ) {
     throw new Error("installer_journal_invalid");
   }
@@ -561,6 +565,9 @@ function validateJournal(value) {
     progress: {
       completed_operations: value.progress.completed_operations,
       phase: value.progress.phase,
+      ...(value.progress.recovery_conflict === undefined
+        ? {}
+        : { recovery_conflict: value.progress.recovery_conflict }),
     },
     schema_version: value.schema_version,
     transaction_id: value.transaction_id,
@@ -875,6 +882,20 @@ function legacyProjectPreservationConflict(journal, preservedTargets) {
     .sort();
 }
 
+function projectRelativeArtifact(project, path) {
+  const candidate = relative(project, path);
+  if (
+    candidate.length === 0
+    || isAbsolute(candidate)
+    || candidate === ".."
+    || candidate.startsWith("../")
+    || candidate.startsWith("..\\")
+  ) {
+    return null;
+  }
+  return candidate.split("\\").join("/");
+}
+
 function listLiveManagedEntries(project, journal) {
   const known = new Set([
     ...Object.values(journal.prior_inventory),
@@ -882,32 +903,31 @@ function listLiveManagedEntries(project, journal) {
   ]
     .filter((item) => item.target.scope === "project")
     .map((item) => item.target.path));
-  const transactionToken = journal.transaction_id;
-  const operationTemporaryNames = new Set();
+  const ignoredPaths = new Set([INSTALLER_JOURNAL_RELATIVE_PATH]);
+  for (const artifact of [
+    ...listJournalOwners(project),
+    ...listJournalTemporaries(project),
+  ]) {
+    const artifactPath = projectRelativeArtifact(project, artifact.path);
+    if (artifactPath !== null) {
+      ignoredPaths.add(artifactPath);
+    }
+  }
   for (const operation of journal.operations) {
     if (operation.desired.kind !== "regular" || operation.target.scope !== "project") {
       continue;
     }
-    operationTemporaryNames.add(
-      basename(
-        targetTemporaryPath(
-          join(project, operation.target.path),
-          journal,
-          operation,
-        ),
-      ),
+    const temporaryPath = targetTemporaryPath(
+      join(project, operation.target.path),
+      journal,
+      operation,
     );
+    const artifactPath = projectRelativeArtifact(project, temporaryPath);
+    if (artifactPath !== null) {
+      ignoredPaths.add(artifactPath);
+    }
   }
-  const ignored = (name, relativePath) => (
-    relativePath === INSTALLER_JOURNAL_RELATIVE_PATH
-    || (
-      operationTemporaryNames.has(name)
-      || (
-        (JOURNAL_OWNER_PATTERN.test(name) || JOURNAL_TEMPORARY_PATTERN.test(name))
-        && name.includes(transactionToken)
-      )
-    )
-  );
+  const ignored = (relativePath) => ignoredPaths.has(relativePath);
   const entries = [];
   const visit = (relativeDirectory) => {
     const directory = join(project, relativeDirectory);
@@ -915,8 +935,7 @@ function listLiveManagedEntries(project, journal) {
     try {
       const status = lstatSync(directory);
       if (status.isSymbolicLink() || !status.isDirectory()) {
-        const name = basename(relativeDirectory);
-        if (!known.has(relativeDirectory) && !ignored(name, relativeDirectory)) {
+        if (!known.has(relativeDirectory) && !ignored(relativeDirectory)) {
           entries.push(relativeDirectory);
         }
         return;
@@ -932,7 +951,7 @@ function listLiveManagedEntries(project, journal) {
       const child = `${relativeDirectory}/${entry.name}`;
       if (entry.isDirectory() && !entry.isSymbolicLink()) {
         visit(child);
-      } else if (!known.has(child) && !ignored(entry.name, child)) {
+      } else if (!known.has(child) && !ignored(child)) {
         entries.push(child);
       }
     }
@@ -947,21 +966,29 @@ function listLiveManagedEntries(project, journal) {
   return entries.sort();
 }
 
-function legacyExcludeCouplingConflict(project, journal, context, preservedTargets) {
+function legacyExcludeCouplingAssessment(
+  project,
+  journal,
+  context,
+  preservedTargets,
+) {
   if (journal.command !== "uninstall") {
-    return null;
+    return { conflict: null, frozen: false };
   }
   if (!isLegacyModeJournal(journal)) {
-    return null;
+    return { conflict: null, frozen: false };
   }
   const hasGitExcludeParticipant = Object.values(journal.prior_inventory)
     .some((item) => item.target.scope === "git-exclude");
   if (!hasGitExcludeParticipant) {
-    return null;
+    return { conflict: null, frozen: false };
   }
   const unjournaled = listLiveManagedEntries(project, journal);
   if (unjournaled.length > 0) {
-    return unjournaled.map((path) => `git-exclude:${path}`).join(",");
+    return {
+      conflict: unjournaled.map((path) => `git-exclude:${path}`).join(","),
+      frozen: false,
+    };
   }
   const projectKeys = [...preservedTargets].filter((key) => {
     const item = journal.prior_inventory[key];
@@ -976,7 +1003,7 @@ function legacyExcludeCouplingConflict(project, journal, context, preservedTarge
     return item?.target.scope === "git-exclude";
   });
   if (projectKeys.length === 0 || excludeKey === undefined) {
-    return null;
+    return { conflict: null, frozen: false };
   }
   const retainedProjects = projectKeys.filter((key) => {
     const item = journal.prior_inventory[key];
@@ -985,20 +1012,43 @@ function legacyExcludeCouplingConflict(project, journal, context, preservedTarge
   });
   if (retainedProjects.length === 0) {
     const exclude = journal.prior_inventory[excludeKey];
-    return targetLabel(exclude.target);
+    return {
+      conflict: targetLabel(exclude.target),
+      frozen: true,
+    };
   }
-  return null;
+  return { conflict: null, frozen: false };
+}
+
+function legacyExcludeCouplingConflict(project, journal, context, preservedTargets) {
+  return legacyExcludeCouplingAssessment(
+    project,
+    journal,
+    context,
+    preservedTargets,
+  ).conflict;
 }
 
 function assertLegacyExcludeCoupling(project, journal, context, preservedTargets) {
-  const conflict = legacyExcludeCouplingConflict(
+  const assessment = legacyExcludeCouplingAssessment(
     project,
     journal,
     context,
     preservedTargets,
   );
-  if (conflict !== null) {
-    throw new Error(`installer_recovery_conflict: ${conflict}`);
+  if (assessment.conflict !== null) {
+    if (
+      assessment.frozen
+      && journal.progress.recovery_conflict !== "legacy_exclude_coupling"
+    ) {
+      journal.progress.recovery_conflict = "legacy_exclude_coupling";
+      persistJournal(project, journal);
+    }
+    throw new Error(`installer_recovery_conflict: ${assessment.conflict}`);
+  }
+  if (journal.progress.recovery_conflict !== undefined) {
+    delete journal.progress.recovery_conflict;
+    persistJournal(project, journal);
   }
 }
 
@@ -1618,6 +1668,9 @@ export function inspectInstallerJournal(context) {
     normalizedContext,
     preservedTargets,
   );
+  const recoveryConflicts = journal.progress.recovery_conflict === undefined
+    ? []
+    : [`journal-recovery:${journal.progress.recovery_conflict}`];
   return {
     active: true,
     command: journal.command,
@@ -1625,6 +1678,7 @@ export function inspectInstallerJournal(context) {
       ...inspection.conflicts,
       ...legacyProjectConflicts,
       ...(legacyExcludeConflict === null ? [] : [legacyExcludeConflict]),
+      ...recoveryConflicts,
       ...journalTemporaryConflicts,
     ].sort(),
     desired_inventory: journal.desired_inventory,

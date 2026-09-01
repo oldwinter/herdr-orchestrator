@@ -152,7 +152,9 @@ returns that result with `recovered_command: "uninstall"` and does not start a n
 the caller must invoke install or upgrade again explicitly. If all initially preserved project
 targets disappear before retirement while the Git exclude block is still retained, recovery
 returns a bounded conflict and keeps the journal; the next retry re-evaluates the live inventory
-and removes the block when no retained project path remains.
+and removes the block when no retained project path remains. That frozen-set condition is recorded
+as `progress.recovery_conflict: "legacy_exclude_coupling"`, so `doctor` continues to report
+`journal-recovery:legacy_exclude_coupling` until a retry clears the marker or finds a new conflict.
 If the exclude endpoint is already at its desired bytes while preserved project paths remain, or
 is in any third state, recovery likewise stops with a conflict rather than claiming that the
 block was retained.

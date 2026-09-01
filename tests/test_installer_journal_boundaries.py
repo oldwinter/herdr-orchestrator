@@ -545,8 +545,6 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
                 for path in project_removals:
                     if path.exists():
                         path.unlink()
-                caller_file = project / ".herdr-orchestrator/caller-owned.txt"
-                caller_file.write_bytes(b"caller bytes\n")
             finally:
                 barrier.mkdir(parents=True, exist_ok=True)
                 (barrier / "release").write_text("", encoding="utf-8")
@@ -565,16 +563,49 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             self.assertEqual(doctor.returncode, 1, doctor.stderr)
             installation = json.loads(doctor.stdout)["installation"]
             self.assertTrue(installation["journal"]["active"])
+            conflicts = ",".join(installation["journal"]["conflicts"])
             self.assertIn(
-                "git-exclude:.herdr-orchestrator/caller-owned.txt",
-                installation["journal"]["conflicts"],
+                "journal-recovery:legacy_exclude_coupling",
+                conflicts,
             )
 
+            caller_file = project / ".herdr-orchestrator/caller-owned.txt"
+            caller_file.write_bytes(b"caller bytes\n")
+            disguised_caller = (
+                project
+                / ".orchestrator"
+                / (
+                    f".install-journal.{journal['transaction_id']}.1."
+                    "00000000-0000-4000-8000-000000000000.tmp"
+                )
+            )
+            disguised_caller.write_bytes(b"disguised caller bytes\n")
             repeated = self._run("uninstall", "--project", str(project))
             self.assertEqual(repeated.returncode, 2, repeated.stderr)
             self.assertTrue(journal_path.is_file())
             self.assertTrue(caller_file.is_file())
+            self.assertTrue(disguised_caller.is_file())
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env={**os.environ, "PYTHON": "/bin/false"},
+            )
+            self.assertEqual(doctor.returncode, 1, doctor.stderr)
+            installation = json.loads(doctor.stdout)["installation"]
+            self.assertTrue(installation["journal"]["active"])
+            conflicts = ",".join(installation["journal"]["conflicts"])
+            self.assertIn(
+                "git-exclude:.herdr-orchestrator/caller-owned.txt",
+                conflicts,
+            )
+            self.assertIn(
+                "git-exclude:.orchestrator/" + disguised_caller.name,
+                conflicts,
+            )
+
             caller_file.unlink()
+            disguised_caller.unlink()
             converged = self._run("uninstall", "--project", str(project))
             self.assertEqual(converged.returncode, 0, converged.stderr)
             self.assertFalse(journal_path.exists())
