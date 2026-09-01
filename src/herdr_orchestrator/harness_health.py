@@ -204,7 +204,7 @@ class EligibilitySnapshot:
     def public_json(self) -> dict[str, object]:
         return {
             "workflow": self.workflow,
-            "workspace_id": hashlib.sha256(self.workspace.encode()).hexdigest()[:16],
+            "workspace_id": _workspace_id(self.workspace),
             "evaluated_at": self.evaluated_at,
             "eligible": [harness.value for harness in self.eligible_harnesses],
             "eligible_harnesses": [harness.value for harness in self.eligible_harnesses],
@@ -426,9 +426,10 @@ class HarnessHealth:
             correlation_id="",
             fields={
                 "role": role,
+                "workspace_id": _workspace_id(snapshot.workspace),
                 "selected": None if selected is None else selected.value,
                 "eligible": [harness.value for harness in snapshot.eligible_harnesses],
-                "excluded": snapshot.reasons,
+                "excluded_reasons": snapshot.reasons,
             },
         )
 
@@ -698,6 +699,7 @@ class HarnessHealth:
             correlation_id="",
             fields={
                 "harness": record.harness.value,
+                "workspace_id": _workspace_id(record.workspace),
                 "status": record.status.value,
                 "reason": record.reason,
                 "source": record.source,
@@ -713,6 +715,10 @@ def _unique_harnesses(harnesses: Iterable[Harness]) -> tuple[Harness, ...]:
     if any(not isinstance(harness, Harness) for harness in values):
         raise ValueError("harness_health_harness_invalid")
     return tuple(dict.fromkeys(values))
+
+
+def _workspace_id(workspace: str) -> str:
+    return hashlib.sha256(workspace.encode()).hexdigest()[:16]
 
 
 def _workflow_health_policy(workflow: WorkflowConfig) -> HarnessHealthConfig:

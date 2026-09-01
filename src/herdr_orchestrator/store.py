@@ -914,6 +914,7 @@ class Store:
         *,
         workspace: str | None = None,
     ) -> tuple[Harness, ...]:
+        """List pending harnesses; legacy NULL workspace rows remain current-scope compatible."""
         query = """
             SELECT DISTINCT harness FROM jobs
             WHERE workflow = ? AND state = ?
