@@ -957,7 +957,7 @@ function listLiveManagedEntries(project, journal) {
     }
   };
   const roots = [".herdr-orchestrator", ".orchestrator"];
-  if (journal.install_skill) {
+  if ([...known].some((path) => path.startsWith(".agents/skills/herdr-orchestrator/"))) {
     roots.push(".agents/skills/herdr-orchestrator");
   }
   for (const root of roots) {

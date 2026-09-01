@@ -2423,6 +2423,7 @@ class DistributionCliTests(unittest.TestCase):
                 str(project),
                 "--harness",
                 "droid",
+                "--install-skill",
             )
             self.assertEqual(install.returncode, 0, install.stderr)
             payload = json.loads(install.stdout)
