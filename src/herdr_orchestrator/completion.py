@@ -287,18 +287,61 @@ def parse_structured_completion(
     output_after: str,
     identity: CompletionIdentity,
 ) -> CompletionResult:
+    try:
+        serialized = _select_envelope(output_before, output_after)
+        envelope = _decode_envelope(serialized)
+        _validate_identity(envelope, identity)
+        status = _completion_status(envelope.status)
+        evidence_summary = _evidence_summary(envelope.evidence_summary)
+    except _CompletionFailure as failure:
+        return _failed(failure.error_code)
+    return CompletionResult(
+        CompletionPolicy.STRUCTURED_V2,
+        VerificationClass.VERIFIED,
+        status,
+        evidence_summary,
+        None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuredEnvelope:
+    schema_version: int
+    job_id: int
+    attempt: int
+    fencing_token: str
+    status: str
+    evidence_summary: str
+
+
+class _CompletionFailure(RuntimeError):
+    def __init__(self, error_code: str) -> None:
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+def _select_envelope(output_before: str, output_after: str) -> str:
     fresh_lines = lines_after_snapshot(output_before, output_after)
     if len("\n".join(fresh_lines).encode("utf-8")) > MAX_COMPLETION_OUTPUT_BYTES:
-        return _failed("completion_output_oversized")
+        raise _CompletionFailure("completion_output_oversized")
     envelopes = [line for line in map(_wire_line, fresh_lines) if line is not None]
     if not envelopes:
         stale = any(_wire_line(line) is not None for line in output_after.splitlines())
-        return _failed("completion_envelope_stale" if stale else "completion_envelope_missing")
+        error_code = "completion_envelope_stale" if stale else "completion_envelope_missing"
+        raise _CompletionFailure(error_code)
     if len(envelopes) != 1:
-        return _failed("completion_envelope_duplicate")
+        raise _CompletionFailure("completion_envelope_duplicate")
     serialized = envelopes[0]
     if len(serialized.encode("utf-8")) > MAX_COMPLETION_ENVELOPE_BYTES:
-        return _failed("completion_envelope_oversized")
+        raise _CompletionFailure("completion_envelope_oversized")
+    return serialized
+
+
+def _decode_envelope(serialized: str) -> _StructuredEnvelope:
     try:
         payload: object = json.loads(
             serialized,
@@ -306,11 +349,11 @@ def parse_structured_completion(
             parse_constant=_reject_json_constant,
         )
     except _DuplicateJsonKey:
-        return _failed("completion_envelope_invalid")
+        raise _CompletionFailure("completion_envelope_invalid") from None
     except (json.JSONDecodeError, RecursionError, ValueError):
-        return _failed("completion_envelope_malformed")
+        raise _CompletionFailure("completion_envelope_malformed") from None
     if not isinstance(payload, dict) or set(payload) != _ENVELOPE_KEYS:
-        return _failed("completion_envelope_invalid")
+        raise _CompletionFailure("completion_envelope_invalid")
     schema_version = payload["schema_version"]
     job_id = payload["job_id"]
     attempt = payload["attempt"]
@@ -325,37 +368,47 @@ def parse_structured_completion(
         or not isinstance(status_value, str)
         or not isinstance(evidence_summary, str)
     ):
-        return _failed("completion_envelope_invalid")
-    if schema_version != 2:
-        return _failed("completion_schema_mismatch")
-    if job_id != identity.job_id:
-        return _failed("completion_job_mismatch")
-    if attempt != identity.attempt:
-        return _failed("completion_attempt_mismatch")
-    if fencing_token != identity.fencing_token:
-        return _failed("completion_fencing_token_mismatch")
-    try:
-        status = CompletionStatus(status_value)
-    except ValueError:
-        return _failed("completion_status_invalid")
-    if len(evidence_summary.encode("utf-8")) > MAX_EVIDENCE_SUMMARY_BYTES:
-        return _failed("completion_evidence_oversized")
-    if not evidence_summary.strip():
-        return _failed("completion_evidence_invalid")
-    sanitized = sanitize(evidence_summary)
-    if not isinstance(sanitized, str) or not sanitized:
-        return _failed("completion_evidence_invalid")
-    return CompletionResult(
-        CompletionPolicy.STRUCTURED_V2,
-        VerificationClass.VERIFIED,
-        status,
-        sanitized,
-        None,
+        raise _CompletionFailure("completion_envelope_invalid")
+    return _StructuredEnvelope(
+        schema_version,
+        job_id,
+        attempt,
+        fencing_token,
+        status_value,
+        evidence_summary,
     )
 
 
-class _DuplicateJsonKey(ValueError):
-    pass
+def _validate_identity(
+    envelope: _StructuredEnvelope,
+    identity: CompletionIdentity,
+) -> None:
+    if envelope.schema_version != 2:
+        raise _CompletionFailure("completion_schema_mismatch")
+    if envelope.job_id != identity.job_id:
+        raise _CompletionFailure("completion_job_mismatch")
+    if envelope.attempt != identity.attempt:
+        raise _CompletionFailure("completion_attempt_mismatch")
+    if envelope.fencing_token != identity.fencing_token:
+        raise _CompletionFailure("completion_fencing_token_mismatch")
+
+
+def _completion_status(value: str) -> CompletionStatus:
+    try:
+        return CompletionStatus(value)
+    except ValueError:
+        raise _CompletionFailure("completion_status_invalid") from None
+
+
+def _evidence_summary(value: str) -> str:
+    if len(value.encode("utf-8")) > MAX_EVIDENCE_SUMMARY_BYTES:
+        raise _CompletionFailure("completion_evidence_oversized")
+    if not value.strip():
+        raise _CompletionFailure("completion_evidence_invalid")
+    sanitized = sanitize(value)
+    if not isinstance(sanitized, str) or not sanitized:
+        raise _CompletionFailure("completion_evidence_invalid")
+    return sanitized
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
