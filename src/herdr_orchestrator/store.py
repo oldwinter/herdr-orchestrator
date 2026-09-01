@@ -6,6 +6,7 @@ import time
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from herdr_orchestrator.attempts import AttemptLedger, StoreError
@@ -22,10 +23,19 @@ from herdr_orchestrator.model import (
     TaskReceipt,
 )
 
-SCHEMA_VERSION = 7
-__all__ = ["SCHEMA_VERSION", "Store", "StoreError"]
+SCHEMA_VERSION = 8
+__all__ = ["HarnessProbeLease", "SCHEMA_VERSION", "Store", "StoreError"]
 
 _INITIALIZE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessProbeLease:
+    """Fencing identity reserved for one in-flight readiness probe."""
+
+    revision: int
+    owner: str
+    lease_until: float
 
 
 def _nullable_bool(value: object) -> bool | None:
@@ -56,6 +66,7 @@ def _job_contract_matches(row: sqlite3.Row, job: NewJob) -> bool:
     return all(
         (
             row["title"] == job.title,
+            row["workspace"] == job.workspace,
             row["harness"] == job.harness.value,
             row["prompt"] == job.prompt,
             row["placement"] == (job.placement.value if job.placement is not None else None),
@@ -75,11 +86,13 @@ def _partial_job_contract_matches(
     placement: PlacementTarget | None,
     receipt: TaskReceipt | None,
     completion_policy: CompletionPolicy | None,
+    workspace: str | None,
 ) -> bool:
     effective_policy = _completion_policy(receipt, completion_policy)
     return all(
         (
             row["title"] == title,
+            row["workspace"] == workspace,
             row["prompt"] == prompt,
             harness is None or row["harness"] == harness.value,
             placement is None or row["placement"] == placement.value,
@@ -203,6 +216,7 @@ class Store:
                     reason TEXT NOT NULL,
                     source TEXT NOT NULL,
                     observed_at REAL NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
                     expires_at REAL,
                     cooldown_until REAL,
                     retryable_failures INTEGER NOT NULL DEFAULT 0,
@@ -238,6 +252,11 @@ class Store:
                 if version == 6:
                     self._migrate_v6_to_v7(connection)
                     version = 7
+                if version == 7:
+                    self._migrate_v7_to_v8(connection)
+                    version = 8
+                if version == SCHEMA_VERSION:
+                    self._ensure_v8_columns(connection)
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
 
@@ -384,6 +403,7 @@ class Store:
                 reason TEXT NOT NULL,
                 source TEXT NOT NULL,
                 observed_at REAL NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
                 expires_at REAL,
                 cooldown_until REAL,
                 retryable_failures INTEGER NOT NULL DEFAULT 0,
@@ -397,6 +417,22 @@ class Store:
                 ON harness_health(workflow, workspace, harness)
             """)
         connection.execute("UPDATE schema_meta SET version = 7")
+
+    def _migrate_v7_to_v8(self, connection: sqlite3.Connection) -> None:
+        self._ensure_v8_columns(connection)
+        connection.execute("UPDATE schema_meta SET version = 8")
+
+    @staticmethod
+    def _ensure_v8_columns(connection: sqlite3.Connection) -> None:
+        # v7 databases may already have the health table but predate the
+        # workspace and probe fencing columns.  The checks make restart safe.
+        Store._add_column_if_missing(connection, "jobs", "workspace", "TEXT")
+        Store._add_column_if_missing(
+            connection,
+            "harness_health",
+            "revision",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
 
     @staticmethod
     def _add_column_if_missing(
@@ -450,7 +486,8 @@ class Store:
                 return cursor.lastrowid, True
             row = connection.execute(
                 """
-                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value,
+                SELECT id, workspace, title, harness, prompt, placement,
+                       receipt_kind, receipt_value,
                        completion_policy
                 FROM jobs WHERE workflow = ? AND dedupe_key = ?
                 """,
@@ -473,11 +510,13 @@ class Store:
         placement: PlacementTarget | None,
         receipt: TaskReceipt | None,
         completion_policy: CompletionPolicy | None = None,
+        workspace: str | None = None,
     ) -> tuple[int, Harness] | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value,
+                SELECT id, workspace, title, harness, prompt, placement,
+                       receipt_kind, receipt_value,
                        completion_policy
                 FROM jobs WHERE workflow = ? AND dedupe_key = ?
                 """,
@@ -493,6 +532,7 @@ class Store:
             placement=placement,
             receipt=receipt,
             completion_policy=completion_policy,
+            workspace=workspace,
         ):
             raise StoreError("dedupe_contract_conflict")
         return int(row["id"]), Harness(str(row["harness"]))
@@ -520,9 +560,14 @@ class Store:
         slot_names: Mapping[str, Sequence[str]] | None = None,
         slot_limits: Mapping[str, int] | None = None,
         allowed_harnesses: Iterable[Harness] | None = None,
+        workspace: str | None = None,
+        require_fresh_health: bool = False,
+        include_legacy: bool = False,
     ) -> list[ClaimedJob]:
         if limit <= 0:
             return []
+        if require_fresh_health and workspace is None:
+            raise StoreError("health_workspace_required")
         now = time.time()
         lease_until = now + lease_seconds
         allowed_values = (
@@ -530,8 +575,20 @@ class Store:
         )
         claimed: list[ClaimedJob] = []
         with self._transaction() as connection:
-            busy_counts, busy_names = self._busy_slots(connection, workflow, now)
-            candidates = self._claim_candidates(connection, workflow, now)
+            busy_counts, busy_names = self._busy_slots(
+                connection,
+                workflow,
+                now,
+                workspace=workspace,
+                include_legacy=include_legacy,
+            )
+            candidates = self._claim_candidates(
+                connection,
+                workflow,
+                now,
+                workspace=workspace,
+                include_legacy=include_legacy,
+            )
             for row in candidates:
                 job = self._claim_candidate(
                     connection,
@@ -543,6 +600,7 @@ class Store:
                     slot_limits=slot_limits,
                     busy_counts=busy_counts,
                     busy_names=busy_names,
+                    health_workspace=workspace if require_fresh_health else None,
                 )
                 if job is None:
                     continue
@@ -556,14 +614,34 @@ class Store:
         connection: sqlite3.Connection,
         workflow: str,
         now: float,
+        *,
+        workspace: str | None = None,
+        include_legacy: bool = False,
     ) -> tuple[Counter[str], dict[str, set[str]]]:
-        rows = connection.execute(
-            """
-            SELECT harness, placement, agent_name FROM jobs
-            WHERE workflow = ? AND state = ? AND lease_until > ?
-            """,
-            (workflow, JobState.RUNNING.value, now),
-        ).fetchall()
+        query = """
+            SELECT jobs.harness, jobs.placement, jobs.agent_name FROM jobs AS jobs
+            WHERE jobs.workflow = ? AND jobs.state = ? AND jobs.lease_until > ?
+        """
+        parameters: tuple[object, ...] = (workflow, JobState.RUNNING.value, now)
+        if workspace is not None:
+            if include_legacy:
+                query += """
+                    AND (
+                        jobs.workspace = ?
+                        OR (
+                            jobs.workspace IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM jobs AS scoped_jobs
+                                WHERE scoped_jobs.workflow = jobs.workflow
+                                  AND scoped_jobs.workspace IS NOT NULL
+                            )
+                        )
+                    )
+                """
+            else:
+                query += " AND jobs.workspace = ?"
+            parameters += (workspace,)
+        rows = connection.execute(query, parameters).fetchall()
         counts: Counter[str] = Counter()
         names: dict[str, set[str]] = {}
         for row in rows:
@@ -579,26 +657,46 @@ class Store:
         connection: sqlite3.Connection,
         workflow: str,
         now: float,
+        *,
+        workspace: str | None = None,
+        include_legacy: bool = False,
     ) -> list[sqlite3.Row]:
-        return connection.execute(
-            """
-            SELECT * FROM jobs
-            WHERE workflow = ?
-              AND placement IS NOT NULL
+        query = """
+            SELECT jobs.* FROM jobs AS jobs
+            WHERE jobs.workflow = ?
+              AND jobs.placement IS NOT NULL
               AND (
-                (state = ? AND available_at <= ? AND attempts < max_attempts)
-                OR (state = ? AND lease_until <= ?)
+                (jobs.state = ? AND jobs.available_at <= ? AND jobs.attempts < jobs.max_attempts)
+                OR (jobs.state = ? AND jobs.lease_until <= ?)
               )
-            ORDER BY created_at, id
-            """,
-            (
-                workflow,
-                JobState.PENDING.value,
-                now,
-                JobState.RUNNING.value,
-                now,
-            ),
-        ).fetchall()
+        """
+        parameters: tuple[object, ...] = (
+            workflow,
+            JobState.PENDING.value,
+            now,
+            JobState.RUNNING.value,
+            now,
+        )
+        if workspace is not None:
+            if include_legacy:
+                query += """
+                    AND (
+                        jobs.workspace = ?
+                        OR (
+                            jobs.workspace IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM jobs AS scoped_jobs
+                                WHERE scoped_jobs.workflow = jobs.workflow
+                                  AND scoped_jobs.workspace IS NOT NULL
+                            )
+                        )
+                    )
+                """
+            else:
+                query += " AND jobs.workspace = ?"
+            parameters += (workspace,)
+        query += " ORDER BY created_at, id"
+        return connection.execute(query, parameters).fetchall()
 
     @staticmethod
     def _claim_candidate(
@@ -612,10 +710,19 @@ class Store:
         slot_limits: Mapping[str, int] | None,
         busy_counts: Counter[str],
         busy_names: dict[str, set[str]],
+        health_workspace: str | None,
     ) -> ClaimedJob | None:
         harness_value = str(row["harness"])
         placement_value = str(row["placement"])
         if allowed_values is not None and harness_value not in allowed_values:
+            return None
+        if health_workspace is not None and not Store._fresh_health(
+            connection,
+            workflow=str(row["workflow"]),
+            workspace=health_workspace,
+            harness=harness_value,
+            now=now,
+        ):
             return None
         names = _candidate_slot_names(row, harness_value, placement_value, slot_names)
         limit = (
@@ -654,6 +761,36 @@ class Store:
         busy_counts[harness_value] += 1
         busy_names.setdefault(harness_value, set()).add(agent_name)
         return claimed
+
+    @staticmethod
+    def _fresh_health(
+        connection: sqlite3.Connection,
+        *,
+        workflow: str,
+        workspace: str,
+        harness: str,
+        now: float,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT status, expires_at, cooldown_until
+            FROM harness_health
+            WHERE workflow = ? AND workspace = ? AND harness = ?
+            """,
+            (workflow, workspace, harness),
+        ).fetchone()
+        if row is None or row["status"] != "ready":
+            return False
+        expires_at = row["expires_at"]
+        cooldown_until = row["cooldown_until"]
+        return (
+            isinstance(expires_at, (int, float))
+            and expires_at > now
+            and (
+                cooldown_until is None
+                or (isinstance(cooldown_until, (int, float)) and cooldown_until <= now)
+            )
+        )
 
     def record_attempt_progress(
         self,
@@ -724,7 +861,7 @@ class Store:
         values = None if harnesses is None else tuple(harness.value for harness in harnesses)
         query = """
             SELECT workflow, workspace, harness, status, reason, source,
-                   observed_at, expires_at, cooldown_until, retryable_failures,
+                   observed_at, revision, expires_at, cooldown_until, retryable_failures,
                    probe_lease_until, probe_owner
             FROM harness_health
             WHERE workflow = ? AND workspace = ?
@@ -757,47 +894,126 @@ class Store:
         retryable_failures: int,
         probe_lease_until: float | None = None,
         probe_owner: str | None = None,
+        expected_revision: int | None = None,
+        expected_owner: str | None = None,
+        clear_probe_lease: bool = False,
+        revision: int | None = None,
+        owner: str | None = None,
     ) -> bool:
+        """Write health evidence with monotonic timestamp and optional fencing.
+
+        A caller with a probe lease must provide both the revision returned by
+        ``acquire_harness_probe_lease`` and its owner.  Lease completion then
+        updates only that exact generation.  Unfenced writes are accepted only
+        when their observation timestamp is newer than the persisted row.
+        """
+        if revision is not None:
+            if expected_revision is not None and expected_revision != revision:
+                raise StoreError("health_revision_conflict")
+            expected_revision = revision
+        if owner is not None:
+            if expected_owner is not None and expected_owner != owner:
+                raise StoreError("health_owner_conflict")
+            expected_owner = owner
+        if expected_revision is not None and expected_owner is None and probe_owner is not None:
+            expected_owner = probe_owner
+            probe_owner = None
+        if expected_revision is not None:
+            if isinstance(expected_revision, bool) or expected_revision < 0:
+                raise StoreError("health_revision_invalid")
+            if not expected_owner:
+                raise StoreError("health_owner_required")
+        workspace_key = str(workspace)
         with self._transaction() as connection:
-            cursor = connection.execute(
+            existing = connection.execute(
                 """
-                INSERT INTO harness_health(
-                    workflow, workspace, harness, status, reason, source,
-                    observed_at, expires_at, cooldown_until, retryable_failures,
-                    probe_lease_until, probe_owner
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(workflow, workspace, harness) DO UPDATE SET
-                    status = excluded.status,
-                    reason = excluded.reason,
-                    source = excluded.source,
-                    observed_at = excluded.observed_at,
-                    expires_at = excluded.expires_at,
-                    cooldown_until = excluded.cooldown_until,
-                    retryable_failures = excluded.retryable_failures,
-                    probe_lease_until = CASE
-                        WHEN excluded.probe_lease_until IS NULL
-                        THEN harness_health.probe_lease_until
-                        ELSE excluded.probe_lease_until END,
-                    probe_owner = CASE
-                        WHEN excluded.probe_owner IS NULL
-                        THEN harness_health.probe_owner
-                        ELSE excluded.probe_owner END
-                WHERE excluded.observed_at >= harness_health.observed_at
+                SELECT revision, observed_at, probe_owner
+                FROM harness_health
+                WHERE workflow = ? AND workspace = ? AND harness = ?
                 """,
-                (
-                    workflow,
-                    str(workspace),
-                    harness.value,
-                    status,
-                    reason,
-                    source,
-                    observed_at,
-                    expires_at,
-                    cooldown_until,
-                    retryable_failures,
-                    probe_lease_until,
-                    probe_owner,
-                ),
+                (workflow, workspace_key, harness.value),
+            ).fetchone()
+            if existing is None:
+                if expected_revision is not None:
+                    return False
+                connection.execute(
+                    """
+                    INSERT INTO harness_health(
+                        workflow, workspace, harness, status, reason, source,
+                        observed_at, revision, expires_at, cooldown_until,
+                        retryable_failures, probe_lease_until, probe_owner
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workflow,
+                        workspace_key,
+                        harness.value,
+                        status,
+                        reason,
+                        source,
+                        observed_at,
+                        expires_at,
+                        cooldown_until,
+                        retryable_failures,
+                        probe_lease_until,
+                        probe_owner,
+                    ),
+                )
+                return True
+
+            current_revision = int(existing["revision"])
+            if expected_revision is None:
+                if observed_at < float(existing["observed_at"]):
+                    return False
+                if observed_at == float(existing["observed_at"]) and current_revision != 0:
+                    return False
+            elif (
+                observed_at < float(existing["observed_at"])
+                or current_revision != expected_revision
+                or existing["probe_owner"] != expected_owner
+            ):
+                return False
+
+            lease_until_sql = (
+                "NULL"
+                if clear_probe_lease
+                else "harness_health.probe_lease_until" if probe_lease_until is None else "?"
+            )
+            owner_sql = (
+                "NULL"
+                if clear_probe_lease
+                else "harness_health.probe_owner" if probe_owner is None else "?"
+            )
+            values: list[object] = [
+                status,
+                reason,
+                source,
+                observed_at,
+                expires_at,
+                cooldown_until,
+                retryable_failures,
+            ]
+            if probe_lease_until is not None and not clear_probe_lease:
+                values.append(probe_lease_until)
+            if probe_owner is not None and not clear_probe_lease:
+                values.append(probe_owner)
+            values.extend([workflow, workspace_key, harness.value, current_revision])
+            owner_predicate = ""
+            if expected_owner is not None:
+                owner_predicate = " AND probe_owner = ?"
+                values.append(expected_owner)
+            cursor = connection.execute(
+                f"""
+                UPDATE harness_health
+                SET status = ?, reason = ?, source = ?, observed_at = ?,
+                    revision = revision + 1, expires_at = ?, cooldown_until = ?,
+                    retryable_failures = ?,
+                    probe_lease_until = {lease_until_sql},
+                    probe_owner = {owner_sql}
+                WHERE workflow = ? AND workspace = ? AND harness = ?
+                  AND revision = ?{owner_predicate}
+                """,
+                values,
             )
         return cursor.rowcount == 1
 
@@ -834,21 +1050,51 @@ class Store:
         force: bool = False,
     ) -> bool:
         """Atomically reserve one readiness refresh without touching task leases."""
+        return (
+            self.acquire_harness_probe_lease(
+                workflow=workflow,
+                workspace=workspace,
+                harness=harness,
+                owner=owner,
+                now=now,
+                lease_seconds=lease_seconds,
+                force=force,
+            )
+            is not None
+        )
+
+    def acquire_harness_probe_lease(
+        self,
+        *,
+        workflow: str,
+        workspace: str,
+        harness: Harness,
+        owner: str,
+        now: float,
+        lease_seconds: float,
+        force: bool = False,
+    ) -> HarnessProbeLease | None:
+        """Reserve a probe and return its immutable revision/owner fence."""
+        if not owner:
+            raise StoreError("health_owner_required")
+        if lease_seconds <= 0:
+            raise StoreError("health_lease_seconds_invalid")
         lease_until = now + lease_seconds
         with self._transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO harness_health(
                     workflow, workspace, harness, status, reason, source,
-                    observed_at, retryable_failures
-                ) VALUES (?, ?, ?, 'unknown', 'health_unknown', 'none', ?, 0)
+                    observed_at, revision, retryable_failures
+                ) VALUES (?, ?, ?, 'unknown', 'health_unknown', 'none', ?, 0, 0)
                 ON CONFLICT(workflow, workspace, harness) DO NOTHING
                 """,
                 (workflow, str(workspace), harness.value, now),
             )
             row = connection.execute(
                 """
-                SELECT status, expires_at, cooldown_until, probe_lease_until, probe_owner
+                SELECT status, expires_at, cooldown_until, probe_lease_until,
+                       probe_owner, revision
                 FROM harness_health
                 WHERE workflow = ? AND workspace = ? AND harness = ?
                 """,
@@ -866,29 +1112,33 @@ class Store:
                     and isinstance(expires_at, (int, float))
                     and expires_at > now
                 ):
-                    return False
+                    return None
                 if (
                     not force
                     and status in {"degraded", "unavailable"}
                     and isinstance(cooldown_until, (int, float))
                     and cooldown_until > now
                 ):
-                    return False
+                    return None
             if (
                 isinstance(active_until, (int, float))
                 and active_until > now
                 and active_owner != owner
             ):
-                return False
-            connection.execute(
+                return None
+            revision = int(row["revision"]) if row is not None else 0
+            cursor = connection.execute(
                 """
                 UPDATE harness_health
-                SET probe_lease_until = ?, probe_owner = ?
+                SET probe_lease_until = ?, probe_owner = ?, revision = revision + 1
                 WHERE workflow = ? AND workspace = ? AND harness = ?
+                  AND revision = ?
                 """,
-                (lease_until, owner, workflow, str(workspace), harness.value),
+                (lease_until, owner, workflow, str(workspace), harness.value, revision),
             )
-        return True
+            if cursor.rowcount != 1:
+                return None
+        return HarnessProbeLease(revision + 1, owner, lease_until)
 
     def release_harness_probe(
         self,
@@ -913,17 +1163,34 @@ class Store:
         self,
         workflow: str,
         *,
-        workspace: str | Path | None = None,
+        workspace: str | None = None,
+        include_legacy: bool = False,
     ) -> tuple[Harness, ...]:
-        """List pending harnesses; legacy NULL workspace rows use the current scope."""
         query = """
-            SELECT DISTINCT harness FROM jobs
-            WHERE workflow = ? AND state = ?
+            SELECT DISTINCT jobs.harness FROM jobs AS jobs
+            WHERE jobs.workflow = ? AND jobs.state = ?
         """
         parameters: tuple[object, ...] = (workflow, JobState.PENDING.value)
         if workspace is not None:
-            query += " AND (workspace = ? OR workspace IS NULL)"
-            parameters += (str(workspace),)
+            # NULL workspace is never attributed by default.  Coordinator
+            # may opt into the constrained fallback for a legacy-only queue.
+            if include_legacy:
+                query += """
+                    AND (
+                        jobs.workspace = ?
+                        OR (
+                            jobs.workspace IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM jobs AS scoped_jobs
+                                WHERE scoped_jobs.workflow = jobs.workflow
+                                  AND scoped_jobs.workspace IS NOT NULL
+                            )
+                        )
+                    )
+                """
+            else:
+                query += " AND jobs.workspace = ?"
+            parameters += (workspace,)
         query += " ORDER BY harness"
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
@@ -1016,7 +1283,8 @@ class Store:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT jobs.id, jobs.title, jobs.harness, jobs.placement, jobs.state,
+                SELECT jobs.id, jobs.workspace, jobs.title, jobs.harness, jobs.placement,
+                       jobs.state,
                        jobs.attempts, jobs.max_attempts, jobs.agent_name,
                        jobs.error_code, jobs.execution_path, jobs.herdr_workspace_id,
                        jobs.receipt_kind, jobs.receipt_value, jobs.agent_settled,
