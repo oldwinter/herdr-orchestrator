@@ -2,6 +2,7 @@ const MODULE_SUFFIX = "/bin/installer-journal.mjs";
 
 const TEST_RUNTIME = String.raw`
 import {
+  appendFileSync as __faultAppendFileSync,
   existsSync as __faultExistsSync,
   mkdirSync as __faultMkdirSync,
   writeFileSync as __faultWriteFileSync,
@@ -59,6 +60,10 @@ function __faultTargetLabel(path, temporaryPath) {
 
 function __faultMutation(label, path = null) {
   __faultMutationCount += 1;
+  const mutationLog = process.env.HERDR_ORCHESTRATOR_TEST_MUTATION_LOG;
+  if (mutationLog) {
+    __faultAppendFileSync(mutationLog, label + "\n");
+  }
   const pausePrefix =
     process.env.HERDR_ORCHESTRATOR_TEST_PAUSE_AT_LABEL_PREFIX;
   const pauseBarrier = process.env.HERDR_ORCHESTRATOR_TEST_PAUSE_BARRIER;

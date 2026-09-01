@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -17,6 +18,7 @@ INSTALLER_FAULT_ENV = {
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL_PREFIX",
+    "HERDR_ORCHESTRATOR_TEST_MUTATION_LOG",
 }
 
 
@@ -125,6 +127,36 @@ class InstallerJournalPackedTests(unittest.TestCase):
                     )
                     self.assertEqual(installed.returncode, 0, installed.stderr)
 
+            def relocate_active_journal(project: Path) -> None:
+                journal_directory = project / ".herdr-orchestrator"
+                journal_path = journal_directory / "install-journal.json"
+                owner_paths = list(journal_directory.glob(".install-journal.*.owner"))
+                self.assertEqual(len(owner_paths), 1)
+                journal_paths = [*owner_paths]
+                if journal_path.is_file():
+                    journal_paths.append(journal_path)
+                exclude_path = str((project / ".git/info/exclude").resolve())
+                for path in journal_paths:
+                    mode = path.stat().st_mode & 0o7777
+                    journal = json.loads(path.read_text(encoding="utf-8"))
+                    for inventory_name in ("prior_inventory", "desired_inventory"):
+                        relocated_inventory: dict[str, object] = {}
+                        for item in journal[inventory_name].values():
+                            target = item["target"]
+                            if target["scope"] == "git-exclude":
+                                target["path"] = exclude_path
+                            relocated_inventory[f"{target['scope']}:{target['path']}"] = item
+                        journal[inventory_name] = relocated_inventory
+                    for operation_item in journal["operations"]:
+                        target = operation_item["target"]
+                        if target["scope"] == "git-exclude":
+                            target["path"] = exclude_path
+                    path.write_text(
+                        f"{json.dumps(journal, indent=2)}\n",
+                        encoding="utf-8",
+                    )
+                    path.chmod(mode)
+
             def operation_arguments(operation: str) -> list[str]:
                 if operation == "install":
                     return ["install", "--harness", "droid"]
@@ -192,89 +224,59 @@ class InstallerJournalPackedTests(unittest.TestCase):
                     f"{context} failed to converge",
                 )
 
+            def unique_mutation_cutoffs(
+                labels: list[str],
+                project: Path,
+            ) -> list[tuple[int, str]]:
+                project_prefix = str(project.resolve())
+                seen: set[str] = set()
+                cutoffs: list[tuple[int, str]] = []
+                for index, label in enumerate(labels, start=1):
+                    normalized = label.replace(project_prefix, "<project>")
+                    if normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    cutoffs.append((index, normalized))
+                return cutoffs
+
             mutation_counts: dict[str, int] = {}
             recovery_mutation_counts: dict[str, int] = {}
             for operation in ("install", "upgrade", "uninstall"):
                 with self.subTest(operation=operation):
+                    template = root / f"template-{operation}"
+                    setup_project(template, operation)
                     expected_project = root / f"expected-{operation}"
-                    setup_project(expected_project, operation)
+                    shutil.copytree(template, expected_project)
+                    initial_mutation_log = root / f"initial-labels-{operation}.txt"
                     expected_run = run_cli(
                         expected_project,
                         operation_arguments(operation),
+                        extra_environment={
+                            "HERDR_ORCHESTRATOR_TEST_MUTATION_LOG": str(initial_mutation_log)
+                        },
                     )
                     self.assertEqual(expected_run.returncode, 0, expected_run.stderr)
                     expected_snapshot = snapshot(expected_project)
+                    initial_labels = initial_mutation_log.read_text(encoding="utf-8").splitlines()
+                    self.assertGreater(len(initial_labels), 0)
+                    initial_cutoffs = unique_mutation_cutoffs(
+                        initial_labels,
+                        expected_project,
+                    )
 
-                    for interrupt_after in range(1, 161):
+                    for interrupt_after, mutation_label in initial_cutoffs:
                         project = root / f"{operation}-{interrupt_after}"
-                        setup_project(project, operation)
+                        shutil.copytree(template, project)
                         interrupted = run_cli(
                             project,
                             operation_arguments(operation),
                             interrupt_after=interrupt_after,
-                        )
-                        if interrupted.returncode != 86:
-                            self.assertEqual(
-                                interrupted.returncode,
-                                0,
-                                interrupted.stderr,
-                            )
-                            self.assertEqual(snapshot(project), expected_snapshot)
-                            mutation_counts[operation] = interrupt_after - 1
-                            break
-
-                        recovered = run_cli(
-                            project,
-                            operation_arguments(operation),
-                        )
-                        self.assertEqual(recovered.returncode, 0, recovered.stderr)
-                        assert_recovered(
-                            project,
-                            operation,
-                            expected_snapshot,
-                            f"{operation} initial mutation {interrupt_after}",
-                        )
-                    else:
-                        self.fail(f"{operation} exceeded the mutation-matrix bound")
-
-                    for interrupt_after in range(1, 161):
-                        project = root / f"recovery-{operation}-{interrupt_after}"
-                        setup_project(project, operation)
-                        interrupted_base = run_cli(
-                            project,
-                            operation_arguments(operation),
-                            extra_environment={
-                                "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": ("journal:published")
-                            },
                         )
                         self.assertEqual(
-                            interrupted_base.returncode,
+                            interrupted.returncode,
                             86,
-                            interrupted_base.stderr,
+                            f"{mutation_label}: {interrupted.stderr}",
                         )
-                        self.assertTrue(
-                            (project / ".herdr-orchestrator/install-journal.json").is_file()
-                        )
-                        interrupted = run_cli(
-                            project,
-                            operation_arguments(operation),
-                            interrupt_after=interrupt_after,
-                        )
-                        if interrupted.returncode != 86:
-                            self.assertEqual(
-                                interrupted.returncode,
-                                0,
-                                interrupted.stderr,
-                            )
-                            assert_recovered(
-                                project,
-                                operation,
-                                expected_snapshot,
-                                f"{operation} terminal recovery mutation " f"{interrupt_after}",
-                            )
-                            recovery_mutation_counts[operation] = interrupt_after - 1
-                            break
-
                         recovered = run_cli(
                             project,
                             operation_arguments(operation),
@@ -284,10 +286,195 @@ class InstallerJournalPackedTests(unittest.TestCase):
                             project,
                             operation,
                             expected_snapshot,
-                            f"{operation} recovery mutation {interrupt_after}",
+                            f"{operation} initial mutation {mutation_label}",
                         )
-                    else:
-                        self.fail(f"{operation} recovery exceeded the mutation-matrix bound")
+                    mutation_counts[operation] = len(initial_cutoffs)
+
+                    recovery_base = root / f"recovery-base-{operation}"
+                    shutil.copytree(template, recovery_base)
+                    interrupted_base = run_cli(
+                        recovery_base,
+                        operation_arguments(operation),
+                        extra_environment={
+                            "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": (
+                                "temporary:journal:owner:created"
+                            )
+                        },
+                    )
+                    self.assertEqual(
+                        interrupted_base.returncode,
+                        86,
+                        interrupted_base.stderr,
+                    )
+                    self.assertEqual(
+                        len(
+                            list(
+                                (recovery_base / ".herdr-orchestrator").glob(
+                                    ".install-journal.*.owner"
+                                )
+                            )
+                        ),
+                        1,
+                    )
+                    self.assertFalse(
+                        (recovery_base / ".herdr-orchestrator/install-journal.json").exists()
+                    )
+                    recovery_discovery_project = root / f"recovery-discovery-{operation}"
+                    shutil.copytree(recovery_base, recovery_discovery_project)
+                    relocate_active_journal(recovery_discovery_project)
+                    recovery_mutation_log = root / f"recovery-labels-{operation}.txt"
+                    recovery_discovery = run_cli(
+                        recovery_discovery_project,
+                        operation_arguments(operation),
+                        extra_environment={
+                            "HERDR_ORCHESTRATOR_TEST_MUTATION_LOG": str(recovery_mutation_log)
+                        },
+                    )
+                    self.assertEqual(
+                        recovery_discovery.returncode,
+                        0,
+                        recovery_discovery.stderr,
+                    )
+                    assert_recovered(
+                        recovery_discovery_project,
+                        operation,
+                        expected_snapshot,
+                        f"{operation} recovery label discovery",
+                    )
+                    recovery_labels = recovery_mutation_log.read_text(encoding="utf-8").splitlines()
+                    self.assertIn("journal:published:recovered", recovery_labels)
+                    recovery_cutoffs = unique_mutation_cutoffs(
+                        recovery_labels,
+                        recovery_discovery_project,
+                    )
+                    for interrupt_after, mutation_label in recovery_cutoffs:
+                        project = root / f"recovery-{operation}-{interrupt_after}"
+                        shutil.copytree(recovery_base, project)
+                        relocate_active_journal(project)
+                        interrupted = run_cli(
+                            project,
+                            operation_arguments(operation),
+                            interrupt_after=interrupt_after,
+                        )
+                        self.assertEqual(
+                            interrupted.returncode,
+                            86,
+                            f"{mutation_label}: {interrupted.stderr}",
+                        )
+                        recovered = run_cli(
+                            project,
+                            operation_arguments(operation),
+                        )
+                        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                        assert_recovered(
+                            project,
+                            operation,
+                            expected_snapshot,
+                            f"{operation} recovery mutation {mutation_label}",
+                        )
+                    recovery_mutation_counts[operation] = len(recovery_cutoffs)
+
+                    recovered_publication_project = root / f"recovered-publication-{operation}"
+                    shutil.copytree(
+                        recovery_base,
+                        recovered_publication_project,
+                    )
+                    relocate_active_journal(recovered_publication_project)
+                    recovered_publication = run_cli(
+                        recovered_publication_project,
+                        operation_arguments(operation),
+                        extra_environment={
+                            "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": (
+                                "journal:published:recovered"
+                            )
+                        },
+                    )
+                    self.assertEqual(
+                        recovered_publication.returncode,
+                        86,
+                        recovered_publication.stderr,
+                    )
+                    self.assertTrue(
+                        (
+                            recovered_publication_project
+                            / ".herdr-orchestrator/install-journal.json"
+                        ).is_file()
+                    )
+                    recovered = run_cli(
+                        recovered_publication_project,
+                        operation_arguments(operation),
+                    )
+                    self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                    assert_recovered(
+                        recovered_publication_project,
+                        operation,
+                        expected_snapshot,
+                        f"{operation} recovered publication chain",
+                    )
+
+                    temporary_removal_project = root / f"temporary-removal-{operation}"
+                    shutil.copytree(template, temporary_removal_project)
+                    published = run_cli(
+                        temporary_removal_project,
+                        operation_arguments(operation),
+                        extra_environment={
+                            "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": ("journal:published")
+                        },
+                    )
+                    self.assertEqual(published.returncode, 86, published.stderr)
+                    progress_temporary = run_cli(
+                        temporary_removal_project,
+                        operation_arguments(operation),
+                        extra_environment={
+                            "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL_PREFIX": (
+                                "temporary:journal:"
+                            )
+                        },
+                    )
+                    self.assertEqual(
+                        progress_temporary.returncode,
+                        86,
+                        progress_temporary.stderr,
+                    )
+                    self.assertTrue(
+                        list(
+                            (temporary_removal_project / ".herdr-orchestrator").glob(
+                                ".install-journal.*.tmp"
+                            )
+                        )
+                    )
+                    temporary_removed = run_cli(
+                        temporary_removal_project,
+                        operation_arguments(operation),
+                        extra_environment={
+                            "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL_PREFIX": (
+                                "journal:temporary:removed:"
+                            )
+                        },
+                    )
+                    self.assertEqual(
+                        temporary_removed.returncode,
+                        86,
+                        temporary_removed.stderr,
+                    )
+                    self.assertFalse(
+                        list(
+                            (temporary_removal_project / ".herdr-orchestrator").glob(
+                                ".install-journal.*.tmp"
+                            )
+                        )
+                    )
+                    recovered = run_cli(
+                        temporary_removal_project,
+                        operation_arguments(operation),
+                    )
+                    self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                    assert_recovered(
+                        temporary_removal_project,
+                        operation,
+                        expected_snapshot,
+                        f"{operation} temporary removal chain",
+                    )
 
             self.assertGreater(mutation_counts["install"], 20)
             self.assertGreater(mutation_counts["upgrade"], 4)
