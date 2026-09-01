@@ -26,7 +26,7 @@ flowchart LR
     K -->|显式 retry：增加预算| B
 ```
 
-`Coordinator.run_once()` 先初始化 schema，按需执行 planner，并为尚未 placement 的任务确定 topology；随后最多 claim `coordinator.max_parallel` 个任务，以本 wave 的 `batch_key` 并发派发，最后逐个将 outcome 转换为 durable state 和 receipt。默认 workflow 的全局并发是 6、lease 是 900 秒、单次 agent timeout 是 300 秒、默认最大尝试次数是 2；这些值来自 `workflows/multi-harness.toml`。
+`Coordinator.run_once()` 先初始化 schema，按需执行 planner，并为尚未 placement 的任务确定 topology；随后最多 claim `coordinator.max_parallel` 个任务，以本 wave 的 `batch_key` 并发派发，最后逐个将 outcome 转换为 durable state 和 receipt。默认 workflow 的全局并发是 6、lease 是 32400 秒、单次 agent timeout 是 28800 秒、默认最大尝试次数是 2；这些值来自 `workflows/multi-harness.toml`。
 
 `Coordinator.run_forever()` 在 `run_once()` 之间按 `poll_seconds` 休眠，适合常驻 worker。它本身不是服务管理器：进程崩溃后应由外部 supervisor 重新启动；恢复依据仍是 SQLite，而不是 Python 线程。
 

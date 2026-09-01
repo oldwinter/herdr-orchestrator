@@ -54,6 +54,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.standardized_delivery.wayfinder, WayfinderMode.AUTO)
         self.assertEqual(config.standardized_delivery.max_parallel, 3)
         self.assertEqual(config.standardized_delivery.review_repair_rounds, 2)
+        self.assertEqual(config.coordinator.max_parallel, 6)
+        self.assertEqual(config.coordinator.lease_seconds, 32400)
+        self.assertEqual(config.coordinator.agent_timeout_seconds, 28800)
 
     def test_loads_grok_only_research_workflow(self) -> None:
         config = load_workflow(REPO_ROOT / "workflows/grok-research.toml")
@@ -66,6 +69,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.coordinator.max_parallel, 10)
         self.assertEqual(config.workers[0].replicas, 10)
         self.assertEqual(config.workers[0].placement, PlacementTarget.PANE)
+        self.assertEqual(config.coordinator.lease_seconds, 32400)
+        self.assertEqual(config.coordinator.agent_timeout_seconds, 28800)
 
     def test_rejects_unknown_harness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -91,6 +96,48 @@ class ConfigTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ConfigError, "planner_output_must_be"):
+                load_workflow(workflow)
+
+    def test_allows_day_long_agent_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow()
+                .replace(
+                    "lease_seconds = 100",
+                    "lease_seconds = 86400",
+                )
+                .replace(
+                    "agent_timeout_seconds = 10",
+                    "agent_timeout_seconds = 86310",
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_workflow(workflow)
+
+        self.assertEqual(config.coordinator.lease_seconds, 86400)
+        self.assertEqual(config.coordinator.agent_timeout_seconds, 86310)
+
+    def test_rejects_agent_timeout_above_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow().replace(
+                    "agent_timeout_seconds = 10",
+                    "agent_timeout_seconds = 86401",
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ConfigError,
+                "agent_timeout_seconds_must_be_integer_10_86400",
+            ):
                 load_workflow(workflow)
 
     def test_rejects_planner_prompt_outside_workspace(self) -> None:

@@ -137,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="until_idle",
         action="store_true",
     )
-    run.add_argument("--drain-timeout-seconds", type=int, default=3600)
+    run.add_argument("--drain-timeout-seconds", type=int, default=86400)
     _add_selection_arguments(run)
 
     enqueue = subparsers.add_parser("enqueue")

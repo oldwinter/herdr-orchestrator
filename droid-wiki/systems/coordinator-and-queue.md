@@ -79,7 +79,7 @@ tests/test_cli.py             # queue CLI 参数、scope 与默认安全行为
 7. future 完成后调用 `Store.record_outcome()`。未处理的 dispatcher 异常被折叠为 `AgentState.UNKNOWN` + `dispatcher_unhandled_error`，不会被算作成功。
 8. 返回本 wave 的状态计数、claimed 数以及整个 workflow 的 queue 快照。
 
-默认策略来自 [`workflows/multi-harness.toml`](../../workflows/multi-harness.toml)：`max_parallel = 6`、`lease_seconds = 900`、`max_attempts = 2`、`agent_timeout_seconds = 300`。这些是配置值而非 Store 内部常量。
+默认策略来自 [`workflows/multi-harness.toml`](../../workflows/multi-harness.toml)：`max_parallel = 6`、`lease_seconds = 32400`、`max_attempts = 2`、`agent_timeout_seconds = 28800`。这些是配置值而非 Store 内部常量。
 
 ## Claim、lease 与 replica
 

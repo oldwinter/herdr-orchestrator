@@ -430,6 +430,19 @@ class CliTests(unittest.TestCase):
         self.assertFalse(args.once)
         self.assertEqual(args.drain_timeout_seconds, 120)
 
+    def test_run_until_idle_defaults_to_day_long_drain(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "run",
+                "--workflow",
+                "workflow.toml",
+                "--until-idle",
+            ]
+        )
+
+        self.assertTrue(args.until_idle)
+        self.assertEqual(args.drain_timeout_seconds, 86400)
+
     def test_retry_accepts_job_and_attempt_budget(self) -> None:
         args = build_parser().parse_args(
             [

@@ -150,7 +150,7 @@ Use one bounded drain invocation for normal queued work:
 ```bash
 npx --yes herdr-orchestrator run --project . \
   --until-idle \
-  --drain-timeout-seconds 3600
+  --drain-timeout-seconds 86400
 ```
 
 The result separates `claimed`, cumulative `batch`, and global `queue`. When workers are
