@@ -136,7 +136,10 @@ Schema version 1 journals written before mode tracking remain valid. Recovery tr
 mode as unknown, preserves the live mode when it replaces that file, and adopts the older
 transaction-specific `.tmp` claim as the current owner claim. Install and upgrade replay may
 finish a content-proven replacement while carrying the live mode onto its temporary file;
-legacy uninstall replay never authorizes deletion of a regular endpoint whose mode is unknown.
+legacy uninstall replay treats each digest-matching regular project deletion whose mode is
+unknown as a preserved participant: it skips that unlink, retains the Git exclude block,
+removes the installer manifest, retires the journal, and returns a partial result listing the
+preserved paths. A content mismatch still stops with a recovery conflict.
 Old manifests that omit `file_modes` are mode-unverified: existing files are reported as
 `modified` (also listed in `mode_unverified`) and are preserved without overwrite or removal.
 New journals and manifests record modes explicitly.

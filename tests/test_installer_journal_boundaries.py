@@ -373,23 +373,22 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             self.assertTrue(installation["journal"]["active"])
             self.assertIn(
                 ".herdr-orchestrator/workflows/multi-harness.toml",
-                installation["journal"]["conflicts"],
+                installation["journal"]["preserved"],
             )
+            self.assertEqual(installation["journal"]["conflicts"], [])
 
             recovered = self._run("uninstall", "--project", str(project))
-            self.assertEqual(
-                recovered.returncode,
-                2,
-                f"{recovered.stderr}\n{recovered.stdout}",
-            )
-            self.assertTrue(recovered.stderr.startswith("installer_recovery_conflict: "))
+            self.assertEqual(recovered.returncode, 1, recovered.stderr)
+            payload = json.loads(recovered.stdout)
+            self.assertFalse(payload["ok"])
             self.assertIn(
                 ".herdr-orchestrator/workflows/multi-harness.toml",
-                recovered.stderr,
+                payload["preserved"],
             )
             self.assertTrue(workflow.is_file())
             self.assertEqual(workflow.stat().st_mode & 0o777, 0o600)
-            self.assertTrue(journal_path.is_file())
+            self.assertFalse(journal_path.exists())
+            self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
 
     def test_legacy_manifest_never_infers_mode_across_umasks(self) -> None:
         previous_umask = os.umask(0)

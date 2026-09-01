@@ -654,12 +654,13 @@ class InstallerJournalPackedTests(unittest.TestCase):
                 if claim_state == "temporary-only":
                     journal_path.unlink()
 
-            for operation in ("install", "upgrade"):
+            for operation in ("install", "upgrade", "uninstall"):
                 expected_project = root / f"expected-{operation}"
                 setup(expected_project, operation)
-                expected = run_cli(expected_project, arguments(operation))
-                self.assertEqual(expected.returncode, 0, expected.stderr)
-                expected_snapshot = snapshot(expected_project)
+                if operation != "uninstall":
+                    expected = run_cli(expected_project, arguments(operation))
+                    self.assertEqual(expected.returncode, 0, expected.stderr)
+                    expected_snapshot = snapshot(expected_project)
                 for claim_state in (
                     "published-and-temporary",
                     "temporary-only",
@@ -671,6 +672,7 @@ class InstallerJournalPackedTests(unittest.TestCase):
                     ):
                         project = root / f"legacy-{operation}-{claim_state}"
                         setup(project, operation)
+                        before_snapshot = snapshot(project)
                         interrupted = run_cli(
                             project,
                             arguments(operation),
@@ -681,7 +683,13 @@ class InstallerJournalPackedTests(unittest.TestCase):
 
                         recovered = run_cli(project, arguments(operation))
 
-                        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                        if operation == "uninstall":
+                            self.assertEqual(recovered.returncode, 1, recovered.stderr)
+                            payload = json.loads(recovered.stdout)
+                            self.assertFalse(payload["ok"])
+                            self.assertTrue(payload["preserved"])
+                        else:
+                            self.assertEqual(recovered.returncode, 0, recovered.stderr)
                         doctor = run_cli(
                             project,
                             ["doctor"],
@@ -690,11 +698,26 @@ class InstallerJournalPackedTests(unittest.TestCase):
                         self.assertEqual(doctor.returncode, 1, doctor.stderr)
                         installation = json.loads(doctor.stdout)["installation"]
                         self.assertFalse(installation["journal"]["active"])
-                        self.assertEqual(snapshot(project), expected_snapshot)
+                        if operation == "uninstall":
+                            self.assertFalse(installation["manifest"])
+                            after_snapshot = snapshot(project)
+                            for path, state in before_snapshot["files"].items():
+                                if path == ".herdr-orchestrator/manifest.json":
+                                    self.assertNotIn(path, after_snapshot["files"])
+                                else:
+                                    self.assertEqual(after_snapshot["files"].get(path), state)
+                            self.assertEqual(after_snapshot["exclude"], before_snapshot["exclude"])
+                        else:
+                            self.assertEqual(snapshot(project), expected_snapshot)
                         repeated = run_cli(project, arguments(operation))
-                        self.assertEqual(repeated.returncode, 0, repeated.stderr)
-                        self.assertEqual(snapshot(project), expected_snapshot)
+                        if operation == "uninstall":
+                            self.assertEqual(repeated.returncode, 1, repeated.stderr)
+                            self.assertTrue(json.loads(repeated.stdout)["preserved"])
+                        else:
+                            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                            self.assertEqual(snapshot(project), expected_snapshot)
 
+    @installer_crash_matrix
     def test_packed_legacy_mode_adjustment_is_recoverable_after_interrupt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -888,23 +911,63 @@ class InstallerJournalPackedTests(unittest.TestCase):
             recovered_uninstall = run(legacy_uninstall, ["uninstall"])
             self.assertEqual(
                 recovered_uninstall.returncode,
-                2,
+                1,
                 f"{recovered_uninstall.stderr}\n{recovered_uninstall.stdout}",
             )
-            self.assertTrue(recovered_uninstall.stderr.startswith("installer_recovery_conflict: "))
+            recovered_payload = json.loads(recovered_uninstall.stdout)
+            self.assertFalse(recovered_payload["ok"])
             self.assertIn(
                 ".herdr-orchestrator/workflows/multi-harness.toml",
-                recovered_uninstall.stderr,
+                recovered_payload["preserved"],
             )
             self.assertTrue(legacy_workflow.is_file())
-            self.assertTrue(legacy_journal_path.is_file())
+            self.assertFalse(legacy_journal_path.exists())
+            self.assertFalse((legacy_uninstall / ".herdr-orchestrator/manifest.json").exists())
+            self.assertEqual(recovered_payload["local_exclude"], "retained")
             doctor = run(legacy_uninstall, ["doctor"], {"PYTHON": "/bin/false"})
             self.assertEqual(doctor.returncode, 1, doctor.stderr)
             doctor_installation = json.loads(doctor.stdout)["installation"]
-            self.assertIn(
-                ".herdr-orchestrator/workflows/multi-harness.toml",
-                doctor_installation["journal"]["conflicts"],
+            self.assertFalse(doctor_installation["journal"]["active"])
+
+            partial_uninstall = root / "legacy-uninstall-partial"
+            initialize(partial_uninstall)
+            installed = run(partial_uninstall, ["install", "--harness", "droid"])
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            before_partial = snapshot(partial_uninstall)
+            interrupted_partial = run(
+                partial_uninstall,
+                ["uninstall"],
+                {"HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL_PREFIX": ("target:operation-1:")},
             )
+            self.assertEqual(interrupted_partial.returncode, 86, interrupted_partial.stderr)
+            partial_journal_path = partial_uninstall / ".herdr-orchestrator/install-journal.json"
+            partial_journal = json.loads(partial_journal_path.read_text(encoding="utf-8"))
+            first_target = partial_journal["operations"][0]["target"]["path"]
+            for inventory_name in ("prior_inventory", "desired_inventory"):
+                for item in partial_journal[inventory_name].values():
+                    item["state"].pop("mode", None)
+            for operation in partial_journal["operations"]:
+                operation["original"].pop("mode", None)
+                operation["desired"].pop("mode", None)
+            partial_journal_path.write_text(
+                f"{json.dumps(partial_journal, indent=2)}\n",
+                encoding="utf-8",
+            )
+            partial_recovered = run(partial_uninstall, ["uninstall"])
+            self.assertEqual(partial_recovered.returncode, 1, partial_recovered.stderr)
+            partial_payload = json.loads(partial_recovered.stdout)
+            self.assertFalse(partial_payload["ok"])
+            self.assertTrue(partial_payload["preserved"])
+            self.assertEqual(partial_payload["local_exclude"], "retained")
+            self.assertFalse(partial_journal_path.exists())
+            self.assertFalse((partial_uninstall / ".herdr-orchestrator/manifest.json").exists())
+            after_partial = snapshot(partial_uninstall)
+            for path, state in before_partial["files"].items():
+                if path == ".herdr-orchestrator/manifest.json" or path == first_target:
+                    self.assertNotIn(path, after_partial["files"])
+                else:
+                    self.assertEqual(after_partial["files"].get(path), state)
+            self.assertEqual(after_partial["exclude"], before_partial["exclude"])
 
     def test_current_package_finishes_an_older_package_transaction_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -798,7 +798,7 @@ function isLegacyModeJournal(journal) {
   );
 }
 
-function legacyOriginalStateMatches(actual, original, journal) {
+function legacyOriginalStateMatches(actual, original, journal, target) {
   if (!stateMatches(actual, original)) {
     return false;
   }
@@ -809,10 +809,58 @@ function legacyOriginalStateMatches(actual, original, journal) {
   ) {
     return true;
   }
-  // A v1 uninstall journal cannot prove the historical mode. Never authorize
-  // deletion of a regular endpoint whose mode is unknown; install/upgrade
-  // replay may preserve the live mode on a content-proven replacement.
-  return journal.command !== "uninstall";
+  // A v1 uninstall journal cannot prove the historical mode of a project
+  // file. The caller may mark a digest-matching project deletion as an
+  // explicit preserved participant; metadata and Git-exclude replacements
+  // remain replayable and carry the live mode.
+  return (
+    journal.command !== "uninstall"
+    || isManifestTarget(target)
+    || target?.scope !== "project"
+  );
+}
+
+function isManifestTarget(target) {
+  return (
+    target.scope === "project"
+    && target.path === ".herdr-orchestrator/manifest.json"
+  );
+}
+
+function legacyUninstallPreservedTargets(project, journal, context) {
+  const preserved = new Set();
+  if (journal.command !== "uninstall" || !isLegacyModeJournal(journal)) {
+    return preserved;
+  }
+  for (const operation of journal.operations) {
+    if (
+      operation.desired.kind !== "absent"
+      || operation.original.kind !== "regular"
+      || isManifestTarget(operation.target)
+    ) {
+      continue;
+    }
+    const actual = observeTarget(project, operation.target, context);
+    if (actual.kind === "regular" && stateMatches(actual, operation.original)) {
+      preserved.add(targetKey(operation.target));
+    }
+  }
+  if ([...preserved].some((key) => key.startsWith("project:"))) {
+    for (const operation of journal.operations) {
+      if (operation.target.scope !== "git-exclude") {
+        continue;
+      }
+      const actual = observeTarget(project, operation.target, context);
+      if (
+        operation.desired.kind === "regular"
+        && actual.kind === "regular"
+        && stateMatches(actual, operation.original)
+      ) {
+        preserved.add(targetKey(operation.target));
+      }
+    }
+  }
+  return preserved;
 }
 
 function recoverPublishedJournal(project) {
@@ -959,15 +1007,19 @@ function publishInitialJournal(project, journal) {
   }
 }
 
-function inspectEndpoints(project, journal, context) {
+function inspectEndpoints(project, journal, context, preservedTargets = new Set()) {
   const conflicts = [];
+  const preserved = [];
   const states = {};
   for (const [key, item] of Object.entries(journal.prior_inventory)) {
     const actual = observeTarget(project, item.target, context);
     const desired = journal.desired_inventory[key].state;
     if (stateMatches(actual, desired)) {
       states[key] = "desired";
-    } else if (legacyOriginalStateMatches(actual, item.state, journal)) {
+    } else if (preservedTargets.has(key)) {
+      states[key] = "preserved";
+      preserved.push(targetLabel(item.target));
+    } else if (legacyOriginalStateMatches(actual, item.state, journal, item.target)) {
       states[key] = "original";
     } else {
       states[key] = "conflict";
@@ -992,18 +1044,19 @@ function inspectEndpoints(project, journal, context) {
   }
   return {
     conflicts: conflicts.sort(),
+    preserved: preserved.sort(),
     states,
   };
 }
 
-function preflightEndpoints(project, journal, context) {
-  const { conflicts } = inspectEndpoints(project, journal, context);
+function preflightEndpoints(project, journal, context, preservedTargets = new Set()) {
+  const { conflicts } = inspectEndpoints(project, journal, context, preservedTargets);
   if (conflicts.length > 0) {
     throw new Error(`installer_recovery_conflict: ${conflicts.join(",")}`);
   }
 }
 
-function applyOperation(project, journal, operation, context) {
+function applyOperation(project, journal, operation, context, preservedTargets = new Set()) {
   const actual = observeTarget(project, operation.target, context);
   const path = resolveTarget(project, operation.target, context);
   if (operation.desired.kind === "regular") {
@@ -1012,6 +1065,13 @@ function applyOperation(project, journal, operation, context) {
       temporaryPath,
       targetLabel(operation.target),
     );
+    if (preservedTargets.has(targetKey(operation.target))) {
+      if (temporary.kind === "regular") {
+        unlinkSync(temporaryPath);
+        fsyncDirectory(dirname(temporaryPath));
+      }
+      return;
+    }
     if (stateMatches(actual, operation.desired)) {
       if (temporary.kind === "regular") {
         unlinkSync(temporaryPath);
@@ -1019,7 +1079,12 @@ function applyOperation(project, journal, operation, context) {
       }
       return;
     }
-    if (!legacyOriginalStateMatches(actual, operation.original, journal)) {
+    if (!legacyOriginalStateMatches(
+      actual,
+      operation.original,
+      journal,
+      operation.target,
+    )) {
       throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
     }
     if (temporary.kind === "regular") {
@@ -1046,7 +1111,15 @@ function applyOperation(project, journal, operation, context) {
     if (stateMatches(actual, operation.desired)) {
       return;
     }
-    if (!legacyOriginalStateMatches(actual, operation.original, journal)) {
+    if (preservedTargets.has(targetKey(operation.target))) {
+      return;
+    }
+    if (!legacyOriginalStateMatches(
+      actual,
+      operation.original,
+      journal,
+      operation.target,
+    )) {
       throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
     }
     unlinkSync(path);
@@ -1054,11 +1127,11 @@ function applyOperation(project, journal, operation, context) {
   }
 }
 
-function verifyDesiredInventory(project, journal, context) {
+function verifyDesiredInventory(project, journal, context, preservedTargets = new Set()) {
   const conflicts = [];
-  for (const item of Object.values(journal.desired_inventory)) {
+  for (const [key, item] of Object.entries(journal.desired_inventory)) {
     const actual = observeTarget(project, item.target, context);
-    if (!stateMatches(actual, item.state)) {
+    if (!stateMatches(actual, item.state) && !preservedTargets.has(key)) {
       conflicts.push(targetLabel(item.target));
     }
   }
@@ -1067,17 +1140,19 @@ function verifyDesiredInventory(project, journal, context) {
   }
 }
 
-function verifyDesiredInventoryBeforeManifest(project, journal, context) {
+function verifyDesiredInventoryBeforeManifest(
+  project,
+  journal,
+  context,
+  preservedTargets = new Set(),
+) {
   const conflicts = [];
-  for (const item of Object.values(journal.desired_inventory)) {
-    if (
-      item.target.scope === "project"
-      && item.target.path === ".herdr-orchestrator/manifest.json"
-    ) {
+  for (const [key, item] of Object.entries(journal.desired_inventory)) {
+    if (isManifestTarget(item.target)) {
       continue;
     }
     const actual = observeTarget(project, item.target, context);
-    if (!stateMatches(actual, item.state)) {
+    if (!stateMatches(actual, item.state) && !preservedTargets.has(key)) {
       conflicts.push(targetLabel(item.target));
     }
   }
@@ -1087,22 +1162,31 @@ function verifyDesiredInventoryBeforeManifest(project, journal, context) {
 }
 
 function completeJournal(project, journal, context, owner) {
-  preflightEndpoints(project, journal, context);
+  const preservedTargets = legacyUninstallPreservedTargets(
+    project,
+    journal,
+    context,
+  );
+  preflightEndpoints(project, journal, context, preservedTargets);
   for (let index = 0; index < journal.operations.length; index += 1) {
     const operation = journal.operations[index];
     if (
-      operation.target.scope === "project"
-      && operation.target.path === ".herdr-orchestrator/manifest.json"
+      isManifestTarget(operation.target)
     ) {
-      verifyDesiredInventoryBeforeManifest(project, journal, context);
+      verifyDesiredInventoryBeforeManifest(
+        project,
+        journal,
+        context,
+        preservedTargets,
+      );
     }
-    applyOperation(project, journal, operation, context);
+    applyOperation(project, journal, operation, context, preservedTargets);
     if (journal.progress.completed_operations < index + 1) {
       journal.progress.completed_operations = index + 1;
       persistJournal(project, journal);
     }
   }
-  verifyDesiredInventory(project, journal, context);
+  verifyDesiredInventory(project, journal, context, preservedTargets);
   if (journal.progress.phase !== "verified") {
     journal.progress.phase = "verified";
     persistJournal(project, journal);
@@ -1110,9 +1194,31 @@ function completeJournal(project, journal, context, owner) {
   unlinkSync(journalPath(project));
   fsyncDirectory(dirname(journalPath(project)));
   removeJournalOwner(owner);
+  const preservedPaths = [...preservedTargets]
+    .filter((key) => key.startsWith("project:"))
+    .map((key) => key.slice("project:".length))
+    .filter((path) => path !== ".herdr-orchestrator/manifest.json")
+    .sort();
+  const preservedExclude = [...preservedTargets]
+    .some((key) => key.startsWith("git-exclude:"));
+  const commandResult = journal.command_result === null
+    ? null
+    : {
+        ...journal.command_result,
+        local_exclude: preservedExclude
+          ? "retained"
+          : journal.command_result.local_exclude,
+        ok: journal.command_result.ok && preservedPaths.length === 0,
+        preserved: [
+          ...new Set([
+            ...journal.command_result.preserved,
+            ...preservedPaths,
+          ]),
+        ].sort(),
+      };
   return {
     command: journal.command,
-    command_result: journal.command_result,
+    command_result: commandResult,
     recovered: true,
     transaction_id: journal.transaction_id,
   };
@@ -1175,6 +1281,7 @@ export function inspectInstallerJournal(context) {
         `journal-${invalidArtifact.kind}:${basename(invalidArtifact.path)}`,
       ],
       invalid: true,
+      preserved: [],
       publication: invalidArtifact.kind,
     };
   }
@@ -1200,6 +1307,7 @@ export function inspectInstallerJournal(context) {
         active: true,
         conflicts: journalTemporaryConflicts,
         invalid: true,
+        preserved: [],
         publication,
       };
     }
@@ -1258,7 +1366,17 @@ export function inspectInstallerJournal(context) {
   if (temporaries.length > 1 && publication === "temporary") {
     journalTemporaryConflicts.push("journal-temporary:multiple");
   }
-  const inspection = inspectEndpoints(project, journal, normalizedContext);
+  const preservedTargets = legacyUninstallPreservedTargets(
+    project,
+    journal,
+    normalizedContext,
+  );
+  const inspection = inspectEndpoints(
+    project,
+    journal,
+    normalizedContext,
+    preservedTargets,
+  );
   return {
     active: true,
     command: journal.command,
@@ -1272,6 +1390,7 @@ export function inspectInstallerJournal(context) {
     journal_owners: owners.map((item) => basename(item.path)).sort(),
     journal_temporaries: temporaries.map((item) => basename(item.path)).sort(),
     package_version: journal.package_version,
+    preserved: inspection.preserved,
     progress: { ...journal.progress },
     publication,
     states: inspection.states,

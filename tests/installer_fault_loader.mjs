@@ -239,6 +239,7 @@ function instrument(source) {
       + "        __faultMutation(`temporary:cleaned:${targetLabel(operation.target)}`);\n"
       + "      }\n"
       + "      return;",
+    2,
   );
   result = replaceExact(
     result,
