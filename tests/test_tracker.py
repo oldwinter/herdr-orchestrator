@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from herdr_orchestrator.tracker import (
     TrackerError,
     TrackerTicket,
     render_spec,
+    tracker_markers,
 )
 
 
@@ -60,6 +62,29 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
         self.assertIn("- [x] The behavior works.", issue)
         self.assertIn("`abcdef1234567890`", issue)
         self.assertEqual(resumed_references, references)
+
+    def test_rejects_a_human_note_appended_to_a_completed_ticket(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = _plan()
+            tracker = LocalMarkdownTracker(root)
+            references = tracker.publish(plan)
+            receipt = TicketReceipt(
+                ticket_id="01",
+                commit="abcdef1234567890",
+                acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
+                checks=("python -m unittest: passed",),
+                summary="Implemented the slice.",
+            )
+            tracker.close(plan.tickets[0], receipt)
+            issue = Path(references["01"].reference)
+            issue.write_text(
+                issue.read_text(encoding="utf-8") + "Human note.\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(TrackerError, "tracker_artifact_conflict"):
+                LocalMarkdownTracker(root).publish(plan)
 
     def test_refuses_to_overwrite_conflicting_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -173,7 +198,85 @@ class FakeGithubRunner:
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
 
+class StatefulGithubRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.issues: dict[int, dict[str, str]] = {}
+        self.next_issue = 41
+        self.create_count = 0
+        self.edit_count = 0
+        self.close_count = 0
+        self.crash_after_create = False
+        self.crash_after_close = False
+
+    def __call__(
+        self,
+        argv: list[str],
+        *,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(argv)
+        body = ""
+        if "--body-file" in argv:
+            body = Path(argv[argv.index("--body-file") + 1]).read_text(encoding="utf-8")
+        command = argv[1:3]
+        if command == ["issue", "list"]:
+            limit = int(argv[argv.index("--limit") + 1])
+            stdout = json.dumps(list(self.issues.values())[:limit])
+        elif command == ["issue", "create"]:
+            number = self.next_issue
+            self.next_issue += 1
+            self.create_count += 1
+            url = f"https://github.com/owner/project/issues/{number}"
+            title = argv[argv.index("--title") + 1]
+            self.issues[number] = {
+                "number": str(number),
+                "url": url,
+                "body": body,
+                "state": "OPEN",
+                "title": title,
+            }
+            if self.crash_after_create:
+                self.crash_after_create = False
+                raise OSError("process died after issue creation")
+            stdout = f"{url}\n"
+        elif command == ["issue", "view"]:
+            issue = self.issues[int(argv[3])]
+            stdout = json.dumps(issue)
+        elif command == ["issue", "edit"]:
+            issue = self.issues[int(argv[3])]
+            issue["body"] = body
+            self.edit_count += 1
+            stdout = ""
+        elif command == ["issue", "close"]:
+            issue = self.issues[int(argv[3])]
+            issue["state"] = "CLOSED"
+            self.close_count += 1
+            if self.crash_after_close:
+                self.crash_after_close = False
+                raise OSError("process died after issue close")
+            stdout = ""
+        else:
+            raise AssertionError(f"unexpected GitHub command: {argv}")
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+
 class GithubTrackerTests(unittest.TestCase):
+    def test_delivery_markers_include_a_run_owned_publication_nonce(self) -> None:
+        plan = _plan()
+        first = tracker_markers("c" * 12, plan)
+        second = tracker_markers("c" * 12, plan)
+
+        self.assertNotEqual(first.spec, second.spec)
+        self.assertRegex(
+            first.spec,
+            r"^<!-- herdr-delivery:run=c{12}:nonce=[0-9a-f]{32}:kind=spec -->$",
+        )
+        self.assertIn(f":nonce={first.nonce}:", first.ticket("01"))
+
     def test_rejects_secret_material_before_creating_issue(self) -> None:
         runner = FakeGithubRunner()
         secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"  # pragma: allowlist secret
@@ -222,6 +325,224 @@ class GithubTrackerTests(unittest.TestCase):
             "https://github.com/owner/project/issues/41",
             runner.body_contents[1],
         )
+
+    def test_reuses_exact_markers_after_publication_process_death(self) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        markers = tracker_markers("a" * 12, plan)
+        runner.crash_after_create = True
+
+        with self.assertRaisesRegex(TrackerError, "github_unavailable"):
+            GithubTracker("owner/project", runner=runner).publish(plan, markers=markers)
+
+        tracker = GithubTracker("owner/project", runner=runner)
+        references = tracker.publish(plan, markers=markers)
+
+        self.assertEqual(runner.create_count, 2)
+        self.assertEqual(
+            references["01"].reference,
+            "https://github.com/owner/project/issues/42",
+        )
+        self.assertEqual(tracker.spec_url, "https://github.com/owner/project/issues/41")
+        self.assertEqual(
+            sum(markers.spec in issue["body"] for issue in runner.issues.values()),
+            1,
+        )
+        self.assertEqual(
+            sum(markers.ticket("01") in issue["body"] for issue in runner.issues.values()),
+            1,
+        )
+        searches = [
+            call[call.index("--search") + 1]
+            for call in runner.calls
+            if call[1:3] == ["issue", "list"]
+        ]
+        self.assertTrue(all(search == f'"{markers.nonce}" in:body' for search in searches))
+
+    def test_rejects_a_closed_marker_match_during_publication_replay(self) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        markers = tracker_markers("d" * 12, plan)
+        runner.crash_after_create = True
+        with self.assertRaisesRegex(TrackerError, "github_unavailable"):
+            GithubTracker("owner/project", runner=runner).publish(plan, markers=markers)
+        runner.issues[41]["state"] = "CLOSED"
+
+        with self.assertRaisesRegex(TrackerError, "github_marker_conflict"):
+            GithubTracker("owner/project", runner=runner).publish(plan, markers=markers)
+
+        self.assertEqual(runner.create_count, 1)
+
+    def test_replays_maximum_plan_without_hiding_the_101st_marker(self) -> None:
+        tickets = tuple(
+            DeliveryTicket(
+                ticket_id=f"{number:02d}" if number < 100 else "100",
+                title=f"Add slice {number}",
+                what_to_build=f"Expose slice {number}.",
+                blocked_by=(),
+                acceptance_criteria=(f"Slice {number} works.",),
+            )
+            for number in range(1, 101)
+        )
+        plan = replace(_plan(), tickets=tickets)
+        markers = tracker_markers("2" * 12, plan)
+        runner = StatefulGithubRunner()
+        first = GithubTracker("owner/project", runner=runner)
+        references = first.publish(plan, markers=markers)
+
+        replay = GithubTracker("owner/project", runner=runner)
+        replayed = replay.publish(plan, markers=markers)
+
+        self.assertEqual(len(references), 100)
+        self.assertEqual(replayed, references)
+        self.assertEqual(runner.create_count, 101)
+        limits = {
+            call[call.index("--limit") + 1]
+            for call in runner.calls
+            if call[1:3] == ["issue", "list"]
+        }
+        self.assertEqual(limits, {"1000"})
+
+    def test_reconciles_close_after_remote_close_before_confirmation(self) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        markers = tracker_markers("b" * 12, plan)
+        tracker = GithubTracker("owner/project", runner=runner)
+        references = tracker.publish(plan, markers=markers)
+        receipt = TicketReceipt(
+            ticket_id="01",
+            commit="abcdef1234567890",
+            acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
+            checks=("python -m unittest: passed",),
+            summary="Implemented the slice.",
+        )
+        runner.crash_after_close = True
+
+        with self.assertRaisesRegex(TrackerError, "github_unavailable"):
+            tracker.close(plan.tickets[0], receipt, marker=markers.ticket("01"))
+
+        resumed = GithubTracker("owner/project", runner=runner)
+        resumed.references = references
+        resumed.spec_url = tracker.spec_url
+        resumed.close(plan.tickets[0], receipt, marker=markers.ticket("01"))
+
+        self.assertEqual(runner.edit_count, 1)
+        self.assertEqual(runner.close_count, 1)
+        ticket_number = int(references["01"].reference.rsplit("/", 1)[1])
+        self.assertEqual(runner.issues[ticket_number]["state"], "CLOSED")
+        self.assertIn("**Status:** completed", runner.issues[ticket_number]["body"])
+
+    def test_adopts_exact_pre_journal_issues_without_changing_identity(self) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        legacy = GithubTracker("owner/project", runner=runner)
+        references = legacy.publish(plan)
+        spec_url = legacy.spec_url
+        self.assertIsNotNone(spec_url)
+        markers = tracker_markers("e" * 12, plan)
+
+        adopted = GithubTracker("owner/project", runner=runner)
+        result = adopted.adopt(
+            plan,
+            references=references,
+            spec_url=spec_url,
+            markers=markers,
+        )
+
+        self.assertEqual(result, references)
+        self.assertEqual(runner.create_count, 2)
+        self.assertEqual(runner.edit_count, 2)
+        self.assertEqual(adopted.spec_url, spec_url)
+        self.assertIn(markers.spec, runner.issues[41]["body"])
+        self.assertIn(markers.ticket("01"), runner.issues[42]["body"])
+
+    def test_adopts_an_exact_completed_pre_journal_ticket(self) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        legacy = GithubTracker("owner/project", runner=runner)
+        references = legacy.publish(plan)
+        receipt = TicketReceipt(
+            ticket_id="01",
+            commit="abcdef1234567890",
+            acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
+            checks=("python -m unittest: passed",),
+            summary="Implemented the slice.",
+        )
+        legacy.close(plan.tickets[0], receipt)
+        markers = tracker_markers("f" * 12, plan)
+        adopted = GithubTracker("owner/project", runner=runner)
+
+        adopted.adopt(
+            plan,
+            references=references,
+            spec_url=legacy.spec_url,
+            markers=markers,
+            receipts={"01": receipt},
+        )
+        adopted.close(plan.tickets[0], receipt, marker=markers.ticket("01"))
+
+        self.assertEqual(runner.create_count, 2)
+        self.assertEqual(runner.edit_count, 3)
+        self.assertEqual(runner.close_count, 1)
+        self.assertEqual(runner.issues[42]["state"], "CLOSED")
+        self.assertIn(markers.ticket("01"), runner.issues[42]["body"])
+
+    def test_completed_run_adoption_requires_the_ticket_to_remain_closed(self) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        legacy = GithubTracker("owner/project", runner=runner)
+        references = legacy.publish(plan)
+        receipt = TicketReceipt(
+            ticket_id="01",
+            commit="abcdef1234567890",
+            acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
+            checks=("python -m unittest: passed",),
+            summary="Implemented the slice.",
+        )
+        legacy.close(plan.tickets[0], receipt)
+        runner.issues[42]["state"] = "OPEN"
+        edit_count = runner.edit_count
+
+        with self.assertRaisesRegex(TrackerError, "github_adoption_conflict"):
+            GithubTracker("owner/project", runner=runner).adopt(
+                plan,
+                references=references,
+                spec_url=legacy.spec_url,
+                markers=tracker_markers("3" * 12, plan),
+                receipts={"01": receipt},
+                require_closed=True,
+            )
+
+        self.assertEqual(runner.edit_count, edit_count)
+
+    def test_legacy_adoption_rejects_a_human_modified_completed_body_before_edits(
+        self,
+    ) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        legacy = GithubTracker("owner/project", runner=runner)
+        references = legacy.publish(plan)
+        receipt = TicketReceipt(
+            ticket_id="01",
+            commit="abcdef1234567890",
+            acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
+            checks=("python -m unittest: passed",),
+            summary="Implemented the slice.",
+        )
+        legacy.close(plan.tickets[0], receipt)
+        runner.issues[42]["body"] += "\nHuman note that is not run-owned.\n"
+        edit_count = runner.edit_count
+
+        with self.assertRaisesRegex(TrackerError, "github_adoption_conflict"):
+            GithubTracker("owner/project", runner=runner).adopt(
+                plan,
+                references=references,
+                spec_url=legacy.spec_url,
+                markers=tracker_markers("1" * 12, plan),
+                receipts={"01": receipt},
+            )
+
+        self.assertEqual(runner.edit_count, edit_count)
 
     def test_transports_multiline_bodies_through_body_files(self) -> None:
         runner = FakeGithubRunner()

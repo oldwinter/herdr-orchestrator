@@ -112,9 +112,12 @@ def write_artifact_text(
         ) as stream:
             temporary = Path(stream.name)
             stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
         validate_artifact_path(temporary, root=root)
         validate_artifact_path(candidate, root=root)
         os.replace(temporary, candidate)
+        _fsync_directory(candidate.parent)
         temporary = None
     except DeliveryArtifactError as exc:
         raise error_type("delivery_artifact_path_invalid") from exc
@@ -148,6 +151,8 @@ def append_artifact_text(
         with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
             descriptor = -1
             stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
     except DeliveryArtifactError as exc:
         raise error_type("delivery_artifact_path_invalid") from exc
     except (OSError, UnicodeError) as exc:
@@ -192,6 +197,14 @@ def exclusive_file_claim(
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 class ProxyAction(StrEnum):
@@ -285,6 +298,13 @@ class TicketReceipt:
     acceptance: tuple[AcceptanceResult, ...]
     checks: tuple[str, ...]
     summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class RepairReceipt:
+    round_number: int
+    before_commit: str
+    commit: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -656,6 +676,34 @@ def load_ticket_receipt(path: Path, ticket: DeliveryTicket) -> TicketReceipt:
         checks=_non_empty_strings(payload, "checks", "ticket_receipt"),
         summary=_text(payload, "summary", 5_000, "ticket_receipt"),
     )
+
+
+def load_repair_receipt(
+    path: Path,
+    *,
+    round_number: int,
+    before_commit: str,
+) -> RepairReceipt:
+    payload = _load_object(path, "repair_receipt")
+    _exact_keys(
+        payload,
+        {"round", "before_commit", "commit"},
+        "repair_receipt",
+    )
+    recorded_round = payload["round"]
+    if (
+        not isinstance(recorded_round, int)
+        or isinstance(recorded_round, bool)
+        or recorded_round != round_number
+    ):
+        raise DeliveryArtifactError("repair_receipt_round_mismatch")
+    recorded_before = _identifier(payload, "before_commit", COMMIT, "repair_receipt")
+    if recorded_before != before_commit:
+        raise DeliveryArtifactError("repair_receipt_before_mismatch")
+    commit = _identifier(payload, "commit", COMMIT, "repair_receipt")
+    if commit == before_commit:
+        raise DeliveryArtifactError("repair_receipt_commit_missing")
+    return RepairReceipt(recorded_round, recorded_before, commit)
 
 
 def load_review_report(path: Path) -> ReviewReport:

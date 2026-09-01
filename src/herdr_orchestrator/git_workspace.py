@@ -127,6 +127,76 @@ class GitWorkspace:
             raise GitWorkspaceError(f"ticket_merge_failed: {ticket.branch}")
         return self._git(integration.path, "rev-parse", "HEAD").stdout.strip()
 
+    def observe_worktree(
+        self,
+        path: Path,
+        branch: str,
+        base_commit: str,
+        *,
+        require_base_head: bool,
+    ) -> Worktree | None:
+        _validate_worktree_path(path, self.runtime_root)
+        if not path.exists():
+            return None
+        worktree = Worktree(path, branch, base_commit)
+        self.validate_ownership(path, worktree)
+        head = self.head(worktree)
+        if require_base_head and head != base_commit:
+            raise GitWorkspaceError("delivery_worktree_create_conflict")
+        if not self.is_ancestor(path, base_commit, head):
+            raise GitWorkspaceError("delivery_worktree_base_conflict")
+        return worktree
+
+    def observe_merge(
+        self,
+        integration: Worktree,
+        *,
+        parent: str,
+        ticket_commit: str,
+    ) -> str | None:
+        current = self.head(integration)
+        if current == parent:
+            return None
+        parents = self.parents(integration.path, current)
+        if len(parents) != 2 or set(parents) != {parent, ticket_commit}:
+            raise GitWorkspaceError("delivery_integration_merge_conflict")
+        return current
+
+    def parents(self, cwd: Path, commit: str) -> tuple[str, ...]:
+        row = self.output(
+            cwd,
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            commit,
+        ).split()
+        if not row or row[0] != commit:
+            raise GitWorkspaceError("delivery_git_query_failed")
+        return tuple(row[1:])
+
+    def find_merge(
+        self,
+        integration: Worktree,
+        ticket_commit: str,
+    ) -> tuple[str, str] | None:
+        process = self._git(
+            integration.path,
+            "rev-list",
+            "--merges",
+            "--parents",
+            "HEAD",
+            check=False,
+        )
+        if process.returncode != 0:
+            raise GitWorkspaceError("delivery_git_query_failed")
+        for line in process.stdout.splitlines():
+            row = line.split()
+            if len(row) == 3 and ticket_commit in row[1:]:
+                parent = row[1] if row[2] == ticket_commit else row[2]
+                return parent, row[0]
+        return None
+
     def head(self, worktree: Worktree) -> str:
         _validate_worktree_path(worktree.path, self.runtime_root)
         return self._git(worktree.path, "rev-parse", "HEAD").stdout.strip()
