@@ -956,11 +956,11 @@ function listLiveManagedEntries(project, journal) {
       }
     }
   };
-  for (const root of [
-    ".herdr-orchestrator",
-    ".orchestrator",
-    ".agents/skills/herdr-orchestrator",
-  ]) {
+  const roots = [".herdr-orchestrator", ".orchestrator"];
+  if ([...known].some((path) => path.startsWith(".agents/skills/herdr-orchestrator/"))) {
+    roots.push(".agents/skills/herdr-orchestrator");
+  }
+  for (const root of roots) {
     visit(root);
   }
   return entries.sort();
@@ -975,9 +975,6 @@ function legacyExcludeCouplingAssessment(
   if (journal.command !== "uninstall") {
     return { conflict: null, frozen: false };
   }
-  if (!isLegacyModeJournal(journal)) {
-    return { conflict: null, frozen: false };
-  }
   const hasGitExcludeParticipant = Object.values(journal.prior_inventory)
     .some((item) => item.target.scope === "git-exclude");
   if (!hasGitExcludeParticipant) {
@@ -989,6 +986,9 @@ function legacyExcludeCouplingAssessment(
       conflict: unjournaled.map((path) => `git-exclude:${path}`).join(","),
       frozen: false,
     };
+  }
+  if (!isLegacyModeJournal(journal)) {
+    return { conflict: null, frozen: false };
   }
   const projectKeys = [...preservedTargets].filter((key) => {
     const item = journal.prior_inventory[key];

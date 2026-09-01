@@ -603,6 +603,132 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             self.assertEqual(manifest.read_bytes(), edited_manifest)
             self.assertFalse((project / ".herdr-orchestrator/install-journal.json").exists())
 
+    def test_uninstall_rechecks_managed_roots_before_removing_git_exclude(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            barrier = root / "uninstall-exclude-barrier"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            exclude = project / ".git/info/exclude"
+            exclude_before = exclude.read_bytes()
+            caller = project / ".orchestrator/caller.txt"
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_UNINSTALL_EXCLUDE_BARRIER"] = str(barrier)
+            process = subprocess.Popen(
+                [
+                    *self._node_command(environment),
+                    "uninstall",
+                    "--project",
+                    str(project),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not list(barrier.glob("*.ready")) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(list(barrier.glob("*.ready")))
+                self.assertIsNone(process.poll())
+                caller.parent.mkdir(parents=True, exist_ok=True)
+                caller.write_bytes(b"caller bytes\n")
+            finally:
+                barrier.mkdir(parents=True, exist_ok=True)
+                (barrier / "release").write_text("", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=30)
+
+            self.assertEqual(process.returncode, 2, f"{stderr}\n{stdout}")
+            self.assertIn(
+                "installer_recovery_conflict: git-exclude:.orchestrator/caller.txt",
+                stderr,
+            )
+            self.assertTrue(caller.is_file())
+            self.assertEqual(exclude.read_bytes(), exclude_before)
+            self.assertTrue((project / ".herdr-orchestrator/manifest.json").is_file())
+            self.assertTrue((project / ".herdr-orchestrator/install-journal.json").is_file())
+
+    def test_uninstall_recovery_rechecks_managed_roots_after_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            exclude = project / ".git/info/exclude"
+            manifest = project / ".herdr-orchestrator/manifest.json"
+            journal = project / ".herdr-orchestrator/install-journal.json"
+            exclude_before = exclude.read_bytes()
+            manifest_before = manifest.read_bytes()
+            interrupted = self._run(
+                "uninstall",
+                "--project",
+                str(project),
+                env={
+                    **os.environ,
+                    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": "journal:published",
+                },
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            caller = project / ".orchestrator/caller.txt"
+            caller.write_bytes(b"caller bytes\n")
+
+            recovered = self._run("uninstall", "--project", str(project))
+
+            self.assertEqual(recovered.returncode, 2, recovered.stderr)
+            self.assertIn(
+                "installer_recovery_conflict: git-exclude:.orchestrator/caller.txt",
+                recovered.stderr,
+            )
+            self.assertTrue(journal.is_file())
+            self.assertTrue(manifest.is_file())
+            self.assertEqual(manifest.read_bytes(), manifest_before)
+            self.assertEqual(exclude.read_bytes(), exclude_before)
+            self.assertTrue(caller.is_file())
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env={**os.environ, "PYTHON": "/bin/false"},
+            )
+            self.assertEqual(doctor.returncode, 1, doctor.stderr)
+            self.assertIn(
+                "git-exclude:.orchestrator/caller.txt",
+                json.loads(doctor.stdout)["installation"]["journal"]["conflicts"],
+            )
+
+            caller.unlink()
+            converged = self._run("uninstall", "--project", str(project))
+            self.assertEqual(converged.returncode, 0, converged.stderr)
+            self.assertFalse(journal.exists())
+
     def test_legacy_uninstall_retries_when_no_preserved_project_target_remains(
         self,
     ) -> None:
