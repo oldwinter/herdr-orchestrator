@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -21,8 +22,10 @@ from herdr_orchestrator.model import (
     TaskReceipt,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 __all__ = ["SCHEMA_VERSION", "Store", "StoreError"]
+
+_INITIALIZE_LOCK = threading.Lock()
 
 
 def _nullable_bool(value: object) -> bool | None:
@@ -111,6 +114,10 @@ class Store:
         self.path = path
 
     def initialize(self) -> None:
+        with _INITIALIZE_LOCK:
+            self._initialize()
+
+    def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript("""
@@ -187,6 +194,23 @@ class Store:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS harness_health (
+                    workflow TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    expires_at REAL,
+                    cooldown_until REAL,
+                    retryable_failures INTEGER NOT NULL DEFAULT 0,
+                    probe_lease_until REAL,
+                    probe_owner TEXT,
+                    PRIMARY KEY(workflow, workspace, harness)
+                );
+                CREATE INDEX IF NOT EXISTS harness_health_scope
+                    ON harness_health(workflow, workspace, harness);
                 """)
             AttemptLedger.create_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
@@ -210,6 +234,9 @@ class Store:
                 if version == 5:
                     self._migrate_v5_to_v6(connection)
                     version = 6
+                if version == 6:
+                    self._migrate_v6_to_v7(connection)
+                    version = 7
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
 
@@ -344,6 +371,30 @@ class Store:
             evidence_values,
         )
         connection.execute("UPDATE schema_meta SET version = 6")
+
+    def _migrate_v6_to_v7(self, connection: sqlite3.Connection) -> None:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS harness_health (
+                workflow TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                source TEXT NOT NULL,
+                observed_at REAL NOT NULL,
+                expires_at REAL,
+                cooldown_until REAL,
+                retryable_failures INTEGER NOT NULL DEFAULT 0,
+                probe_lease_until REAL,
+                probe_owner TEXT,
+                PRIMARY KEY(workflow, workspace, harness)
+            )
+            """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS harness_health_scope
+                ON harness_health(workflow, workspace, harness)
+            """)
+        connection.execute("UPDATE schema_meta SET version = 7")
 
     @staticmethod
     def _add_column_if_missing(
@@ -658,6 +709,204 @@ class Store:
             if allowed_values is None or str(row["harness"]) in allowed_values:
                 counts[str(row["state"])] += 1
         return counts
+
+    def harness_health_rows(
+        self,
+        workflow: str,
+        workspace: str,
+        *,
+        harnesses: Iterable[Harness] | None = None,
+    ) -> list[dict[str, object]]:
+        """Read privacy-safe health rows for one workflow/workspace scope."""
+        values = None if harnesses is None else tuple(harness.value for harness in harnesses)
+        query = """
+            SELECT workflow, workspace, harness, status, reason, source,
+                   observed_at, expires_at, cooldown_until, retryable_failures,
+                   probe_lease_until, probe_owner
+            FROM harness_health
+            WHERE workflow = ? AND workspace = ?
+        """
+        parameters: tuple[object, ...] = (workflow, workspace)
+        if values is not None and not values:
+            return []
+        if values is not None:
+            placeholders = ", ".join("?" for _ in values)
+            query += f" AND harness IN ({placeholders})"
+            parameters += values
+        query += " ORDER BY harness"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_harness_health(
+        self,
+        *,
+        workflow: str,
+        workspace: str,
+        harness: Harness,
+        status: str,
+        reason: str,
+        source: str,
+        observed_at: float,
+        expires_at: float | None,
+        cooldown_until: float | None,
+        retryable_failures: int,
+        probe_lease_until: float | None = None,
+        probe_owner: str | None = None,
+    ) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO harness_health(
+                    workflow, workspace, harness, status, reason, source,
+                    observed_at, expires_at, cooldown_until, retryable_failures,
+                    probe_lease_until, probe_owner
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workflow, workspace, harness) DO UPDATE SET
+                    status = excluded.status,
+                    reason = excluded.reason,
+                    source = excluded.source,
+                    observed_at = excluded.observed_at,
+                    expires_at = excluded.expires_at,
+                    cooldown_until = excluded.cooldown_until,
+                    retryable_failures = excluded.retryable_failures,
+                    probe_lease_until = CASE
+                        WHEN excluded.probe_lease_until IS NULL
+                        THEN harness_health.probe_lease_until
+                        ELSE excluded.probe_lease_until END,
+                    probe_owner = CASE
+                        WHEN excluded.probe_owner IS NULL
+                        THEN harness_health.probe_owner
+                        ELSE excluded.probe_owner END
+                """,
+                (
+                    workflow,
+                    workspace,
+                    harness.value,
+                    status,
+                    reason,
+                    source,
+                    observed_at,
+                    expires_at,
+                    cooldown_until,
+                    retryable_failures,
+                    probe_lease_until,
+                    probe_owner,
+                ),
+            )
+
+    def ensure_harness_health(
+        self,
+        *,
+        workflow: str,
+        workspace: str,
+        harness: Harness,
+        observed_at: float,
+    ) -> None:
+        """Create the unknown baseline without overwriting a concurrent probe lease."""
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO harness_health(
+                    workflow, workspace, harness, status, reason, source,
+                    observed_at, retryable_failures
+                ) VALUES (?, ?, ?, 'unknown', 'health_unknown', 'none', ?, 0)
+                ON CONFLICT(workflow, workspace, harness) DO NOTHING
+                """,
+                (workflow, workspace, harness.value, observed_at),
+            )
+
+    def acquire_harness_probe(
+        self,
+        *,
+        workflow: str,
+        workspace: str,
+        harness: Harness,
+        owner: str,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        """Atomically reserve one readiness refresh without touching task leases."""
+        lease_until = now + lease_seconds
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO harness_health(
+                    workflow, workspace, harness, status, reason, source,
+                    observed_at, retryable_failures
+                ) VALUES (?, ?, ?, 'unknown', 'health_unknown', 'none', ?, 0)
+                ON CONFLICT(workflow, workspace, harness) DO NOTHING
+                """,
+                (workflow, workspace, harness.value, now),
+            )
+            row = connection.execute(
+                """
+                SELECT status, expires_at, cooldown_until, probe_lease_until, probe_owner
+                FROM harness_health
+                WHERE workflow = ? AND workspace = ? AND harness = ?
+                """,
+                (workflow, workspace, harness.value),
+            ).fetchone()
+            active_until = row["probe_lease_until"] if row is not None else None
+            active_owner = row["probe_owner"] if row is not None else None
+            if row is not None:
+                status = str(row["status"])
+                expires_at = row["expires_at"]
+                cooldown_until = row["cooldown_until"]
+                if status == "ready" and isinstance(expires_at, (int, float)) and expires_at > now:
+                    return False
+                if (
+                    status in {"degraded", "unavailable"}
+                    and isinstance(cooldown_until, (int, float))
+                    and cooldown_until > now
+                ):
+                    return False
+            if (
+                isinstance(active_until, (int, float))
+                and active_until > now
+                and active_owner != owner
+            ):
+                return False
+            connection.execute(
+                """
+                UPDATE harness_health
+                SET probe_lease_until = ?, probe_owner = ?
+                WHERE workflow = ? AND workspace = ? AND harness = ?
+                """,
+                (lease_until, owner, workflow, workspace, harness.value),
+            )
+        return True
+
+    def release_harness_probe(
+        self,
+        *,
+        workflow: str,
+        workspace: str,
+        harness: Harness,
+        owner: str,
+    ) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE harness_health
+                SET probe_lease_until = NULL, probe_owner = NULL
+                WHERE workflow = ? AND workspace = ? AND harness = ?
+                  AND probe_owner = ?
+                """,
+                (workflow, workspace, harness.value, owner),
+            )
+
+    def pending_harnesses(self, workflow: str) -> tuple[Harness, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT harness FROM jobs
+                WHERE workflow = ? AND state = ?
+                ORDER BY harness
+                """,
+                (workflow, JobState.PENDING.value),
+            ).fetchall()
+        return tuple(Harness(str(row["harness"])) for row in rows)
 
     def claim_blocked_for_resume(
         self,

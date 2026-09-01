@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING
 
 from herdr_orchestrator.model import Harness, WorkflowConfig
+
+if TYPE_CHECKING:
+    from herdr_orchestrator.harness_health import EligibilitySnapshot, HarnessHealth, HealthProbe
 
 ExecutableFinder = Callable[[str], str | None]
 
@@ -42,13 +46,49 @@ def select_controller_harness(
     override: Harness | None = None,
     force_auto: bool = False,
     executable_finder: ExecutableFinder = shutil.which,
+    health: HarnessHealth | None = None,
+    readiness_probe: HealthProbe | None = None,
 ) -> Harness:
     requested = None if force_auto else (override or config.planner.harness)
     if requested is not None:
+        if health is not None:
+            health.require(requested, role="controller", probe=readiness_probe)
         return requested
 
-    candidates = set(worker_harnesses)
+    candidates = tuple(dict.fromkeys(worker_harnesses))
+    eligible = set(candidates)
+    snapshot: EligibilitySnapshot | None = None
+    if health is not None:
+        snapshot = health.snapshot(candidates, refresh=True, probe=readiness_probe)
+        eligible = set(snapshot.eligible_harnesses)
     for harness in AUTO_CONTROLLER_ORDER:
-        if harness in candidates and executable_finder(harness.value) is not None:
+        if harness in eligible and (
+            health is not None or executable_finder(harness.value) is not None
+        ):
+            if health is not None and snapshot is not None:
+                health.record_selection(snapshot, role="controller", selected=harness)
             return harness
+    if snapshot is not None:
+        assert health is not None
+        health.record_selection(snapshot, role="controller")
+        reasons = ",".join(
+            f"{harness.value}={snapshot.record_for(harness).reason}" for harness in candidates
+        )
+        raise ValueError(f"controller_harness_unavailable:{reasons}")
     raise ValueError("controller_harness_unavailable")
+
+
+def eligible_worker_harnesses(
+    config: WorkflowConfig,
+    worker_harnesses: Iterable[Harness],
+    *,
+    health: HarnessHealth | None = None,
+    readiness_probe: HealthProbe | None = None,
+) -> tuple[Harness, ...]:
+    """Return the configured worker pool filtered through one health snapshot."""
+    requested = tuple(dict.fromkeys(worker_harnesses))
+    if health is None:
+        return requested
+    snapshot = health.snapshot(requested, refresh=True, probe=readiness_probe)
+    health.record_selection(snapshot, role="worker")
+    return tuple(harness for harness in requested if harness in snapshot.eligible_harnesses)

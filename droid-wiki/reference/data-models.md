@@ -115,6 +115,9 @@ schema 没有把它声明成不可变审计日志；外部代码不应绕过 `St
 
 - `schema_meta(version INTEGER NOT NULL)`：数据库 schema version。
 - `metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)`：当前用于 coordinator 的少量运行 metadata，例如 planner cadence；它不是通用配置存储。
+- `harness_health(workflow, workspace, harness)`：readiness health projection。它保存 `status`、
+  `reason`、`source`、`observed_at`、`expires_at`、`cooldown_until`、`retryable_failures` 和
+  compare-and-set probe lease；不保存 prompt 或 terminal output。当前 schema version 为 `7`。
 
 ### 状态迁移
 

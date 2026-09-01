@@ -111,6 +111,18 @@ class CoordinatorConfig:
     lease_seconds: int
     max_attempts: int
     agent_timeout_seconds: int
+    readiness_ttl_seconds: int = 3600
+    readiness_cooldown_seconds: int = 300
+    readiness_probe_timeout_seconds: int = 30
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessHealthConfig:
+    """Bounded persistence policy for readiness evidence."""
+
+    ttl_seconds: int = 3600
+    cooldown_seconds: int = 300
+    probe_timeout_seconds: int = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +199,7 @@ class WorkflowConfig:
     profiles: tuple[HarnessProfile, ...]
     workers: tuple[WorkerConfig, ...]
     seed_jobs: tuple[SeedJobConfig, ...]
+    harness_health: HarnessHealthConfig = HarnessHealthConfig()
 
 
 @dataclass(frozen=True, slots=True)
