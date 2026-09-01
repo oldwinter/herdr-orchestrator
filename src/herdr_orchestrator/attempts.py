@@ -5,6 +5,13 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from herdr_orchestrator.completion import (
+    CompletionPolicy,
+    CompletionResult,
+    CompletionStatus,
+    VerificationClass,
+    compatible_completion,
+)
 from herdr_orchestrator.model import (
     AgentState,
     AttemptPhase,
@@ -35,6 +42,7 @@ class _NormalizedOutcome:
     agent_settled: bool
     task_verified: bool | None
     correlation_id: str
+    completion: CompletionResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +111,17 @@ def _optional_text(row: sqlite3.Row, key: str) -> str | None:
     return str(value) if value is not None else None
 
 
+def _completion_from_row(row: sqlite3.Row) -> CompletionResult:
+    status = _optional_text(row, "completion_status")
+    return CompletionResult(
+        CompletionPolicy(str(row["completion_policy"])),
+        VerificationClass(str(row["verification_class"])),
+        CompletionStatus(status) if status is not None else None,
+        _optional_text(row, "completion_evidence_summary"),
+        _optional_text(row, "completion_error_code"),
+    )
+
+
 def _runtime(row: sqlite3.Row) -> AttemptRuntime:
     def text(key: str) -> str | None:
         value = row[key]
@@ -131,6 +150,7 @@ def _runtime(row: sqlite3.Row) -> AttemptRuntime:
         agent_state=AgentState(agent_state) if agent_state is not None else None,
         agent_settled=boolean("agent_settled"),
         task_verified=boolean("task_verified"),
+        completion=_completion_from_row(row),
     )
 
 
@@ -150,6 +170,7 @@ def _insert_receipt(
     herdr_workspace_id: str | None,
     agent_settled: bool | None,
     task_verified: bool | None,
+    completion: CompletionResult,
     error_summary: str | None,
     correlation_id: str | None,
     observed_at: float,
@@ -165,10 +186,12 @@ def _insert_receipt(
         INSERT INTO receipts(
             job_id, attempt, state, agent_name, agent_state, member_reused,
             pane_id, error_code, placement, execution_path, herdr_workspace_id,
-            agent_settled, task_verified, error_summary, correlation_id,
+            agent_settled, task_verified, completion_policy, verification_class,
+            completion_status, completion_evidence_summary, completion_error_code,
+            error_summary, correlation_id,
             observed_at, attempt_id, fencing_token, operation_token,
             operation_sequence, event_kind, is_stale
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job_id,
@@ -184,6 +207,11 @@ def _insert_receipt(
             herdr_workspace_id,
             int(agent_settled) if agent_settled is not None else None,
             int(task_verified) if task_verified is not None else None,
+            completion.policy.value,
+            completion.verification.value,
+            completion.status.value if completion.status is not None else None,
+            completion.evidence_summary,
+            completion.error_code,
             error_summary,
             correlation_id,
             observed_at,
@@ -203,10 +231,43 @@ def _agent_is_settled(outcome: DispatchOutcome) -> bool:
     return outcome.state in _SETTLED_AGENT_STATES
 
 
-def _effective_error(job: ClaimedJob, outcome: DispatchOutcome) -> str | None:
+def _outcome_completion(job: ClaimedJob, outcome: DispatchOutcome) -> CompletionResult:
+    if outcome.completion is None:
+        return compatible_completion(
+            job.completion_policy,
+            outcome.task_verified,
+            outcome.error_code,
+        )
+    if outcome.completion.policy is job.completion_policy:
+        return outcome.completion
+    return CompletionResult(
+        job.completion_policy,
+        VerificationClass.VERIFICATION_FAILED,
+        None,
+        None,
+        "completion_policy_mismatch",
+    )
+
+
+def _effective_error(
+    job: ClaimedJob,
+    outcome: DispatchOutcome,
+    completion: CompletionResult,
+) -> str | None:
     if outcome.error_code is not None:
         return outcome.error_code
-    if job.receipt is not None and outcome.task_verified is not True:
+    if completion.verification is VerificationClass.VERIFICATION_FAILED:
+        return completion.error_code or "completion_verification_failed"
+    if completion.status is CompletionStatus.BLOCKED:
+        return "completion_reported_blocked"
+    if completion.status is CompletionStatus.FAILED:
+        return "completion_reported_failed"
+    if (
+        job.completion_policy is CompletionPolicy.STRUCTURED_V2
+        and completion.task_verified is not True
+    ):
+        return "completion_envelope_missing"
+    if job.receipt is not None and completion.task_verified is not True:
         return "task_receipt_missing"
     if outcome.task_verified is False:
         return "task_receipt_invalid"
@@ -224,7 +285,8 @@ def _normalize(
     resume: bool,
     now: float,
 ) -> _NormalizedOutcome:
-    error_code = _effective_error(job, outcome)
+    completion = _outcome_completion(job, outcome)
+    error_code = _effective_error(job, outcome, completion)
     if resume:
         state = (
             JobState.SUCCEEDED
@@ -237,7 +299,9 @@ def _normalize(
             error_code = "agent_not_settled"
         available_at = now
     else:
-        if error_code is None and outcome.state in _SETTLED_AGENT_STATES:
+        if completion.status is CompletionStatus.BLOCKED:
+            state = JobState.BLOCKED
+        elif error_code is None and outcome.state in _SETTLED_AGENT_STATES:
             state = JobState.SUCCEEDED
         elif error_code == "unsafe_turn_adoption" or outcome.state is AgentState.BLOCKED:
             state = JobState.BLOCKED
@@ -255,8 +319,9 @@ def _normalize(
         error_code=error_code,
         error_summary=_bounded_error_summary(outcome.error_summary),
         agent_settled=_agent_is_settled(outcome),
-        task_verified=outcome.task_verified,
+        task_verified=completion.task_verified,
         correlation_id=outcome.correlation_id or job.correlation_id,
+        completion=completion,
     )
 
 
@@ -288,6 +353,11 @@ class AttemptLedger:
                 member_reused INTEGER,
                 agent_settled INTEGER,
                 task_verified INTEGER,
+                completion_policy TEXT NOT NULL DEFAULT 'legacy-unverified',
+                verification_class TEXT NOT NULL DEFAULT 'unverified',
+                completion_status TEXT,
+                completion_evidence_summary TEXT,
+                completion_error_code TEXT,
                 error_code TEXT,
                 error_summary TEXT,
                 created_at REAL NOT NULL,
@@ -580,8 +650,9 @@ class AttemptLedger:
             INSERT INTO job_attempts(
                 job_id, attempt, fencing_token, lease_owner, lease_until,
                 selected_harness, agent_name, phase, operation_token,
-                operation_sequence, operation_kind, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'dispatch', ?, ?)
+                operation_sequence, operation_kind, completion_policy,
+                verification_class, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'dispatch', ?, ?, ?, ?)
             """,
             (
                 row["id"],
@@ -593,6 +664,8 @@ class AttemptLedger:
                 agent_name,
                 AttemptPhase.CLAIMED.value,
                 operation,
+                str(row["completion_policy"]),
+                VerificationClass.UNVERIFIED.value,
                 now,
                 now,
             ),
@@ -606,6 +679,8 @@ class AttemptLedger:
             SET state = ?, attempts = ?, lease_until = ?, agent_name = ?,
                 error_code = NULL, execution_path = NULL, herdr_workspace_id = NULL,
                 agent_settled = NULL, task_verified = NULL, error_summary = NULL,
+                verification_class = ?, completion_status = NULL,
+                completion_evidence_summary = NULL, completion_error_code = NULL,
                 correlation_id = ?, current_attempt_id = ?, updated_at = ?
             WHERE id = ?
             """,
@@ -614,6 +689,7 @@ class AttemptLedger:
                 number,
                 lease_until,
                 agent_name,
+                VerificationClass.UNVERIFIED.value,
                 correlation,
                 attempt_id,
                 now,
@@ -638,6 +714,7 @@ class AttemptLedger:
             owner,
             lease_until,
             operation,
+            completion_policy=CompletionPolicy(str(row["completion_policy"])),
         )
 
     @staticmethod
@@ -705,6 +782,7 @@ class AttemptLedger:
             AttemptPhase(str(attempt["phase"])),
             True,
             _runtime(attempt),
+            CompletionPolicy(str(row["completion_policy"])),
         )
 
     @staticmethod
@@ -724,6 +802,18 @@ class AttemptLedger:
         predecessors = _PHASE_PREDECESSORS.get(progress.phase, frozenset())
         if current is not progress.phase and current not in predecessors:
             raise StoreError("attempt_phase_invalid")
+        completion = progress.completion
+        if completion is None and progress.phase is AttemptPhase.RECEIPT_OBSERVED:
+            completion = compatible_completion(
+                job.completion_policy,
+                progress.task_verified,
+                progress.error_code,
+            )
+        if completion is not None and completion.policy is not job.completion_policy:
+            raise StoreError("completion_policy_mismatch")
+        task_verified = (
+            completion.task_verified if completion is not None else progress.task_verified
+        )
         cursor = connection.execute(
             """
             UPDATE job_attempts
@@ -738,6 +828,10 @@ class AttemptLedger:
                 member_reused = COALESCE(?, member_reused),
                 agent_settled = COALESCE(?, agent_settled),
                 task_verified = COALESCE(?, task_verified),
+                verification_class = COALESCE(?, verification_class),
+                completion_status = COALESCE(?, completion_status),
+                completion_evidence_summary = COALESCE(?, completion_evidence_summary),
+                completion_error_code = COALESCE(?, completion_error_code),
                 error_code = COALESCE(?, error_code),
                 error_summary = COALESCE(?, error_summary), updated_at = ?
             WHERE id = ? AND job_id = ? AND fencing_token = ?
@@ -756,7 +850,15 @@ class AttemptLedger:
                 progress.agent_state.value if progress.agent_state is not None else None,
                 int(progress.member_reused) if progress.member_reused is not None else None,
                 int(progress.agent_settled) if progress.agent_settled is not None else None,
-                int(progress.task_verified) if progress.task_verified is not None else None,
+                int(task_verified) if task_verified is not None else None,
+                completion.verification.value if completion is not None else None,
+                (
+                    completion.status.value
+                    if completion is not None and completion.status is not None
+                    else None
+                ),
+                completion.evidence_summary if completion is not None else None,
+                completion.error_code if completion is not None else None,
                 progress.error_code,
                 _bounded_error_summary(progress.error_summary),
                 now,
@@ -902,6 +1004,8 @@ class AttemptLedger:
                 herdr_workspace_id = COALESCE(?, herdr_workspace_id),
                 execution_path = COALESCE(?, execution_path), agent_state = ?,
                 member_reused = ?, agent_settled = ?, task_verified = ?,
+                completion_policy = ?, verification_class = ?, completion_status = ?,
+                completion_evidence_summary = ?, completion_error_code = ?,
                 error_code = ?, error_summary = ?, updated_at = ?, finished_at = ?
             WHERE id = ? AND job_id = ? AND fencing_token = ?
               AND lease_owner = ? AND operation_token = ? AND lease_until > ?
@@ -916,6 +1020,15 @@ class AttemptLedger:
                 int(outcome.member_reused),
                 int(normalized.agent_settled),
                 int(normalized.task_verified) if normalized.task_verified is not None else None,
+                normalized.completion.policy.value,
+                normalized.completion.verification.value,
+                (
+                    normalized.completion.status.value
+                    if normalized.completion.status is not None
+                    else None
+                ),
+                normalized.completion.evidence_summary,
+                normalized.completion.error_code,
                 normalized.error_code,
                 normalized.error_summary,
                 now,
@@ -947,6 +1060,8 @@ class AttemptLedger:
             SET state = ?, available_at = ?, lease_until = NULL, agent_name = ?,
                 error_code = ?, execution_path = ?, herdr_workspace_id = ?,
                 agent_settled = ?, task_verified = ?, error_summary = ?,
+                completion_policy = ?, verification_class = ?, completion_status = ?,
+                completion_evidence_summary = ?, completion_error_code = ?,
                 correlation_id = ?, updated_at = ?
             WHERE id = ? AND current_attempt_id = ? AND state = ? AND correlation_id = ?
             """,
@@ -960,6 +1075,15 @@ class AttemptLedger:
                 int(normalized.agent_settled),
                 int(normalized.task_verified) if normalized.task_verified is not None else None,
                 normalized.error_summary,
+                normalized.completion.policy.value,
+                normalized.completion.verification.value,
+                (
+                    normalized.completion.status.value
+                    if normalized.completion.status is not None
+                    else None
+                ),
+                normalized.completion.evidence_summary,
+                normalized.completion.error_code,
                 job.correlation_id,
                 now,
                 job.job_id,
@@ -996,6 +1120,7 @@ class AttemptLedger:
             herdr_workspace_id=outcome.herdr_workspace_id,
             agent_settled=normalized.agent_settled,
             task_verified=normalized.task_verified,
+            completion=normalized.completion,
             error_summary=normalized.error_summary,
             correlation_id=job.correlation_id,
             observed_at=now,
@@ -1176,7 +1301,9 @@ class AttemptLedger:
                 agent_session_id = NULL, prompt_baseline_sequence = NULL,
                 prompt_accepted_sequence = NULL, last_state_change_sequence = NULL,
                 agent_state = NULL, member_reused = NULL, agent_settled = NULL,
-                task_verified = NULL, error_code = NULL, error_summary = NULL,
+                task_verified = NULL, verification_class = ?, completion_status = NULL,
+                completion_evidence_summary = NULL, completion_error_code = NULL,
+                error_code = NULL, error_summary = NULL,
                 finished_at = NULL, updated_at = ?
             WHERE id = ? AND job_id = ? AND fencing_token = ?
               AND (lease_until IS NULL OR lease_until <= ?)
@@ -1187,6 +1314,7 @@ class AttemptLedger:
                 operation,
                 sequence,
                 AttemptPhase.CLAIMED.value,
+                VerificationClass.UNVERIFIED.value,
                 now,
                 attempt["id"],
                 job["id"],
@@ -1252,6 +1380,7 @@ class AttemptLedger:
             lease.phase,
             lease.recovery,
             lease.runtime,
+            CompletionPolicy(str(job["completion_policy"])),
         )
 
     @staticmethod
@@ -1310,6 +1439,14 @@ class AttemptLedger:
             herdr_workspace_id=progress.herdr_workspace_id,
             agent_settled=progress.agent_settled,
             task_verified=progress.task_verified,
+            completion=(
+                progress.completion
+                or compatible_completion(
+                    job.completion_policy,
+                    progress.task_verified,
+                    progress.error_code,
+                )
+            ),
             error_summary=_bounded_error_summary(progress.error_summary),
             correlation_id=job.correlation_id or None,
             observed_at=now,
@@ -1345,6 +1482,7 @@ class AttemptLedger:
             herdr_workspace_id=outcome.herdr_workspace_id,
             agent_settled=normalized.agent_settled,
             task_verified=normalized.task_verified,
+            completion=normalized.completion,
             error_summary=normalized.error_summary,
             correlation_id=normalized.correlation_id or job.correlation_id or None,
             observed_at=normalized.observed_at,

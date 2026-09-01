@@ -59,6 +59,44 @@ class CompletionResult:
     evidence_summary: str | None
     error_code: str | None
 
+    @property
+    def task_verified(self) -> bool | None:
+        if self.verification is VerificationClass.VERIFIED:
+            return True
+        if self.verification is VerificationClass.VERIFICATION_FAILED:
+            return False
+        return None
+
+
+def unverified_completion(policy: CompletionPolicy) -> CompletionResult:
+    return CompletionResult(policy, VerificationClass.UNVERIFIED, None, None, None)
+
+
+def compatible_completion(
+    policy: CompletionPolicy,
+    task_verified: bool | None,
+    error_code: str | None = None,
+) -> CompletionResult:
+    if policy is CompletionPolicy.LEGACY_UNVERIFIED:
+        return unverified_completion(policy)
+    if task_verified is True:
+        return CompletionResult(
+            policy,
+            VerificationClass.VERIFIED,
+            CompletionStatus.COMPLETED,
+            None,
+            None,
+        )
+    if task_verified is False:
+        return CompletionResult(
+            policy,
+            VerificationClass.VERIFICATION_FAILED,
+            None,
+            None,
+            error_code or "completion_verification_failed",
+        )
+    return unverified_completion(policy)
+
 
 def parse_structured_completion(
     output_before: str,
