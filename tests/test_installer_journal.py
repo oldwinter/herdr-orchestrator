@@ -21,6 +21,7 @@ INSTALLER_FAULT_ENV = {
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL_PREFIX",
     "HERDR_ORCHESTRATOR_TEST_MUTATION_LOG",
+    "HERDR_ORCHESTRATOR_TEST_PRESERVED_DISCOVERY_BARRIER",
 }
 
 
@@ -531,6 +532,7 @@ class InstallerJournalPackedTests(unittest.TestCase):
             self.assertGreater(recovery_mutation_counts["upgrade"], 5)
             self.assertGreater(recovery_mutation_counts["uninstall"], 15)
 
+    @installer_crash_matrix
     def test_current_package_recovers_pre_owner_pre_mode_v1_journals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -968,6 +970,104 @@ class InstallerJournalPackedTests(unittest.TestCase):
                 else:
                     self.assertEqual(after_partial["files"].get(path), state)
             self.assertEqual(after_partial["exclude"], before_partial["exclude"])
+
+            legacy_install = root / "legacy-install-removal"
+            initialize(legacy_install)
+            installed = run(legacy_install, ["install", "--harness", "droid"])
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            skill = legacy_install / ".agents/skills/herdr-orchestrator/SKILL.md"
+            interrupted_install = run(
+                legacy_install,
+                ["install", "--skip-skill", "--harness", "droid"],
+                {"HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": "journal:published"},
+            )
+            self.assertEqual(interrupted_install.returncode, 86, interrupted_install.stderr)
+            install_journal_path = legacy_install / ".herdr-orchestrator/install-journal.json"
+            install_journal = json.loads(install_journal_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                any(
+                    item["desired"]["kind"] == "absent"
+                    and item["target"]["path"] == ".agents/skills/herdr-orchestrator/SKILL.md"
+                    for item in install_journal["operations"]
+                )
+            )
+            skill_mode = skill.stat().st_mode & 0o7777
+            alternate_skill_mode = 0o600 if skill_mode != 0o600 else 0o640
+            skill.chmod(alternate_skill_mode)
+            for inventory_name in ("prior_inventory", "desired_inventory"):
+                for item in install_journal[inventory_name].values():
+                    item["state"].pop("mode", None)
+            for operation in install_journal["operations"]:
+                operation["original"].pop("mode", None)
+                operation["desired"].pop("mode", None)
+            install_journal_path.write_text(
+                f"{json.dumps(install_journal, indent=2)}\n",
+                encoding="utf-8",
+            )
+            recovered_install = run(
+                legacy_install,
+                ["install", "--skip-skill", "--harness", "droid"],
+            )
+            self.assertEqual(recovered_install.returncode, 1, recovered_install.stderr)
+            install_payload = json.loads(recovered_install.stdout)
+            self.assertIn(
+                ".agents/skills/herdr-orchestrator/SKILL.md",
+                install_payload["preserved"],
+            )
+            self.assertTrue(skill.is_file())
+            self.assertEqual(skill.stat().st_mode & 0o7777, alternate_skill_mode)
+            self.assertFalse(install_journal_path.exists())
+
+            legacy_upgrade = root / "legacy-upgrade-removal"
+            initialize(legacy_upgrade)
+            installed = run(
+                legacy_upgrade,
+                ["install", "--harness", "droid", "--harness", "codex"],
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            removed_profile = legacy_upgrade / ".herdr-orchestrator/profiles/harnesses/codex.toml"
+            interrupted_upgrade = run(
+                legacy_upgrade,
+                ["upgrade", "--harness", "droid"],
+                {"HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": "journal:published"},
+            )
+            self.assertEqual(interrupted_upgrade.returncode, 86, interrupted_upgrade.stderr)
+            upgrade_journal_path = legacy_upgrade / ".herdr-orchestrator/install-journal.json"
+            upgrade_journal = json.loads(upgrade_journal_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                any(
+                    item["desired"]["kind"] == "absent"
+                    and item["target"]["path"]
+                    == ".herdr-orchestrator/profiles/harnesses/codex.toml"
+                    for item in upgrade_journal["operations"]
+                )
+            )
+            profile_mode = removed_profile.stat().st_mode & 0o7777
+            alternate_profile_mode = 0o600 if profile_mode != 0o600 else 0o640
+            removed_profile.chmod(alternate_profile_mode)
+            for inventory_name in ("prior_inventory", "desired_inventory"):
+                for item in upgrade_journal[inventory_name].values():
+                    item["state"].pop("mode", None)
+            for operation in upgrade_journal["operations"]:
+                operation["original"].pop("mode", None)
+                operation["desired"].pop("mode", None)
+            upgrade_journal_path.write_text(
+                f"{json.dumps(upgrade_journal, indent=2)}\n",
+                encoding="utf-8",
+            )
+            recovered_upgrade = run(
+                legacy_upgrade,
+                ["upgrade", "--harness", "droid"],
+            )
+            self.assertEqual(recovered_upgrade.returncode, 1, recovered_upgrade.stderr)
+            upgrade_payload = json.loads(recovered_upgrade.stdout)
+            self.assertIn(
+                ".herdr-orchestrator/profiles/harnesses/codex.toml",
+                upgrade_payload["preserved"],
+            )
+            self.assertTrue(removed_profile.is_file())
+            self.assertEqual(removed_profile.stat().st_mode & 0o7777, alternate_profile_mode)
+            self.assertFalse(upgrade_journal_path.exists())
 
     def test_current_package_finishes_an_older_package_transaction_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

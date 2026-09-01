@@ -798,7 +798,7 @@ function isLegacyModeJournal(journal) {
   );
 }
 
-function legacyOriginalStateMatches(actual, original, journal, target) {
+function legacyOriginalStateMatches(actual, original, journal, target, desired) {
   if (!stateMatches(actual, original)) {
     return false;
   }
@@ -809,14 +809,14 @@ function legacyOriginalStateMatches(actual, original, journal, target) {
   ) {
     return true;
   }
-  // A v1 uninstall journal cannot prove the historical mode of a project
-  // file. The caller may mark a digest-matching project deletion as an
-  // explicit preserved participant; metadata and Git-exclude replacements
+  // A mode-less journal cannot prove the historical mode of a project file
+  // slated for deletion. The caller may mark a digest-matching deletion as
+  // an explicit preserved participant; metadata and Git-exclude replacements
   // remain replayable and carry the live mode.
   return (
-    journal.command !== "uninstall"
-    || isManifestTarget(target)
+    isManifestTarget(target)
     || target?.scope !== "project"
+    || desired?.kind !== "absent"
   );
 }
 
@@ -827,15 +827,16 @@ function isManifestTarget(target) {
   );
 }
 
-function legacyUninstallPreservedTargets(project, journal, context) {
+function legacyPreservedTargets(project, journal, context) {
   const preserved = new Set();
-  if (journal.command !== "uninstall" || !isLegacyModeJournal(journal)) {
+  if (!isLegacyModeJournal(journal)) {
     return preserved;
   }
   for (const operation of journal.operations) {
     if (
       operation.desired.kind !== "absent"
       || operation.original.kind !== "regular"
+      || operation.target.scope !== "project"
       || isManifestTarget(operation.target)
     ) {
       continue;
@@ -846,6 +847,17 @@ function legacyUninstallPreservedTargets(project, journal, context) {
     }
   }
   if ([...preserved].some((key) => key.startsWith("project:"))) {
+    if (journal.command !== "uninstall") {
+      for (const operation of journal.operations) {
+        if (!isManifestTarget(operation.target)) {
+          continue;
+        }
+        const actual = observeTarget(project, operation.target, context);
+        if (actual.kind === "regular" && stateMatches(actual, operation.original)) {
+          preserved.add(targetKey(operation.target));
+        }
+      }
+    }
     for (const operation of journal.operations) {
       if (operation.target.scope !== "git-exclude") {
         continue;
@@ -1017,9 +1029,22 @@ function inspectEndpoints(project, journal, context, preservedTargets = new Set(
     if (stateMatches(actual, desired)) {
       states[key] = "desired";
     } else if (preservedTargets.has(key)) {
-      states[key] = "preserved";
-      preserved.push(targetLabel(item.target));
-    } else if (legacyOriginalStateMatches(actual, item.state, journal, item.target)) {
+      if (stateMatches(actual, item.state)) {
+        states[key] = "preserved";
+        preserved.push(targetLabel(item.target));
+      } else {
+        states[key] = "conflict";
+        conflicts.push(targetLabel(item.target));
+      }
+    } else if (
+      legacyOriginalStateMatches(
+        actual,
+        item.state,
+        journal,
+        item.target,
+        desired,
+      )
+    ) {
       states[key] = "original";
     } else {
       states[key] = "conflict";
@@ -1066,6 +1091,9 @@ function applyOperation(project, journal, operation, context, preservedTargets =
       targetLabel(operation.target),
     );
     if (preservedTargets.has(targetKey(operation.target))) {
+      if (!stateMatches(actual, operation.original)) {
+        throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
+      }
       if (temporary.kind === "regular") {
         unlinkSync(temporaryPath);
         fsyncDirectory(dirname(temporaryPath));
@@ -1084,6 +1112,7 @@ function applyOperation(project, journal, operation, context, preservedTargets =
       operation.original,
       journal,
       operation.target,
+      operation.desired,
     )) {
       throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
     }
@@ -1112,6 +1141,9 @@ function applyOperation(project, journal, operation, context, preservedTargets =
       return;
     }
     if (preservedTargets.has(targetKey(operation.target))) {
+      if (!stateMatches(actual, operation.original)) {
+        throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
+      }
       return;
     }
     if (!legacyOriginalStateMatches(
@@ -1119,6 +1151,7 @@ function applyOperation(project, journal, operation, context, preservedTargets =
       operation.original,
       journal,
       operation.target,
+      operation.desired,
     )) {
       throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
     }
@@ -1131,8 +1164,13 @@ function verifyDesiredInventory(project, journal, context, preservedTargets = ne
   const conflicts = [];
   for (const [key, item] of Object.entries(journal.desired_inventory)) {
     const actual = observeTarget(project, item.target, context);
-    if (!stateMatches(actual, item.state) && !preservedTargets.has(key)) {
-      conflicts.push(targetLabel(item.target));
+    if (!stateMatches(actual, item.state)) {
+      if (
+        !preservedTargets.has(key)
+        || !stateMatches(actual, journal.prior_inventory[key].state)
+      ) {
+        conflicts.push(targetLabel(item.target));
+      }
     }
   }
   if (conflicts.length > 0) {
@@ -1152,8 +1190,13 @@ function verifyDesiredInventoryBeforeManifest(
       continue;
     }
     const actual = observeTarget(project, item.target, context);
-    if (!stateMatches(actual, item.state) && !preservedTargets.has(key)) {
-      conflicts.push(targetLabel(item.target));
+    if (!stateMatches(actual, item.state)) {
+      if (
+        !preservedTargets.has(key)
+        || !stateMatches(actual, journal.prior_inventory[key].state)
+      ) {
+        conflicts.push(targetLabel(item.target));
+      }
     }
   }
   if (conflicts.length > 0) {
@@ -1162,7 +1205,7 @@ function verifyDesiredInventoryBeforeManifest(
 }
 
 function completeJournal(project, journal, context, owner) {
-  const preservedTargets = legacyUninstallPreservedTargets(
+  const preservedTargets = legacyPreservedTargets(
     project,
     journal,
     context,
@@ -1187,6 +1230,16 @@ function completeJournal(project, journal, context, owner) {
     }
   }
   verifyDesiredInventory(project, journal, context, preservedTargets);
+  for (const key of preservedTargets) {
+    const item = journal.prior_inventory[key];
+    if (item === undefined) {
+      throw new Error("installer_recovery_conflict: preserved_target_missing");
+    }
+    const actual = observeTarget(project, item.target, context);
+    if (!stateMatches(actual, item.state)) {
+      throw new Error(`installer_recovery_conflict: ${targetLabel(item.target)}`);
+    }
+  }
   if (journal.progress.phase !== "verified") {
     journal.progress.phase = "verified";
     persistJournal(project, journal);
@@ -1219,6 +1272,7 @@ function completeJournal(project, journal, context, owner) {
   return {
     command: journal.command,
     command_result: commandResult,
+    preserved: preservedPaths,
     recovered: true,
     transaction_id: journal.transaction_id,
   };
@@ -1366,7 +1420,7 @@ export function inspectInstallerJournal(context) {
   if (temporaries.length > 1 && publication === "temporary") {
     journalTemporaryConflicts.push("journal-temporary:multiple");
   }
-  const preservedTargets = legacyUninstallPreservedTargets(
+  const preservedTargets = legacyPreservedTargets(
     project,
     journal,
     normalizedContext,

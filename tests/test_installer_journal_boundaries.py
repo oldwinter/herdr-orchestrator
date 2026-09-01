@@ -460,6 +460,80 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
                     self.assertTrue(workflow.is_file())
                 self.assertEqual(workflow.stat().st_mode & 0o7777, current_default)
 
+    def test_legacy_preserved_recovery_rechecks_after_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            barrier = root / "preserved-discovery-barrier"
+            (project / ".git").mkdir(parents=True)
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            interrupted_environment = os.environ.copy()
+            interrupted_environment["HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL"] = (
+                "journal:published"
+            )
+            interrupted = self._run(
+                "uninstall",
+                "--project",
+                str(project),
+                env=interrupted_environment,
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            journal_path = project / ".herdr-orchestrator/install-journal.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            for inventory_name in ("prior_inventory", "desired_inventory"):
+                for item in journal[inventory_name].values():
+                    item["state"].pop("mode", None)
+            for operation in journal["operations"]:
+                operation["original"].pop("mode", None)
+                operation["desired"].pop("mode", None)
+            journal_path.write_text(
+                f"{json.dumps(journal, indent=2)}\n",
+                encoding="utf-8",
+            )
+            workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+            original = workflow.read_bytes()
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_PRESERVED_DISCOVERY_BARRIER"] = str(barrier)
+            process = subprocess.Popen(
+                [
+                    *self._node_command(environment),
+                    "uninstall",
+                    "--project",
+                    str(project),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not list(barrier.glob("*.ready")) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(list(barrier.glob("*.ready")))
+                self.assertIsNone(process.poll())
+                edited = original + b"concurrent user edit\n"
+                workflow.write_bytes(edited)
+            finally:
+                barrier.mkdir(parents=True, exist_ok=True)
+                (barrier / "release").write_text("", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=30)
+
+            self.assertEqual(process.returncode, 2, f"{stderr}\n{stdout}")
+            self.assertTrue(stderr.startswith("installer_recovery_conflict: "))
+            self.assertIn(".herdr-orchestrator/workflows/multi-harness.toml", stderr)
+            self.assertEqual(workflow.read_bytes(), edited)
+            self.assertTrue(journal_path.is_file())
+            self.assertTrue((project / ".herdr-orchestrator/manifest.json").is_file())
+
     def test_git_exclude_preserves_mode_under_a_restrictive_umask(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

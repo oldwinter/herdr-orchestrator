@@ -42,6 +42,13 @@ function __faultBeforeJournalClaim() {
   }
 }
 
+function __faultPauseAfterPreservedDiscovery() {
+  const barrier = process.env.HERDR_ORCHESTRATOR_TEST_PRESERVED_DISCOVERY_BARRIER;
+  if (barrier) {
+    __faultWaitAtBarrier(barrier);
+  }
+}
+
 function __faultOperationId(temporaryPath) {
   return /-(operation-[1-9][0-9]*)\.tmp$/.exec(temporaryPath)?.[1] ?? null;
 }
@@ -153,6 +160,22 @@ function instrument(source) {
     "    renameSync(temporaryPath, path);\n"
       + "    fsyncDirectory(parent);\n"
       + "    __faultMutation(__faultTargetLabel(path, temporaryPath), path);",
+  );
+  result = replaceExact(
+    result,
+    "  const preservedTargets = legacyPreservedTargets(\n"
+      + "    project,\n"
+      + "    journal,\n"
+      + "    context,\n"
+      + "  );\n"
+      + "  preflightEndpoints(project, journal, context, preservedTargets);",
+    "  const preservedTargets = legacyPreservedTargets(\n"
+      + "    project,\n"
+      + "    journal,\n"
+      + "    context,\n"
+      + "  );\n"
+      + "  __faultPauseAfterPreservedDiscovery();\n"
+      + "  preflightEndpoints(project, journal, context, preservedTargets);",
   );
   result = replaceExact(
     result,

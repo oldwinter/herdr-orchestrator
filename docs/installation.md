@@ -135,11 +135,13 @@ package before it plans its own update.
 Schema version 1 journals written before mode tracking remain valid. Recovery treats a missing
 mode as unknown, preserves the live mode when it replaces that file, and adopts the older
 transaction-specific `.tmp` claim as the current owner claim. Install and upgrade replay may
-finish a content-proven replacement while carrying the live mode onto its temporary file;
-legacy uninstall replay treats each digest-matching regular project deletion whose mode is
-unknown as a preserved participant: it skips that unlink, retains the Git exclude block,
-removes the installer manifest, retires the journal, and returns a partial result listing the
-preserved paths. A content mismatch still stops with a recovery conflict.
+finish a content-proven replacement while carrying the live mode onto its temporary file. For
+any command, a digest-matching regular project deletion whose mode is unknown becomes an
+explicit preserved participant: recovery skips that unlink, rechecks the original digest at
+each boundary, and leaves a content mismatch as a recovery conflict. For install and upgrade,
+the prior manifest is retained and the outer command replans and reports the preserved paths;
+for uninstall, the Git exclude block is retained, only the installer manifest is removed, the
+journal is retired, and the command returns a partial result.
 Old manifests that omit `file_modes` are mode-unverified: existing files are reported as
 `modified` (also listed in `mode_unverified`) and are preserved without overwrite or removal.
 New journals and manifests record modes explicitly.
@@ -149,9 +151,10 @@ process is running, concurrent install, upgrade, or uninstall commands stop with
 `installer_transaction_active` before they change the journal or a target. A new process
 atomically adopts a dead owner claim before recovery.
 
-`just test-installer-crash-matrix` runs the packed interruption matrix. `just check` and CI run
-this matrix once as a required gate. The repeated coverage and stability suites exclude only
-this marked test; all other installer tests remain in those suites.
+`just test-installer-crash-matrix` runs the packed interruption matrix and legacy-removal
+chains. `just check` and CI run these marked tests once as a required gate. The repeated
+coverage and stability suites exclude only these heavy marked tests; all other installer tests
+remain in those suites.
 
 ## Diagnostics
 
