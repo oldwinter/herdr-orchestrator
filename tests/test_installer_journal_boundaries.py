@@ -390,6 +390,176 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             self.assertFalse(journal_path.exists())
             self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
 
+    def test_setup_entry_reports_a_recovered_legacy_uninstall_before_planning(self) -> None:
+        for command in ("install", "upgrade"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as temporary:
+                project = Path(temporary)
+                (project / ".git").mkdir()
+                installed = self._run(
+                    "install",
+                    "--project",
+                    str(project),
+                    "--harness",
+                    "droid",
+                )
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+                workflow_bytes = workflow.read_bytes()
+                environment = os.environ.copy()
+                environment["HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL"] = "journal:published"
+                interrupted = self._run(
+                    "uninstall",
+                    "--project",
+                    str(project),
+                    env=environment,
+                )
+                self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+                journal_path = project / ".herdr-orchestrator/install-journal.json"
+                journal = json.loads(journal_path.read_text(encoding="utf-8"))
+                for inventory_name in ("prior_inventory", "desired_inventory"):
+                    for item in journal[inventory_name].values():
+                        item["state"].pop("mode", None)
+                for operation in journal["operations"]:
+                    operation["original"].pop("mode", None)
+                    operation["desired"].pop("mode", None)
+                journal_path.write_text(
+                    f"{json.dumps(journal, indent=2)}\n",
+                    encoding="utf-8",
+                )
+                workflow.chmod(0o600)
+
+                recovered = self._run(
+                    command,
+                    "--project",
+                    str(project),
+                    "--harness",
+                    "droid",
+                )
+
+                self.assertEqual(recovered.returncode, 1, recovered.stderr)
+                payload = json.loads(recovered.stdout)
+                self.assertEqual(payload["recovered_command"], "uninstall")
+                self.assertFalse(payload["ok"])
+                self.assertIn(
+                    ".herdr-orchestrator/workflows/multi-harness.toml",
+                    payload["preserved"],
+                )
+                self.assertTrue(workflow.is_file())
+                self.assertEqual(workflow.read_bytes(), workflow_bytes)
+                self.assertEqual(workflow.stat().st_mode & 0o7777, 0o600)
+                self.assertFalse(journal_path.exists())
+                self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
+
+                repeated = self._run(
+                    command,
+                    "--project",
+                    str(project),
+                    "--harness",
+                    "droid",
+                )
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                manifest = json.loads(
+                    (project / ".herdr-orchestrator/manifest.json").read_text(encoding="utf-8")
+                )
+                relative_workflow = ".herdr-orchestrator/workflows/multi-harness.toml"
+                self.assertNotIn(relative_workflow, manifest["files"])
+                self.assertIn(relative_workflow, manifest["unmanaged_files"])
+
+    def test_legacy_uninstall_retries_when_no_preserved_project_target_remains(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            barrier = root / "preserved-discovery-barrier"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL"] = "journal:published"
+            interrupted = self._run(
+                "uninstall",
+                "--project",
+                str(project),
+                env=environment,
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            journal_path = project / ".herdr-orchestrator/install-journal.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            project_removals = [
+                project / operation["target"]["path"]
+                for operation in journal["operations"]
+                if operation["target"]["scope"] == "project"
+                and operation["target"]["path"] != ".herdr-orchestrator/manifest.json"
+                and operation["desired"]["kind"] == "absent"
+                and operation["original"]["kind"] == "regular"
+            ]
+            self.assertTrue(project_removals)
+            for inventory_name in ("prior_inventory", "desired_inventory"):
+                for item in journal[inventory_name].values():
+                    item["state"].pop("mode", None)
+            for operation in journal["operations"]:
+                operation["original"].pop("mode", None)
+                operation["desired"].pop("mode", None)
+            journal_path.write_text(
+                f"{json.dumps(journal, indent=2)}\n",
+                encoding="utf-8",
+            )
+            exclude = project / ".git/info/exclude"
+            exclude_before = exclude.read_bytes()
+            recovery_environment = os.environ.copy()
+            recovery_environment["HERDR_ORCHESTRATOR_TEST_PRESERVED_DISCOVERY_BARRIER"] = str(
+                barrier
+            )
+            process = subprocess.Popen(
+                [
+                    *self._node_command(recovery_environment),
+                    "uninstall",
+                    "--project",
+                    str(project),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=recovery_environment,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not list(barrier.glob("*.ready")) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(list(barrier.glob("*.ready")))
+                self.assertIsNone(process.poll())
+                for path in project_removals:
+                    if path.exists():
+                        path.unlink()
+            finally:
+                barrier.mkdir(parents=True, exist_ok=True)
+                (barrier / "release").write_text("", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=30)
+
+            self.assertEqual(process.returncode, 2, f"{stderr}\n{stdout}")
+            self.assertTrue(stderr.startswith("installer_recovery_conflict: git-exclude:"))
+            self.assertTrue(journal_path.is_file())
+            self.assertEqual(exclude.read_bytes(), exclude_before)
+
+            repeated = self._run("uninstall", "--project", str(project))
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertFalse(journal_path.exists())
+            self.assertNotIn(b"herdr-orchestrator:begin", exclude.read_bytes())
+
     def test_legacy_manifest_never_infers_mode_across_umasks(self) -> None:
         previous_umask = os.umask(0)
         os.umask(previous_umask)

@@ -1284,6 +1284,23 @@ function completeJournal(project, journal, context, owner) {
       retainedPreservedTargets.add(key);
     }
   }
+  const retainedProjectCount = [...retainedPreservedTargets]
+    .filter((key) => key.startsWith("project:"))
+    .filter((key) => {
+      const item = journal.prior_inventory[key];
+      return item !== undefined && !isManifestTarget(item.target);
+    }).length;
+  const retainedExcludeKey = [...retainedPreservedTargets].find((key) => {
+    const item = journal.prior_inventory[key];
+    return item?.target.scope === "git-exclude";
+  });
+  if (retainedProjectCount === 0 && retainedExcludeKey !== undefined) {
+    throw new Error(
+      `installer_recovery_conflict: ${targetLabel(
+        journal.prior_inventory[retainedExcludeKey].target,
+      )}`,
+    );
+  }
   if (journal.progress.phase !== "verified") {
     journal.progress.phase = "verified";
     persistJournal(project, journal);

@@ -665,7 +665,16 @@ function install(options) {
     gitExcludePath: localExcludePath,
     project,
   };
-  reconcileInstallerJournal(journalContext);
+  const recovery = reconcileInstallerJournal(journalContext);
+  if (recovery.command === "uninstall" && recovery.command_result?.ok === false) {
+    process.stdout.write(`${JSON.stringify({
+      ...recovery.command_result,
+      project,
+      recovered_command: "uninstall",
+    })}\n`);
+    process.exitCode = 1;
+    return;
+  }
   const previous = loadManifest(project);
   const skillRouterExists = directoryHasFiles(join(project, ".agents/skills"));
   const installSkill = options.installSkill ?? (

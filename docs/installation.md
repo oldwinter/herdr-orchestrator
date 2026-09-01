@@ -147,6 +147,12 @@ explicit operator resolution or reconstruction outside automatic recovery. For u
 Git exclude block is retained, each digest-matching unknown-mode project deletion is reported as
 preserved and skipped, only the installer manifest is removed, the journal is retired, and the
 command returns a partial result.
+If install or upgrade is the entry point that completes such a partial legacy uninstall, it
+returns that result with `recovered_command: "uninstall"` and does not start a new transaction;
+the caller must invoke install or upgrade again explicitly. If all initially preserved project
+targets disappear before retirement while the Git exclude block is still retained, recovery
+returns a bounded conflict and keeps the journal; the next retry re-evaluates the live inventory
+and removes the block when no retained project path remains.
 Old manifests that omit `file_modes` are mode-unverified: existing files are reported as
 `modified` (also listed in `mode_unverified`) and are preserved without overwrite or removal.
 New journals and manifests record modes explicitly.
