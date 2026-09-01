@@ -554,6 +554,7 @@ def readiness_matrix(
         environ=current_environ,
         which=which,
     )
+    inspect_build_after_probes = build is None
     active_build = build or resolve_build_identity(
         workflow.workspace,
         __version__,
@@ -569,6 +570,19 @@ def readiness_matrix(
         probe=readiness_probe or probe_harness_readiness,
         clock=active_clock,
     )
+    if inspect_build_after_probes:
+        try:
+            final_build = resolve_build_identity(
+                workflow.workspace,
+                __version__,
+                runner=build_runner,
+            )
+        except ValueError:
+            source_changed = True
+        else:
+            source_changed = final_build != active_build
+        if source_changed:
+            matrix = matrix.invalidate_source_change(active_clock())
     print(json.dumps(matrix.public_json(), indent=2, sort_keys=True))
     return 0 if matrix.verification is ReadinessVerification.VERIFIED else 1
 

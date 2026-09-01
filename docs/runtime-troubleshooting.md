@@ -115,6 +115,8 @@ summary 不会进入 matrix。
 
 `readiness_source_dirty` 表示 tracked、staged、untracked 或无法检查的 working tree bytes 与 matrix
 记录的 commit 不一致。先审查并收口 source state；不要删除或隐藏用户改动来取得 `VERIFIED`。
+`readiness_source_changed` 表示 live probe 期间 HEAD 或 porcelain source state 改变；该 run 的全部
+rows 都失效。等待 source 稳定后重新运行完整 matrix，不复用上一轮单-row evidence。
 
 再读取结构化 agent 状态：
 

@@ -262,6 +262,80 @@ class CliTests(unittest.TestCase):
         self.assertEqual(report["results"][0]["attempt_count"], 0)
         self.assertEqual(report["results"][0]["error_code"], "readiness_source_dirty")
 
+    def test_readiness_matrix_invalidates_source_changes_during_probe(self) -> None:
+        original = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        environment = ReadinessEnvironment(
+            True,
+            {harness: True for harness in Harness},
+            {harness: True for harness in Harness},
+        )
+        for change_kind in ("tracked-mutation", "new-commit"):
+            with self.subTest(change_kind=change_kind), tempfile.TemporaryDirectory() as temporary:
+                workspace = Path(temporary)
+                tracked = workspace / "tracked.txt"
+                _git(workspace, "init", "-q")
+                tracked.write_text("original\n", encoding="utf-8")
+                _git(workspace, "add", "tracked.txt")
+                _git(
+                    workspace,
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "initial",
+                )
+                original_commit = _git_output(workspace, "rev-parse", "HEAD")
+                config = replace(original, workspace=workspace)
+
+                def probe(
+                    *args: object,
+                    current_kind: str = change_kind,
+                    current_workspace: Path = workspace,
+                    current_tracked: Path = tracked,
+                ) -> dict[str, object]:
+                    del args
+                    current_tracked.write_text(f"{current_kind}\n", encoding="utf-8")
+                    if current_kind == "new-commit":
+                        _git(current_workspace, "add", "tracked.txt")
+                        _git(
+                            current_workspace,
+                            "-c",
+                            "user.name=Test",
+                            "-c",
+                            "user.email=test@example.invalid",
+                            "commit",
+                            "-qm",
+                            "changed",
+                        )
+                    return {
+                        "status": "ready",
+                        "error_code": None,
+                        "phase_timings_ms": {"total": 7},
+                    }
+
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = readiness_matrix(
+                        config,
+                        selected_harnesses=["droid"],
+                        probe_timeout_seconds=15,
+                        environment=environment,
+                        readiness_probe=probe,
+                        clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
+                    )
+
+                report = json.loads(output.getvalue())
+                result = report["results"][0]
+                self.assertEqual(code, 1)
+                self.assertEqual(report["commit"], original_commit)
+                self.assertFalse(report["source_clean"])
+                self.assertEqual(report["verification"], "NOT VERIFIED")
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["error_code"], "readiness_source_changed")
+                self.assertEqual(result["attempt_count"], 1)
+
     def test_enqueue_defaults_to_automatic_selection(self) -> None:
         args = build_parser().parse_args(
             [
@@ -698,6 +772,26 @@ class CliCommandDispatchTests(unittest.TestCase):
                 cli_module.main(["catalog", "--workflow", "workflow.toml"]),
                 3,
             )
+
+
+def _git(workspace: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _git_output(workspace: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 if __name__ == "__main__":

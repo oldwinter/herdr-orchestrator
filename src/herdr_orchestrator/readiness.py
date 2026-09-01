@@ -67,56 +67,56 @@ class ReadinessErrorCode(StrEnum):
     READINESS_EVIDENCE_EXPIRED = "readiness_evidence_expired"
     READINESS_CI_FORBIDDEN = "readiness_ci_forbidden"
     READINESS_SOURCE_DIRTY = "readiness_source_dirty"
+    READINESS_SOURCE_CHANGED = "readiness_source_changed"
 
 
-_RETRYABLE_ERRORS = frozenset(
-    {
-        ReadinessErrorCode.HERDR_TIMEOUT,
-        ReadinessErrorCode.TIMEOUT,
-        ReadinessErrorCode.PROMPT_ACCEPTANCE_TIMEOUT,
-        ReadinessErrorCode.AGENT_PROVIDER_FAILED,
-        ReadinessErrorCode.AGENT_TURN_NOT_OBSERVED,
-        ReadinessErrorCode.HERDR_INVALID_RESPONSE,
-        ReadinessErrorCode.TASK_RECEIPT_MISSING,
-        ReadinessErrorCode.READINESS_PROBE_FAILED,
-    }
-)
-_STATUS_BY_ERROR: dict[ReadinessErrorCode, ReadinessStatus] = {
-    ReadinessErrorCode.HARNESS_UNAVAILABLE: ReadinessStatus.UNAVAILABLE,
-    ReadinessErrorCode.PROFILE_UNAVAILABLE: ReadinessStatus.UNAVAILABLE,
-    ReadinessErrorCode.NOT_IN_HERDR: ReadinessStatus.UNAVAILABLE,
-    ReadinessErrorCode.HERDR_UNAVAILABLE: ReadinessStatus.UNAVAILABLE,
-    ReadinessErrorCode.AGENT_AUTH_FAILED: ReadinessStatus.AUTH_REQUIRED,
-    ReadinessErrorCode.AGENT_AUTH_REQUIRED: ReadinessStatus.AUTH_REQUIRED,
-    ReadinessErrorCode.AGENT_MODEL_INVALID: ReadinessStatus.MODEL_INVALID,
-    ReadinessErrorCode.AGENT_BLOCKED: ReadinessStatus.ERROR,
-    ReadinessErrorCode.AGENT_IDENTITY_MISMATCH: ReadinessStatus.ERROR,
-    ReadinessErrorCode.AGENT_NOT_READY: ReadinessStatus.ERROR,
-    ReadinessErrorCode.AGENT_NOT_SETTLED: ReadinessStatus.ERROR,
-    ReadinessErrorCode.AGENT_PANE_MISMATCH: ReadinessStatus.ERROR,
-    ReadinessErrorCode.AGENT_START_FAILED: ReadinessStatus.ERROR,
-    ReadinessErrorCode.AGENT_WORKSPACE_MISMATCH: ReadinessStatus.ERROR,
-    ReadinessErrorCode.HERDR_TIMEOUT: ReadinessStatus.TIMEOUT,
-    ReadinessErrorCode.TIMEOUT: ReadinessStatus.TIMEOUT,
-    ReadinessErrorCode.PROMPT_ACCEPTANCE_TIMEOUT: ReadinessStatus.TIMEOUT,
-    ReadinessErrorCode.AGENT_PROVIDER_FAILED: ReadinessStatus.ERROR,
-    ReadinessErrorCode.AGENT_TURN_NOT_OBSERVED: ReadinessStatus.ERROR,
-    ReadinessErrorCode.HERDR_INVALID_RESPONSE: ReadinessStatus.ERROR,
-    ReadinessErrorCode.HERDR_PANE_ID_MISSING: ReadinessStatus.UNAVAILABLE,
-    ReadinessErrorCode.HERDR_WORKSPACE_ID_MISSING: ReadinessStatus.UNAVAILABLE,
-    ReadinessErrorCode.PANE_SHELL_NOT_READY: ReadinessStatus.ERROR,
-    ReadinessErrorCode.TASK_RECEIPT_AMBIGUOUS: ReadinessStatus.ERROR,
-    ReadinessErrorCode.TASK_RECEIPT_INVALID: ReadinessStatus.ERROR,
-    ReadinessErrorCode.TASK_RECEIPT_KIND_INVALID: ReadinessStatus.ERROR,
-    ReadinessErrorCode.TASK_RECEIPT_MISSING: ReadinessStatus.ERROR,
-    ReadinessErrorCode.TASK_RECEIPT_PATH_INVALID: ReadinessStatus.ERROR,
-    ReadinessErrorCode.TASK_RECEIPT_STALE: ReadinessStatus.ERROR,
-    ReadinessErrorCode.TASK_RECEIPT_UNREADABLE: ReadinessStatus.ERROR,
-    ReadinessErrorCode.READINESS_PROBE_FAILED: ReadinessStatus.ERROR,
-    ReadinessErrorCode.READINESS_RESULT_INVALID: ReadinessStatus.ERROR,
-    ReadinessErrorCode.READINESS_EVIDENCE_EXPIRED: ReadinessStatus.EXPIRED,
-    ReadinessErrorCode.READINESS_CI_FORBIDDEN: ReadinessStatus.UNAVAILABLE,
-    ReadinessErrorCode.READINESS_SOURCE_DIRTY: ReadinessStatus.ERROR,
+@dataclass(frozen=True, slots=True)
+class _ReadinessErrorPolicy:
+    status: ReadinessStatus
+    retryable: bool = False
+
+
+_ERROR_POLICY: dict[ReadinessErrorCode, _ReadinessErrorPolicy] = {
+    ReadinessErrorCode.HARNESS_UNAVAILABLE: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.PROFILE_UNAVAILABLE: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.NOT_IN_HERDR: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.HERDR_UNAVAILABLE: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.AGENT_AUTH_FAILED: _ReadinessErrorPolicy(ReadinessStatus.AUTH_REQUIRED),
+    ReadinessErrorCode.AGENT_AUTH_REQUIRED: _ReadinessErrorPolicy(ReadinessStatus.AUTH_REQUIRED),
+    ReadinessErrorCode.AGENT_MODEL_INVALID: _ReadinessErrorPolicy(ReadinessStatus.MODEL_INVALID),
+    ReadinessErrorCode.AGENT_BLOCKED: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_IDENTITY_MISMATCH: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_NOT_READY: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_NOT_SETTLED: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_PANE_MISMATCH: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_START_FAILED: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_WORKSPACE_MISMATCH: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.HERDR_TIMEOUT: _ReadinessErrorPolicy(ReadinessStatus.TIMEOUT, True),
+    ReadinessErrorCode.TIMEOUT: _ReadinessErrorPolicy(ReadinessStatus.TIMEOUT, True),
+    ReadinessErrorCode.PROMPT_ACCEPTANCE_TIMEOUT: _ReadinessErrorPolicy(
+        ReadinessStatus.TIMEOUT, True
+    ),
+    ReadinessErrorCode.AGENT_PROVIDER_FAILED: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.AGENT_TURN_NOT_OBSERVED: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.HERDR_INVALID_RESPONSE: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.HERDR_PANE_ID_MISSING: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.HERDR_WORKSPACE_ID_MISSING: _ReadinessErrorPolicy(
+        ReadinessStatus.UNAVAILABLE
+    ),
+    ReadinessErrorCode.PANE_SHELL_NOT_READY: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_AMBIGUOUS: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_INVALID: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_KIND_INVALID: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_MISSING: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.TASK_RECEIPT_PATH_INVALID: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_STALE: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_UNREADABLE: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.READINESS_PROBE_FAILED: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.READINESS_RESULT_INVALID: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.READINESS_EVIDENCE_EXPIRED: _ReadinessErrorPolicy(ReadinessStatus.EXPIRED),
+    ReadinessErrorCode.READINESS_CI_FORBIDDEN: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.READINESS_SOURCE_DIRTY: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.READINESS_SOURCE_CHANGED: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
 }
 
 
@@ -194,7 +194,24 @@ def resolve_build_identity(
     except (OSError, subprocess.TimeoutExpired):
         source_clean = False
     else:
-        source_clean = status_process.returncode == 0 and not status_process.stdout.strip()
+        try:
+            confirm_process = runner(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            source_clean = False
+        else:
+            source_clean = bool(
+                status_process.returncode == 0
+                and not status_process.stdout.strip()
+                and confirm_process.returncode == 0
+                and confirm_process.stdout.strip() == commit_process.stdout.strip()
+            )
     return BuildIdentity(commit_process.stdout.strip(), package_version, source_clean)
 
 
@@ -255,6 +272,19 @@ class ReadinessEntry:
     observed_at: datetime
     attempt_count: int
 
+    def __post_init__(self) -> None:
+        expected_status = (
+            ReadinessStatus.READY
+            if self.error_code is None
+            else _ERROR_POLICY[self.error_code].status
+        )
+        if (
+            self.status is not expected_status
+            or not 0 <= self.attempt_count <= 2
+            or self.observed_at.tzinfo is None
+        ):
+            raise ValueError("readiness_entry_invalid")
+
     @property
     def verification(self) -> ReadinessVerification:
         if self.status is ReadinessStatus.READY and self.error_code is None:
@@ -302,6 +332,24 @@ class ReadinessMatrix:
             "results": [result.public_json() for result in self.results],
         }
 
+    def invalidate_source_change(self, observed_at: datetime) -> ReadinessMatrix:
+        return ReadinessMatrix(
+            BuildIdentity(self.build.commit, self.build.package_version, source_clean=False),
+            self.workflow,
+            self.workspace_id,
+            _utc(observed_at),
+            tuple(
+                _error_entry(
+                    result.harness,
+                    ReadinessErrorCode.READINESS_SOURCE_CHANGED,
+                    result.phase_timings,
+                    observed_at,
+                    result.attempt_count,
+                )
+                for result in self.results
+            ),
+        )
+
 
 def collect_readiness_matrix(
     workflow: WorkflowConfig,
@@ -322,9 +370,8 @@ def collect_readiness_matrix(
         preflight_error = _preflight_error(environment, build, harness)
         if preflight_error is not None:
             entries.append(
-                ReadinessEntry(
+                _error_entry(
                     harness,
-                    ReadinessStatus.UNAVAILABLE,
                     preflight_error,
                     ReadinessPhaseTimings(),
                     started_at,
@@ -409,7 +456,11 @@ def _probe_with_retry(
             started_at=started_at,
             clock=clock,
         )
-        if attempt == 2 or result.error_code not in _RETRYABLE_ERRORS:
+        if (
+            attempt == 2
+            or result.error_code is None
+            or not _ERROR_POLICY[result.error_code].retryable
+        ):
             return result
     raise AssertionError("readiness_retry_exhausted")
 
@@ -427,9 +478,8 @@ def _probe_once(
     try:
         raw = probe(workflow, harness, timeout_seconds)
     except Exception:
-        return ReadinessEntry(
+        return _error_entry(
             harness,
-            ReadinessStatus.ERROR,
             ReadinessErrorCode.READINESS_PROBE_FAILED,
             ReadinessPhaseTimings(),
             _utc(clock()),
@@ -467,7 +517,9 @@ def _parse_probe_result(
             error_code = ReadinessErrorCode(str(raw_error))
         except ValueError:
             return _invalid_entry(harness, attempt, observed_at)
-    expected_status = ReadinessStatus.READY if error_code is None else _STATUS_BY_ERROR[error_code]
+    expected_status = (
+        ReadinessStatus.READY if error_code is None else _ERROR_POLICY[error_code].status
+    )
     if status is not expected_status:
         return _invalid_entry(harness, attempt, observed_at)
     timings = ReadinessPhaseTimings.parse(raw.get("phase_timings_ms", {}))
@@ -482,9 +534,8 @@ def _parse_probe_result(
     else:
         evidence_time = observed_at
     if evidence_time < started_at or evidence_time > observed_at:
-        return ReadinessEntry(
+        return _error_entry(
             harness,
-            ReadinessStatus.EXPIRED,
             ReadinessErrorCode.READINESS_EVIDENCE_EXPIRED,
             timings,
             evidence_time,
@@ -498,13 +549,29 @@ def _invalid_entry(
     attempt: int,
     observed_at: datetime,
 ) -> ReadinessEntry:
-    return ReadinessEntry(
+    return _error_entry(
         harness,
-        ReadinessStatus.ERROR,
         ReadinessErrorCode.READINESS_RESULT_INVALID,
         ReadinessPhaseTimings(),
         observed_at,
         attempt,
+    )
+
+
+def _error_entry(
+    harness: Harness,
+    error_code: ReadinessErrorCode,
+    phase_timings: ReadinessPhaseTimings,
+    observed_at: datetime,
+    attempt_count: int,
+) -> ReadinessEntry:
+    return ReadinessEntry(
+        harness,
+        _ERROR_POLICY[error_code].status,
+        error_code,
+        phase_timings,
+        _utc(observed_at),
+        attempt_count,
     )
 
 

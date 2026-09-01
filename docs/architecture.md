@@ -140,9 +140,11 @@ missing profile 和 unknown result 不重试。每个 selected harness 必须产
 失败、结果过期或结果不可解析时都显式输出 `NOT VERIFIED`。只有所有 selected rows 均为当前
 `ready` evidence 时 matrix 才为 `VERIFIED`。
 
-Exact commit 证据还要求 clean source。Collector 在 live probe 前读取 porcelain Git status；tracked、
-staged、untracked 或无法检查的 source 都投影为 zero-attempt `readiness_source_dirty`。因此 working
-tree bytes 与 recorded commit 不一致时，matrix 不能返回 `VERIFIED`。
+Exact commit 证据还要求 clean 且 stable source。每次 build sample 按 HEAD → porcelain status → HEAD
+读取，拒绝 sample 内 commit drift；collector 在全部 live probes 前后各取一次 sample。Initial
+tracked、staged、untracked 或无法检查的 source 投影为 zero-attempt `readiness_source_dirty`。Probe
+期间 working tree 或 HEAD 改变时，所有 rows 改为 `readiness_source_changed`。因此 probe 执行所见
+bytes 与 recorded commit 不一致时，matrix 不能返回 `VERIFIED`。
 
 真实 matrix 依赖本机登录态，只能由 operator 在 Herdr-managed pane 运行。`CI` 或
 `GITHUB_ACTIONS` 环境返回 zero-attempt `readiness_ci_forbidden`，不会调用 live probe。Matrix 只生产

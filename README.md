@@ -246,10 +246,11 @@ just readiness-matrix --harness codex --harness claude
 或 profile 不自动重试。输出不包含 prompt、credential、terminal output、完整 response 或任意
 provider 错误文本。
 
-Matrix 在 probe 前同时读取 `git rev-parse HEAD` 和
-`git status --porcelain=v1 --untracked-files=all`。Tracked modification、staged change、untracked file
-或无法检查 source state 时，每个 selected harness 都返回 zero-attempt
-`readiness_source_dirty`；dirty tree 不能产生 `VERIFIED` 或 exit 0。
+Matrix 在所有 probe 前后都读取 HEAD、`git status --porcelain=v1 --untracked-files=all`，再读取
+HEAD 确认同一次 sample 没有跨 commit。Initial tracked modification、staged change、untracked file 或
+无法检查 source state 时，每个 selected harness 都返回 zero-attempt `readiness_source_dirty`。若
+probe 期间 working tree 或 HEAD 改变，所有 rows 改为 `readiness_source_changed`。Dirty 或 drifted
+source 都不能产生 `VERIFIED` 或 exit 0。
 
 真实 matrix 只在 operator-controlled Herdr pane 运行，不进入 pull-request CI。检测到 `CI` 或
 `GITHUB_ACTIONS` 时，每个 selected harness 都返回 zero-attempt `readiness_ci_forbidden`，不会调用

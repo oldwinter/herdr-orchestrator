@@ -12,8 +12,10 @@ from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.model import Harness
 from herdr_orchestrator.readiness import (
     BuildIdentity,
+    ReadinessEntry,
     ReadinessEnvironment,
     ReadinessErrorCode,
+    ReadinessPhaseTimings,
     ReadinessStatus,
     ReadinessVerification,
     collect_readiness_matrix,
@@ -26,6 +28,17 @@ NOW = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
 
 
 class ReadinessMatrixTests(unittest.TestCase):
+    def test_readiness_entry_rejects_mismatched_status_and_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "readiness_entry_invalid"):
+            ReadinessEntry(
+                Harness.DROID,
+                ReadinessStatus.UNAVAILABLE,
+                ReadinessErrorCode.READINESS_SOURCE_DIRTY,
+                ReadinessPhaseTimings(),
+                NOW,
+                0,
+            )
+
     def test_classifies_every_result_and_retries_only_retryable_failures(self) -> None:
         workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
         calls: Counter[Harness] = Counter()
@@ -349,6 +362,11 @@ class ReadinessMatrixTests(unittest.TestCase):
 
                 self.assertFalse(build.source_clean)
                 self.assertEqual(result["attempt_count"], 0)
+                self.assertEqual(result["status"], ReadinessStatus.ERROR.value)
+                self.assertEqual(
+                    result["verification"],
+                    ReadinessVerification.NOT_VERIFIED.value,
+                )
                 self.assertEqual(
                     result["error_code"],
                     ReadinessErrorCode.READINESS_SOURCE_DIRTY.value,
