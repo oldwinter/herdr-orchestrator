@@ -1401,11 +1401,26 @@ function uninstall(options) {
   if (localExcludePath !== null) {
     assertGitExcludeSafe(project, localExcludePath);
   }
-  const recovery = reconcileInstallerJournal({
+  const journalContext = {
     assertGitExcludeSafe,
     gitExcludePath: localExcludePath,
     project,
-  });
+  };
+  const plannedOriginals = new Map();
+  const plannedTargetState = (target) => {
+    const key = `${target.scope}:${target.path}`;
+    if (!plannedOriginals.has(key)) {
+      plannedOriginals.set(
+        key,
+        observeInstallerTarget(project, target, journalContext),
+      );
+    }
+    return plannedOriginals.get(key);
+  };
+  const manifestTarget = projectFileTarget(
+    ".herdr-orchestrator/manifest.json",
+  );
+  const recovery = reconcileInstallerJournal(journalContext);
   if (!existsSync(manifestPath)) {
     if (recovery.active && recovery.command === "uninstall") {
       writeUninstallResult(project, recovery.command_result);
@@ -1419,6 +1434,13 @@ function uninstall(options) {
     });
     return;
   }
+  const plannedManifestOriginal = plannedTargetState(manifestTarget);
+  const localExcludeTarget = localExcludePath === null
+    ? null
+    : gitExcludeTarget(localExcludePath);
+  const plannedLocalExcludeOriginal = localExcludeTarget === null
+    ? null
+    : plannedTargetState(localExcludeTarget);
   const manifest = loadManifest(project);
   const managedSkill = Object.keys(manifest.files).some((relativePath) =>
     relativePath.startsWith(".agents/skills/herdr-orchestrator/")
@@ -1428,15 +1450,10 @@ function uninstall(options) {
   const originalStates = new Map();
   const manifestModesUnknown = manifestModesAreUnknown(manifest);
   const manifestFileModes = fileModesForManifest(manifest);
-  const journalContext = {
-    assertGitExcludeSafe,
-    gitExcludePath: localExcludePath,
-    project,
-  };
   for (const [relativePath, expectedHash] of Object.entries(manifest.files).sort()) {
     assertNoSymlink(project, relativePath);
     const target = projectFileTarget(relativePath);
-    const original = observeInstallerTarget(project, target, journalContext);
+    const original = plannedTargetState(target);
     originalStates.set(relativePath, original);
     if (original.kind === "absent") {
       continue;
@@ -1475,8 +1492,8 @@ function uninstall(options) {
     });
   }
   if (localExcludePath !== null) {
-    const target = gitExcludeTarget(localExcludePath);
-    const original = observeInstallerTarget(project, target, journalContext);
+    const target = localExcludeTarget;
+    const original = plannedLocalExcludeOriginal;
     participants.push({
       desired: installerFileState(localExclude.content, original),
       desiredContent: localExclude.content,
@@ -1484,15 +1501,22 @@ function uninstall(options) {
       target,
     });
   }
-  const manifestTarget = projectFileTarget(
-    ".herdr-orchestrator/manifest.json",
-  );
   participants.push({
     desired: installerFileState(null),
     desiredContent: null,
-    original: observeInstallerTarget(project, manifestTarget, journalContext),
+    original: plannedManifestOriginal,
     target: manifestTarget,
   });
+  for (const participant of participants) {
+    const actual = observeInstallerTarget(
+      project,
+      participant.target,
+      journalContext,
+    );
+    if (!installerStateEqual(actual, participant.original)) {
+      throw new Error(`installer_state_changed: ${installerTargetLabel(participant.target)}`);
+    }
+  }
   runInstallerTransaction({
     ...journalContext,
     command: "uninstall",

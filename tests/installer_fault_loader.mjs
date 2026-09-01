@@ -319,12 +319,21 @@ function instrumentCli(source) {
   const shebang = source.startsWith("#!") && newline >= 0
     ? source.slice(0, newline + 1)
     : "";
-  const body = source.slice(shebang.length);
-  const result = replaceExact(
-    body,
-    "  const manifest = {\n",
-    "  __faultPauseAfterPlanning();\n  const manifest = {\n",
-  );
+  let result = source.slice(shebang.length);
+  if (result.includes("  const manifest = {\n")) {
+    result = replaceExact(
+      result,
+      "  const manifest = {\n",
+      "  __faultPauseAfterPlanning();\n  const manifest = {\n",
+    );
+  }
+  if (result.includes("  const localExclude = desiredUninstallGitExclude(\n")) {
+    result = replaceExact(
+      result,
+      "  const localExclude = desiredUninstallGitExclude(\n",
+      "  __faultPauseAfterPlanning();\n  const localExclude = desiredUninstallGitExclude(\n",
+    );
+  }
   return `${shebang}${TEST_RUNTIME}\n${result}`;
 }
 

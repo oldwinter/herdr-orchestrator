@@ -540,6 +540,69 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             self.assertEqual(manifest_path.read_bytes(), manifest_before)
             self.assertFalse((project / ".herdr-orchestrator/install-journal.json").exists())
 
+    def test_uninstall_planning_rejects_concurrent_metadata_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            barrier = root / "uninstall-planning-barrier"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(project)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            exclude = project / ".git/info/exclude"
+            manifest = project / ".herdr-orchestrator/manifest.json"
+            exclude_before = exclude.read_bytes()
+            manifest_before = manifest.read_bytes()
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_PLANNING_BARRIER"] = str(barrier)
+            process = subprocess.Popen(
+                [
+                    *self._node_command(environment),
+                    "uninstall",
+                    "--project",
+                    str(project),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not list(barrier.glob("*.ready")) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(list(barrier.glob("*.ready")))
+                self.assertIsNone(process.poll())
+                edited_exclude = exclude_before + b"caller edit\n"
+                edited_manifest = manifest_before + b"caller edit\n"
+                exclude.write_bytes(edited_exclude)
+                manifest.write_bytes(edited_manifest)
+            finally:
+                barrier.mkdir(parents=True, exist_ok=True)
+                (barrier / "release").write_text("", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=30)
+
+            self.assertEqual(process.returncode, 2, f"{stderr}\n{stdout}")
+            self.assertEqual(
+                stderr.strip(),
+                "installer_state_changed: git-exclude:" + str(exclude.resolve()),
+            )
+            self.assertEqual(exclude.read_bytes(), edited_exclude)
+            self.assertEqual(manifest.read_bytes(), edited_manifest)
+            self.assertFalse((project / ".herdr-orchestrator/install-journal.json").exists())
+
     def test_legacy_uninstall_retries_when_no_preserved_project_target_remains(
         self,
     ) -> None:

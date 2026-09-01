@@ -165,7 +165,7 @@ Old manifests that omit `file_modes` are mode-unverified: existing files are rep
 `modified` (also listed in `mode_unverified`) and are preserved without overwrite or removal.
 New journals and manifests record modes explicitly.
 
-Install and upgrade bind each planning observation to the transaction's original inventory.
+Install, upgrade, and uninstall bind each planning observation to the transaction's original inventory.
 If a managed file, manifest, or Git exclude changes while the plan is being assembled, the
 command stops with `installer_state_changed: <path>` before publishing a journal or mutating
 the changed bytes.
