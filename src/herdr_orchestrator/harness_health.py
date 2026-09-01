@@ -468,6 +468,8 @@ class HarnessHealth:
         *,
         source: str | HealthSource = HealthSource.DOCTOR,
         observed_at: float | None = None,
+        expected_revision: int | None = None,
+        expected_owner: str | None = None,
     ) -> HarnessHealthRecord:
         self.store.initialize()
         now = self._now() if observed_at is None else _coerce_time(observed_at)
@@ -492,7 +494,13 @@ class HarnessHealth:
             cooldown_until,
             failures,
         )
-        if not self._write(record):
+        written = self._write(
+            record,
+            expected_revision=expected_revision,
+            expected_owner=expected_owner,
+            clear_probe_lease=expected_revision is not None,
+        )
+        if not written:
             return self._records((harness,), self._now())[0]
         self._event("harness_health_changed", record, now)
         return record
@@ -644,7 +652,7 @@ class HarnessHealth:
         owner = f"health-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:12]}"
         lease_seconds = max(30.0, float(timeout_seconds or self.probe_timeout_seconds) + 5.0)
         with self._refresh_lock:
-            acquired = self.store.acquire_harness_probe(
+            lease = self.store.acquire_harness_probe_lease(
                 workflow=self.workflow_name,
                 workspace=self.workspace,
                 harness=harness,
@@ -653,7 +661,7 @@ class HarnessHealth:
                 lease_seconds=lease_seconds,
                 force=force,
             )
-        if not acquired:
+        if lease is None:
             return {"status": "error", "error_code": "readiness_probe_in_progress"}
         try:
             try:
@@ -668,6 +676,8 @@ class HarnessHealth:
                 result,
                 source=source,
                 observed_at=self._now(),
+                expected_revision=lease.revision,
+                expected_owner=owner,
             )
             return result
         finally:
@@ -678,7 +688,14 @@ class HarnessHealth:
                 owner=owner,
             )
 
-    def _write(self, record: HarnessHealthRecord) -> bool:
+    def _write(
+        self,
+        record: HarnessHealthRecord,
+        *,
+        expected_revision: int | None = None,
+        expected_owner: str | None = None,
+        clear_probe_lease: bool = False,
+    ) -> bool:
         return self.store.upsert_harness_health(
             workflow=record.workflow,
             workspace=record.workspace,
@@ -691,6 +708,9 @@ class HarnessHealth:
             cooldown_until=record.cooldown_until,
             retryable_failures=record.retryable_failures,
             probe_lease_until=record.probe_lease_until,
+            expected_revision=expected_revision,
+            expected_owner=expected_owner,
+            clear_probe_lease=clear_probe_lease,
         )
 
     def _now(self) -> float:
