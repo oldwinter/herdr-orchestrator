@@ -201,7 +201,8 @@ class StatefulGithubRunner:
             body = Path(argv[argv.index("--body-file") + 1]).read_text(encoding="utf-8")
         command = argv[1:3]
         if command == ["issue", "list"]:
-            stdout = json.dumps(list(self.issues.values()))
+            limit = int(argv[argv.index("--limit") + 1])
+            stdout = json.dumps(list(self.issues.values())[:limit])
         elif command == ["issue", "create"]:
             number = self.next_issue
             self.next_issue += 1
@@ -349,6 +350,36 @@ class GithubTrackerTests(unittest.TestCase):
 
         self.assertEqual(runner.create_count, 1)
 
+    def test_replays_maximum_plan_without_hiding_the_101st_marker(self) -> None:
+        tickets = tuple(
+            DeliveryTicket(
+                ticket_id=f"{number:02d}" if number < 100 else "100",
+                title=f"Add slice {number}",
+                what_to_build=f"Expose slice {number}.",
+                blocked_by=(),
+                acceptance_criteria=(f"Slice {number} works.",),
+            )
+            for number in range(1, 101)
+        )
+        plan = replace(_plan(), tickets=tickets)
+        markers = tracker_markers("2" * 12, plan)
+        runner = StatefulGithubRunner()
+        first = GithubTracker("owner/project", runner=runner)
+        references = first.publish(plan, markers=markers)
+
+        replay = GithubTracker("owner/project", runner=runner)
+        replayed = replay.publish(plan, markers=markers)
+
+        self.assertEqual(len(references), 100)
+        self.assertEqual(replayed, references)
+        self.assertEqual(runner.create_count, 101)
+        limits = {
+            call[call.index("--limit") + 1]
+            for call in runner.calls
+            if call[1:3] == ["issue", "list"]
+        }
+        self.assertEqual(limits, {"1000"})
+
     def test_reconciles_close_after_remote_close_before_confirmation(self) -> None:
         runner = StatefulGithubRunner()
         plan = _plan()
@@ -423,6 +454,7 @@ class GithubTrackerTests(unittest.TestCase):
             references=references,
             spec_url=legacy.spec_url,
             markers=markers,
+            receipts={"01": receipt},
         )
         adopted.close(plan.tickets[0], receipt, marker=markers.ticket("01"))
 
@@ -431,6 +463,35 @@ class GithubTrackerTests(unittest.TestCase):
         self.assertEqual(runner.close_count, 1)
         self.assertEqual(runner.issues[42]["state"], "CLOSED")
         self.assertIn(markers.ticket("01"), runner.issues[42]["body"])
+
+    def test_legacy_adoption_rejects_a_human_modified_completed_body_before_edits(
+        self,
+    ) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        legacy = GithubTracker("owner/project", runner=runner)
+        references = legacy.publish(plan)
+        receipt = TicketReceipt(
+            ticket_id="01",
+            commit="abcdef1234567890",
+            acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
+            checks=("python -m unittest: passed",),
+            summary="Implemented the slice.",
+        )
+        legacy.close(plan.tickets[0], receipt)
+        runner.issues[42]["body"] += "\nHuman note that is not run-owned.\n"
+        edit_count = runner.edit_count
+
+        with self.assertRaisesRegex(TrackerError, "github_adoption_conflict"):
+            GithubTracker("owner/project", runner=runner).adopt(
+                plan,
+                references=references,
+                spec_url=legacy.spec_url,
+                markers=tracker_markers("1" * 12, plan),
+                receipts={"01": receipt},
+            )
+
+        self.assertEqual(runner.edit_count, edit_count)
 
     def test_transports_multiline_bodies_through_body_files(self) -> None:
         runner = FakeGithubRunner()

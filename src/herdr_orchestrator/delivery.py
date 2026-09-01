@@ -633,52 +633,65 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
         head_after = git.validate_commit(integration)
         if head_after != head_before:
             raise DeliveryError("delivery_review_mutated_integration")
-        report = ReviewReport(
-            standards=load_review_axis(standards_file, "standards"),
-            spec=load_review_axis(spec_file, "spec"),
+        return self._revalidate_review(
+            plan,
+            integration,
+            round_number,
+            head_before,
         )
-        journal = self._journal
-        if journal is not None:
-            expected = {
+
+    def _revalidate_review(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        round_number: int,
+        integration_commit: str,
+    ) -> ReviewReport:
+        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
+        review_root = self._run_root / "reviews" / f"round-{round_number}"
+        standards_file = review_root / "standards.json"
+        spec_file = review_root / "spec.json"
+
+        def observed() -> tuple[ReviewReport, dict[str, object]]:
+            report = ReviewReport(
+                standards=load_review_axis(standards_file, "standards"),
+                spec=load_review_axis(spec_file, "spec"),
+            )
+            return report, {
                 "round": round_number,
-                "integration_commit": head_before,
+                "integration_commit": integration_commit,
                 "standards_sha256": _file_sha256(standards_file),
                 "spec_sha256": _file_sha256(spec_file),
                 "standards_findings": len(report.standards),
                 "spec_findings": len(report.spec),
             }
 
-            def observe(
-                confirmation: dict[str, object] | None,
-                started: bool,
-            ) -> DeliveryEffectObservation:
-                try:
-                    current = git.validate_commit(integration)
-                    observed_report = ReviewReport(
-                        standards=load_review_axis(standards_file, "standards"),
-                        spec=load_review_axis(spec_file, "spec"),
-                    )
-                except (DeliveryArtifactError, GitWorkspaceError):
-                    return _effect_conflict()
-                if current != head_before:
-                    return _effect_conflict()
-                details = {
-                    "round": round_number,
-                    "integration_commit": current,
-                    "standards_sha256": _file_sha256(standards_file),
-                    "spec_sha256": _file_sha256(spec_file),
-                    "standards_findings": len(observed_report.standards),
-                    "spec_findings": len(observed_report.spec),
-                }
-                return _effect_matched(details)
+        def observe(
+            confirmation: dict[str, object] | None,
+            started: bool,
+        ) -> DeliveryEffectObservation:
+            try:
+                current = git.validate_commit(integration)
+                _, details = observed()
+            except (DeliveryArtifactError, GitWorkspaceError):
+                return _effect_conflict()
+            if current != integration_commit:
+                return _effect_conflict()
+            return _effect_matched(details)
 
+        try:
+            report, expected = observed()
+        except (DeliveryArtifactError, GitWorkspaceError) as exc:
+            raise DeliveryError("delivery_recovery_conflict:review.accept") from exc
+        journal = self._journal
+        if journal is not None:
             payload = journal.reconcile(
                 DeliveryEffect(
                     key=f"review:accept:{round_number}",
                     kind="review.accept",
                     intent={
                         "round": round_number,
-                        "integration_commit": head_before,
+                        "integration_commit": integration_commit,
                     },
                     observe=observe,
                     apply=lambda: expected,

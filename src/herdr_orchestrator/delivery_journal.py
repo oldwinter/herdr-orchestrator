@@ -163,7 +163,18 @@ class DeliveryJournal:
     ) -> Iterator[DeliveryJournal]:
         with exclusive_file_claim(run_root / "run.lock", error_type=error_type):
             now = clock()
-            previous = cls._load_owner(run_root, run_id, error_type)
+            journal = cls(
+                run_root,
+                run_id,
+                "0" * 32,
+                lease_seconds,
+                error_type=error_type,
+                clock=clock,
+                payload_validator=payload_validator,
+            )
+            previous = journal._durable_owner()
+            if previous is not None:
+                journal._write_owner_snapshot(previous)
             if (
                 previous is not None
                 and previous.status == "active"
@@ -173,24 +184,16 @@ class DeliveryJournal:
             owner_token = token_factory()
             if not re.fullmatch(r"[0-9a-f]{32}", owner_token):
                 raise error_type("delivery_owner_token_invalid")
-            journal = cls(
-                run_root,
-                run_id,
-                owner_token,
-                lease_seconds,
-                error_type=error_type,
-                clock=clock,
-                payload_validator=payload_validator,
-            )
+            journal.owner_token = owner_token
+            details = journal._owner_details("active", now)
             if previous is not None and previous.status == "active":
-                journal._append(
-                    "owner_recovered",
+                details.update(
                     {
-                        "previous_owner_token": previous.owner_token,
+                        "previous_owner": previous.owner_token,
                         "previous_lease_deadline": previous.lease_deadline,
-                    },
+                    }
                 )
-            journal._append("owner_acquired", {})
+            journal._append("owner_acquired", details)
             journal._write_owner("active", now)
             try:
                 yield journal
@@ -200,14 +203,18 @@ class DeliveryJournal:
     def renew(self) -> None:
         with self._lock:
             now = self.clock()
-            current = self._load_owner(self.run_root, self.run_id, self.error_type)
+            current = self._durable_owner()
             if (
                 current is None
                 or current.status != "active"
                 or current.owner_token != self.owner_token
             ):
                 raise self.error_type("delivery_owner_lost")
-            self._append_locked("owner_renewed", {}, now)
+            self._append_locked(
+                "owner_renewed",
+                self._owner_details("active", now),
+                now,
+            )
             self._write_owner("active", now)
 
     def reconcile(self, effect: DeliveryEffect) -> dict[str, object]:
@@ -409,28 +416,40 @@ class DeliveryJournal:
     def release(self) -> None:
         with self._lock:
             now = self.clock()
-            current = self._load_owner(self.run_root, self.run_id, self.error_type)
+            current = self._durable_owner()
             if (
                 current is None
                 or current.status != "active"
                 or current.owner_token != self.owner_token
             ):
                 raise self.error_type("delivery_owner_lost")
-            self._append_locked("owner_released", {}, now)
+            self._append_locked(
+                "owner_released",
+                self._owner_details("released", now),
+                now,
+            )
             self._write_owner("released", now)
 
     def _write_owner(self, status: str, observed_at: float) -> None:
-        deadline = observed_at + self.lease_seconds if status == "active" else observed_at
+        owner = _DeliveryOwner(
+            self.owner_token,
+            status,
+            observed_at,
+            (observed_at + self.lease_seconds if status == "active" else observed_at),
+        )
+        self._write_owner_snapshot(owner)
+
+    def _write_owner_snapshot(self, owner: _DeliveryOwner) -> None:
         write_artifact_text(
             self.run_root / "run-owner.json",
             json.dumps(
                 {
                     "version": 1,
                     "run_id": self.run_id,
-                    "owner_token": self.owner_token,
-                    "status": status,
-                    "last_renewed_at": observed_at,
-                    "lease_deadline": deadline,
+                    "owner_token": owner.owner_token,
+                    "status": owner.status,
+                    "last_renewed_at": owner.last_renewed_at,
+                    "lease_deadline": owner.lease_deadline,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -440,6 +459,36 @@ class DeliveryJournal:
             root=self.run_root,
             error_type=self.error_type,
         )
+
+    def _owner_details(
+        self,
+        status: str,
+        observed_at: float,
+    ) -> dict[str, object]:
+        return {
+            "status": status,
+            "last_renewed_at": observed_at,
+            "lease_deadline": (
+                observed_at + self.lease_seconds if status == "active" else observed_at
+            ),
+        }
+
+    def _durable_owner(self) -> _DeliveryOwner | None:
+        owner: _DeliveryOwner | None = None
+        for event in self._events:
+            if event.event not in {
+                "owner_acquired",
+                "owner_renewed",
+                "owner_released",
+            }:
+                continue
+            owner = _DeliveryOwner(
+                event.owner_token,
+                cast(str, event.details["status"]),
+                float(cast(int | float, event.details["last_renewed_at"])),
+                float(cast(int | float, event.details["lease_deadline"])),
+            )
+        return owner
 
     def _append(self, event: str, details: dict[str, object]) -> None:
         with self._lock:
@@ -572,7 +621,12 @@ class DeliveryJournal:
         if event in self._OWNER_EVENTS:
             if operation_key is not None or effect_kind is not None:
                 raise self.error_type("delivery_journal_invalid")
-            self._reduce_owner_event(event, owner_token, owner_state)
+            self._reduce_owner_event(
+                event,
+                owner_token,
+                details,
+                owner_state,
+            )
         elif event in self._EFFECT_EVENTS:
             if owner_state[0] != owner_token:
                 raise self.error_type("delivery_journal_invalid")
@@ -600,6 +654,7 @@ class DeliveryJournal:
         self,
         event: str,
         owner_token: str,
+        details: dict[str, object],
         state: list[str | None],
     ) -> None:
         active, pending = state
@@ -608,8 +663,13 @@ class DeliveryJournal:
                 raise self.error_type("delivery_journal_invalid")
             state[1] = owner_token
             return
+        self._validate_owner_details(event, details)
         if event == "owner_acquired":
-            if active is not None and pending != owner_token:
+            previous_owner = details.get("previous_owner")
+            if active is None:
+                if previous_owner is not None:
+                    raise self.error_type("delivery_journal_invalid")
+            elif previous_owner != active and pending != owner_token:
                 raise self.error_type("delivery_journal_invalid")
             state[:] = [owner_token, None]
             return
@@ -617,6 +677,45 @@ class DeliveryJournal:
             raise self.error_type("delivery_journal_invalid")
         if event == "owner_released":
             state[:] = [None, None]
+
+    def _validate_owner_details(
+        self,
+        event: str,
+        details: dict[str, object],
+    ) -> None:
+        base_keys = {"status", "last_renewed_at", "lease_deadline"}
+        keys = set(details)
+        if event == "owner_acquired":
+            allowed = (
+                base_keys,
+                base_keys | {"previous_owner", "previous_lease_deadline"},
+            )
+            if keys not in allowed:
+                raise self.error_type("delivery_journal_invalid")
+            previous_owner = details.get("previous_owner")
+            if previous_owner is not None and (
+                not isinstance(previous_owner, str)
+                or re.fullmatch(r"[0-9a-f]{32}", previous_owner) is None
+                or not _finite_number(details.get("previous_lease_deadline"))
+            ):
+                raise self.error_type("delivery_journal_invalid")
+        elif keys != base_keys:
+            raise self.error_type("delivery_journal_invalid")
+        status = details.get("status")
+        renewed = details.get("last_renewed_at")
+        deadline = details.get("lease_deadline")
+        expected_status = "released" if event == "owner_released" else "active"
+        if (
+            status != expected_status
+            or not _finite_number(renewed)
+            or not _finite_number(deadline)
+            or float(cast(int | float, deadline)) < float(cast(int | float, renewed))
+            or (
+                expected_status == "released"
+                and float(cast(int | float, deadline)) != float(cast(int | float, renewed))
+            )
+        ):
+            raise self.error_type("delivery_journal_invalid")
 
     def _validated_event_payload(
         self,
@@ -678,55 +777,6 @@ class DeliveryJournal:
             if prior[3]:
                 raise self.error_type("delivery_journal_invalid")
             operations[operation_key] = (prior[0], prior[1], prior[2], True)
-
-    @staticmethod
-    def _load_owner(
-        run_root: Path,
-        run_id: str,
-        error_type: type[Exception],
-    ) -> _DeliveryOwner | None:
-        path = run_root / "run-owner.json"
-        try:
-            validate_artifact_path(path, root=run_root)
-        except DeliveryArtifactError as exc:
-            raise error_type("delivery_artifact_path_invalid") from exc
-        if not path.is_file():
-            return None
-        try:
-            payload = json.loads(
-                path.read_text(encoding="utf-8"),
-                object_pairs_hook=_unique_json_object,
-                parse_constant=_reject_json_constant,
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            raise error_type("delivery_owner_invalid") from exc
-        if (
-            not isinstance(payload, dict)
-            or set(payload)
-            != {
-                "version",
-                "run_id",
-                "owner_token",
-                "status",
-                "last_renewed_at",
-                "lease_deadline",
-            }
-            or payload["version"] != 1
-            or payload["run_id"] != run_id
-            or not isinstance(payload["owner_token"], str)
-            or re.fullmatch(r"[0-9a-f]{32}", payload["owner_token"]) is None
-            or payload["status"] not in {"active", "released"}
-            or not _finite_number(payload["last_renewed_at"])
-            or not _finite_number(payload["lease_deadline"])
-            or payload["lease_deadline"] < payload["last_renewed_at"]
-        ):
-            raise error_type("delivery_owner_invalid")
-        return _DeliveryOwner(
-            owner_token=payload["owner_token"],
-            status=payload["status"],
-            last_renewed_at=float(payload["last_renewed_at"]),
-            lease_deadline=float(payload["lease_deadline"]),
-        )
 
 
 def _finite_number(value: object) -> bool:

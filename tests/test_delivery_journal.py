@@ -36,6 +36,7 @@ JournalPersist = Callable[
     [DeliveryJournal, str, str | None, str | None, dict[str, object], float],
     None,
 ]
+OwnerProjectionWrite = Callable[[DeliveryJournal, str, float], None]
 
 
 def _interrupt_journal(
@@ -63,6 +64,80 @@ def _interrupt_journal(
         if not state[0] and event == target_event and operation_key == target_key:
             state[0] = True
             raise RuntimeError("journal interruption")
+
+    return interrupt
+
+
+def _interrupt_before_confirmation(
+    original: JournalPersist,
+    target_key: str,
+    interrupted: list[bool],
+) -> JournalPersist:
+    def interrupt(
+        journal: DeliveryJournal,
+        event: str,
+        operation_key: str | None,
+        effect_kind: str | None,
+        details: dict[str, object],
+        observed_at: float,
+    ) -> None:
+        if not interrupted[0] and event == "effect_confirmed" and operation_key == target_key:
+            interrupted[0] = True
+            raise RuntimeError("applied effect before confirmation")
+        original(
+            journal,
+            event,
+            operation_key,
+            effect_kind,
+            details,
+            observed_at,
+        )
+
+    return interrupt
+
+
+def _interrupt_owner_event(
+    original: JournalPersist,
+    target_event: str,
+    interrupted: list[bool],
+) -> JournalPersist:
+    def interrupt(
+        journal: DeliveryJournal,
+        event: str,
+        operation_key: str | None,
+        effect_kind: str | None,
+        details: dict[str, object],
+        observed_at: float,
+    ) -> None:
+        original(
+            journal,
+            event,
+            operation_key,
+            effect_kind,
+            details,
+            observed_at,
+        )
+        if not interrupted[0] and event == target_event:
+            interrupted[0] = True
+            raise RuntimeError("owner transition interruption")
+
+    return interrupt
+
+
+def _interrupt_owner_projection(
+    original: OwnerProjectionWrite,
+    target_status: str,
+    interrupted: list[bool],
+) -> OwnerProjectionWrite:
+    def interrupt(
+        journal: DeliveryJournal,
+        status: str,
+        observed_at: float,
+    ) -> None:
+        original(journal, status, observed_at)
+        if not interrupted[0] and status == target_status:
+            interrupted[0] = True
+            raise RuntimeError("owner transition interruption")
 
     return interrupt
 
@@ -588,12 +663,24 @@ class AdoptingTracker(StableTracker):
         references: dict[str, TrackerTicket],
         spec_url: str | None,
         markers: object,
+        receipts: dict[str, TicketReceipt] | None = None,
     ) -> dict[str, TrackerTicket]:
         self.adopt_calls += 1
         self.external["published"] = True
         self.references = dict(references)
         self.spec_url = spec_url
         return dict(references)
+
+    def inspect_adoption(
+        self,
+        plan: object,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: object,
+        receipts: dict[str, TicketReceipt],
+    ) -> None:
+        return None
 
     def observe_publication(
         self,
@@ -926,23 +1013,108 @@ class DeliveryJournalTests(unittest.TestCase):
                 [event["sequence"] for event in events], list(range(1, len(events) + 1))
             )
             owner_events = [
-                event
-                for event in events
-                if event["event"] in {"owner_acquired", "owner_recovered", "owner_released"}
+                event for event in events if event["event"] in {"owner_acquired", "owner_released"}
             ]
             self.assertEqual(
                 [event["event"] for event in owner_events],
                 [
                     "owner_acquired",
-                    "owner_recovered",
                     "owner_acquired",
                     "owner_released",
                 ],
             )
             self.assertNotEqual(
                 owner_events[0]["owner_token"],
-                owner_events[2]["owner_token"],
+                owner_events[1]["owner_token"],
             )
+            self.assertEqual(
+                owner_events[1]["details"]["previous_owner"],
+                owner_events[0]["owner_token"],
+            )
+
+    def test_owner_transitions_converge_after_each_physical_write(self) -> None:
+        cases = (
+            ("acquire", "journal"),
+            ("acquire", "projection"),
+            ("release", "journal"),
+            ("release", "projection"),
+        )
+        for transition, physical_write in cases:
+            with (
+                self.subTest(
+                    transition=transition,
+                    physical_write=physical_write,
+                ),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                run_root = Path(temporary) / "delivery-run"
+                run_root.mkdir()
+                now = [100.0]
+                tokens = iter(("1" * 32, "2" * 32))
+                interrupted = [False]
+                target_event = "owner_acquired" if transition == "acquire" else "owner_released"
+                target_status = "active" if transition == "acquire" else "released"
+                patcher = (
+                    patch.object(
+                        DeliveryJournal,
+                        "_persist_event",
+                        _interrupt_owner_event(
+                            DeliveryJournal._persist_event,
+                            target_event,
+                            interrupted,
+                        ),
+                    )
+                    if physical_write == "journal"
+                    else patch.object(
+                        DeliveryJournal,
+                        "_write_owner",
+                        _interrupt_owner_projection(
+                            DeliveryJournal._write_owner,
+                            target_status,
+                            interrupted,
+                        ),
+                    )
+                )
+                with (
+                    patcher,
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "owner transition interruption",
+                    ),
+                    DeliveryJournal.claim(
+                        run_root,
+                        "a" * 12,
+                        5.0,
+                        error_type=DeliveryError,
+                        clock=lambda current_now=now: current_now[0],
+                        token_factory=tokens.__next__,
+                    ),
+                ):
+                    pass
+                self.assertTrue(interrupted[0])
+                now[0] = 200.0
+
+                with DeliveryJournal.claim(
+                    run_root,
+                    "a" * 12,
+                    5.0,
+                    error_type=DeliveryError,
+                    clock=lambda current_now=now: current_now[0],
+                    token_factory=tokens.__next__,
+                ):
+                    pass
+
+                DeliveryJournal(
+                    run_root,
+                    "a" * 12,
+                    "f" * 32,
+                    5.0,
+                    error_type=DeliveryError,
+                    clock=lambda current_now=now: current_now[0],
+                )
+                owner = json.loads((run_root / "run-owner.json").read_text(encoding="utf-8"))
+                self.assertEqual(owner["status"], "released")
+                self.assertEqual(owner["owner_token"], "2" * 32)
 
     def test_tracker_publication_replays_from_intent_without_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1322,10 +1494,99 @@ class DeliveryJournalTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(
                     DeliveryError,
-                    "delivery_recovery_conflict:result.publish",
+                    "delivery_recovery_conflict:review.accept",
                 ),
             ):
                 delivery.run(goal)
+
+    def test_first_result_publication_freshly_observes_all_prerequisites(self) -> None:
+        mutations = (
+            ("receipt", "delivery_recovery_conflict:receipt.ticket.accept"),
+            ("tracker-close", "delivery_recovery_conflict:tracker.close"),
+            ("review", "delivery_recovery_conflict:review.accept"),
+        )
+        for mutation, expected_error in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                repository = Path(temporary) / "repository"
+                _initialize_repository(repository)
+                config = _workflow(repository)
+                goal = repository / "goal.md"
+                goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+                external: dict[str, object] = {}
+                dispatcher = CompleteDispatcher()
+                delivery = StandardizedDelivery(
+                    config,
+                    dispatcher=dispatcher,
+                    tracker=StableTracker(external),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                )
+                review = delivery._review_and_repair
+
+                def mutate_after_review(
+                    plan: DeliveryPlan,
+                    integration: Worktree,
+                    current_mutation: str = mutation,
+                    current_review: Callable[[DeliveryPlan, Worktree], int] = review,
+                    current_delivery: StandardizedDelivery = delivery,
+                    current_external: dict[str, object] = external,
+                ) -> int:
+                    rounds = current_review(plan, integration)
+                    _mutate_final_prerequisite(
+                        current_delivery._run_root,
+                        current_external,
+                        current_mutation,
+                    )
+                    return rounds
+
+                with (
+                    patch.object(
+                        delivery,
+                        "_review_and_repair",
+                        side_effect=mutate_after_review,
+                    ),
+                    self.assertRaisesRegex(DeliveryError, expected_error),
+                ):
+                    delivery.run(goal)
+
+    def test_completed_result_freshly_reobserves_all_prerequisites(self) -> None:
+        mutations = (
+            ("receipt", "delivery_recovery_conflict:receipt.ticket.accept"),
+            ("tracker-close", "delivery_recovery_conflict:tracker.close"),
+            ("review", "delivery_recovery_conflict:review.accept"),
+        )
+        for mutation, expected_error in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                repository = Path(temporary) / "repository"
+                _initialize_repository(repository)
+                config = _workflow(repository)
+                goal = repository / "goal.md"
+                goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+                external: dict[str, object] = {}
+                first_dispatcher = CompleteDispatcher()
+                result = StandardizedDelivery(
+                    config,
+                    dispatcher=first_dispatcher,
+                    tracker=StableTracker(external),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                ).run(goal)
+                _mutate_final_prerequisite(
+                    result.artifact_root,
+                    external,
+                    mutation,
+                )
+                replay_dispatcher = CompleteDispatcher()
+
+                with self.assertRaisesRegex(DeliveryError, expected_error):
+                    StandardizedDelivery(
+                        config,
+                        dispatcher=replay_dispatcher,
+                        tracker=StableTracker(external),
+                        controller_harness=Harness.DROID,
+                        worker_harnesses=(Harness.DROID,),
+                    ).run(goal)
+                self.assertEqual(replay_dispatcher.prompts, [])
 
     def test_repair_commit_recovers_without_a_second_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1529,6 +1790,52 @@ class DeliveryJournalTests(unittest.TestCase):
                 [event["event"] for event in publication],
                 ["effect_intent", "effect_started", "effect_confirmed"],
             )
+
+    def test_legacy_receipt_conflict_causes_zero_tracker_adoption_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            _initialize_repository(repository)
+            config = _workflow(repository)
+            config = replace(
+                config,
+                standardized_delivery=replace(
+                    config.standardized_delivery,
+                    tracker_backend=TrackerBackend.GITHUB,
+                    github_repository="owner/project",
+                ),
+            )
+            goal = repository / "goal.md"
+            goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+            external: dict[str, object] = {}
+            with self.assertRaisesRegex(RuntimeError, "tracker died after close"):
+                StandardizedDelivery(
+                    config,
+                    dispatcher=CompleteDispatcher(),
+                    tracker=CrashAfterCloseTracker(external),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                ).run(goal)
+            run_root = next(config.standardized_delivery.artifact_root.iterdir())
+            (run_root / "journal.jsonl").unlink()
+            (run_root / "run-owner.json").unlink()
+            receipt_path = run_root / "receipts/ticket-01.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["commit"] = "f" * 40
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            tracker = AdoptingTracker()
+
+            with self.assertRaisesRegex(
+                DeliveryError,
+                "ticket_receipt_commit_mismatch|delivery_recovery_conflict",
+            ):
+                StandardizedDelivery(
+                    config,
+                    dispatcher=CompleteDispatcher(),
+                    tracker=tracker,
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                ).run(goal)
+            self.assertEqual(tracker.adopt_calls, 0)
 
     def test_proxy_response_recovers_without_sending_the_answer_twice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1750,6 +2057,102 @@ class DeliveryJournalTests(unittest.TestCase):
                     self.assertEqual(external["close_mutations"], 1)
                     self.assertEqual(log.count("Merge branch"), 1)
 
+    def test_applied_git_and_review_effects_converge_without_confirmation(
+        self,
+    ) -> None:
+        targets = (
+            "git:worktree:integration",
+            "git:worktree:ticket:01",
+            "git:merge:01",
+            "review:accept:1",
+        )
+        for target in targets:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                repository = Path(temporary) / "repository"
+                _initialize_repository(repository)
+                config = _workflow(repository)
+                goal = repository / "goal.md"
+                goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+                external: dict[str, object] = {}
+                interrupted = [False]
+                interrupt = _interrupt_before_confirmation(
+                    DeliveryJournal._persist_event,
+                    target,
+                    interrupted,
+                )
+
+                with (
+                    patch.object(DeliveryJournal, "_persist_event", interrupt),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "applied effect before confirmation",
+                    ),
+                ):
+                    StandardizedDelivery(
+                        config,
+                        dispatcher=CompleteDispatcher(),
+                        tracker=StableTracker(external),
+                        controller_harness=Harness.DROID,
+                        worker_harnesses=(Harness.DROID,),
+                    ).run(goal)
+                self.assertTrue(interrupted[0])
+                run_root = next(config.standardized_delivery.artifact_root.iterdir())
+                events = [
+                    json.loads(line)
+                    for line in (run_root / "journal.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                self.assertFalse(
+                    any(
+                        event["event"] == "effect_confirmed" and event["operation_key"] == target
+                        for event in events
+                    )
+                )
+                if target == "git:worktree:integration":
+                    self.assertTrue((run_root / "worktrees/integration").is_dir())
+                elif target == "git:worktree:ticket:01":
+                    self.assertTrue((run_root / "worktrees/ticket-01").is_dir())
+                elif target == "git:merge:01":
+                    log = _git(
+                        run_root / "worktrees/integration",
+                        "log",
+                        "--format=%s",
+                    ).stdout
+                    self.assertEqual(log.count("Merge branch"), 1)
+                else:
+                    self.assertTrue((run_root / "reviews/round-1/standards.json").is_file())
+                    self.assertTrue((run_root / "reviews/round-1/spec.json").is_file())
+
+                result = StandardizedDelivery(
+                    config,
+                    dispatcher=CompleteDispatcher(),
+                    tracker=StableTracker(external),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                ).run(goal)
+                recovered_events = [
+                    json.loads(line)
+                    for line in (run_root / "journal.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+
+                self.assertEqual(result.status, "succeeded")
+                self.assertEqual(
+                    sum(
+                        event["event"] == "effect_confirmed" and event["operation_key"] == target
+                        for event in recovered_events
+                    ),
+                    1,
+                )
+                final_log = _git(
+                    result.artifact_root / "worktrees/integration",
+                    "log",
+                    "--format=%s",
+                ).stdout
+                self.assertEqual(final_log.count("Merge branch"), 1)
+
     def test_human_commit_after_confirmed_merge_stops_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary) / "repository"
@@ -1854,6 +2257,24 @@ def _workflow(repository: Path):
         state_db=repository / ".orchestrator/state.db",
         standardized_delivery=delivery,
     )
+
+
+def _mutate_final_prerequisite(
+    run_root: Path,
+    external: dict[str, object],
+    mutation: str,
+) -> None:
+    if mutation == "receipt":
+        (run_root / "receipts/ticket-01.json").unlink()
+    elif mutation == "tracker-close":
+        external["closed"] = False
+    elif mutation == "review":
+        (run_root / "reviews/round-1/standards.json").write_text(
+            json.dumps({"standards": [], "concurrent": True}),
+            encoding="utf-8",
+        )
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
 
 
 def _initialize_repository(repository: Path) -> None:

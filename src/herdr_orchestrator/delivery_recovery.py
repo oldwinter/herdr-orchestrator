@@ -21,6 +21,7 @@ from herdr_orchestrator.delivery_journal import (
     DeliveryEffectState,
     DeliveryJournal,
 )
+from herdr_orchestrator.delivery_legacy import legacy_migration_payload
 from herdr_orchestrator.delivery_prompts import (
     implementation_prompt,
 )
@@ -33,7 +34,6 @@ from herdr_orchestrator.delivery_protocol import (
     ReviewReport,
     TicketReceipt,
     load_delivery_plan,
-    load_review_axis,
     load_review_verdict,
     load_ticket_receipt,
     load_tracker_publication,
@@ -120,8 +120,20 @@ class _InspectAgent(Protocol):
     ) -> tuple[bool, DispatchOutcome | None]: ...
 
 
+class _RevalidateReview(Protocol):
+    def __call__(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        round_number: int,
+        integration_commit: str,
+    ) -> ReviewReport: ...
+
+
 class DeliveryRecoveryMixin:
     config: WorkflowConfig
+    controller: Harness
+    worker_harnesses: tuple[Harness, ...]
     tracker: DeliveryTracker
     _run_root: Path
     _run_id: str
@@ -135,6 +147,7 @@ class DeliveryRecoveryMixin:
     _repair_attempts: Callable[[], int]
     _repair_inflight: Callable[[], tuple[int, str] | None]
     _delivery_base_commit: Callable[[GitWorkspace], str]
+    _revalidate_review: _RevalidateReview
 
     def _validate_completed_result(self, result: DeliveryResult) -> None:
         plan = load_delivery_plan(self._run_root / "delivery-plan.json")
@@ -149,11 +162,6 @@ class DeliveryRecoveryMixin:
             for reference in result.tracker_references.values()
         ):
             raise DeliveryError("delivery_result_tracker_references_mismatch")
-        publication = {
-            key: reference.reference for key, reference in self._publish_tracker(plan).items()
-        }
-        if publication != result.tracker_references:
-            raise DeliveryError("delivery_result_tracker_publication_mismatch")
         repair_attempts = self._repair_attempts()
         if self._repair_inflight() is not None:
             raise DeliveryError("delivery_result_repair_inflight")
@@ -179,54 +187,11 @@ class DeliveryRecoveryMixin:
         commit = git.head(integration)
         if commit != result.integration_commit:
             raise DeliveryError("delivery_result_integration_commit_mismatch")
-        for ticket in plan.tickets:
-            receipt = load_ticket_receipt(
-                self._run_root / "receipts" / f"ticket-{ticket.ticket_id}.json",
-                ticket,
-            )
-            ticket_worktree = Worktree(
-                self._run_root / "worktrees" / f"ticket-{ticket.ticket_id}",
-                f"ho/{plan.slug}/ticket-{ticket.ticket_id}",
-                base_commit,
-            )
-            _validate_worktree_ownership(
-                git,
-                ticket_worktree.path,
-                ticket_worktree,
-            )
-            _validate_worktree_clean(git, ticket_worktree.path)
-            if git.head(ticket_worktree) != receipt.commit:
-                raise DeliveryError(f"delivery_result_ticket_commit_mismatch: {ticket.ticket_id}")
-            if not git.is_ancestor(ticket_worktree.path, base_commit, receipt.commit):
-                raise DeliveryError(f"delivery_result_ticket_commit_diverged: {ticket.ticket_id}")
-            if not _git_succeeds(
-                git,
-                integration.path,
-                "merge-base",
-                "--is-ancestor",
-                receipt.commit,
-                result.integration_commit,
-            ):
-                raise DeliveryError(f"delivery_result_ticket_not_integrated: {ticket.ticket_id}")
-        review_root = self._run_root / "reviews" / f"round-{repair_attempts + 1}"
-        report = ReviewReport(
-            standards=load_review_axis(review_root / "standards.json", "standards"),
-            spec=load_review_axis(review_root / "spec.json", "spec"),
-        )
-        findings = _finding_map(report)
-        if findings:
-            verdict = load_review_verdict(
-                review_root / "verdict.json",
-                candidates=tuple(findings),
-            )
-            if any(
-                findings[finding_id].severity is FindingSeverity.MUST_FIX
-                for finding_id in verdict.accepted
-            ):
-                raise DeliveryError("delivery_result_review_gate_failed")
+        self._revalidate_result_prerequisites(result)
 
     def _publish_result(self, result: DeliveryResult) -> None:
         path = self._run_root / "result.json"
+        self._revalidate_result_prerequisites(result)
         preconditions = self._result_preconditions(result)
         result_payload = {
             "run_id": result.run_id,
@@ -277,6 +242,68 @@ class DeliveryRecoveryMixin:
         )
         if payload != {**result_payload, "result_sha256": _file_sha256(path)}:
             raise DeliveryError("delivery_recovery_conflict:result.publish")
+
+    def _revalidate_result_prerequisites(self, result: DeliveryResult) -> None:
+        plan = load_delivery_plan(self._run_root / "delivery-plan.json")
+        publication = {
+            key: reference.reference for key, reference in self._publish_tracker(plan).items()
+        }
+        if publication != result.tracker_references:
+            raise DeliveryError("delivery_result_tracker_publication_mismatch")
+        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
+        base_commit = self._delivery_base_commit(git)
+        integration = Worktree(
+            self._run_root / "worktrees/integration",
+            result.integration_branch,
+            base_commit,
+        )
+        _validate_worktree_ownership(git, integration.path, integration)
+        _validate_worktree_clean(git, integration.path)
+        if git.head(integration) != result.integration_commit:
+            raise DeliveryError("delivery_recovery_conflict:git.integration")
+        journal = self._require_journal()
+        for ticket in plan.tickets:
+            worktree_record = journal.require_confirmed(f"git:worktree:ticket:{ticket.ticket_id}")
+            ticket_base = worktree_record.get("base_commit")
+            ticket_branch = worktree_record.get("branch")
+            acceptance_intent = journal._intent_details(f"ticket:accept:{ticket.ticket_id}")
+            if (
+                not isinstance(ticket_base, str)
+                or not isinstance(ticket_branch, str)
+                or acceptance_intent is None
+            ):
+                raise DeliveryError("delivery_recovery_conflict:receipt.ticket.accept")
+            ticket_worktree = Worktree(
+                self._run_root / "worktrees" / f"ticket-{ticket.ticket_id}",
+                ticket_branch,
+                ticket_base,
+            )
+            implemented = self._reconcile_ticket_acceptance(
+                plan,
+                ticket,
+                None,
+                ticket_worktree,
+                intent=acceptance_intent,
+            )
+            self._merge_ticket(git, integration, implemented)
+            self._close_ticket(plan, ticket, implemented.receipt)
+        report = self._revalidate_review(
+            plan,
+            integration,
+            result.review_rounds,
+            result.integration_commit,
+        )
+        findings = _finding_map(report)
+        if findings:
+            verdict = load_review_verdict(
+                self._run_root / "reviews" / f"round-{result.review_rounds}" / "verdict.json",
+                candidates=tuple(findings),
+            )
+            if any(
+                findings[finding_id].severity is FindingSeverity.MUST_FIX
+                for finding_id in verdict.accepted
+            ):
+                raise DeliveryError("delivery_result_review_gate_failed")
 
     def _result_preconditions(self, result: DeliveryResult) -> dict[str, object]:
         journal = self._require_journal()
@@ -340,18 +367,43 @@ class DeliveryRecoveryMixin:
             if journal is not None:
                 recorded = journal._intent_details("tracker:publish")
                 spec_url = getattr(self.tracker, "spec_url", None)
+                migration_receipts: dict[str, TicketReceipt] | None = None
                 if recorded is None:
                     markers = tracker_markers(self._run_id, plan)
+                    migration_receipts = self._preflight_legacy_delivery(
+                        plan,
+                        references,
+                        spec_url,
+                        markers,
+                    )
                     recorded = {
                         "markers": markers.payload(),
-                        "migration": {
-                            "spec_url": spec_url,
-                            "tickets": {key: value.reference for key, value in references.items()},
-                        },
+                        "migration": legacy_migration_payload(
+                            self._run_root,
+                            references,
+                            spec_url,
+                            migration_receipts,
+                            file_sha256=_file_sha256,
+                        ),
                     }
                 else:
                     markers = tracker_markers_from_payload(recorded.get("markers"), plan)
                 migration = recorded.get("migration")
+                if migration is not None:
+                    migration_receipts = self._preflight_legacy_delivery(
+                        plan,
+                        references,
+                        spec_url,
+                        markers,
+                    )
+                    if migration != legacy_migration_payload(
+                        self._run_root,
+                        references,
+                        spec_url,
+                        migration_receipts,
+                        file_sha256=_file_sha256,
+                    ):
+                        raise DeliveryError("delivery_recovery_conflict:tracker.publish")
                 apply = (
                     partial(
                         self._adopt_tracker_effect,
@@ -359,6 +411,7 @@ class DeliveryRecoveryMixin:
                         markers,
                         references,
                         spec_url,
+                        migration_receipts,
                     )
                     if migration is not None
                     else partial(self._publish_tracker_effect, plan, markers)
@@ -468,12 +521,14 @@ class DeliveryRecoveryMixin:
         markers: TrackerMarkers,
         references: dict[str, TrackerTicket],
         spec_url: str | None,
+        receipts: dict[str, TicketReceipt] | None,
     ) -> dict[str, object]:
         adopted = self.tracker.adopt(
             plan,
             references=references,
             spec_url=spec_url,
             markers=markers,
+            receipts=receipts,
         )
         if adopted != references:
             raise DeliveryError("delivery_tracker_adoption_conflict")
@@ -482,6 +537,103 @@ class DeliveryRecoveryMixin:
             "spec_url": spec_url,
             "tickets": {key: value.reference for key, value in adopted.items()},
         }
+
+    def _preflight_legacy_delivery(
+        self,
+        plan: DeliveryPlan,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+    ) -> dict[str, TicketReceipt]:
+        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
+        base_commit = self._delivery_base_commit(git)
+        integration_path = self._run_root / "worktrees/integration"
+        integration = Worktree(
+            integration_path,
+            f"ho/{plan.slug}/integration",
+            base_commit,
+        )
+        integration_head: str | None = None
+        if integration_path.exists():
+            _validate_worktree_ownership(git, integration_path, integration)
+            _validate_worktree_clean(git, integration_path)
+            integration_head = git.head(integration)
+            if not git.is_ancestor(integration_path, base_commit, integration_head):
+                raise DeliveryError("delivery_recovery_conflict:git.worktree.create")
+        receipts: dict[str, TicketReceipt] = {}
+        for ticket in plan.tickets:
+            receipt_path = self._run_root / "receipts" / f"ticket-{ticket.ticket_id}.json"
+            worktree_path = self._run_root / "worktrees" / f"ticket-{ticket.ticket_id}"
+            if not receipt_path.is_file() and not worktree_path.exists():
+                continue
+            ticket_worktree = Worktree(
+                worktree_path,
+                f"ho/{plan.slug}/ticket-{ticket.ticket_id}",
+                base_commit,
+            )
+            if not worktree_path.exists():
+                raise DeliveryError("delivery_recovery_conflict:receipt.ticket.accept")
+            _validate_worktree_ownership(git, worktree_path, ticket_worktree)
+            _validate_worktree_clean(git, worktree_path)
+            for harness in self.worker_harnesses:
+                self._preflight_legacy_agent(
+                    worktree_path,
+                    harness,
+                    f"impl-{ticket.ticket_id}",
+                )
+            if not receipt_path.is_file():
+                if git.head(ticket_worktree) != base_commit:
+                    raise DeliveryError("delivery_recovery_conflict:receipt.ticket.accept")
+                continue
+            try:
+                receipt = load_ticket_receipt(receipt_path, ticket)
+            except DeliveryArtifactError as exc:
+                raise DeliveryError("delivery_recovery_conflict:receipt.ticket.accept") from exc
+            if (
+                git.head(ticket_worktree) != receipt.commit
+                or not git.is_ancestor(worktree_path, base_commit, receipt.commit)
+                or integration_head is None
+            ):
+                raise DeliveryError("delivery_recovery_conflict:receipt.ticket.accept")
+            if git.is_ancestor(integration_path, receipt.commit, integration_head):
+                merged = git.find_merge(integration, receipt.commit)
+                if merged is None:
+                    raise DeliveryError("delivery_recovery_conflict:git.integration.merge")
+            receipts[ticket.ticket_id] = receipt
+        self._preflight_legacy_agent(
+            self.config.workspace,
+            self.controller,
+            "plan",
+        )
+        inspect = getattr(self.tracker, "inspect_adoption", None)
+        if not callable(inspect):
+            raise DeliveryError("delivery_tracker_adoption_uninspectable")
+        inspect(
+            plan,
+            references=references,
+            spec_url=spec_url,
+            markers=markers,
+            receipts=receipts,
+        )
+        return receipts
+
+    def _preflight_legacy_agent(
+        self,
+        workspace: Path,
+        harness: Harness,
+        role: str,
+    ) -> None:
+        agent_name = self._delivery_agent_name(workspace, harness, role)
+        try:
+            supported, inspected = self._inspect_delivery_agent(
+                workspace,
+                agent_name,
+                harness,
+            )
+        except TransportError as exc:
+            raise DeliveryError("delivery_recovery_conflict:agent.dispatch") from exc
+        if supported and _agent_is_active(inspected):
+            raise DeliveryError("delivery_recovery_conflict:agent.dispatch")
 
     def _tracker_references_from_effect(
         self,
