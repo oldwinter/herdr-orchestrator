@@ -18,6 +18,7 @@ CLI = REPO_ROOT / "bin/herdr-orchestrator.mjs"
 MANAGER_PACKAGE = REPO_ROOT / "packages/herdr-manager"
 INSTALLER_FAULT_ADAPTER = REPO_ROOT / "tests/installer_fault_adapter.mjs"
 INSTALLER_FAULT_ENV = {
+    "HERDR_ORCHESTRATOR_TEST_FAIL_ON_JOURNAL_CLAIM",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL_PREFIX",
@@ -1955,6 +1956,33 @@ class DistributionCliTests(unittest.TestCase):
                 b"caller-owned temporary bytes\n",
             )
             self.assertTrue((project / ".herdr-orchestrator/manifest.json").is_file())
+
+    def test_noop_install_never_claims_a_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_FAIL_ON_JOURNAL_CLAIM"] = "1"
+
+            repeated = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                env=environment,
+            )
+
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertFalse((project / ".herdr-orchestrator/install-journal.json").exists())
 
     @unittest.skipIf(os.geteuid() == 0, "permission errors require a non-root user")
     def test_upgrade_recovers_after_a_target_directory_write_error(self) -> None:

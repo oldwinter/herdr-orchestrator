@@ -16,6 +16,11 @@ function requestedMutation(name) {
 
 globalThis[ADAPTER] = {
   beforeJournalClaim() {
+    if (
+      process.env.HERDR_ORCHESTRATOR_TEST_FAIL_ON_JOURNAL_CLAIM === "1"
+    ) {
+      throw new Error("installer_test_unexpected_journal_claim");
+    }
     const barrier = process.env.HERDR_ORCHESTRATOR_TEST_JOURNAL_CLAIM_BARRIER;
     if (!barrier) {
       return;

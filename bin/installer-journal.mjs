@@ -1010,7 +1010,6 @@ export function runInstallerTransaction(spec) {
   ) {
     throw new Error("installer_transaction_active");
   }
-  beforeJournalClaim();
   const transactionId = randomUUID();
   const priorInventory = {};
   const desiredInventory = {};
@@ -1094,6 +1093,7 @@ export function runInstallerTransaction(spec) {
       transaction_id: null,
     };
   }
+  beforeJournalClaim();
   publishInitialJournal(project, journal);
   return completeJournal(project, journal, normalizedContext);
 }
