@@ -84,6 +84,7 @@ jobs:
               print(f"security={security_outcome}", file=output)
           PY
       - name: Generate quality review
+        id: summary
         if: always()
         continue-on-error: true
         env:
@@ -111,6 +112,7 @@ jobs:
         env:
           INSTALLER_MATRIX: ${{ steps.installer-matrix.outcome }}
           RESULT_PATH: ${{ steps.bundle.outputs.result }}
+          SUMMARY_STATUS: ${{ steps.summary.outcome }}
         run: |
           set +e
           python3 scripts/quality_bundle.py enforce \
@@ -119,7 +121,8 @@ jobs:
             --require-clean
           quality_status=$?
           set -e
-          printf 'quality=%s installer_matrix=%s\n' "$quality_status" "$INSTALLER_MATRIX"
+          printf 'quality=%s summary=%s installer_matrix=%s\n' "$quality_status" "$SUMMARY_STATUS" "$INSTALLER_MATRIX"
+          test "$SUMMARY_STATUS" = success
           test "$INSTALLER_MATRIX" = success
           exit "$quality_status"
 

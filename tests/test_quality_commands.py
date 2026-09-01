@@ -538,6 +538,14 @@ class QualityCommandTests(unittest.TestCase):
         self.assertIn("INSTALLER_MATRIX: ${{ steps.installer-matrix.outcome }}", workflow)
         self.assertIn('test "$INSTALLER_MATRIX" = success', workflow)
 
+    def test_ci_cannot_hide_a_failed_quality_summary(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        test_job = workflow[workflow.index("  test:\n") : workflow.index("  pr-review:\n")]
+
+        self.assertIn("id: summary", test_job)
+        self.assertIn("SUMMARY_STATUS: ${{ steps.summary.outcome }}", test_job)
+        self.assertIn('test "$SUMMARY_STATUS" = success', test_job)
+
     def test_security_skips_editable_package_and_propagates_pip_audit_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
