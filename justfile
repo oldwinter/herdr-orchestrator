@@ -49,10 +49,10 @@ profile-tests:
     @python3 scripts/quality_bundle.py run --producer profiling
 
 quality-summary result="" output="":
-    @result={{quote(result)}}; if test -z "$result"; then result="$(python3 scripts/quality_bundle.py latest-result)"; fi; output={{quote(output)}}; if test -z "$output"; then output="${result%.json}.md"; fi; python3 scripts/quality_summary.py --result "$result" --output "$output"
+    @result={{quote(result)}}; if test -z "$result"; then result="$(python3 scripts/quality_bundle.py latest-result)"; fi; output={{quote(output)}}; if test -z "$output"; then output="${result%.json}.md"; fi; python3 scripts/quality_summary.py --result "$result" --root .orchestrator/quality --output "$output"
 
 quality-enforce result:
-    @python3 scripts/quality_bundle.py enforce --result {{quote(result)}} --require-full
+    @python3 scripts/quality_bundle.py enforce --root .orchestrator/quality --result {{quote(result)}} --require-full
 
 docs-generate:
     @uv run python scripts/generate_reference.py
@@ -65,7 +65,7 @@ check:
     @uv sync --locked
     @PYTHONPATH=src {{python}} -m compileall -q src tests scripts
     @mkdir -p .orchestrator/quality/results
-    @just test-installer-crash-matrix || installer_status=$?; installer_status=${installer_status:-0}; result="$(mktemp .orchestrator/quality/results/check.XXXXXX.json)"; summary="${result%.json}.md"; set +e; python3 scripts/quality_bundle.py run --all --result "$result"; collect_status=$?; python3 scripts/quality_summary.py --result "$result" --output "$summary"; summary_status=$?; python3 scripts/quality_bundle.py enforce --result "$result" --require-full; enforce_status=$?; set -e; printf 'bundle=%s summary=%s collect=%s render=%s enforce=%s installer=%s\n' "$result" "$summary" "$collect_status" "$summary_status" "$enforce_status" "$installer_status"; if test "$installer_status" -ne 0; then exit "$installer_status"; fi; if test "$enforce_status" -ne 0; then exit "$enforce_status"; fi; if test "$summary_status" -ne 0; then exit "$summary_status"; fi; exit "$collect_status"
+    @just test-installer-crash-matrix || installer_status=$?; installer_status=${installer_status:-0}; result="$(mktemp .orchestrator/quality/results/check.XXXXXX.json)"; summary="${result%.json}.md"; set +e; python3 scripts/quality_bundle.py run --all --root .orchestrator/quality --result "$result"; collect_status=$?; python3 scripts/quality_summary.py --result "$result" --root .orchestrator/quality --output "$summary"; summary_status=$?; python3 scripts/quality_bundle.py enforce --result "$result" --root .orchestrator/quality --require-full; enforce_status=$?; set -e; printf 'bundle=%s summary=%s collect=%s render=%s enforce=%s installer=%s\n' "$result" "$summary" "$collect_status" "$summary_status" "$enforce_status" "$installer_status"; if test "$installer_status" -ne 0; then exit "$installer_status"; fi; if test "$enforce_status" -ne 0; then exit "$enforce_status"; fi; if test "$summary_status" -ne 0; then exit "$summary_status"; fi; exit "$collect_status"
 
 seed:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator seed --workflow {{workflow}}

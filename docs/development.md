@@ -37,6 +37,6 @@ uv run pre-commit install --install-hooks
 uv run pre-commit install --hook-type pre-push
 ```
 
-CI uses the same locked tools, uploads one completed bundle, and posts only its bounded summary on
-pull requests. Manifest enforcement remains independent of summary generation. Do not edit
+CI uses the same locked tools, uploads one completed run-scoped bundle, and posts only its bounded
+summary on pull requests. Manifest enforcement remains independent of summary generation. Do not edit
 `docs/generated/cli.md`; run `just docs-generate`.

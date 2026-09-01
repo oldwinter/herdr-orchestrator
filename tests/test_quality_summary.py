@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -85,6 +87,18 @@ class QualitySummaryTests(unittest.TestCase):
         self.assertIn("**0** medium/high Bandit findings", summary)
         self.assertIn("**0** dependency vulnerabilities", summary)
 
+    def test_npm_findings_cannot_be_reported_as_zero(self) -> None:
+        security = self._complete_security()
+        security["npm-audit-root.json"]["metadata"]["vulnerabilities"].update(
+            {"low": 1, "total": 1}
+        )
+        security["npm-audit-root.json"]["vulnerabilities"] = {"fixture": {}}
+        status, summary = self._run_summary(security_files=security)
+
+        self.assertEqual(status, 1)
+        self.assertIn("Security: **NOT VERIFIED**", summary)
+        self.assertNotIn("**0** dependency vulnerabilities", summary)
+
     def test_wrong_manifest_commit_is_not_verified(self) -> None:
         status, summary = self._run_summary(
             security_files=self._complete_security(),
@@ -133,6 +147,11 @@ class QualitySummaryTests(unittest.TestCase):
             output = root / "summary.md"
             manifest_payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
             with (
+                patch.dict(
+                    quality_summary.quality_bundle.PRODUCER_SPECS,
+                    {spec.name: spec for spec in specs},
+                    clear=True,
+                ),
                 patch.object(
                     sys,
                     "argv",
@@ -148,14 +167,11 @@ class QualitySummaryTests(unittest.TestCase):
                         bundle.path.name,
                         "--expected-source",
                         manifest_payload["source_digest"],
+                        "--root",
+                        str(root / "quality"),
                         "--output",
                         str(output),
                     ],
-                ),
-                patch.object(
-                    quality_summary.quality_bundle,
-                    "PRODUCER_SPECS",
-                    {spec.name: spec for spec in specs},
                 ),
             ):
                 status = quality_summary.main()
@@ -183,6 +199,8 @@ class QualitySummaryTests(unittest.TestCase):
                     "missing-run",
                     "--expected-source",
                     "0" * 64,
+                    "--root",
+                    str(Path(temporary) / "quality"),
                     "--output",
                     str(output),
                 ],
@@ -194,6 +212,40 @@ class QualitySummaryTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("NOT VERIFIED", summary)
         self.assertIn("quality_manifest_missing", summary)
+
+    def test_summary_storage_failure_has_stable_error_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blocked = root / "blocked"
+            blocked.write_text("occupied", encoding="utf-8")
+            output = blocked / "summary.md"
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "quality_summary.py",
+                        "--manifest",
+                        str(root / "missing" / "manifest.json"),
+                        "--expected-commit",
+                        "a" * 40,
+                        "--expected-invocation",
+                        "missing",
+                        "--expected-run",
+                        "missing-run",
+                        "--expected-source",
+                        "0" * 64,
+                        "--output",
+                        str(output),
+                    ],
+                ),
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                status = quality_summary.main()
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stderr.getvalue().strip(), "quality_storage_unavailable")
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_failed_quality_producers_are_not_verified(self) -> None:
         status, summary = self._run_summary(
@@ -213,8 +265,8 @@ class QualitySummaryTests(unittest.TestCase):
         specs[1] = self._json_producer(
             "coverage",
             {
-                "coverage.json": self._coverage_payload(10**1000),
-                "tests.json": self._tests_payload(),
+                "coverage.json": {"totals": {"percent_covered": 10**1000}},
+                "tests.json": {"tests": [{"nodeid": "fixture", "outcome": "passed"}]},
             },
             {"coverage": "coverage.json", "tests": "tests.json"},
         )
@@ -230,6 +282,11 @@ class QualitySummaryTests(unittest.TestCase):
             manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
             output = root / "summary.md"
             with (
+                patch.dict(
+                    quality_summary.quality_bundle.PRODUCER_SPECS,
+                    {spec.name: spec for spec in specs},
+                    clear=True,
+                ),
                 patch.object(
                     sys,
                     "argv",
@@ -245,21 +302,18 @@ class QualitySummaryTests(unittest.TestCase):
                         bundle.path.name,
                         "--expected-source",
                         manifest["source_digest"],
+                        "--root",
+                        str(root / "quality"),
                         "--output",
                         str(output),
                     ],
-                ),
-                patch.object(
-                    quality_summary.quality_bundle,
-                    "PRODUCER_SPECS",
-                    {spec.name: spec for spec in specs},
                 ),
             ):
                 status = quality_summary.main()
             summary = output.read_text(encoding="utf-8")
 
         self.assertEqual(status, 1)
-        self.assertIn("Evidence: **NOT VERIFIED**", summary)
+        self.assertIn("Coverage: **NOT VERIFIED**", summary)
 
     def _run_summary(
         self,
@@ -292,6 +346,11 @@ class QualitySummaryTests(unittest.TestCase):
             output = root / "summary.md"
             manifest_payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
             with (
+                patch.dict(
+                    quality_summary.quality_bundle.PRODUCER_SPECS,
+                    {spec.name: spec for spec in specs},
+                    clear=True,
+                ),
                 patch.object(
                     sys,
                     "argv",
@@ -307,14 +366,11 @@ class QualitySummaryTests(unittest.TestCase):
                         expected_run or bundle.path.name,
                         "--expected-source",
                         manifest_payload["source_digest"],
+                        "--root",
+                        str(root / "quality"),
                         "--output",
                         str(output),
                     ],
-                ),
-                patch.object(
-                    quality_summary.quality_bundle,
-                    "PRODUCER_SPECS",
-                    {spec.name: spec for spec in specs},
                 ),
             ):
                 status = quality_summary.main()
@@ -335,8 +391,27 @@ class QualitySummaryTests(unittest.TestCase):
             cls._json_producer(
                 "coverage",
                 {
-                    "coverage.json": cls._coverage_payload(91.0),
-                    "tests.json": cls._tests_payload(),
+                    "coverage.json": {
+                        "meta": {
+                            "format": 3,
+                            "version": "fixture",
+                            "timestamp": "now",
+                            "branch_coverage": True,
+                            "show_contexts": False,
+                        },
+                        "files": {"fixture.py": {"summary": {"percent_covered": 91.0}}},
+                        "totals": {"percent_covered": 91.0},
+                    },
+                    "tests.json": {
+                        "created": 1.0,
+                        "duration": 0.1,
+                        "exitcode": 0,
+                        "root": "/fixture",
+                        "environment": {},
+                        "collectors": [],
+                        "summary": {"total": 1, "passed": 1, "collected": 1, "deselected": 0},
+                        "tests": [{"nodeid": "fixture", "outcome": "passed"}],
+                    },
                 },
                 {"coverage": "coverage.json", "tests": "tests.json"},
                 exit_code=coverage_exit,
@@ -346,9 +421,9 @@ class QualitySummaryTests(unittest.TestCase):
                 {
                     "stability.json": {
                         "executions": [
-                            {"exit_code": 0, "run": 1, "tests": 1, "duration_seconds": 0.1},
-                            {"exit_code": 0, "run": 2, "tests": 1, "duration_seconds": 0.1},
-                            {"exit_code": 0, "run": 3, "tests": 1, "duration_seconds": 0.1},
+                            {"duration_seconds": 0.1, "exit_code": 0, "run": 1, "tests": 1},
+                            {"duration_seconds": 0.1, "exit_code": 0, "run": 2, "tests": 1},
+                            {"duration_seconds": 0.1, "exit_code": 0, "run": 3, "tests": 1},
                         ],
                         "runs": 3,
                         "status": "passed",
@@ -373,10 +448,10 @@ class QualitySummaryTests(unittest.TestCase):
                 "build",
                 {
                     "build.json": {
-                        "command": "fixture",
+                        "command": "npm pack --dry-run --json",
                         "duration_seconds": 0.1,
-                        "entry_count": 1,
                         "exit_code": 0,
+                        "entry_count": 1,
                         "package_size_bytes": 10,
                         "status": "passed",
                         "unpacked_size_bytes": 20,
@@ -427,7 +502,7 @@ class QualitySummaryTests(unittest.TestCase):
             "bandit.json": {
                 "errors": [],
                 "generated_at": "2026-08-31T00:00:00Z",
-                "metrics": {"_totals": {}},
+                "metrics": {"_totals": {"SEVERITY.HIGH": 0, "SEVERITY.MEDIUM": 0, "loc": 1}},
                 "results": [],
             },
             "pip-audit.json": {
@@ -437,51 +512,47 @@ class QualitySummaryTests(unittest.TestCase):
             "npm-audit-root.json": {
                 "auditReportVersion": 2,
                 "metadata": {
-                    "vulnerabilities": {"total": 0},
-                    "dependencies": {"prod": 0, "dev": 0, "optional": 0},
+                    "vulnerabilities": {
+                        "info": 0,
+                        "low": 0,
+                        "moderate": 0,
+                        "high": 0,
+                        "critical": 0,
+                        "total": 0,
+                    },
+                    "dependencies": {
+                        "prod": 0,
+                        "dev": 0,
+                        "optional": 0,
+                        "peer": 0,
+                        "peerOptional": 0,
+                        "total": 0,
+                    },
                 },
                 "vulnerabilities": {},
             },
             "npm-audit-manager.json": {
                 "auditReportVersion": 2,
                 "metadata": {
-                    "vulnerabilities": {"total": 0},
-                    "dependencies": {"prod": 0, "dev": 0, "optional": 0},
+                    "vulnerabilities": {
+                        "info": 0,
+                        "low": 0,
+                        "moderate": 0,
+                        "high": 0,
+                        "critical": 0,
+                        "total": 0,
+                    },
+                    "dependencies": {
+                        "prod": 0,
+                        "dev": 0,
+                        "optional": 0,
+                        "peer": 0,
+                        "peerOptional": 0,
+                        "total": 0,
+                    },
                 },
                 "vulnerabilities": {},
             },
-        }
-
-    @staticmethod
-    def _coverage_payload(percent: float) -> dict[str, object]:
-        return {
-            "files": {"fixture.py": {"summary": {}}},
-            "meta": {
-                "branch_coverage": True,
-                "format": 3,
-                "show_contexts": False,
-                "timestamp": "2026-08-31T00:00:00",
-                "version": "7.0.0",
-            },
-            "totals": {
-                "covered_lines": 1,
-                "missing_lines": 0,
-                "num_statements": 1,
-                "percent_covered": percent,
-            },
-        }
-
-    @staticmethod
-    def _tests_payload() -> dict[str, object]:
-        return {
-            "collectors": [{"nodeid": "fixture", "outcome": "passed", "result": []}],
-            "created": 0.0,
-            "duration": 0.1,
-            "environment": {},
-            "exitcode": 0,
-            "root": "/tmp/fixture",
-            "summary": {"collected": 1, "deselected": 0, "passed": 1, "total": 1},
-            "tests": [{"nodeid": "fixture", "outcome": "passed"}],
         }
 
     @staticmethod

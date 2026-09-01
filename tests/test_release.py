@@ -214,6 +214,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("Enforce quality manifest", test_job)
         self.assertIn("quality_bundle.py enforce", test_job)
         self.assertIn('test "$SUMMARY_STATUS" = success', test_job)
+        self.assertIn("timeout-minutes: 30", test_job)
         self.assertLess(
             test_job.index("Collect quality bundle"), test_job.index("Generate quality review")
         )

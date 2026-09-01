@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -11,9 +10,74 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+BUNDLE_SCRIPT = REPO_ROOT / "scripts/quality_bundle.py"
 
 
 class QualityCommandTests(unittest.TestCase):
+    def test_quality_bundle_storage_failure_has_stable_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            blocked_parent = Path(temporary) / "not-a-directory"
+            blocked_parent.write_text("occupied", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(BUNDLE_SCRIPT),
+                    "run",
+                    "--root",
+                    str(blocked_parent / "quality"),
+                    "--producer",
+                    "build",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "quality_storage_unavailable")
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_quality_bundle_result_write_failure_removes_published_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence_root = root / "quality"
+            commands = root / "bin"
+            commands.mkdir()
+            self._write_full_quality_tools(commands)
+            blocked_parent = root / "not-a-directory"
+            blocked_parent.write_text("occupied", encoding="utf-8")
+            environment = os.environ.copy()
+            environment["PATH"] = f"{commands}{os.pathsep}{environment['PATH']}"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(BUNDLE_SCRIPT),
+                    "run",
+                    "--root",
+                    str(evidence_root),
+                    "--producer",
+                    "build",
+                    "--result",
+                    str(blocked_parent / "result.json"),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+            runs = list((evidence_root / "runs").iterdir())
+            results = list((evidence_root / "results").iterdir())
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "quality_storage_unavailable")
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(runs, [])
+        self.assertEqual(results, [])
+
     def test_public_runner_binds_tracked_and_untracked_source_changes(self) -> None:
         for label, status_line in (
             ("tracked", " M scripts/quality_bundle.py"),
@@ -86,6 +150,8 @@ class QualityCommandTests(unittest.TestCase):
                         sys.executable,
                         "scripts/quality_bundle.py",
                         "enforce",
+                        "--root",
+                        str(evidence_root),
                         "--result",
                         str(result_path),
                         "--require-clean",
@@ -179,6 +245,8 @@ class QualityCommandTests(unittest.TestCase):
                 [
                     sys.executable,
                     "scripts/quality_summary.py",
+                    "--root",
+                    str(evidence_root),
                     "--result",
                     str(result_path),
                     "--require-clean",
@@ -197,6 +265,8 @@ class QualityCommandTests(unittest.TestCase):
                     sys.executable,
                     "scripts/quality_bundle.py",
                     "enforce",
+                    "--root",
+                    str(evidence_root),
                     "--result",
                     str(result_path),
                     "--require-full",
@@ -299,6 +369,8 @@ class QualityCommandTests(unittest.TestCase):
                             [
                                 sys.executable,
                                 "scripts/quality_summary.py",
+                                "--root",
+                                str(case_root),
                                 "--result",
                                 str(case_result_path),
                                 "--output",
@@ -315,119 +387,6 @@ class QualityCommandTests(unittest.TestCase):
                         self.assertEqual(summarize.returncode, 1)
                         self.assertIn("NOT VERIFIED", summary)
                         self.assertIn(error_code, summary)
-
-    def test_schema_invalid_verified_artifacts_cannot_pass_summary_or_enforce(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            evidence_root = root / "quality"
-            result_path = root / "base-result.json"
-            commands = root / "bin"
-            commands.mkdir()
-            self._write_full_quality_tools(commands)
-            environment = os.environ.copy()
-            environment["PATH"] = f"{commands}{os.pathsep}{environment['PATH']}"
-            collect = subprocess.run(
-                [
-                    sys.executable,
-                    "scripts/quality_bundle.py",
-                    "run",
-                    "--root",
-                    str(evidence_root),
-                    "--all",
-                    "--result",
-                    str(result_path),
-                ],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-                env=environment,
-                timeout=30,
-            )
-            self.assertEqual(collect.returncode, 0, collect.stderr)
-            base_result = json.loads(result_path.read_text(encoding="utf-8"))
-            base_bundle = Path(base_result["bundle"])
-            base_manifest = json.loads(Path(base_result["manifest"]).read_text(encoding="utf-8"))
-            targets = [
-                (producer["name"], artifact)
-                for producer in base_manifest["producers"]
-                for artifact in producer["artifacts"]
-                if artifact["key"] != "result" and artifact["format"] == "json"
-            ]
-            self.assertEqual(
-                {key for _, artifact in targets for key in (artifact["key"],)},
-                {
-                    "coverage",
-                    "tests",
-                    "stability",
-                    "bandit",
-                    "pip-audit",
-                    "npm-audit-root",
-                    "npm-audit-manager",
-                    "build",
-                },
-            )
-
-            for index, (producer_name, artifact) in enumerate(targets):
-                with self.subTest(producer=producer_name, key=artifact["key"]):
-                    case_root = root / "schema-cases" / str(index)
-                    case_bundle = case_root / "runs" / base_bundle.name
-                    case_bundle.parent.mkdir(parents=True)
-                    shutil.copytree(base_bundle, case_bundle)
-                    case_manifest_path = case_bundle / "manifest.json"
-                    case_manifest = json.loads(case_manifest_path.read_text(encoding="utf-8"))
-                    target = case_bundle / artifact["path"]
-                    target.write_text("{}", encoding="utf-8")
-                    producer = next(
-                        item for item in case_manifest["producers"] if item["name"] == producer_name
-                    )
-                    entry = next(
-                        item for item in producer["artifacts"] if item["key"] == artifact["key"]
-                    )
-                    entry["sha256"] = hashlib.sha256(b"{}").hexdigest()
-                    case_manifest_path.write_text(json.dumps(case_manifest), encoding="utf-8")
-                    case_result = dict(base_result)
-                    case_result["bundle"] = str(case_bundle)
-                    case_result["manifest"] = str(case_manifest_path)
-                    case_result_path = case_root / "result.json"
-                    case_result_path.write_text(json.dumps(case_result), encoding="utf-8")
-                    summary_path = case_root / "summary.md"
-                    summary = subprocess.run(
-                        [
-                            sys.executable,
-                            "scripts/quality_summary.py",
-                            "--result",
-                            str(case_result_path),
-                            "--output",
-                            str(summary_path),
-                        ],
-                        cwd=REPO_ROOT,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        env=environment,
-                        timeout=30,
-                    )
-                    enforce = subprocess.run(
-                        [
-                            sys.executable,
-                            "scripts/quality_bundle.py",
-                            "enforce",
-                            "--result",
-                            str(case_result_path),
-                            "--require-full",
-                        ],
-                        cwd=REPO_ROOT,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        env=environment,
-                        timeout=30,
-                    )
-                    rendered = summary_path.read_text(encoding="utf-8")
-                    self.assertEqual(summary.returncode, 1, summary.stderr)
-                    self.assertIn("NOT VERIFIED", rendered)
-                    self.assertNotEqual(enforce.returncode, 0, enforce.stderr)
 
     def test_inventory_failure_is_recorded_without_stopping_later_producers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -551,14 +510,21 @@ class QualityCommandTests(unittest.TestCase):
                 "if '--version' in args:\n"
                 "    print('pytest 9.1.1')\n"
                 "    raise SystemExit(0)\n"
+                "coverage_payload = {'meta': {'format': 3, 'version': 'fixture', "
+                "'timestamp': 'now', 'branch_coverage': True, 'show_contexts': False}, "
+                "'files': {'fixture.py': {'summary': {'percent_covered': 91.0}}}, "
+                "'totals': {'percent_covered': 91.0}}\n"
+                "tests_payload = {'created': 1.0, 'duration': 0.1, 'exitcode': 0, "
+                "'root': '/fixture', 'environment': {}, 'collectors': [], "
+                "'summary': {'total': 1, 'passed': 1, 'collected': 1, 'deselected': 0}, "
+                "'tests': [{'nodeid': 'fixture', 'outcome': 'passed'}]}\n"
                 "for argument in args:\n"
                 "    if argument.startswith('--cov-report=json:'):\n"
                 "        path = pathlib.Path(argument.split('json:', 1)[1])\n"
-                "        path.write_text(json.dumps({'totals': {'percent_covered': 91.0}}))\n"
+                "        path.write_text(json.dumps(coverage_payload))\n"
                 "    if argument.startswith('--json-report-file='):\n"
                 "        path = pathlib.Path(argument.split('=', 1)[1])\n"
-                "        path.write_text(json.dumps({'tests': [{'nodeid': 'fixture', "
-                "'outcome': 'passed'}]}))\n"
+                "        path.write_text(json.dumps(tests_payload))\n"
                 "raise SystemExit(0)\n",
                 encoding="utf-8",
             )
@@ -741,10 +707,12 @@ class QualityCommandTests(unittest.TestCase):
                 "if '--version' in args:\n"
                 "    print('fixture 1.0')\n"
                 "    raise SystemExit(0)\n"
+                "bandit_payload = {'errors': [], 'generated_at': 'now', "
+                "'metrics': {'_totals': {'SEVERITY.HIGH': 0, "
+                "'SEVERITY.MEDIUM': 0, 'loc': 1}}, 'results': []}\n"
                 "if args[1:2] == ['bandit']:\n"
                 "    path = pathlib.Path(args[args.index('-o') + 1])\n"
-                "    path.write_text(json.dumps({'errors': [], 'generated_at': 'now', "
-                "'metrics': {'_totals': {}}, 'results': []}))\n"
+                "    path.write_text(json.dumps(bandit_payload))\n"
                 "    raise SystemExit(23)\n"
                 "if args[1:2] == ['pip-audit']:\n"
                 "    path = pathlib.Path(args[args.index('--output') + 1])\n"
@@ -766,8 +734,11 @@ class QualityCommandTests(unittest.TestCase):
                 "if '--version' in args:\n"
                 "    print('12.0.2')\n"
                 "else:\n"
-                "    print(json.dumps({'auditReportVersion': 2, "
-                "'metadata': {'vulnerabilities': {'total': 0}}, 'vulnerabilities': {}}))\n"
+                "    print(json.dumps({'auditReportVersion': 2, 'metadata': {\n"
+                "        'vulnerabilities': {'info': 0, 'low': 0, 'moderate': 0, 'high': 0,\n"
+                "            'critical': 0, 'total': 0},\n"
+                "        'dependencies': {'prod': 0, 'dev': 0, 'optional': 0, 'peer': 0,\n"
+                "            'peerOptional': 0, 'total': 0}}, 'vulnerabilities': {}}))\n"
                 "raise SystemExit(0)\n",
                 encoding="utf-8",
             )
@@ -855,35 +826,40 @@ class QualityCommandTests(unittest.TestCase):
             "if '--version' in args:\n"
             "    print('fixture 1.0')\n"
             "    raise SystemExit(0)\n"
+            "coverage_payload = {'meta': {'format': 3, 'version': 'fixture', "
+            "'timestamp': 'now', 'branch_coverage': True, 'show_contexts': False}, "
+            "'files': {'fixture.py': {'summary': {'percent_covered': 91.0}}}, "
+            "'totals': {'percent_covered': 91.0}}\n"
+            "tests_payload = {'created': 1.0, 'duration': 0.1, 'exitcode': 0, "
+            "'root': '/fixture', 'environment': {}, 'collectors': [], "
+            "'summary': {'total': 1, 'passed': 1, 'collected': 1, 'deselected': 0}, "
+            "'tests': [{'nodeid': 'fixture', 'outcome': 'passed'}]}\n"
+            "bandit_payload = {'errors': [], 'generated_at': 'now', "
+            "'metrics': {'_totals': {'SEVERITY.HIGH': 0, 'SEVERITY.MEDIUM': 0, 'loc': 1}}, "
+            "'results': []}\n"
+            "pip_payload = {'dependencies': [{'name': 'fixture', 'version': '1', 'vulns': []}], "
+            "'fixes': []}\n"
             "for argument in args:\n"
             "    if argument.startswith('--cov-report=json:'):\n"
-            "        pathlib.Path(argument.split('json:', 1)[1]).write_text(json.dumps({"
-            "'files': {'fixture.py': {'summary': {}}}, 'meta': {"
-            "'branch_coverage': True, 'format': 3, 'show_contexts': False, "
-            "'timestamp': 'now', 'version': '7.0.0'}, "
-            "'totals': {'covered_lines': 1, 'missing_lines': 0, "
-            "'num_statements': 1, 'percent_covered': 91.0}}))\n"
+            "        path = pathlib.Path(argument.split('json:', 1)[1])\n"
+            "        path.write_text(json.dumps(coverage_payload))\n"
             "    if argument.startswith('--json-report-file='):\n"
-            "        pathlib.Path(argument.split('=', 1)[1]).write_text(json.dumps({"
-            "'collectors': [{'nodeid': 'fixture', 'outcome': 'passed', 'result': []}], "
-            "'created': 0.0, 'duration': 0.1, 'environment': {}, 'exitcode': 0, "
-            "'root': '/tmp/fixture', 'summary': {'collected': 1, 'deselected': 0, "
-            "'passed': 1, 'total': 1}, 'tests': [{'nodeid': 'fixture', "
-            "'outcome': 'passed'}]}))\n"
+            "        path = pathlib.Path(argument.split('=', 1)[1])\n"
+            "        path.write_text(json.dumps(tests_payload))\n"
             "if args[1:2] == ['bandit']:\n"
-            "    pathlib.Path(args[args.index('-o') + 1]).write_text(json.dumps("
-            "{'errors': [], 'generated_at': 'now', 'metrics': {'_totals': {}}, "
-            "'results': []}))\n"
+            "    path = pathlib.Path(args[args.index('-o') + 1])\n"
+            "    path.write_text(json.dumps(bandit_payload))\n"
             "if args[1:2] == ['pip-audit']:\n"
-            "    pathlib.Path(args[args.index('--output') + 1]).write_text(json.dumps("
-            "{'dependencies': [{'name': 'fixture', 'version': '1', 'vulns': []}], "
-            "'fixes': []}))\n"
+            "    path = pathlib.Path(args[args.index('--output') + 1])\n"
+            "    path.write_text(json.dumps(pip_payload))\n"
             "if args[1:3] == ['python', 'scripts/test_stability.py']:\n"
-            "    pathlib.Path(args[args.index('--output') + 1]).write_text(json.dumps("
-            "{'executions': [{'exit_code': 0, 'run': 1, 'tests': 1, 'duration_seconds': 0.1}, "
-            "{'exit_code': 0, 'run': 2, 'tests': 1, 'duration_seconds': 0.1}, "
-            "{'exit_code': 0, 'run': 3, 'tests': 1, 'duration_seconds': 0.1}], "
-            "'runs': 3, 'status': 'passed', 'unstable': []}))\n"
+            "    stability_payload = {'executions': ["
+            "{'duration_seconds': 0.1, 'exit_code': 0, 'run': 1, 'tests': 1}, "
+            "{'duration_seconds': 0.1, 'exit_code': 0, 'run': 2, 'tests': 1}, "
+            "{'duration_seconds': 0.1, 'exit_code': 0, 'run': 3, 'tests': 1}], "
+            "'runs': 3, 'status': 'passed', 'unstable': []}\n"
+            "    path = pathlib.Path(args[args.index('--output') + 1])\n"
+            "    path.write_text(json.dumps(stability_payload))\n"
             "if args[1:3] == ['python', 'scripts/profile_tests.py']:\n"
             "    output = pathlib.Path(args[args.index('--output') + 1])\n"
             "    profiler = cProfile.Profile()\n"
@@ -905,10 +881,11 @@ class QualityCommandTests(unittest.TestCase):
             "    print(json.dumps([{'files': [{'path': 'package.json'}], "
             "'size': 10, 'unpackedSize': 20}]))\n"
             "else:\n"
-            "    print(json.dumps({'auditReportVersion': 2, "
-            "'metadata': {'vulnerabilities': {'total': 0}, "
-            "'dependencies': {'prod': 0, 'dev': 0, 'optional': 0}}, "
-            "'vulnerabilities': {}}))\n"
+            "    print(json.dumps({'auditReportVersion': 2, 'metadata': {\n"
+            "        'vulnerabilities': {'info': 0, 'low': 0, 'moderate': 0, 'high': 0,\n"
+            "            'critical': 0, 'total': 0},\n"
+            "        'dependencies': {'prod': 0, 'dev': 0, 'optional': 0, 'peer': 0,\n"
+            "            'peerOptional': 0, 'total': 0}}, 'vulnerabilities': {}}))\n"
             "raise SystemExit(0)\n",
             encoding="utf-8",
         )

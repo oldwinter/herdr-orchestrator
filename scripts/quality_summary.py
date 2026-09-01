@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -186,6 +188,15 @@ def _security(artifact: Artifact, label: str) -> tuple[str, int | None, str | No
         ):
             return "unavailable", None, "completion metadata missing"
         return ("failed", len(results), "findings") if results else ("passed", 0, None)
+    if label == "npm":
+        metadata = artifact.payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return "unavailable", None, "metadata missing"
+        counts = metadata.get("vulnerabilities")
+        if not isinstance(counts, dict) or not _integer(counts.get("total")):
+            return "unavailable", None, "vulnerability counts missing"
+        total = counts["total"]
+        return ("failed", total, "vulnerabilities") if total else ("passed", 0, None)
     dependencies = artifact.payload.get("dependencies")
     if not isinstance(dependencies, list):
         return "unavailable", None, "dependencies missing"
@@ -209,15 +220,25 @@ def _security(artifact: Artifact, label: str) -> tuple[str, int | None, str | No
     return ("failed", count, "vulnerabilities") if count else ("passed", 0, None)
 
 
-def _security_line(bandit: Artifact, audit: Artifact) -> tuple[str, str]:
+def _security_line(
+    bandit: Artifact,
+    audit: Artifact,
+    npm_audits: Sequence[Artifact] = (),
+) -> tuple[str, str]:
     bandit_status, bandit_count, bandit_detail = _security(bandit, "bandit")
     audit_status, audit_count, audit_detail = _security(audit, "audit")
-    if bandit_status == "passed" and audit_status == "passed":
+    npm_results = [_security(artifact, "npm") for artifact in npm_audits]
+    if (
+        bandit_status == "passed"
+        and audit_status == "passed"
+        and all(status == "passed" for status, _, _ in npm_results)
+    ):
         assert bandit_count is not None and audit_count is not None
+        npm_count = sum(count or 0 for _, count, _ in npm_results)
         return (
             "passed",
             f"- Security: **{bandit_count}** medium/high Bandit findings, "
-            f"**{audit_count}** dependency vulnerabilities",
+            f"**{audit_count + npm_count}** dependency vulnerabilities",
         )
     details: list[str] = []
     if bandit_count is not None:
@@ -228,15 +249,26 @@ def _security_line(bandit: Artifact, audit: Artifact) -> tuple[str, str]:
         details.append(f"{audit_count} dependency vulnerabilities")
     if audit_detail is not None:
         details.append(f"pip-audit: {audit_detail}")
-    status = "failed" if "failed" in (bandit_status, audit_status) else "unavailable"
+    for index, (_status, count, detail) in enumerate(npm_results, 1):
+        if count is not None:
+            details.append(f"npm audit {index}: {count} dependency vulnerabilities")
+        if detail is not None:
+            details.append(f"npm audit {index}: {detail}")
+    statuses = (bandit_status, audit_status, *(status for status, _, _ in npm_results))
+    status = "failed" if "failed" in statuses else "unavailable"
     label = status.upper() if status == "failed" else status
-    if status == "unavailable" or "unavailable" in (bandit_status, audit_status):
+    if status == "unavailable" or "unavailable" in statuses:
         details.insert(0, "incomplete evidence")
     return status, f"- Security: **{label}** ({'; '.join(details)})"
 
 
 def _not_verified(label: str, detail: str) -> tuple[str, str]:
     return "not_verified", f"- {label}: **NOT VERIFIED** ({detail})"
+
+
+def _write_output(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 def _manifest_artifact(producer: object, key: str) -> Artifact:
@@ -275,6 +307,10 @@ def _render_manifest(manifest: object) -> tuple[int, str]:
             status, line = _security_line(
                 _manifest_artifact(producer, "bandit"),
                 _manifest_artifact(producer, "pip-audit"),
+                (
+                    _manifest_artifact(producer, "npm-audit-root"),
+                    _manifest_artifact(producer, "npm-audit-manager"),
+                ),
             )
         else:
             status, line = "passed", f"- {label}: **verified**"
@@ -306,14 +342,22 @@ def main() -> int:
     parser.add_argument("--expected-run")
     parser.add_argument("--expected-source")
     parser.add_argument("--require-clean", action="store_true")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(
+            os.environ.get("QUALITY_EVIDENCE_ROOT", quality_bundle.ROOT / ".orchestrator/quality")
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.result is not None:
-            result = quality_bundle.load_run_result(args.result)
+            result = quality_bundle.load_run_result(args.result, expected_root=args.root)
             manifest = quality_bundle.load_manifest_from_result(
                 result,
                 require_clean=args.require_clean,
+                expected_root=args.root,
             )
         else:
             expectations = (
@@ -331,25 +375,32 @@ def main() -> int:
                 expected_run_id=args.expected_run,
                 expected_source_digest=args.expected_source,
                 require_clean=args.require_clean,
+                expected_root=args.root,
             )
     except quality_bundle.QualityBundleError as error:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(
-            "\n".join(
-                (
-                    "## Automated quality review",
-                    "",
-                    f"- Evidence: **NOT VERIFIED** ({error})",
-                    "",
-                )
-            ),
-            encoding="utf-8",
-        )
+        try:
+            _write_output(
+                args.output,
+                "\n".join(
+                    (
+                        "## Automated quality review",
+                        "",
+                        f"- Evidence: **NOT VERIFIED** ({error})",
+                        "",
+                    )
+                ),
+            )
+        except (OSError, RuntimeError):
+            print("quality_storage_unavailable", file=sys.stderr)
+            return 2
         print(args.output)
         return 1
     status, summary = _render_manifest(manifest)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(summary, encoding="utf-8")
+    try:
+        _write_output(args.output, summary)
+    except (OSError, RuntimeError):
+        print("quality_storage_unavailable", file=sys.stderr)
+        return 2
     print(args.output)
     return status
 

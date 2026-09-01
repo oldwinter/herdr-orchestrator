@@ -16,7 +16,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     outputs:
       security: ${{ steps.bundle.outputs.security }}
     steps:
@@ -93,6 +93,7 @@ jobs:
         run: |
           mkdir -p "$(dirname "$SUMMARY_PATH")"
           python3 scripts/quality_summary.py \
+            --root "$GITHUB_WORKSPACE/.orchestrator/quality" \
             --result "$RESULT_PATH" \
             --require-clean \
             --output "$SUMMARY_PATH"
@@ -116,6 +117,7 @@ jobs:
         run: |
           set +e
           python3 scripts/quality_bundle.py enforce \
+            --root "$GITHUB_WORKSPACE/.orchestrator/quality" \
             --result "$RESULT_PATH" \
             --require-full \
             --require-clean

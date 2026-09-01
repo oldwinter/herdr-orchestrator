@@ -22,10 +22,16 @@ from pathlib import Path
 from typing import Literal, cast
 
 try:
-    from scripts import quality_validation
-except ImportError:
-    sys.path.insert(0, str(Path(__file__).parent))
-    import quality_validation
+    import quality_storage as _quality_storage
+    import quality_validation as _quality_validation
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import quality_storage as _quality_storage
+    import quality_validation as _quality_validation
+
+QualityBundleError = _quality_validation.QualityBundleError
+_inventory_digest = _quality_validation.inventory_digest
+_validate_artifact_payload = _quality_validation.validate_artifact_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
@@ -34,12 +40,7 @@ NAME = re.compile(r"[a-z][a-z0-9-]*")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 OUTPUT_DIRECTORY = "${QUALITY_OUTPUT_DIR}"
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
-EMPTY_INPUT_SHA256 = hashlib.sha256(b"").hexdigest()
-SOURCE_PROBE_FAILURE_SHA256 = hashlib.sha256(b"quality_source_probe_unavailable").hexdigest()
-
-
-class QualityBundleError(ValueError):
-    """A stable quality-bundle contract failure."""
+COMMAND_TIMEOUT_SECONDS = 1800
 
 
 @dataclass(frozen=True)
@@ -126,15 +127,6 @@ class QualityManifest:
 
 
 @dataclass(frozen=True)
-class ArtifactSnapshot:
-    data: bytes
-    device: int
-    inode: int
-    size: int
-    modified_ns: int
-
-
-@dataclass(frozen=True)
 class CommandInvocation:
     argv: tuple[str, ...]
     input_count: int
@@ -149,15 +141,6 @@ class ValidatedCommand:
     exit_code: int
     started_at: datetime
     ended_at: datetime
-
-
-def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate_json_key")
-        result[key] = value
-    return result
 
 
 def _utc_now() -> str:
@@ -220,96 +203,11 @@ def _artifact_path(output_dir: Path, spec: ArtifactSpec) -> Path:
     return path
 
 
-def _snapshot_signature(metadata: os.stat_result) -> tuple[int, int, int, int]:
-    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
-
-
-def _artifact_snapshot(path: Path) -> ArtifactSnapshot:
-    if path.is_symlink():
-        raise QualityBundleError("quality_artifact_path_invalid")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise QualityBundleError("quality_artifact_missing") from error
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_ARTIFACT_BYTES:
-            raise QualityBundleError("quality_artifact_invalid")
-        chunks: list[bytes] = []
-        remaining = MAX_ARTIFACT_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-        after = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
-        current = path.lstat()
-    except OSError as error:
-        raise QualityBundleError("quality_artifact_changed") from error
-    signature = _snapshot_signature(before)
-    if len(data) > MAX_ARTIFACT_BYTES or signature != _snapshot_signature(after):
-        raise QualityBundleError("quality_artifact_changed")
-    if signature != _snapshot_signature(current):
-        raise QualityBundleError("quality_artifact_changed")
-    return ArtifactSnapshot(data, *signature)
-
-
-def _assert_artifact_unchanged(path: Path, snapshot: ArtifactSnapshot) -> None:
-    try:
-        current = path.lstat()
-    except OSError as error:
-        raise QualityBundleError("quality_artifact_changed") from error
-    expected = (snapshot.device, snapshot.inode, snapshot.size, snapshot.modified_ns)
-    if _snapshot_signature(current) != expected:
-        raise QualityBundleError("quality_artifact_changed")
-
-
-def _parse_artifact_bytes(data: bytes, parser: str) -> dict[str, object] | None:
-    if parser == "json":
-        try:
-            text = data.decode("utf-8")
-            payload = json.loads(text, object_pairs_hook=_object_without_duplicates)
-        except (UnicodeError, ValueError, RecursionError) as error:
-            raise QualityBundleError("quality_artifact_invalid") from error
-        if not isinstance(payload, dict):
-            raise QualityBundleError("quality_artifact_invalid")
-        return payload
-    if parser == "nonempty":
-        if not data:
-            raise QualityBundleError("quality_artifact_invalid")
-        return None
-    if parser == "pstats":
-        import pstats
-
-        descriptor, temporary = tempfile.mkstemp(prefix="quality-profile-", suffix=".pstats")
-        try:
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(data)
-            pstats.Stats(temporary)
-        except (EOFError, OSError, TypeError, ValueError) as error:
-            raise QualityBundleError("quality_artifact_invalid") from error
-        finally:
-            with suppress(FileNotFoundError):
-                os.unlink(temporary)
-        return None
-    raise QualityBundleError("quality_artifact_parser_invalid")
-
-
-def _inspect_artifact(
-    path: Path,
-    parser: str,
-) -> tuple[str, dict[str, object] | None, bytes]:
-    snapshot = _artifact_snapshot(path)
-    digest = hashlib.sha256(snapshot.data).hexdigest()
-    payload = _parse_artifact_bytes(snapshot.data, parser)
-    _assert_artifact_unchanged(path, snapshot)
-    return digest, payload, snapshot.data
+_object_without_duplicates = _quality_storage.object_without_duplicates
+_artifact_snapshot = _quality_storage.artifact_snapshot
+_assert_artifact_unchanged = _quality_storage.assert_artifact_unchanged
+_parse_artifact_bytes = _quality_storage.parse_artifact_bytes
+_inspect_artifact = _quality_storage.inspect_artifact
 
 
 def _tool_version(command: CommandSpec) -> tuple[str, bool]:
@@ -352,7 +250,7 @@ def _tracked_files() -> tuple[str, ...]:
 def _expanded_argv(command: CommandSpec, output_dir: Path) -> CommandInvocation:
     argv = tuple(argument.replace(OUTPUT_DIRECTORY, str(output_dir)) for argument in command.argv)
     inputs = _tracked_files() if command.include_tracked_files else ()
-    return CommandInvocation((*argv, *inputs), len(inputs), quality_validation.input_digest(inputs))
+    return CommandInvocation((*argv, *inputs), len(inputs), _inventory_digest(inputs))
 
 
 def _claim_run_directory(pending: Path, final: Path) -> None:
@@ -393,7 +291,6 @@ def run_quality(
     final = runs_root / run_id
     _claim_run_directory(pending, final)
     (pending / "producers").mkdir()
-
     started_at = _utc_now()
     producer_payloads: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -409,12 +306,8 @@ def run_quality(
         publish_dir.mkdir()
         environment = os.environ.copy()
         environment["QUALITY_OUTPUT_DIR"] = str(work_dir)
-        source_path = str(ROOT / "src")
-        existing_pythonpath = environment.get("PYTHONPATH")
-        environment["PYTHONPATH"] = (
-            f"{source_path}{os.pathsep}{existing_pythonpath}"
-            if existing_pythonpath
-            else source_path
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(ROOT / "src"), environment.get("PYTHONPATH")))
         )
         producer_started = _utc_now()
         commands: list[dict[str, object]] = []
@@ -432,7 +325,7 @@ def run_quality(
                 error_code = str(error)
                 exit_code = 1
             else:
-                stdout_path: Path | None = None
+                stdout_path = None
                 stdout = None
                 if command.stdout_artifact is not None:
                     stdout_path = work_dir / command.stdout_artifact
@@ -446,8 +339,12 @@ def run_quality(
                             env=environment,
                             stdout=stdout,
                             check=False,
+                            timeout=COMMAND_TIMEOUT_SECONDS,
                         )
                         exit_code = result.returncode
+                    except subprocess.TimeoutExpired:
+                        exit_code = 124
+                        error_code = "quality_command_timeout"
                     except OSError:
                         exit_code = 127
                         error_code = "quality_command_unavailable"
@@ -466,6 +363,10 @@ def run_quality(
                 "argv_count": len(invocation.argv),
                 "ended_at": command_ended,
                 "exit_code": exit_code,
+                "executed_argv": [
+                    argument.replace(str(work_dir), OUTPUT_DIRECTORY)
+                    for argument in invocation.argv
+                ],
                 "input_count": invocation.input_count,
                 "input_sha256": invocation.input_sha256,
                 "outcome": "passed" if command_passed else "failed",
@@ -476,19 +377,44 @@ def run_quality(
             if error_code is not None:
                 command_payload["error_code"] = error_code
             commands.append(command_payload)
-
         parsed_artifacts: list[tuple[ArtifactSpec, bytes, str]] = []
+        expected_exit_code = next(
+            (
+                command["exit_code"]
+                for command in commands
+                if isinstance(command.get("exit_code"), int)
+            ),
+            None,
+        )
+        expected_branch = _quality_validation.expected_branch_coverage(producer.commands)
         for artifact in producer.artifacts:
             try:
                 path = _artifact_path(work_dir, artifact)
-                digest, _, data = _inspect_artifact(path, artifact.parser)
+                digest, payload, data = _inspect_artifact(path, artifact.parser)
+                if artifact.parser == "json":
+                    if payload is None:
+                        raise QualityBundleError("quality_artifact_invalid")
+                    _validate_artifact_payload(
+                        producer.name,
+                        artifact.key,
+                        payload,
+                        expected_runs=_quality_validation.expected_runs(producer.commands),
+                        expected_exit_code=(
+                            expected_exit_code
+                            if artifact.key in {"tests", "stability", "build"}
+                            else None
+                        ),
+                        expected_branch=expected_branch,
+                    )
+                    if _quality_validation.finding_count(artifact.key, payload):
+                        producer_passed = False
+                        bundle_exit_code = bundle_exit_code or 1
             except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
                 producer_passed = False
                 if bundle_exit_code == 0:
                     bundle_exit_code = 1
                 continue
             parsed_artifacts.append((artifact, data, digest))
-
         producer_ended = _utc_now()
         result_exit_code = next(
             (
@@ -542,15 +468,14 @@ def run_quality(
         shutil.rmtree(work_dir)
         producer_payloads.append(producer_payload)
         all_passed = all_passed and producer_passed
-
     source_consistent = True
     ending_source_digest = source.digest
     if source_probe is not None:
         try:
             ending_source = source_probe()
-        except QualityBundleError:
+        except (QualityBundleError, OSError, RuntimeError):
             source_consistent = False
-            ending_source_digest = SOURCE_PROBE_FAILURE_SHA256
+            ending_source_digest = _quality_validation.SOURCE_PROBE_FAILURE_SHA256
         else:
             ending_source_digest = ending_source.digest
             source_consistent = ending_source == source
@@ -558,7 +483,6 @@ def run_quality(
         all_passed = False
         if bundle_exit_code == 0:
             bundle_exit_code = 1
-
     manifest = {
         "commit": commit.lower(),
         "completed_at": _utc_now(),
@@ -616,6 +540,7 @@ def _validate_command(payload: object) -> ValidatedCommand:
     if not isinstance(payload, dict):
         raise QualityBundleError("quality_producer_invalid")
     argv = payload.get("argv")
+    executed_argv = payload.get("executed_argv")
     exit_code = payload.get("exit_code")
     outcome_value = payload.get("outcome")
     argv_count = payload.get("argv_count")
@@ -626,8 +551,12 @@ def _validate_command(payload: object) -> ValidatedCommand:
         not isinstance(argv, list)
         or not argv
         or not all(isinstance(argument, str) and argument for argument in argv)
+        or not isinstance(executed_argv, list)
+        or not executed_argv
+        or not all(isinstance(argument, str) and argument for argument in executed_argv)
         or not isinstance(exit_code, int)
         or isinstance(exit_code, bool)
+        or not isinstance(outcome_value, str)
         or outcome_value not in {"passed", "failed"}
         or not isinstance(argv_count, int)
         or isinstance(argv_count, bool)
@@ -651,6 +580,33 @@ def _validate_command(payload: object) -> ValidatedCommand:
     return ValidatedCommand(tool, tool_version, outcome, exit_code, started_at, ended_at)
 
 
+def _validate_command_contract(payload: object, expected: CommandSpec) -> ValidatedCommand:
+    validated = _validate_command(payload)
+    if not isinstance(payload, dict):
+        raise QualityBundleError("quality_command_mismatch")
+    input_count = payload.get("input_count")
+    inputs: tuple[str, ...] = ()
+    if expected.include_tracked_files:
+        if "--" not in expected.argv:
+            raise QualityBundleError("quality_command_mismatch")
+        inputs = tuple(_tracked_files())
+        expected_input_count = len(inputs)
+        expected_input_sha256 = _inventory_digest(inputs)
+    else:
+        expected_input_count = 0
+        expected_input_sha256 = _quality_validation.EMPTY_INPUT_SHA256
+    if (
+        tuple(payload.get("argv", ())) != expected.argv
+        or payload.get("tool") != expected.tool
+        or tuple(payload.get("executed_argv", ())) != (*expected.argv, *inputs)
+        or payload.get("argv_count") != len(expected.argv) + expected_input_count
+        or input_count != expected_input_count
+        or payload.get("input_sha256") != expected_input_sha256
+    ):
+        raise QualityBundleError("quality_command_mismatch")
+    return validated
+
+
 def load_completed_manifest(
     path: Path,
     *,
@@ -660,6 +616,8 @@ def load_completed_manifest(
     expected_source_digest: str,
     require_clean: bool = False,
     expected_specs: Sequence[ProducerSpec] | None = None,
+    source_probe: Callable[[], SourceIdentity] | None = None,
+    expected_root: Path | None = None,
 ) -> QualityManifest:
     """Parse and verify one atomically published manifest and its artifacts."""
     if path.is_symlink() or not path.is_file() or path.name != "manifest.json":
@@ -667,7 +625,6 @@ def load_completed_manifest(
     payload = _json_object(path, "quality_manifest_invalid")
     if payload.get("schema_version") != SCHEMA_VERSION or payload.get("status") != "completed":
         raise QualityBundleError("quality_manifest_incomplete")
-
     commit = _string(payload, "commit", "quality_manifest_invalid").lower()
     invocation_id = _string(payload, "invocation_id", "quality_manifest_invalid")
     run_id = _string(payload, "run_id", "quality_manifest_invalid")
@@ -698,15 +655,12 @@ def load_completed_manifest(
         or SHA256.fullmatch(ending_source_digest) is None
     ):
         raise QualityBundleError("quality_manifest_invalid")
-    if not source_consistent:
-        raise QualityBundleError("quality_source_changed")
-    if ending_source_digest != source_digest:
+    if not source_consistent or ending_source_digest != source_digest:
         raise QualityBundleError("quality_source_changed")
     if require_clean and not source_clean:
         raise QualityBundleError("quality_source_not_clean")
     if run_id != _run_id(commit, invocation_id, source_digest):
         raise QualityBundleError("quality_run_mismatch")
-
     bundle = path.parent
     if (
         bundle.name != run_id
@@ -716,8 +670,24 @@ def load_completed_manifest(
     ):
         raise QualityBundleError("quality_run_mismatch")
     bundle_resolved = bundle.resolve()
+    if expected_root is not None:
+        root_resolved = expected_root.resolve()
+        if not bundle_resolved.is_relative_to(root_resolved / "runs"):
+            raise QualityBundleError("quality_run_mismatch")
+        if _quality_validation.path_has_symlink(
+            root_resolved, bundle_resolved.relative_to(root_resolved)
+        ):
+            raise QualityBundleError("quality_run_mismatch")
+    if source_probe is None and bundle_resolved.is_relative_to(ROOT.resolve()):
+        source_probe = _git_source_identity
+    if source_probe is not None:
+        try:
+            current_source = source_probe()
+        except (QualityBundleError, OSError, RuntimeError) as error:
+            raise QualityBundleError("quality_source_changed") from error
+        if current_source != SourceIdentity(commit, source_digest, source_clean):
+            raise QualityBundleError("quality_source_changed")
     expected_files: set[Path] = {Path("manifest.json")}
-
     required = payload.get("required_producers")
     producers = payload.get("producers")
     if (
@@ -729,11 +699,9 @@ def load_completed_manifest(
     ):
         raise QualityBundleError("quality_manifest_invalid")
     spec_source = expected_specs if expected_specs is not None else tuple(PRODUCER_SPECS.values())
-    strict_schema = expected_specs is None
     specs_by_name = {spec.name: spec for spec in spec_source}
     if len(specs_by_name) != len(spec_source) or not set(required).issubset(specs_by_name):
         raise QualityBundleError("quality_producer_invalid")
-
     producer_evidence: list[ProducerEvidence] = []
     seen_producers: set[str] = set()
     for raw_producer in producers:
@@ -745,10 +713,16 @@ def load_completed_manifest(
         seen_producers.add(name)
         outcome_value = raw_producer.get("outcome")
         verification_value = raw_producer.get("verification")
-        if outcome_value not in {"passed", "failed"} or verification_value not in {
-            "verified",
-            "not_verified",
-        }:
+        if (
+            not isinstance(outcome_value, str)
+            or outcome_value not in {"passed", "failed"}
+            or not isinstance(verification_value, str)
+            or verification_value
+            not in {
+                "verified",
+                "not_verified",
+            }
+        ):
             raise QualityBundleError("quality_producer_invalid")
         outcome = cast(Literal["passed", "failed"], outcome_value)
         verification = cast(Literal["verified", "not_verified"], verification_value)
@@ -775,20 +749,14 @@ def load_completed_manifest(
             raise QualityBundleError("quality_producer_invalid")
         if len(commands) != len(producer_spec.commands):
             raise QualityBundleError("quality_command_mismatch")
-        validated_commands = []
-        for command, expected in zip(commands, producer_spec.commands, strict=True):
-            validated = _validate_command(command)
-            try:
-                quality_validation.validate_command_contract(
-                    command,
-                    expected,
-                    _tracked_files,
-                    EMPTY_INPUT_SHA256,
-                )
-            except quality_validation.ValidationError as error:
-                raise QualityBundleError(str(error)) from error
-            validated_commands.append(validated)
-        validated_commands = tuple(validated_commands)
+        validated_commands = tuple(
+            _validate_command_contract(command, expected)
+            for command, expected in zip(commands, producer_spec.commands, strict=True)
+        )
+        command_exit_code = (
+            validated_commands[0].exit_code if len(validated_commands) == 1 else None
+        )
+        expected_branch = _quality_validation.expected_branch_coverage(producer_spec.commands)
         if any(
             command.started_at < producer_started or command.ended_at > producer_ended
             for command in validated_commands
@@ -807,7 +775,6 @@ def load_completed_manifest(
         raw_artifacts = raw_producer.get("artifacts")
         if not isinstance(raw_artifacts, list):
             raise QualityBundleError("quality_producer_invalid")
-
         artifact_specs = {
             artifact.key: artifact
             for artifact in (
@@ -828,10 +795,6 @@ def load_completed_manifest(
             raise QualityBundleError("quality_producer_incomplete")
         if verification == "verified" and declared_keys != expected_keys:
             raise QualityBundleError("quality_producer_incomplete")
-
-        producer_fact_path = bundle / "producers" / name / "producer.json"
-        expected_files.add(Path("producers") / name / "producer.json")
-
         artifacts: list[ArtifactEvidence] = []
         seen_artifacts: set[str] = set()
         for raw_artifact in raw_artifacts:
@@ -859,11 +822,10 @@ def load_completed_manifest(
                 or ".." in relative.parts
                 or relative != expected_relative
                 or parser != expected_artifact.parser
-                or quality_validation.path_has_symlink(bundle, relative)
+                or _quality_validation.path_has_symlink(bundle, relative)
             ):
                 raise QualityBundleError("quality_artifact_path_invalid")
             artifact_path = bundle / relative
-            expected_files.add(relative)
             if (
                 artifact_path.is_symlink()
                 or not artifact_path.is_file()
@@ -876,19 +838,32 @@ def load_completed_manifest(
                 raise QualityBundleError("quality_artifact_digest_mismatch")
             artifact_payload = _parse_artifact_bytes(snapshot.data, parser)
             _assert_artifact_unchanged(artifact_path, snapshot)
-            if verified != (verification == "verified"):
-                raise QualityBundleError("quality_artifact_verification_mismatch")
-            if strict_schema and verified and parser == "json" and key != "result":
+            if parser == "json" and key != "result":
                 if artifact_payload is None:
                     raise QualityBundleError("quality_artifact_invalid")
-                try:
-                    quality_validation.validate_artifact_payload(name, key, artifact_payload)
-                except quality_validation.ValidationError as error:
-                    raise QualityBundleError(str(error)) from error
+                _validate_artifact_payload(
+                    name,
+                    key,
+                    artifact_payload,
+                    expected_runs=_quality_validation.expected_runs(producer_spec.commands),
+                    expected_exit_code=(
+                        command_exit_code if key in {"tests", "stability", "build"} else None
+                    ),
+                    expected_branch=expected_branch,
+                )
+            if verified != (verification == "verified"):
+                raise QualityBundleError("quality_artifact_verification_mismatch")
+            expected_files.add(relative)
             artifacts.append(
                 ArtifactEvidence(key, artifact_path, digest, verified, artifact_payload)
             )
-
+        producer_fact_path = bundle / "producers" / name / "producer.json"
+        producer_fact_snapshot = _artifact_snapshot(producer_fact_path)
+        producer_fact = _parse_artifact_bytes(producer_fact_snapshot.data, "json")
+        _assert_artifact_unchanged(producer_fact_path, producer_fact_snapshot)
+        if producer_fact != raw_producer:
+            raise QualityBundleError("quality_producer_invalid")
+        expected_files.add(Path("producers") / name / "producer.json")
         result_evidence = next(artifact for artifact in artifacts if artifact.key == "result")
         result_payload = result_evidence.payload
         expected_exit_code = next(
@@ -906,24 +881,16 @@ def load_completed_manifest(
             or result_payload.get("exit_code") != expected_exit_code
         ):
             raise QualityBundleError("quality_producer_invalid")
-        try:
-            producer_fact_snapshot = _artifact_snapshot(producer_fact_path)
-            producer_fact = _parse_artifact_bytes(producer_fact_snapshot.data, "json")
-            _assert_artifact_unchanged(producer_fact_path, producer_fact_snapshot)
-        except QualityBundleError:
-            raise
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-            raise QualityBundleError("quality_producer_invalid") from error
-        if producer_fact != raw_producer:
+        if verification == "verified" and any(
+            _quality_validation.finding_count(artifact.key, artifact.payload or {})
+            for artifact in artifacts
+            if artifact.key != "result" and artifact.payload is not None
+        ):
             raise QualityBundleError("quality_producer_invalid")
         producer_evidence.append(ProducerEvidence(name, outcome, verification, tuple(artifacts)))
-
     if seen_producers != set(required):
         raise QualityBundleError("quality_producer_incomplete")
-    try:
-        quality_validation.validate_bundle_inventory(bundle, expected_files)
-    except quality_validation.ValidationError as error:
-        raise QualityBundleError(str(error)) from error
+    _quality_validation.validate_bundle_inventory(bundle, expected_files)
     return QualityManifest(
         path,
         commit,
@@ -959,7 +926,7 @@ def enforce_manifest(
     )
 
 
-def load_run_result(path: Path) -> RunResult:
+def load_run_result(path: Path, *, expected_root: Path | None = None) -> RunResult:
     if path.is_symlink() or not path.is_file():
         raise QualityBundleError("quality_result_missing")
     payload = _json_object(path, "quality_result_invalid")
@@ -984,6 +951,15 @@ def load_run_result(path: Path) -> RunResult:
         or manifest_path != bundle_path / "manifest.json"
     ):
         raise QualityBundleError("quality_result_invalid")
+    if expected_root is not None:
+        root_resolved = expected_root.resolve()
+        bundle_resolved = bundle_path.resolve()
+        if not bundle_resolved.is_relative_to(root_resolved / "runs"):
+            raise QualityBundleError("quality_run_mismatch")
+        if _quality_validation.path_has_symlink(
+            root_resolved, bundle_resolved.relative_to(root_resolved)
+        ):
+            raise QualityBundleError("quality_run_mismatch")
     return RunResult(
         path,
         bundle_path,
@@ -1002,6 +978,8 @@ def load_manifest_from_result(
     result: RunResult,
     *,
     require_clean: bool = False,
+    expected_root: Path | None = None,
+    source_probe: Callable[[], SourceIdentity] | None = None,
 ) -> QualityManifest:
     manifest = load_completed_manifest(
         result.manifest_path,
@@ -1010,7 +988,11 @@ def load_manifest_from_result(
         expected_run_id=result.run_id,
         expected_source_digest=result.source_digest,
         require_clean=require_clean,
+        expected_root=expected_root,
+        source_probe=source_probe,
     )
+    if manifest.source_clean != result.source_clean:
+        raise QualityBundleError("quality_result_mismatch")
     manifest_passed = (
         enforce_manifest(
             manifest,
@@ -1417,6 +1399,11 @@ def main() -> int:
     run_parser.add_argument("--result", type=Path)
     enforce_parser = subparsers.add_parser("enforce")
     enforce_parser.add_argument("--result", type=Path, required=True)
+    enforce_parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(os.environ.get("QUALITY_EVIDENCE_ROOT", ROOT / ".orchestrator/quality")),
+    )
     enforce_parser.add_argument("--require-full", action="store_true")
     enforce_parser.add_argument("--require-clean", action="store_true")
     latest_parser = subparsers.add_parser("latest-result")
@@ -1429,8 +1416,12 @@ def main() -> int:
 
     try:
         if args.command == "enforce":
-            result = load_run_result(args.result)
-            manifest = load_manifest_from_result(result, require_clean=args.require_clean)
+            result = load_run_result(args.result, expected_root=args.root)
+            manifest = load_manifest_from_result(
+                result,
+                require_clean=args.require_clean,
+                expected_root=args.root,
+            )
             required = (
                 FULL_PRODUCERS
                 if args.require_full
@@ -1443,7 +1434,7 @@ def main() -> int:
             results_root = args.root / "results"
             if results_root.is_dir():
                 for result_path in results_root.glob("*.json"):
-                    result = load_run_result(result_path)
+                    result = load_run_result(result_path, expected_root=args.root)
                     if result.commit == source.commit and result.source_digest == source.digest:
                         candidates.append((result_path.stat().st_mtime_ns, result_path))
             if not candidates:
@@ -1476,13 +1467,17 @@ def main() -> int:
             source=source,
         )
         default_result = args.root / "results" / f"{bundle.path.name}.json"
-        _atomic_write_json(default_result, result_payload)
-        if args.result is not None:
-            _atomic_write_json(args.result, result_payload)
+        _quality_storage.publish_results(
+            bundle_path=bundle.path,
+            default_path=default_result,
+            requested_path=args.result,
+            payload=result_payload,
+            write_json=_atomic_write_json,
+        )
     except QualityBundleError as error:
         print(str(error), file=sys.stderr)
         return 2
-    except OSError:
+    except (OSError, shutil.Error):
         print("quality_storage_unavailable", file=sys.stderr)
         return 2
     except RuntimeError:
