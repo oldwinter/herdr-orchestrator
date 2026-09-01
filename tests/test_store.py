@@ -9,6 +9,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from herdr_orchestrator.attempts import AttemptLedger
+from herdr_orchestrator.completion import CompletionPolicy, VerificationClass
 from herdr_orchestrator.model import (
     AgentState,
     AttemptPhase,
@@ -21,7 +23,7 @@ from herdr_orchestrator.model import (
     ReceiptKind,
     TaskReceipt,
 )
-from herdr_orchestrator.store import Store, StoreError
+from herdr_orchestrator.store import SCHEMA_VERSION, Store, StoreError
 
 
 class StoreTests(unittest.TestCase):
@@ -1439,7 +1441,7 @@ class StoreTests(unittest.TestCase):
                 row[1] for row in migrated_connection.execute("PRAGMA table_info(receipts)")
             }
 
-        self.assertEqual(version, 5)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(migrated[0]["placement"], PlacementTarget.TAB.value)
         self.assertIsNone(migrated[0]["task_verified"])
         self.assertIsNone(migrated[0]["agent_settled"])
@@ -1477,6 +1479,11 @@ class StoreTests(unittest.TestCase):
             "error_summary",
             "correlation_id",
             "current_attempt_id",
+            "completion_policy",
+            "verification_class",
+            "completion_status",
+            "completion_evidence_summary",
+            "completion_error_code",
         }
         expected_receipt_columns = (
             expected_job_columns - {"receipt_kind", "receipt_value", "current_attempt_id"}
@@ -1489,7 +1496,7 @@ class StoreTests(unittest.TestCase):
             "is_stale",
         }
 
-        for version in range(1, 5):
+        for version in range(1, 6):
             with self.subTest(version=version):
                 path = Path(self.temporary.name) / f"v{version}.db"
                 _create_schema_version(path, version)
@@ -1515,7 +1522,7 @@ class StoreTests(unittest.TestCase):
                         "SELECT id, phase FROM job_attempts WHERE job_id = 1"
                     ).fetchall()
 
-                self.assertEqual(current_version, 5)
+                self.assertEqual(current_version, SCHEMA_VERSION)
                 self.assertTrue(expected_job_columns <= job_columns)
                 self.assertTrue(expected_receipt_columns <= receipt_columns)
                 self.assertEqual(store.jobs("example")[0]["placement"], "tab")
@@ -1561,7 +1568,7 @@ class StoreTests(unittest.TestCase):
                 "SELECT * FROM receipts WHERE job_id = 1 AND attempt = 1"
             ).fetchone()
 
-        self.assertEqual(version, 5)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertIsNotNone(attempt)
         assert job is not None and attempt is not None and receipt is not None
         self.assertEqual(job["current_attempt_id"], attempt["id"])
@@ -1581,6 +1588,68 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(receipt["fencing_token"], "legacy-correlation")
         self.assertEqual(receipt["event_kind"], "outcome_committed")
         self.assertEqual(receipt["is_stale"], 0)
+        self.assertEqual(job["completion_policy"], CompletionPolicy.LEGACY_UNVERIFIED.value)
+        self.assertEqual(job["verification_class"], VerificationClass.UNVERIFIED.value)
+        self.assertEqual(attempt["verification_class"], VerificationClass.UNVERIFIED.value)
+        self.assertEqual(receipt["verification_class"], VerificationClass.UNVERIFIED.value)
+
+    def test_v5_migration_preserves_historical_receipt_verification(self) -> None:
+        path = Path(self.temporary.name) / "v5-completion.db"
+        _create_schema_version(path, 5)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            attempt_id = connection.execute(
+                "SELECT id FROM job_attempts WHERE job_id = 1 AND attempt = 1"
+            ).fetchone()[0]
+            receipt_id = connection.execute("SELECT id FROM receipts WHERE job_id = 1").fetchone()[
+                0
+            ]
+            connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'succeeded', attempts = 1, receipt_kind = 'output-prefix',
+                    receipt_value = 'TASK-OK', task_verified = 1,
+                    current_attempt_id = ?, updated_at = 3
+                WHERE id = 1
+                """,
+                (attempt_id,),
+            )
+            connection.execute(
+                """
+                UPDATE job_attempts
+                SET phase = 'outcome_committed', task_verified = 1, updated_at = 3,
+                    finished_at = 3
+                WHERE id = ?
+                """,
+                (attempt_id,),
+            )
+            connection.execute(
+                "UPDATE receipts SET task_verified = 1, observed_at = 3 WHERE id = ?",
+                (receipt_id,),
+            )
+
+        Store(path).initialize()
+
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            version = connection.execute("SELECT version FROM schema_meta").fetchone()[0]
+            job = connection.execute("SELECT * FROM jobs WHERE id = 1").fetchone()
+            attempt = connection.execute(
+                "SELECT * FROM job_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            receipt = connection.execute(
+                "SELECT * FROM receipts WHERE id = ?", (receipt_id,)
+            ).fetchone()
+
+        assert job is not None and attempt is not None and receipt is not None
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+        self.assertEqual(job["dedupe_key"], "legacy-v1")
+        self.assertEqual(job["current_attempt_id"], attempt_id)
+        for row in (job, attempt, receipt):
+            self.assertEqual(row["task_verified"], 1)
+            self.assertEqual(row["completion_policy"], CompletionPolicy.RECEIPT_V1.value)
+            self.assertEqual(row["verification_class"], VerificationClass.VERIFIED.value)
+            self.assertEqual(row["completion_status"], "completed")
 
     def test_v4_migration_uses_unique_fences_for_null_historical_correlations(self) -> None:
         path = Path(self.temporary.name) / "v4-multiple-attempts.db"
@@ -1765,7 +1834,10 @@ class StoreTests(unittest.TestCase):
 
         store.initialize()
         with closing(sqlite3.connect(path)) as connection, connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_meta").fetchone()[0], 5)
+            self.assertEqual(
+                connection.execute("SELECT version FROM schema_meta").fetchone()[0],
+                SCHEMA_VERSION,
+            )
 
     def test_partial_migration_state_is_reconciled_on_restart(self) -> None:
         path = Path(self.temporary.name) / "partial.db"
@@ -1780,7 +1852,10 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(store.jobs("example")[0]["placement"], "pane")
         with closing(sqlite3.connect(path)) as connection, connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_meta").fetchone()[0], 5)
+            self.assertEqual(
+                connection.execute("SELECT version FROM schema_meta").fetchone()[0],
+                SCHEMA_VERSION,
+            )
 
 
 def _job(
@@ -1800,7 +1875,7 @@ def _job(
 
 
 def _create_schema_version(path: Path, version: int) -> None:
-    if version not in {1, 2, 3, 4}:
+    if version not in {1, 2, 3, 4, 5}:
         raise ValueError(version)
     connection = sqlite3.connect(path)
     connection.executescript("""
@@ -1879,6 +1954,17 @@ def _create_schema_version(path: Path, version: int) -> None:
     receipt_columns += ", observed_at"
     receipt_values += ", 2"
     connection.execute(f"INSERT INTO receipts({receipt_columns}) VALUES ({receipt_values})")
+    if version == 5:
+        connection.row_factory = sqlite3.Row
+        AttemptLedger.migrate_v4_to_v5(connection, Store._add_column_if_missing)
+        for column in (
+            "completion_policy",
+            "verification_class",
+            "completion_status",
+            "completion_evidence_summary",
+            "completion_error_code",
+        ):
+            connection.execute(f"ALTER TABLE job_attempts DROP COLUMN {column}")
     connection.commit()
     connection.close()
 

@@ -5,6 +5,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from herdr_orchestrator.completion import (
+    CompletionIdentity,
+    CompletionPolicy,
+    CompletionResult,
+)
+from herdr_orchestrator.completion import (
+    ReceiptKind as ReceiptKind,
+)
+from herdr_orchestrator.completion import (
+    TaskReceipt as TaskReceipt,
+)
+
 
 class Harness(StrEnum):
     DROID = "droid"
@@ -56,6 +68,7 @@ class AttemptRuntime:
     agent_state: AgentState | None = None
     agent_settled: bool | None = None
     task_verified: bool | None = None
+    completion: CompletionResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,11 +91,6 @@ class PlacementTarget(StrEnum):
     TAB = "tab"
     PANE = "pane"
     WORKTREE = "worktree"
-
-
-class ReceiptKind(StrEnum):
-    OUTPUT_PREFIX = "output-prefix"
-    FILE = "file"
 
 
 class TrackerBackend(StrEnum):
@@ -191,12 +199,7 @@ class NewJob:
     max_attempts: int
     placement: PlacementTarget | None = PlacementTarget.TAB
     receipt: TaskReceipt | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TaskReceipt:
-    kind: ReceiptKind
-    value: str
+    completion_policy: CompletionPolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +225,7 @@ class ClaimedJob:
     phase: AttemptPhase = AttemptPhase.CLAIMED
     recovery: bool = False
     runtime: AttemptRuntime | None = None
+    completion_policy: CompletionPolicy = CompletionPolicy.LEGACY_UNVERIFIED
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +243,7 @@ class DispatchOutcome:
     agent_settled: bool | None = None
     phase_timings_ms: dict[str, int] | None = None
     correlation_id: str = ""
+    completion: CompletionResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +263,7 @@ class AttemptProgress:
     task_verified: bool | None = None
     error_code: str | None = None
     error_summary: str | None = None
+    completion: CompletionResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +276,7 @@ class DispatchContext:
     receipt: TaskReceipt | None = None
     correlation_id: str = ""
     attempt_progress: Callable[[AttemptProgress], None] | None = None
+    completion_identity: CompletionIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)

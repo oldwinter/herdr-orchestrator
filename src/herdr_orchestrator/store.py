@@ -8,6 +8,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from herdr_orchestrator.attempts import AttemptLedger, StoreError
+from herdr_orchestrator.completion import CompletionPolicy, VerificationClass
 from herdr_orchestrator.model import (
     AttemptPhase,
     AttemptProgress,
@@ -20,7 +21,7 @@ from herdr_orchestrator.model import (
     TaskReceipt,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 __all__ = ["SCHEMA_VERSION", "Store", "StoreError"]
 
 
@@ -48,6 +49,7 @@ def _candidate_slot_names(
 
 
 def _job_contract_matches(row: sqlite3.Row, job: NewJob) -> bool:
+    completion_policy = _completion_policy(job.receipt, job.completion_policy)
     return all(
         (
             row["title"] == job.title,
@@ -56,6 +58,7 @@ def _job_contract_matches(row: sqlite3.Row, job: NewJob) -> bool:
             row["placement"] == (job.placement.value if job.placement is not None else None),
             row["receipt_kind"] == (job.receipt.kind.value if job.receipt is not None else None),
             row["receipt_value"] == (job.receipt.value if job.receipt is not None else None),
+            row["completion_policy"] == completion_policy.value,
         )
     )
 
@@ -68,7 +71,9 @@ def _partial_job_contract_matches(
     harness: Harness | None,
     placement: PlacementTarget | None,
     receipt: TaskReceipt | None,
+    completion_policy: CompletionPolicy | None,
 ) -> bool:
+    effective_policy = _completion_policy(receipt, completion_policy)
     return all(
         (
             row["title"] == title,
@@ -77,8 +82,28 @@ def _partial_job_contract_matches(
             placement is None or row["placement"] == placement.value,
             row["receipt_kind"] == (receipt.kind.value if receipt is not None else None),
             row["receipt_value"] == (receipt.value if receipt is not None else None),
+            row["completion_policy"] == effective_policy.value,
         )
     )
+
+
+def _completion_policy(
+    receipt: TaskReceipt | None,
+    requested: CompletionPolicy | None,
+) -> CompletionPolicy:
+    if requested is None:
+        return (
+            CompletionPolicy.RECEIPT_V1
+            if receipt is not None
+            else CompletionPolicy.LEGACY_UNVERIFIED
+        )
+    if requested is CompletionPolicy.STRUCTURED_V2 and receipt is None:
+        return requested
+    if requested is CompletionPolicy.RECEIPT_V1 and receipt is not None:
+        return requested
+    if requested is CompletionPolicy.LEGACY_UNVERIFIED and receipt is None:
+        return requested
+    raise StoreError("completion_policy_invalid")
 
 
 class Store:
@@ -111,6 +136,11 @@ class Store:
                     herdr_workspace_id TEXT,
                     receipt_kind TEXT,
                     receipt_value TEXT,
+                    completion_policy TEXT NOT NULL DEFAULT 'legacy-unverified',
+                    verification_class TEXT NOT NULL DEFAULT 'unverified',
+                    completion_status TEXT,
+                    completion_evidence_summary TEXT,
+                    completion_error_code TEXT,
                     agent_settled INTEGER,
                     task_verified INTEGER,
                     error_summary TEXT,
@@ -137,6 +167,11 @@ class Store:
                     herdr_workspace_id TEXT,
                     agent_settled INTEGER,
                     task_verified INTEGER,
+                    completion_policy TEXT NOT NULL DEFAULT 'legacy-unverified',
+                    verification_class TEXT NOT NULL DEFAULT 'unverified',
+                    completion_status TEXT,
+                    completion_evidence_summary TEXT,
+                    completion_error_code TEXT,
                     error_summary TEXT,
                     correlation_id TEXT,
                     attempt_id INTEGER,
@@ -172,6 +207,9 @@ class Store:
                 if version == 4:
                     self._migrate_v4_to_v5(connection)
                     version = 5
+                if version == 5:
+                    self._migrate_v5_to_v6(connection)
+                    version = 6
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
 
@@ -211,6 +249,102 @@ class Store:
     def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
         AttemptLedger.migrate_v4_to_v5(connection, self._add_column_if_missing)
 
+    def _migrate_v5_to_v6(self, connection: sqlite3.Connection) -> None:
+        for table in ("jobs", "job_attempts", "receipts"):
+            self._add_column_if_missing(connection, table, "completion_policy", "TEXT")
+            self._add_column_if_missing(connection, table, "verification_class", "TEXT")
+            self._add_column_if_missing(connection, table, "completion_status", "TEXT")
+            self._add_column_if_missing(
+                connection,
+                table,
+                "completion_evidence_summary",
+                "TEXT",
+            )
+            self._add_column_if_missing(connection, table, "completion_error_code", "TEXT")
+        connection.execute(
+            """
+            UPDATE jobs
+            SET completion_policy = CASE
+                    WHEN receipt_kind IS NULL THEN ? ELSE ? END,
+                verification_class = CASE
+                    WHEN receipt_kind IS NULL THEN ?
+                    WHEN task_verified = 1 THEN ?
+                    WHEN task_verified = 0 THEN ?
+                    ELSE ? END,
+                completion_status = CASE
+                    WHEN receipt_kind IS NOT NULL AND task_verified = 1 THEN ?
+                    ELSE NULL END,
+                completion_error_code = CASE
+                    WHEN receipt_kind IS NOT NULL AND task_verified = 0
+                    THEN COALESCE(error_code, 'completion_verification_failed')
+                    ELSE NULL END
+            """,
+            (
+                CompletionPolicy.LEGACY_UNVERIFIED.value,
+                CompletionPolicy.RECEIPT_V1.value,
+                VerificationClass.UNVERIFIED.value,
+                VerificationClass.VERIFIED.value,
+                VerificationClass.VERIFICATION_FAILED.value,
+                VerificationClass.UNVERIFIED.value,
+                "completed",
+            ),
+        )
+        evidence_values = (
+            CompletionPolicy.LEGACY_UNVERIFIED.value,
+            VerificationClass.UNVERIFIED.value,
+            VerificationClass.VERIFIED.value,
+            VerificationClass.VERIFICATION_FAILED.value,
+            VerificationClass.UNVERIFIED.value,
+            "completed",
+        )
+        connection.execute(
+            """
+            UPDATE job_attempts
+            SET completion_policy = (
+                    SELECT jobs.completion_policy
+                    FROM jobs WHERE jobs.id = job_attempts.job_id
+                ),
+                verification_class = CASE
+                    WHEN (
+                        SELECT jobs.completion_policy
+                        FROM jobs WHERE jobs.id = job_attempts.job_id
+                    ) = ? THEN ?
+                    WHEN task_verified = 1 THEN ?
+                    WHEN task_verified = 0 THEN ?
+                    ELSE ? END,
+                completion_status = CASE
+                    WHEN task_verified = 1 THEN ? ELSE NULL END,
+                completion_error_code = CASE
+                    WHEN task_verified = 0
+                    THEN COALESCE(error_code, 'completion_verification_failed')
+                    ELSE NULL END
+            """,
+            evidence_values,
+        )
+        connection.execute(
+            """
+            UPDATE receipts
+            SET completion_policy = (
+                    SELECT jobs.completion_policy FROM jobs WHERE jobs.id = receipts.job_id
+                ),
+                verification_class = CASE
+                    WHEN (
+                        SELECT jobs.completion_policy FROM jobs WHERE jobs.id = receipts.job_id
+                    ) = ? THEN ?
+                    WHEN task_verified = 1 THEN ?
+                    WHEN task_verified = 0 THEN ?
+                    ELSE ? END,
+                completion_status = CASE
+                    WHEN task_verified = 1 THEN ? ELSE NULL END,
+                completion_error_code = CASE
+                    WHEN task_verified = 0
+                    THEN COALESCE(error_code, 'completion_verification_failed')
+                    ELSE NULL END
+            """,
+            evidence_values,
+        )
+        connection.execute("UPDATE schema_meta SET version = 6")
+
     @staticmethod
     def _add_column_if_missing(
         connection: sqlite3.Connection,
@@ -226,15 +360,16 @@ class Store:
 
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
+        completion_policy = _completion_policy(job.receipt, job.completion_policy)
         with self._transaction() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO jobs(
                     workflow, title, harness, prompt, dedupe_key, placement, state,
                     attempts, max_attempts, available_at, receipt_kind, receipt_value,
-                    created_at, updated_at
+                    completion_policy, verification_class, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workflow, dedupe_key) DO NOTHING
                 """,
                 (
@@ -249,6 +384,8 @@ class Store:
                     now,
                     job.receipt.kind.value if job.receipt is not None else None,
                     job.receipt.value if job.receipt is not None else None,
+                    completion_policy.value,
+                    VerificationClass.UNVERIFIED.value,
                     now,
                     now,
                 ),
@@ -259,7 +396,8 @@ class Store:
                 return cursor.lastrowid, True
             row = connection.execute(
                 """
-                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value
+                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value,
+                       completion_policy
                 FROM jobs WHERE workflow = ? AND dedupe_key = ?
                 """,
                 (job.workflow, job.dedupe_key),
@@ -280,11 +418,13 @@ class Store:
         harness: Harness | None,
         placement: PlacementTarget | None,
         receipt: TaskReceipt | None,
+        completion_policy: CompletionPolicy | None = None,
     ) -> tuple[int, Harness] | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value
+                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value,
+                       completion_policy
                 FROM jobs WHERE workflow = ? AND dedupe_key = ?
                 """,
                 (workflow, dedupe_key),
@@ -298,6 +438,7 @@ class Store:
             harness=harness,
             placement=placement,
             receipt=receipt,
+            completion_policy=completion_policy,
         ):
             raise StoreError("dedupe_contract_conflict")
         return int(row["id"]), Harness(str(row["harness"]))
@@ -580,13 +721,16 @@ class Store:
                 UPDATE jobs
                 SET state = ?, max_attempts = ?, available_at = ?, lease_until = NULL,
                     error_code = NULL, error_summary = NULL, agent_settled = NULL,
-                    task_verified = NULL, correlation_id = NULL, updated_at = ?
+                    task_verified = NULL, verification_class = ?, completion_status = NULL,
+                    completion_evidence_summary = NULL, completion_error_code = NULL,
+                    correlation_id = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     JobState.PENDING.value,
                     max_attempts,
                     now,
+                    VerificationClass.UNVERIFIED.value,
                     now,
                     job_id,
                 ),
@@ -607,7 +751,10 @@ class Store:
                        jobs.error_code, jobs.execution_path, jobs.herdr_workspace_id,
                        jobs.receipt_kind, jobs.receipt_value, jobs.agent_settled,
                        jobs.task_verified, jobs.error_summary, jobs.correlation_id,
-                       jobs.current_attempt_id, job_attempts.phase AS attempt_phase
+                       jobs.completion_policy, jobs.verification_class,
+                       jobs.completion_status, jobs.completion_evidence_summary,
+                       jobs.completion_error_code, jobs.current_attempt_id,
+                       job_attempts.phase AS attempt_phase
                 FROM jobs
                 LEFT JOIN job_attempts ON job_attempts.id = jobs.current_attempt_id
                 WHERE jobs.workflow = ? ORDER BY jobs.id

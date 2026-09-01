@@ -13,6 +13,11 @@ from herdr_orchestrator.catalog import (
     profile_for_harness,
     render_compact_catalog,
 )
+from herdr_orchestrator.completion import (
+    CompletionIdentity,
+    CompletionPolicy,
+    structured_completion_prompt,
+)
 from herdr_orchestrator.herdr import (
     HerdrTransport,
     replica_slot_names,
@@ -149,6 +154,7 @@ class Coordinator:
         dedupe_key: str,
         placement: PlacementTarget | None = None,
         receipt: TaskReceipt | None = None,
+        completion_policy: CompletionPolicy | None = None,
     ) -> tuple[int, bool, Harness]:
         self.initialize()
         if not prompt_file.is_file():
@@ -164,6 +170,7 @@ class Coordinator:
             harness=harness,
             placement=placement,
             receipt=receipt,
+            completion_policy=completion_policy,
         )
         if existing is not None:
             job_id, existing_harness = existing
@@ -186,6 +193,7 @@ class Coordinator:
                     placement,
                 ),
                 receipt=receipt,
+                completion_policy=completion_policy,
             )
         )
         if not created:
@@ -402,6 +410,7 @@ class Coordinator:
             receipt=job.receipt,
             correlation_id=job.correlation_id,
             attempt_progress=lambda progress: self._record_attempt_progress(job, progress),
+            completion_identity=_completion_identity(job),
         )
         try:
             if job.recovery:
@@ -601,7 +610,13 @@ class Coordinator:
                 correlation_id=job.correlation_id,
             )
         else:
-            prompt = execution_prompt(profile, job.prompt)
+            completion_identity = _completion_identity(job)
+            task_prompt = (
+                structured_completion_prompt(job.prompt, completion_identity)
+                if completion_identity is not None
+                else job.prompt
+            )
+            prompt = execution_prompt(profile, task_prompt)
             context = DispatchContext(
                 placement=job.placement,
                 title=job.title,
@@ -611,6 +626,7 @@ class Coordinator:
                 receipt=job.receipt,
                 correlation_id=job.correlation_id,
                 attempt_progress=lambda progress: self._record_attempt_progress(job, progress),
+                completion_identity=completion_identity,
             )
             if job.recovery:
                 outcome = self._recover_job(
@@ -964,6 +980,12 @@ class Coordinator:
         if remaining <= 0:
             raise _DispatchDeadlineExceeded
         return min(timeout_seconds, remaining)
+
+
+def _completion_identity(job: ClaimedJob) -> CompletionIdentity | None:
+    if job.completion_policy is not CompletionPolicy.STRUCTURED_V2:
+        return None
+    return CompletionIdentity(job.job_id, job.attempt, job.fencing_token)
 
 
 def _controller_agent_name(

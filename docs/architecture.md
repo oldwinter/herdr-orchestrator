@@ -70,6 +70,25 @@ identity、phase 和 sequence。这个 reconciliation 不增加 attempt：
 `attention` receipt 使用 `unsafe_turn_adoption`，明确表示无法证明 turn ownership，而不是普通
 agent question。
 
+Schema v6 为 `jobs`、`job_attempts` 和 `receipts` 增加 completion policy、verification class、
+completion status、有界 evidence summary 和稳定 completion error。Migration 不改写历史 job
+state、attempt、dedupe key 或 receipt。没有 receipt 的历史行投影为 `legacy-unverified`；既有
+output-prefix 和 file receipt 投影为 `receipt-v1`；新协议使用 `structured-v2`。
+
+`structured-v2` identity 只在 claim 后构造，因为此时 job ID、attempt number 和 immutable
+fencing token 才同时存在。Coordinator 把 identity contract 追加到 selected profile 与原始 task
+packet 之后。Enqueue、planner 和 router 类型都没有 identity 字段。Transport 只解析当前 turn
+baseline 之后的一条 envelope，并拒绝 malformed、oversized、duplicate、wrong-job、wrong-attempt、
+wrong-token 和 stale evidence。Evidence summary 在 transport boundary 脱敏并截断，raw output 不进入
+queue logic 或 SQLite。
+
+`receipt_observed` 现在表示 completion evidence 已观察；phase 与完整 typed completion result 使用同一
+fenced SQL update。Durable `receipt_observed` recovery 复用该 result，不重读 terminal output。若 crash
+发生在 settled 与该 atomic update 之间，`receipt-v1` 返回 `task_receipt_recovery_unverified`，
+`structured-v2` 返回 `completion_recovery_unverified`，两者都进入 attention。Envelope 的
+`completed`、`blocked` 或 `failed` 是 attempt-bound machine claim；verification class 与 job state
+分别投影，不能互相替代。
+
 `just status` 的 job 项包含 `current_attempt_id` 和 `attempt_phase`。`blocked` 加
 `attempt_phase=attention` 表示 operator attention，不是可直接回答的 agent 提问。
 
@@ -95,6 +114,8 @@ durably settled 的 operation 进入 `attention`，不会自动或人工重复�
   turn 新建或改变；分别记录 `agent_settled` 与 `task_verified`；
 - prompt 接受前的 `unknown`、timeout 和协议错误按失败与重试策略处理。prompt 接受后若 turn
   仍可能运行，则 job 进入 `attention`，不会自动重试。
+- `structured-v2` task 在 claim 后收到 immutable completion identity；transport 将 fresh envelope
+  parse 为 typed verified 或 verification-failed result，coordinator 和 store 不读取 raw model output；
 - 对必须写 strict JSON 的 turn，settled 后目标 artifact 缺失会在同一已 ready agent 上仅重发
   一次；artifact handshake 防止 startup lifecycle 变化被误认成任务完成。
 
@@ -104,6 +125,31 @@ dispatch。在没有 blocked job 时，它持续运行到当前 worker pool 没�
 blocked 会立即返回 `idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
 `queue_idle` 明确区分所选 pool 和全局 queue；pool 外任务不会造成假死，也不会被误报为
 全局排空。
+
+### Readiness evidence
+
+`readiness-matrix` 与 durable queue、`doctor` summary、`smoke` 和 routing policy 相互独立。它从当前
+Herdr-managed pane 对每个 enabled 或 repeat-filtered harness 调用既有真实 probe，并输出 schema v1
+matrix。每条结果包含 exact Git commit、package version、workflow、canonical workspace digest、
+harness、source-clean flag、closed status、closed error code、allowlisted phase timings、UTC observation
+time 和 attempt count。Serializer 没有 prompt、credential、pane、terminal output、full response 或
+arbitrary error summary 字段。
+
+Collector 对 transient closed error set 最多重试一次。认证、invalid model、missing executable、
+missing profile 和 unknown result 不重试。每个 selected harness 必须产生一条结果；不能 probe、probe
+失败、结果过期或结果不可解析时都显式输出 `NOT VERIFIED`。只有所有 selected rows 均为当前
+`ready` evidence 时 matrix 才为 `VERIFIED`。
+
+Exact commit 证据还要求 clean 且 stable source。每次 build sample 按 HEAD → porcelain status → HEAD
+读取，拒绝 sample 内 commit drift；collector 在全部 live probes 前后各取一次 sample。Initial
+tracked、staged、untracked 或无法检查的 source 投影为 zero-attempt `readiness_source_dirty`。Probe
+期间 working tree 或 HEAD 改变时，所有 rows 改为 `readiness_source_changed`。因此 probe 执行所见
+bytes 与 recorded commit 不一致时，matrix 不能返回 `VERIFIED`。
+
+真实 matrix 依赖本机登录态，只能由 operator 在 Herdr-managed pane 运行。`CI` 或
+`GITHUB_ACTIONS` 环境返回 zero-attempt `readiness_ci_forbidden`，不会调用 live probe。Matrix 只生产
+compatibility evidence，不持久化 health、不计算 eligibility，也不影响 controller 或 worker
+selection。Readiness-aware routing 仍由 Issue #39 单独拥有。
 
 ### Execution topology
 
