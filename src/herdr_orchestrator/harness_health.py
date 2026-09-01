@@ -62,6 +62,24 @@ _TASK_FAILURES = frozenset(
         "task_receipt_stale",
         "task_receipt_unreadable",
         "completion_verification_failed",
+        "completion_reported_failed",
+        "completion_reported_blocked",
+        "completion_envelope_missing",
+        "completion_envelope_malformed",
+        "completion_envelope_stale",
+        "completion_envelope_duplicate",
+        "completion_envelope_invalid",
+        "completion_envelope_oversized",
+        "completion_output_invalid",
+        "completion_output_oversized",
+        "completion_schema_mismatch",
+        "completion_job_mismatch",
+        "completion_attempt_mismatch",
+        "completion_fencing_token_mismatch",
+        "completion_status_invalid",
+        "completion_evidence_invalid",
+        "completion_evidence_oversized",
+        "completion_policy_mismatch",
     }
 )
 _HARD_FAILURES = frozenset(
@@ -202,12 +220,19 @@ class EligibilitySnapshot:
         return {record.harness.value: record.reason for record in self.records}
 
     def public_json(self) -> dict[str, object]:
+        static_reasons = {
+            record.harness.value: record.reason
+            for record in self.records
+            if record.source == "preflight"
+        }
         return {
             "workflow": self.workflow,
             "workspace_id": _workspace_id(self.workspace),
             "evaluated_at": self.evaluated_at,
             "eligible": [harness.value for harness in self.eligible_harnesses],
             "eligible_harnesses": [harness.value for harness in self.eligible_harnesses],
+            "static_reasons": static_reasons,
+            "excluded_reasons": self.reasons,
             "records": [record.public_json(self.evaluated_at) for record in self.records],
         }
 
@@ -272,11 +297,9 @@ class HarnessHealth:
         self.environment = environment
         self.executable_finder = executable_finder
         self._refresh_lock = threading.Lock()
+        probe_environment = os.environ if environment is None else environment
         self.live_probe_allowed = (
-            not any(
-                os.environ.get(key, "").strip().lower() in {"1", "true", "yes"}
-                for key in ("CI", "GITHUB_ACTIONS")
-            )
+            not any(_environment_flag(probe_environment.get(key)) for key in ("CI", "GITHUB_ACTIONS"))
             if allow_live_probe is None
             else allow_live_probe
         )
@@ -291,37 +314,52 @@ class HarnessHealth:
         timeout_seconds: int | None = None,
         deadline: float | None = None,
         static_reasons: Mapping[Harness, str] | None = None,
+        refresh_harnesses: Iterable[Harness] | None = None,
     ) -> EligibilitySnapshot:
         if timeout_seconds is not None and timeout_seconds != 0 and not 5 <= timeout_seconds <= 300:
             raise ValueError("harness_health_probe_timeout_invalid")
+        _validate_deadline(deadline)
         values = _unique_harnesses(harnesses)
+        refresh_values = values if refresh_harnesses is None else _unique_harnesses(refresh_harnesses)
+        refresh_set = set(refresh_values)
         now = self._now()
         self.store.initialize()
+        effective_static_reasons = self.static_reasons(values)
+        if static_reasons:
+            effective_static_reasons.update(
+                {
+                    harness: reason
+                    for harness, reason in static_reasons.items()
+                    if harness in values
+                }
+            )
         records = self._apply_static_reasons(
             self._records(values, now),
-            static_reasons,
+            effective_static_reasons,
         )
         if refresh:
             active_probe = probe or self.probe
-            for record in records:
-                if static_reasons is not None and record.harness in static_reasons:
-                    continue
-                if not (force_refresh or record.refresh_due(now)):
-                    continue
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                self._refresh(
-                    record.harness,
+            due = tuple(
+                record.harness
+                for record in records
+                if record.harness in refresh_set
+                and record.harness not in effective_static_reasons
+                and (force_refresh or record.refresh_due(now))
+            )
+            if deadline is None:
+                for harness in due:
+                    self._refresh(harness, active_probe, timeout_seconds)
+            else:
+                self._refresh_concurrently(
+                    due,
                     active_probe,
                     timeout_seconds,
-                    deadline=deadline,
+                    deadline,
                 )
             now = self._now()
             records = self._apply_static_reasons(
                 self._records(values, now),
-                static_reasons,
+                effective_static_reasons,
             )
         return EligibilitySnapshot(self.workflow_name, self.workspace, now, records)
 
@@ -371,26 +409,36 @@ class HarnessHealth:
     def static_reason(self, harness: Harness) -> str | None:
         if self.environment is None:
             return None
+        def value(key: str) -> str:
+            raw = self.environment.get(key, "")
+            return raw if isinstance(raw, str) else ""
+
         if any(
-            self.environment.get(key, "").strip().lower() in {"1", "true", "yes"}
+            _environment_flag(value(key))
             for key in ("CI", "GITHUB_ACTIONS")
         ):
             return "readiness_ci_forbidden"
-        if self.environment.get("HERDR_ENV") != "1":
+        if value("HERDR_ENV") != "1":
             return "not_in_herdr"
-        if not self.environment.get("HERDR_PANE_ID"):
+        if not value("HERDR_PANE_ID"):
             return "herdr_pane_id_missing"
-        if not self.environment.get("HERDR_WORKSPACE_ID"):
+        if not value("HERDR_WORKSPACE_ID"):
             return "herdr_workspace_id_missing"
-        if self.executable_finder("herdr") is None:
-            return "herdr_unavailable"
-        if self.executable_finder(harness.value) is None:
+        try:
+            if self.executable_finder("herdr") is None:
+                return "herdr_unavailable"
+            if self.executable_finder(harness.value) is None:
+                return "harness_unavailable"
+        except Exception:
             return "harness_unavailable"
         profile = next(
             (item for item in self.workflow.profiles if item.harness is harness),
             None,
         )
-        if profile is None or not profile.context_file.is_file():
+        try:
+            if profile is None or not profile.context_file.is_file():
+                return "profile_unavailable"
+        except OSError:
             return "profile_unavailable"
         return None
 
@@ -404,6 +452,7 @@ class HarnessHealth:
         timeout_seconds: int | None = None,
         deadline: float | None = None,
         static_reasons: Mapping[Harness, str] | None = None,
+        refresh_harnesses: Iterable[Harness] | None = None,
     ) -> EligibilitySnapshot:
         return self.snapshot(
             harnesses,
@@ -413,6 +462,7 @@ class HarnessHealth:
             timeout_seconds=timeout_seconds,
             deadline=deadline,
             static_reasons=static_reasons,
+            refresh_harnesses=refresh_harnesses,
         )
 
     def record_selection(
@@ -448,6 +498,13 @@ class HarnessHealth:
     ) -> Mapping[str, object]:
         """Run one leased probe, including a forced doctor refresh, and return its raw shape."""
         self.store.initialize()
+        if not self.live_probe_allowed:
+            result = {
+                "status": HarnessHealthStatus.UNAVAILABLE.value,
+                "error_code": "readiness_ci_forbidden",
+            }
+            self.record_probe(harness, result, source=source)
+            return result
         now = self._now()
         current = self._records((harness,), now)[0]
         if not force and not current.refresh_due(now):
@@ -514,7 +571,12 @@ class HarnessHealth:
     ) -> HarnessHealthRecord | None:
         """Classify runtime outcome; task-specific blocked/receipt failures are neutral."""
         code = _bounded_reason(outcome.error_code)
-        if outcome.state is AgentState.BLOCKED:
+        if (
+            outcome.state is AgentState.BLOCKED
+            and code not in _HARD_FAILURES
+            and code not in _RETRYABLE_FAILURES
+            and code not in _TASK_FAILURES
+        ):
             return None
         if code in _TASK_FAILURES:
             if outcome.agent_settled is not True and outcome.state not in {
@@ -630,6 +692,34 @@ class HarnessHealth:
             deadline=deadline,
         )
 
+    def _refresh_concurrently(
+        self,
+        harnesses: tuple[Harness, ...],
+        probe: HealthProbe | None,
+        timeout_seconds: int | None,
+        deadline: float,
+    ) -> None:
+        if not harnesses or probe is None or timeout_seconds == 0 or not self.live_probe_allowed:
+            return
+        runs: list[threading.Thread] = []
+        for harness in harnesses:
+            if deadline - time.monotonic() <= 0:
+                break
+            thread = threading.Thread(
+                target=self._refresh,
+                args=(harness, probe, timeout_seconds),
+                kwargs={"deadline": deadline},
+                daemon=True,
+                name=f"harness-health-{harness.value}",
+            )
+            thread.start()
+            runs.append(thread)
+        for thread in runs:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+
     def _probe_with_lease(
         self,
         harness: Harness,
@@ -644,11 +734,13 @@ class HarnessHealth:
             return {"status": "unavailable", "error_code": "readiness_ci_forbidden"}
         now = self._now()
         configured_timeout = timeout_seconds or self.probe_timeout_seconds
+        deadline_exhausted = False
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining < 5:
-                return {"status": "timeout", "error_code": "timeout"}
-            configured_timeout = min(configured_timeout, int(remaining))
+                deadline_exhausted = True
+            else:
+                configured_timeout = min(configured_timeout, int(remaining))
         owner = f"health-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:12]}"
         lease_seconds = max(30.0, float(timeout_seconds or self.probe_timeout_seconds) + 5.0)
         with self._refresh_lock:
@@ -664,22 +756,48 @@ class HarnessHealth:
         if lease is None:
             return {"status": "error", "error_code": "readiness_probe_in_progress"}
         try:
-            try:
-                result = probe(self.workflow, harness, configured_timeout)
-            except Exception:
+            if deadline_exhausted:
                 result = {
-                    "status": HarnessHealthStatus.DEGRADED.value,
-                    "error_code": "readiness_probe_failed",
+                    "status": "timeout",
+                    "error_code": "timeout",
                 }
-            self.record_probe(
+            else:
+                try:
+                    result = self._invoke_probe(
+                        probe,
+                        harness,
+                        configured_timeout,
+                        deadline=deadline,
+                    )
+                except Exception:
+                    result = {
+                        "status": HarnessHealthStatus.DEGRADED.value,
+                        "error_code": "readiness_probe_failed",
+                    }
+            if deadline is not None and deadline - time.monotonic() <= 0:
+                result = {
+                    "status": "timeout",
+                    "error_code": "timeout",
+                }
+            result = _normalize_probe_result(result)
+            observed_at = self._now()
+            persisted = self.record_probe(
                 harness,
                 result,
                 source=source,
-                observed_at=self._now(),
+                observed_at=observed_at,
                 expected_revision=lease.revision,
                 expected_owner=owner,
             )
-            return result
+            expected_status, expected_reason = _classify_probe(result)
+            if (
+                persisted.status is expected_status
+                and persisted.reason == expected_reason
+                and persisted.source == _source_value(source)
+                and persisted.observed_at == observed_at
+            ):
+                return result
+            return persisted.public_json()
         finally:
             self.store.release_harness_probe(
                 workflow=self.workflow_name,
@@ -687,6 +805,39 @@ class HarnessHealth:
                 harness=harness,
                 owner=owner,
             )
+
+    def _invoke_probe(
+        self,
+        probe: HealthProbe,
+        harness: Harness,
+        timeout_seconds: int,
+        *,
+        deadline: float | None,
+    ) -> Mapping[str, object]:
+        if deadline is None:
+            return _normalize_probe_result(probe(self.workflow, harness, timeout_seconds))
+        result: dict[str, object] = {}
+        error: list[Exception] = []
+        finished = threading.Event()
+
+        def invoke() -> None:
+            try:
+                candidate = probe(self.workflow, harness, timeout_seconds)
+                normalized = _normalize_probe_result(candidate)
+                result.update(normalized)
+            except Exception as exc:
+                error.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=invoke, daemon=True, name="harness-health-probe")
+        thread.start()
+        remaining = max(0.0, deadline - time.monotonic())
+        if not finished.wait(timeout=remaining):
+            return {"status": "timeout", "error_code": "timeout"}
+        if error:
+            raise error[0]
+        return result
 
     def _write(
         self,
@@ -740,6 +891,33 @@ def _unique_harnesses(harnesses: Iterable[Harness]) -> tuple[Harness, ...]:
     if any(not isinstance(harness, Harness) for harness in values):
         raise ValueError("harness_health_harness_invalid")
     return tuple(dict.fromkeys(values))
+
+
+def _validate_deadline(deadline: float | None) -> None:
+    if deadline is None:
+        return
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        raise ValueError("harness_health_deadline_invalid")
+    if not math.isfinite(float(deadline)):
+        raise ValueError("harness_health_deadline_invalid")
+
+
+def _environment_flag(value: object) -> bool:
+    return isinstance(value, str) and value.strip().lower() in {"1", "true", "yes"}
+
+
+def _normalize_probe_result(result: Mapping[str, object] | object) -> Mapping[str, object]:
+    if isinstance(result, Mapping):
+        return result
+    public_json = getattr(result, "public_json", None)
+    if callable(public_json):
+        candidate = public_json()
+        if isinstance(candidate, Mapping):
+            return candidate
+    return {
+        "status": HarnessHealthStatus.DEGRADED.value,
+        "error_code": "readiness_result_invalid",
+    }
 
 
 def _workspace_id(workspace: str) -> str:
@@ -799,7 +977,10 @@ def _classify_probe(result: Mapping[str, object] | object) -> tuple[HarnessHealt
         return HarnessHealthStatus.DEGRADED, "readiness_result_invalid"
     raw_status = result.get("status")
     status = str(raw_status.value if isinstance(raw_status, StrEnum) else raw_status or "")
-    reason = _bounded_reason(result.get("error_code"))
+    raw_reason = result.get("error_code")
+    reason = _bounded_reason(raw_reason)
+    if raw_reason not in (None, "") and not reason:
+        return HarnessHealthStatus.DEGRADED, "readiness_reason_invalid"
     if status == "expired" or reason == "readiness_evidence_expired":
         return HarnessHealthStatus.UNKNOWN, READINESS_EXPIRED
     if status == HarnessHealthStatus.READY.value and not reason:

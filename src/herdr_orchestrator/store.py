@@ -835,16 +835,36 @@ class Store:
         workflow: str,
         *,
         allowed_harnesses: Iterable[Harness] | None = None,
+        workspace: str | Path | None = None,
+        include_legacy: bool = False,
     ) -> dict[str, int]:
         counts = {state.value: 0 for state in JobState}
         allowed_values = (
             None if allowed_harnesses is None else {harness.value for harness in allowed_harnesses}
         )
+        query = "SELECT state, harness, workspace FROM jobs WHERE workflow = ?"
+        parameters: tuple[object, ...] = (workflow,)
+        if workspace is not None:
+            workspace_key = str(workspace)
+            if include_legacy:
+                query += """
+                    AND (
+                        workspace = ?
+                        OR (
+                            workspace IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM jobs AS scoped_jobs
+                                WHERE scoped_jobs.workflow = jobs.workflow
+                                  AND scoped_jobs.workspace IS NOT NULL
+                            )
+                        )
+                    )
+                """
+            else:
+                query += " AND workspace = ?"
+            parameters += (workspace_key,)
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT state, harness FROM jobs WHERE workflow = ?",
-                (workflow,),
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
         for row in rows:
             if allowed_values is None or str(row["harness"]) in allowed_values:
                 counts[str(row["state"])] += 1
@@ -1279,10 +1299,14 @@ class Store:
             "max_attempts": max_attempts,
         }
 
-    def jobs(self, workflow: str) -> list[dict[str, object]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
+    def jobs(
+        self,
+        workflow: str,
+        *,
+        workspace: str | Path | None = None,
+        include_legacy: bool = False,
+    ) -> list[dict[str, object]]:
+        query = """
                 SELECT jobs.id, jobs.workspace, jobs.title, jobs.harness, jobs.placement,
                        jobs.state,
                        jobs.attempts, jobs.max_attempts, jobs.agent_name,
@@ -1295,10 +1319,31 @@ class Store:
                        job_attempts.phase AS attempt_phase
                 FROM jobs
                 LEFT JOIN job_attempts ON job_attempts.id = jobs.current_attempt_id
-                WHERE jobs.workflow = ? ORDER BY jobs.id
-                """,
-                (workflow,),
-            ).fetchall()
+                WHERE jobs.workflow = ?
+        """
+        parameters: tuple[object, ...] = (workflow,)
+        if workspace is not None:
+            workspace_key = str(workspace)
+            if include_legacy:
+                query += """
+                    AND (
+                        jobs.workspace = ?
+                        OR (
+                            jobs.workspace IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM jobs AS scoped_jobs
+                                WHERE scoped_jobs.workflow = jobs.workflow
+                                  AND scoped_jobs.workspace IS NOT NULL
+                            )
+                        )
+                    )
+                """
+            else:
+                query += " AND jobs.workspace = ?"
+            parameters += (workspace_key,)
+        query += " ORDER BY jobs.id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
         jobs = [dict(row) for row in rows]
         for job in jobs:
             job["agent_settled"] = _nullable_bool(job["agent_settled"])
@@ -1333,20 +1378,40 @@ class Store:
         workflow: str,
         *,
         allowed_harnesses: Iterable[Harness] | None = None,
+        workspace: str | Path | None = None,
+        include_legacy: bool = False,
     ) -> list[dict[str, object]]:
         allowed_values = (
             None if allowed_harnesses is None else {harness.value for harness in allowed_harnesses}
         )
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
+        query = """
                 SELECT id, title, harness, prompt, dedupe_key
                 FROM jobs
                 WHERE workflow = ? AND state = ? AND placement IS NULL
-                ORDER BY created_at, id
-                """,
-                (workflow, JobState.PENDING.value),
-            ).fetchall()
+        """
+        parameters: tuple[object, ...] = (workflow, JobState.PENDING.value)
+        if workspace is not None:
+            workspace_key = str(workspace)
+            if include_legacy:
+                query += """
+                    AND (
+                        workspace = ?
+                        OR (
+                            workspace IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM jobs AS scoped_jobs
+                                WHERE scoped_jobs.workflow = jobs.workflow
+                                  AND scoped_jobs.workspace IS NOT NULL
+                            )
+                        )
+                    )
+                """
+            else:
+                query += " AND workspace = ?"
+            parameters += (workspace_key,)
+        query += " ORDER BY created_at, id"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
         return [
             dict(row)
             for row in rows

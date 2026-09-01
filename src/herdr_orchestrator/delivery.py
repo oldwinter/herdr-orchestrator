@@ -277,6 +277,12 @@ class StandardizedDelivery(
         self.worker_harnesses = effective_worker_harnesses(config, worker_harnesses)
         self.health = health
         self.readiness_probe = readiness_probe
+        health_harnesses = list(self.worker_harnesses)
+        for harness in (controller_harness, config.planner.harness):
+            if harness is not None and harness not in health_harnesses:
+                health_harnesses.append(harness)
+        self._health_harnesses = tuple(health_harnesses)
+        self._health_snapshot = None
         if health is None:
             try:
                 self.controller = select_controller_harness(
@@ -321,25 +327,28 @@ class StandardizedDelivery(
             )
         self._goal = goal
         delivery_config = self.config.standardized_delivery
-        run_id = hashlib.sha256(
-            (
-                f"{self.config.name}\0{self.config.workspace.resolve()}\0{goal}\0"
-                f"{delivery_config.tracker_backend.value}\0"
-                f"{delivery_config.tracker_root}\0"
-                f"{delivery_config.github_repository}\0"
-                f"{delivery_config.wayfinder.value}\0"
-                f"{delivery_config.max_parallel}\0"
-                f"{delivery_config.review_repair_rounds}"
-            ).encode()
-        ).hexdigest()[:12]
+        run_id = _delivery_run_id(
+            self.config,
+            goal,
+            controller_request=self._controller_request_identity(),
+            worker_harnesses=self.worker_harnesses,
+        )
+        run_id, run_root = _recoverable_delivery_identity(
+            self.config,
+            goal,
+            run_id,
+            self.controller,
+            self.worker_harnesses,
+        )
         self._run_id = run_id
         self._run_root = _safe_delivery_path(
-            self.config.standardized_delivery.artifact_root / run_id,
+            run_root,
             root=self.config.standardized_delivery.artifact_root,
         )
         self._run_root.mkdir(parents=True, exist_ok=True)
         _safe_delivery_path(self._run_root, root=self.config.standardized_delivery.artifact_root)
         self._previous_state = {}
+        self._health_snapshot = None
         lease_seconds = self._lease_seconds or max(
             MINIMUM_DELIVERY_LEASE_SECONDS,
             self.config.coordinator.agent_timeout_seconds + DELIVERY_LEASE_GRACE_SECONDS,
@@ -364,6 +373,11 @@ class StandardizedDelivery(
         if previous is not None and not isinstance(previous, str):
             raise DeliveryError("delivery_health_selection_invalid")
         try:
+            self._health_snapshot = self.health.snapshot(
+                self._health_harnesses,
+                refresh=True,
+                probe=self.readiness_probe,
+            )
             override = self.controller_override
             force_auto = self.controller_auto
             if isinstance(previous, str):
@@ -376,6 +390,7 @@ class StandardizedDelivery(
                 force_auto=force_auto,
                 health=self.health,
                 readiness_probe=self.readiness_probe,
+                health_snapshot=self._health_snapshot,
             )
         except (HarnessHealthError, ValueError) as exc:
             raise DeliveryError(str(exc)) from exc
@@ -393,9 +408,17 @@ class StandardizedDelivery(
                 raise DeliveryError("delivery_state_invalid")
             self._previous_state = state
         try:
-            self._resolve_health_selection()
-            self._recover_proxy_responses()
             completed_result = _load_completed_result(self._run_root / "result.json", run_id)
+            if completed_result is None:
+                self._resolve_health_selection()
+                self._recover_proxy_responses()
+            else:
+                previous = self._previous_state.get("controller")
+                if previous is not None:
+                    try:
+                        self.controller = Harness(previous)
+                    except ValueError as exc:
+                        raise DeliveryError("delivery_health_selection_invalid") from exc
         except Exception as exc:
             self._write_state("failed", stage="stopped", error=type(exc).__name__)
             raise
@@ -784,7 +807,10 @@ class StandardizedDelivery(
         if not allowed_harnesses:
             if self.health is None:
                 raise DeliveryError("worker_harness_unavailable")
-            snapshot = self.health.snapshot(self.worker_harnesses, refresh=False)
+            snapshot = self._health_snapshot or self.health.snapshot(
+                self._health_harnesses,
+                refresh=False,
+            )
             reasons = ",".join(
                 f"{harness.value}={snapshot.record_for(harness).reason}"
                 for harness in self.worker_harnesses
@@ -991,6 +1017,7 @@ class StandardizedDelivery(
                     harness,
                     role=role,
                     probe=self.readiness_probe,
+                    static_reason=self.health.static_reason(harness),
                 )
             except HarnessHealthError as exc:
                 raise DeliveryError(str(exc)) from exc
@@ -1324,11 +1351,17 @@ class StandardizedDelivery(
         )
 
     def _eligible_worker_harnesses(self) -> tuple[Harness, ...]:
+        if self.health is not None and self._health_snapshot is None:
+            self._health_snapshot = self.health.snapshot(
+                self._health_harnesses,
+                refresh=True,
+                probe=self.readiness_probe,
+            )
         return eligible_worker_harnesses(
             self.config,
             self.worker_harnesses,
             health=self.health,
-            readiness_probe=self.readiness_probe,
+            health_snapshot=self._health_snapshot,
         )
 
     def _record_health(self, harness: Harness, outcome: DispatchOutcome) -> None:
@@ -1349,6 +1382,13 @@ class StandardizedDelivery(
                 error_code=code,
             ),
         )
+
+    def _controller_request_identity(self) -> str:
+        if self.controller_override is not None:
+            return self.controller_override.value
+        if not self.controller_auto and self.config.planner.harness is not None:
+            return self.config.planner.harness.value
+        return "auto"
 
     def _worker_profiles(
         self,
@@ -1389,6 +1429,84 @@ def _first_decision_frontier(map_: WayfinderMap) -> DecisionTicket:
         if not ticket.resolution and set(ticket.blocked_by).issubset(resolved):
             return ticket
     raise DeliveryError("wayfinder_frontier_stalled")
+
+
+def _delivery_run_id(
+    config: WorkflowConfig,
+    goal: str,
+    *,
+    controller_request: str,
+    worker_harnesses: Iterable[Harness],
+) -> str:
+    delivery_config = config.standardized_delivery
+    identity = (
+        f"{config.name}\0{config.workspace.resolve()}\0{goal}\0"
+        f"{delivery_config.tracker_backend.value}\0"
+        f"{delivery_config.tracker_root}\0"
+        f"{delivery_config.github_repository}\0"
+        f"{delivery_config.wayfinder.value}\0"
+        f"{delivery_config.max_parallel}\0"
+        f"{delivery_config.review_repair_rounds}\0"
+        f"controller-request={controller_request}\0"
+        f"workers={','.join(harness.value for harness in worker_harnesses)}"
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()[:12]
+
+
+def _legacy_delivery_run_id(
+    config: WorkflowConfig,
+    goal: str,
+    *,
+    controller: Harness,
+    worker_harnesses: Iterable[Harness],
+) -> str:
+    delivery_config = config.standardized_delivery
+    identity = (
+        f"{config.name}\0{config.workspace.resolve()}\0{goal}\0"
+        f"{delivery_config.tracker_backend.value}\0"
+        f"{delivery_config.tracker_root}\0"
+        f"{delivery_config.github_repository}\0"
+        f"{delivery_config.wayfinder.value}\0"
+        f"{delivery_config.max_parallel}\0"
+        f"{delivery_config.review_repair_rounds}\0"
+        f"{controller.value}\0"
+        f"{','.join(harness.value for harness in worker_harnesses)}"
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()[:12]
+
+
+def _recoverable_delivery_identity(
+    config: WorkflowConfig,
+    goal: str,
+    run_id: str,
+    selected_controller: Harness,
+    worker_harnesses: Iterable[Harness],
+) -> tuple[str, Path]:
+    artifact_root = config.standardized_delivery.artifact_root
+    current_root = artifact_root / run_id
+    if _delivery_root_has_state(current_root):
+        return run_id, current_root
+    candidates = [selected_controller]
+    candidates.extend(
+        harness
+        for harness in AUTO_CONTROLLER_ORDER
+        if harness in worker_harnesses and harness not in candidates
+    )
+    for controller in candidates:
+        legacy_id = _legacy_delivery_run_id(
+            config,
+            goal,
+            controller=controller,
+            worker_harnesses=worker_harnesses,
+        )
+        legacy_root = artifact_root / legacy_id
+        if legacy_id != run_id and _delivery_root_has_state(legacy_root):
+            return legacy_id, legacy_root
+    return run_id, current_root
+
+
+def _delivery_root_has_state(root: Path) -> bool:
+    return any((root / name).is_file() for name in ("state.json", "journal.jsonl", "result.json"))
 
 
 def _agent_name(role: str, workspace: Path, harness: Harness) -> str:

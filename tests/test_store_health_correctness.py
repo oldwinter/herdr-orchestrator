@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from herdr_orchestrator.model import Harness, NewJob
+from herdr_orchestrator.model import Harness, NewJob, PlacementTarget
 from herdr_orchestrator.store import SCHEMA_VERSION, Store
 
 
@@ -175,6 +175,57 @@ class StoreHealthCorrectnessTests(unittest.TestCase):
             )
         self.assertEqual(len(claimed), 1)
         self.assertEqual(self.store.jobs("workflow")[0]["attempts"], 1)
+
+    def test_claim_status_and_unplaced_queries_are_workspace_scoped(self) -> None:
+        self.store.enqueue(
+            NewJob(
+                workflow="workflow",
+                workspace="/workspace-a",
+                title="a",
+                harness=Harness.CODEX,
+                prompt="a",
+                dedupe_key="claim-a",
+                max_attempts=1,
+                placement=None,
+            )
+        )
+        self.store.enqueue(
+            NewJob(
+                workflow="workflow",
+                workspace="/workspace-b",
+                title="b",
+                harness=Harness.CODEX,
+                prompt="b",
+                dedupe_key="claim-b",
+                max_attempts=1,
+                placement=None,
+            )
+        )
+        self.assertEqual(
+            len(
+                self.store.unplaced_jobs(
+                    "workflow",
+                    workspace="/workspace-a",
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.store.status_counts("workflow", workspace="/workspace-a")["pending"],
+            1,
+        )
+
+        self.store.set_placement(1, PlacementTarget.TAB)
+        claimed = self.store.claim(
+            "workflow",
+            limit=1,
+            lease_seconds=30,
+            workspace="/workspace-a",
+        )
+
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0].job_id, 1)
+        self.assertEqual(self.store.status_counts("workflow", workspace="/workspace-b")["pending"], 1)
 
     def test_v7_health_schema_migration_is_restart_safe(self) -> None:
         path = Path(self.temporary.name) / "v7.db"

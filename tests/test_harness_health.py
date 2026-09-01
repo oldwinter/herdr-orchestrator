@@ -166,6 +166,141 @@ class HarnessHealthTests(unittest.TestCase):
             assert record is not None
             self.assertEqual(record.status, HarnessHealthStatus.READY)
 
+    def test_blocked_hard_failure_updates_health_but_task_block_is_neutral(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            health = HarnessHealth(Store(config.state_db), config)
+            health.record_probe(Harness.DROID, {"status": "ready"})
+
+            task_block = DispatchOutcome(
+                "worker",
+                AgentState.BLOCKED,
+                False,
+                "pane",
+                error_code="agent_blocked",
+            )
+            self.assertIsNone(health.record_dispatch(Harness.DROID, task_block))
+            self.assertEqual(
+                health.snapshot((Harness.DROID,), refresh=False)
+                .record_for(Harness.DROID)
+                .status,
+                HarnessHealthStatus.READY,
+            )
+
+            auth_block = replace(task_block, error_code="agent_auth_required")
+            record = health.record_dispatch(Harness.DROID, auth_block)
+            assert record is not None
+            self.assertEqual(record.status, HarnessHealthStatus.UNAVAILABLE)
+            self.assertEqual(record.reason, "agent_auth_required")
+
+    def test_non_cooperative_probe_is_bounded_and_late_ready_does_not_authorize(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            started = threading.Event()
+            release = threading.Event()
+
+            def probe(_workflow, _harness, _timeout):
+                started.set()
+                release.wait(timeout=30)
+                return {"status": "ready"}
+
+            health = HarnessHealth(
+                Store(config.state_db),
+                config,
+                probe=probe,
+                probe_timeout_seconds=5,
+            )
+            deadline = time.monotonic() + 5.1
+            began = time.monotonic()
+            snapshot = health.snapshot(
+                (Harness.DROID,),
+                refresh=True,
+                timeout_seconds=5,
+                deadline=deadline,
+            )
+            elapsed = time.monotonic() - began
+
+            self.assertTrue(started.is_set())
+            self.assertLess(elapsed, 6.0)
+            self.assertEqual(snapshot.eligible_harnesses, ())
+            persisted = health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID)
+            self.assertEqual(persisted.status, HarnessHealthStatus.DEGRADED)
+            self.assertEqual(persisted.reason, "timeout")
+            release.set()
+
+    def test_injected_ci_disables_and_persists_probe_classification(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            calls = 0
+
+            def probe(_workflow, _harness, _timeout):
+                nonlocal calls
+                calls += 1
+                return {"status": "ready"}
+
+            health = HarnessHealth(
+                Store(config.state_db),
+                config,
+                probe=probe,
+                environment={"CI": "1"},
+            )
+            result = health.run_probe(Harness.DROID, probe)
+
+            self.assertEqual(calls, 0)
+            self.assertEqual(result["error_code"], "readiness_ci_forbidden")
+            record = health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID)
+            self.assertEqual(record.status, HarnessHealthStatus.UNAVAILABLE)
+            self.assertEqual(record.reason, "readiness_ci_forbidden")
+
+    def test_health_report_exposes_static_exclusion_over_persisted_ready(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            health = HarnessHealth(
+                Store(config.state_db),
+                config,
+                environment={"HERDR_ENV": "0"},
+            )
+            health.record_probe(Harness.DROID, {"status": "ready"})
+
+            report = health.snapshot((Harness.DROID,), refresh=False).public_json()
+
+            self.assertEqual(report["eligible"], [])
+            self.assertEqual(report["static_reasons"], {"droid": "not_in_herdr"})
+            self.assertEqual(report["records"][0]["source"], "preflight")
+
+    def test_malformed_probe_result_is_stable_for_doctor_checks(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            output = io.StringIO()
+
+            def probe(_workflow, _harness, _timeout):
+                return "malformed"
+
+            with redirect_stdout(output):
+                result = doctor(
+                    config,
+                    environ={
+                        "HERDR_ENV": "1",
+                        "HERDR_PANE_ID": "w:p",
+                        "HERDR_WORKSPACE_ID": "w",
+                    },
+                    which=lambda command: f"/bin/{command}",
+                    version_runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                        ["herdr", "--version"], 0, "herdr 0.8.2\n", ""
+                    ),
+                    readiness_probe=probe,
+                    selected_harnesses=["droid"],
+                    store=Store(config.state_db),
+                )
+
+            report = json.loads(output.getvalue())
+            readiness = next(
+                check for check in report["checks"] if check["check"] == "readiness:droid"
+            )
+            self.assertEqual(result, 1)
+            self.assertFalse(readiness["ok"])
+            self.assertEqual(readiness["error_code"], "readiness_result_invalid")
+
     def test_probe_lease_deduplicates_concurrent_refreshes(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

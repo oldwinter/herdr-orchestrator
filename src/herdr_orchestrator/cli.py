@@ -774,16 +774,24 @@ def _doctor_harness_checks(
     profile = profile_for_harness(workflow.profiles, harness)
     profile_ok = profile.context_file.is_file()
     probe_started = time.monotonic()
-    active_readiness = readiness or _harness_readiness(
-        workflow,
-        harness,
-        environ,
-        executable,
-        profile_ok,
-        herdr_path,
-        probe,
-        probe_timeout_seconds,
-    )
+    active_readiness = readiness
+    if active_readiness is None:
+        active_readiness = _harness_readiness(
+            workflow,
+            harness,
+            environ,
+            executable,
+            profile_ok,
+            herdr_path,
+            probe,
+            probe_timeout_seconds,
+        )
+    if not isinstance(active_readiness, Mapping):
+        active_readiness = {
+            "status": "error",
+            "error_code": "readiness_result_invalid",
+            "error_summary": None,
+        }
     measured_ms = max(0, int((time.monotonic() - probe_started) * 1000))
     reported_ms = active_readiness.get("duration_ms")
     duration_ms = (
@@ -847,7 +855,14 @@ def _harness_readiness(
             "error_summary": None,
         }
     try:
-        return probe(workflow, harness, probe_timeout_seconds)
+        result = probe(workflow, harness, probe_timeout_seconds)
+        if isinstance(result, Mapping):
+            return result
+        return {
+            "status": "error",
+            "error_code": "readiness_result_invalid",
+            "error_summary": None,
+        }
     except Exception as exc:
         return {
             "status": "error",
