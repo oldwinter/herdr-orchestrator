@@ -9,8 +9,10 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
+from herdr_orchestrator import __version__
 from herdr_orchestrator.catalog import (
     CatalogError,
     full_profile_payload,
@@ -43,6 +45,15 @@ from herdr_orchestrator.model import (
     WorkflowConfig,
 )
 from herdr_orchestrator.protocol import TransportError
+from herdr_orchestrator.readiness import (
+    BuildIdentity,
+    ReadinessEnvironment,
+    ReadinessProbe,
+    ReadinessVerification,
+    collect_readiness_matrix,
+    inspect_readiness_environment,
+    resolve_build_identity,
+)
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.store import Store, StoreError
 from herdr_orchestrator.tracker import TrackerError
@@ -63,6 +74,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         choices=[item.value for item in Harness],
         help="Limit readiness probes to one enabled harness; repeat for more than one.",
+    )
+
+    readiness_parser = subparsers.add_parser("readiness-matrix")
+    readiness_parser.add_argument("--workflow", required=True)
+    readiness_parser.add_argument("--probe-timeout-seconds", type=int, default=30)
+    readiness_parser.add_argument(
+        "--harness",
+        action="append",
+        choices=[item.value for item in Harness],
+        help="Limit evidence to one enabled harness; repeat for more than one.",
     )
 
     retry_parser = subparsers.add_parser("retry")
@@ -177,6 +198,14 @@ def _command_doctor(config: WorkflowConfig, args: argparse.Namespace) -> int:
         config,
         probe_timeout_seconds=args.probe_timeout_seconds,
         selected_harnesses=getattr(args, "harness", None),
+    )
+
+
+def _command_readiness_matrix(config: WorkflowConfig, args: argparse.Namespace) -> int:
+    return readiness_matrix(
+        config,
+        probe_timeout_seconds=args.probe_timeout_seconds,
+        selected_harnesses=args.harness,
     )
 
 
@@ -390,6 +419,7 @@ COMMAND_HANDLERS: Mapping[str, CommandHandler] = {
     "enqueue": _command_enqueue,
     "gc": _command_gc,
     "profile": _command_profile,
+    "readiness-matrix": _command_readiness_matrix,
     "resume": _command_resume,
     "retry": _command_retry,
     "run": _command_run,
@@ -442,9 +472,6 @@ def _task_receipt_from_args(args: argparse.Namespace) -> TaskReceipt | None:
             raise ValueError("receipt_file_invalid")
         return TaskReceipt(ReceiptKind.FILE, path.as_posix())
     return None
-
-
-ReadinessProbe = Callable[[WorkflowConfig, Harness, int], Mapping[str, object]]
 
 
 def doctor(
@@ -506,6 +533,44 @@ def doctor(
         )
     )
     return 0 if ok else 1
+
+
+def readiness_matrix(
+    workflow: WorkflowConfig,
+    *,
+    selected_harnesses: list[str] | None = None,
+    probe_timeout_seconds: int = 30,
+    environ: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    environment: ReadinessEnvironment | None = None,
+    build: BuildIdentity | None = None,
+    build_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    readiness_probe: ReadinessProbe | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> int:
+    current_environ = os.environ if environ is None else environ
+    active_environment = environment or inspect_readiness_environment(
+        workflow,
+        environ=current_environ,
+        which=which,
+    )
+    active_build = build or resolve_build_identity(
+        workflow.workspace,
+        __version__,
+        runner=build_runner,
+    )
+    active_clock = clock or (lambda: datetime.now(UTC))
+    matrix = collect_readiness_matrix(
+        workflow,
+        selected_harnesses=selected_harnesses,
+        timeout_seconds=probe_timeout_seconds,
+        environment=active_environment,
+        build=active_build,
+        probe=readiness_probe or probe_harness_readiness,
+        clock=active_clock,
+    )
+    print(json.dumps(matrix.public_json(), indent=2, sort_keys=True))
+    return 0 if matrix.verification is ReadinessVerification.VERIFIED else 1
 
 
 def _doctor_system_checks(

@@ -8,12 +8,19 @@ import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import herdr_orchestrator.cli as cli_module
-from herdr_orchestrator.cli import build_parser, doctor, probe_harness_readiness, smoke
+from herdr_orchestrator.cli import (
+    build_parser,
+    doctor,
+    probe_harness_readiness,
+    readiness_matrix,
+    smoke,
+)
 from herdr_orchestrator.completion import CompletionPolicy
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.delivery import DeliveryEscalation
@@ -24,6 +31,7 @@ from herdr_orchestrator.model import (
     Harness,
     ReceiptKind,
 )
+from herdr_orchestrator.readiness import BuildIdentity, ReadinessEnvironment
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -180,6 +188,52 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(args.harness, ["droid", "codex"])
+
+    def test_readiness_matrix_accepts_repeatable_harness_filter(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "readiness-matrix",
+                "--workflow",
+                "workflow.toml",
+                "--harness",
+                "droid",
+                "--harness",
+                "codex",
+            ]
+        )
+
+        self.assertEqual(args.harness, ["droid", "codex"])
+
+    def test_readiness_matrix_prints_structured_current_build_evidence(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        output = io.StringIO()
+        environment = ReadinessEnvironment(
+            True,
+            {harness: True for harness in Harness},
+            {harness: True for harness in Harness},
+        )
+
+        with redirect_stdout(output):
+            code = readiness_matrix(
+                config,
+                selected_harnesses=["droid"],
+                probe_timeout_seconds=15,
+                environment=environment,
+                build=BuildIdentity("a" * 40, "0.1.6"),
+                readiness_probe=lambda *args: {
+                    "status": "ready",
+                    "error_code": None,
+                    "phase_timings_ms": {"total": 7},
+                },
+                clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
+            )
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["verification"], "VERIFIED")
+        self.assertEqual(report["results"][0]["harness"], "droid")
+        self.assertEqual(report["results"][0]["attempt_count"], 1)
+        self.assertEqual(report["commit"], "a" * 40)
 
     def test_enqueue_defaults_to_automatic_selection(self) -> None:
         args = build_parser().parse_args(
