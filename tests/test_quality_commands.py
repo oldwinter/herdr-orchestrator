@@ -10,9 +10,74 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+BUNDLE_SCRIPT = REPO_ROOT / "scripts/quality_bundle.py"
 
 
 class QualityCommandTests(unittest.TestCase):
+    def test_quality_bundle_storage_failure_has_stable_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            blocked_parent = Path(temporary) / "not-a-directory"
+            blocked_parent.write_text("occupied", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(BUNDLE_SCRIPT),
+                    "run",
+                    "--root",
+                    str(blocked_parent / "quality"),
+                    "--producer",
+                    "build",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "quality_storage_unavailable")
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_quality_bundle_result_write_failure_removes_published_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence_root = root / "quality"
+            commands = root / "bin"
+            commands.mkdir()
+            self._write_full_quality_tools(commands)
+            blocked_parent = root / "not-a-directory"
+            blocked_parent.write_text("occupied", encoding="utf-8")
+            environment = os.environ.copy()
+            environment["PATH"] = f"{commands}{os.pathsep}{environment['PATH']}"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(BUNDLE_SCRIPT),
+                    "run",
+                    "--root",
+                    str(evidence_root),
+                    "--producer",
+                    "build",
+                    "--result",
+                    str(blocked_parent / "result.json"),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+            runs = list((evidence_root / "runs").iterdir())
+            results = list((evidence_root / "results").iterdir())
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "quality_storage_unavailable")
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(runs, [])
+        self.assertEqual(results, [])
+
     def test_public_runner_binds_tracked_and_untracked_source_changes(self) -> None:
         for label, status_line in (
             ("tracked", " M scripts/quality_bundle.py"),
@@ -307,6 +372,7 @@ class QualityCommandTests(unittest.TestCase):
                             capture_output=True,
                             text=True,
                             check=False,
+                            env=environment,
                             timeout=30,
                         )
                         summary = summary_path.read_text(encoding="utf-8")
@@ -757,7 +823,9 @@ class QualityCommandTests(unittest.TestCase):
             "'fixes': []}))\n"
             "if args[1:3] == ['python', 'scripts/test_stability.py']:\n"
             "    pathlib.Path(args[args.index('--output') + 1]).write_text(json.dumps("
-            "{'executions': [{'exit_code': 0}, {'exit_code': 0}, {'exit_code': 0}], "
+            "{'executions': [{'duration_seconds': 0.1, 'exit_code': 0, 'run': 1, 'tests': 1}, "
+            "{'duration_seconds': 0.1, 'exit_code': 0, 'run': 2, 'tests': 1}, "
+            "{'duration_seconds': 0.1, 'exit_code': 0, 'run': 3, 'tests': 1}], "
             "'runs': 3, 'status': 'passed', 'unstable': []}))\n"
             "if args[1:3] == ['python', 'scripts/profile_tests.py']:\n"
             "    output = pathlib.Path(args[args.index('--output') + 1])\n"

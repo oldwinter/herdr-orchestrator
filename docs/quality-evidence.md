@@ -23,6 +23,7 @@ After all producers settle, the runner writes one completed manifest and atomica
 ```text
 .orchestrator/quality/runs/<run-id>/
   manifest.json
+  producers/<producer>/producer.json
   producers/<producer>/result.json
   producers/<producer>/<raw-artifacts>
 ```

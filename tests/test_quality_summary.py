@@ -118,11 +118,12 @@ class QualitySummaryTests(unittest.TestCase):
     def test_summary_reads_only_the_completed_manifest_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            specs = self._specs(self._complete_security())
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit="c" * 40,
                 invocation_id="manifest-only",
-                specs=self._specs(self._complete_security()),
+                specs=specs,
             )
             poisoned = root / "coverage.json"
             poisoned.write_text(
@@ -131,24 +132,31 @@ class QualitySummaryTests(unittest.TestCase):
             )
             output = root / "summary.md"
             manifest_payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "quality_summary.py",
-                    "--manifest",
-                    str(bundle.manifest_path),
-                    "--expected-commit",
-                    "c" * 40,
-                    "--expected-invocation",
-                    "manifest-only",
-                    "--expected-run",
-                    bundle.path.name,
-                    "--expected-source",
-                    manifest_payload["source_digest"],
-                    "--output",
-                    str(output),
-                ],
+            with (
+                patch.dict(
+                    quality_summary.quality_bundle.PRODUCER_SPECS,
+                    {spec.name: spec for spec in specs},
+                    clear=True,
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "quality_summary.py",
+                        "--manifest",
+                        str(bundle.manifest_path),
+                        "--expected-commit",
+                        "c" * 40,
+                        "--expected-invocation",
+                        "manifest-only",
+                        "--expected-run",
+                        bundle.path.name,
+                        "--expected-source",
+                        manifest_payload["source_digest"],
+                        "--output",
+                        str(output),
+                    ],
+                ),
             ):
                 status = quality_summary.main()
             summary = output.read_text(encoding="utf-8")
@@ -206,7 +214,7 @@ class QualitySummaryTests(unittest.TestCase):
             "coverage",
             {
                 "coverage.json": {"totals": {"percent_covered": 10**1000}},
-                "tests.json": {"tests": []},
+                "tests.json": {"tests": [{"nodeid": "fixture", "outcome": "passed"}]},
             },
             {"coverage": "coverage.json", "tests": "tests.json"},
         )
@@ -221,24 +229,31 @@ class QualitySummaryTests(unittest.TestCase):
             )
             manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
             output = root / "summary.md"
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "quality_summary.py",
-                    "--manifest",
-                    str(bundle.manifest_path),
-                    "--expected-commit",
-                    commit,
-                    "--expected-invocation",
-                    "unbounded-coverage",
-                    "--expected-run",
-                    bundle.path.name,
-                    "--expected-source",
-                    manifest["source_digest"],
-                    "--output",
-                    str(output),
-                ],
+            with (
+                patch.dict(
+                    quality_summary.quality_bundle.PRODUCER_SPECS,
+                    {spec.name: spec for spec in specs},
+                    clear=True,
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "quality_summary.py",
+                        "--manifest",
+                        str(bundle.manifest_path),
+                        "--expected-commit",
+                        commit,
+                        "--expected-invocation",
+                        "unbounded-coverage",
+                        "--expected-run",
+                        bundle.path.name,
+                        "--expected-source",
+                        manifest["source_digest"],
+                        "--output",
+                        str(output),
+                    ],
+                ),
             ):
                 status = quality_summary.main()
             summary = output.read_text(encoding="utf-8")
@@ -261,38 +276,46 @@ class QualitySummaryTests(unittest.TestCase):
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            specs = self._specs(
+                security_files,
+                security_exit=security_exit,
+                coverage_exit=coverage_exit,
+                stability_exit=stability_exit,
+                build_exit=build_exit,
+            )
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit=commit,
                 invocation_id="summary-fixture",
-                specs=self._specs(
-                    security_files,
-                    security_exit=security_exit,
-                    coverage_exit=coverage_exit,
-                    stability_exit=stability_exit,
-                    build_exit=build_exit,
-                ),
+                specs=specs,
             )
             output = root / "summary.md"
             manifest_payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "quality_summary.py",
-                    "--manifest",
-                    str(bundle.manifest_path),
-                    "--expected-commit",
-                    expected_commit or commit,
-                    "--expected-invocation",
-                    expected_invocation or "summary-fixture",
-                    "--expected-run",
-                    expected_run or bundle.path.name,
-                    "--expected-source",
-                    manifest_payload["source_digest"],
-                    "--output",
-                    str(output),
-                ],
+            with (
+                patch.dict(
+                    quality_summary.quality_bundle.PRODUCER_SPECS,
+                    {spec.name: spec for spec in specs},
+                    clear=True,
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "quality_summary.py",
+                        "--manifest",
+                        str(bundle.manifest_path),
+                        "--expected-commit",
+                        expected_commit or commit,
+                        "--expected-invocation",
+                        expected_invocation or "summary-fixture",
+                        "--expected-run",
+                        expected_run or bundle.path.name,
+                        "--expected-source",
+                        manifest_payload["source_digest"],
+                        "--output",
+                        str(output),
+                    ],
+                ),
             ):
                 status = quality_summary.main()
             return status, output.read_text(encoding="utf-8")
@@ -313,7 +336,7 @@ class QualitySummaryTests(unittest.TestCase):
                 "coverage",
                 {
                     "coverage.json": {"totals": {"percent_covered": 91.0}},
-                    "tests.json": {"tests": []},
+                    "tests.json": {"tests": [{"nodeid": "fixture", "outcome": "passed"}]},
                 },
                 {"coverage": "coverage.json", "tests": "tests.json"},
                 exit_code=coverage_exit,
@@ -323,9 +346,9 @@ class QualitySummaryTests(unittest.TestCase):
                 {
                     "stability.json": {
                         "executions": [
-                            {"exit_code": 0},
-                            {"exit_code": 0},
-                            {"exit_code": 0},
+                            {"duration_seconds": 0.1, "exit_code": 0, "run": 1, "tests": 1},
+                            {"duration_seconds": 0.1, "exit_code": 0, "run": 2, "tests": 1},
+                            {"duration_seconds": 0.1, "exit_code": 0, "run": 3, "tests": 1},
                         ],
                         "runs": 3,
                         "status": "passed",
@@ -350,9 +373,12 @@ class QualitySummaryTests(unittest.TestCase):
                 "build",
                 {
                     "build.json": {
+                        "command": "npm pack --dry-run --json",
                         "duration_seconds": 0.1,
+                        "exit_code": 0,
                         "entry_count": 1,
                         "package_size_bytes": 10,
+                        "status": "passed",
                         "unpacked_size_bytes": 20,
                     }
                 },
