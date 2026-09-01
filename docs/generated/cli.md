@@ -65,6 +65,7 @@ Run commands from a source checkout with `uv run python -m herdr_orchestrator`.
 | `--placement` | no |
 | `--receipt-prefix` | no |
 | `--receipt-file` | no |
+| `--completion-policy` | no |
 | `--controller-harness` | no |
 | `--worker-harness` | no |
 
@@ -88,6 +89,16 @@ Run commands from a source checkout with `uv run python -m herdr_orchestrator`.
 | `--workflow` | yes |
 | `harness` | yes |
 | `--format` | no |
+
+## `readiness-matrix`
+
+`herdr-orchestrator readiness-matrix [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--workflow` | yes |
+| `--probe-timeout-seconds` | no |
+| `--harness` | no |
 
 ## `resume`
 

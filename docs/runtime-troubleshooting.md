@@ -100,6 +100,18 @@ just doctor --harness droid
 just doctor --harness droid --harness codex
 ```
 
+需要可比较的 current-build evidence 时，在 Herdr-managed pane 运行 structured matrix。不要从普通
+shell 或 pull-request CI 运行真实 matrix：
+
+```bash
+just readiness-matrix --harness droid
+just readiness-matrix --harness droid --harness codex
+```
+
+Matrix 中只有 `ready` row 是 `VERIFIED`。`attempt_count=0` 表示本机环境、executable 或 profile 在
+probe 前不可用；失败、过期和不可解析结果均为 `NOT VERIFIED`。Raw prompt、terminal output、完整
+response 和 provider error summary 不会进入 matrix。
+
 再读取结构化 agent 状态：
 
 ```bash
@@ -142,6 +154,10 @@ herdr integration status
 | `lease_expired_unaccepted` | reconciliation 证明原 operation 未接受输入 | abandon 原 operation；dispatch 可按 budget 创建 replacement |
 | `unsafe_turn_adoption` | runtime identity 或 sequence 不能证明同一 accepted turn | terminal attention；不发送 replacement prompt |
 | `task_receipt_recovery_unverified` | settled recovery 的 durable verification 缺失或不为 true | terminal attention；不重复执行任务 |
+| `completion_recovery_unverified` | structured-v2 已 settled，但 typed evidence 未 durable commit | terminal attention；不重读旧 terminal output |
+| `completion_job_mismatch` / `completion_attempt_mismatch` | envelope identity 不属于当前 claim | 按 completion verification failure 处理 |
+| `completion_fencing_token_mismatch` | envelope 使用旧 attempt token | 按 completion verification failure 处理 |
+| `completion_envelope_duplicate` | 当前 output window 有多条 envelope | 按 completion verification failure 处理 |
 
 Herdr 0.8.2 没有 active-turn cancellation command。`unsafe_turn_adoption` 的 fencing 只保护
 SQLite current projection。它不能停止 agent，也不能撤销外部副作用。
