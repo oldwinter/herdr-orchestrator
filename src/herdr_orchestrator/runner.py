@@ -185,6 +185,7 @@ class Coordinator:
             placement=placement,
             receipt=receipt,
             completion_policy=completion_policy,
+            workspace=str(self.config.workspace.resolve()),
         )
         if existing is not None:
             job_id, existing_harness = existing
@@ -242,6 +243,9 @@ class Coordinator:
             slot_names=slot_names,
             slot_limits={worker.harness.value: worker.replicas for worker in self.config.workers},
             allowed_harnesses=eligible_workers,
+            workspace=str(self.config.workspace.resolve()),
+            require_fresh_health=self.health is not None,
+            include_legacy=True,
         )
         results = {state.value: 0 for state in JobState}
         if not jobs:
@@ -696,6 +700,7 @@ class Coordinator:
             self.store.pending_harnesses(
                 self.config.name,
                 workspace=str(self.config.workspace.resolve()),
+                include_legacy=True,
             )
         ) & set(self.worker_harnesses)
         if not pending:
