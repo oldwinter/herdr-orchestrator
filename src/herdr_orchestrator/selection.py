@@ -49,6 +49,7 @@ def select_controller_harness(
     health: HarnessHealth | None = None,
     readiness_probe: HealthProbe | None = None,
     health_timeout_seconds: int | None = None,
+    health_deadline: float | None = None,
 ) -> Harness:
     requested = None if force_auto else (override or config.planner.harness)
     if requested is not None:
@@ -58,6 +59,8 @@ def select_controller_harness(
                 role="controller",
                 probe=readiness_probe,
                 timeout_seconds=health_timeout_seconds,
+                deadline=health_deadline,
+                static_reason=health.static_reason(requested),
             )
         return requested
 
@@ -65,11 +68,14 @@ def select_controller_harness(
     eligible = set(candidates)
     snapshot: EligibilitySnapshot | None = None
     if health is not None:
+        static_reasons = health.static_reasons(candidates)
         snapshot = health.snapshot(
             candidates,
             refresh=True,
             probe=readiness_probe,
             timeout_seconds=health_timeout_seconds,
+            deadline=health_deadline,
+            static_reasons=static_reasons,
         )
         eligible = set(snapshot.eligible_harnesses)
     for harness in AUTO_CONTROLLER_ORDER:
@@ -96,16 +102,20 @@ def eligible_worker_harnesses(
     health: HarnessHealth | None = None,
     readiness_probe: HealthProbe | None = None,
     health_timeout_seconds: int | None = None,
+    health_deadline: float | None = None,
 ) -> tuple[Harness, ...]:
     """Return the configured worker pool filtered through one health snapshot."""
     requested = tuple(dict.fromkeys(worker_harnesses))
     if health is None:
         return requested
+    static_reasons = health.static_reasons(requested)
     snapshot = health.snapshot(
         requested,
         refresh=True,
         probe=readiness_probe,
         timeout_seconds=health_timeout_seconds,
+        deadline=health_deadline,
+        static_reasons=static_reasons,
     )
     health.record_selection(snapshot, role="worker")
     return tuple(harness for harness in requested if harness in snapshot.eligible_harnesses)

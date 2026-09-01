@@ -213,6 +213,7 @@ class NewJob:
     placement: PlacementTarget | None = PlacementTarget.TAB
     receipt: TaskReceipt | None = None
     completion_policy: CompletionPolicy | None = None
+    workspace: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

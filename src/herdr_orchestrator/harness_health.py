@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -243,6 +244,8 @@ class HarnessHealth:
         cooldown_seconds: int | None = None,
         probe_timeout_seconds: int | None = None,
         allow_live_probe: bool | None = None,
+        environment: Mapping[str, str] | None = None,
+        executable_finder: Callable[[str], str | None] = shutil.which,
     ) -> None:
         self.store = store
         self.workflow = workflow
@@ -266,6 +269,8 @@ class HarnessHealth:
         self.probe = probe
         self.clock = clock
         self.observability = observability
+        self.environment = environment
+        self.executable_finder = executable_finder
         self._refresh_lock = threading.Lock()
         self.live_probe_allowed = (
             not any(
@@ -284,20 +289,37 @@ class HarnessHealth:
         force_refresh: bool = False,
         probe: HealthProbe | None = None,
         timeout_seconds: int | None = None,
+        deadline: float | None = None,
+        static_reasons: Mapping[Harness, str] | None = None,
     ) -> EligibilitySnapshot:
         if timeout_seconds is not None and timeout_seconds != 0 and not 5 <= timeout_seconds <= 300:
             raise ValueError("harness_health_probe_timeout_invalid")
         values = _unique_harnesses(harnesses)
         now = self._now()
         self.store.initialize()
-        records = self._records(values, now)
+        records = self._apply_static_reasons(
+            self._records(values, now),
+            static_reasons,
+        )
         if refresh:
             active_probe = probe or self.probe
             for record in records:
+                if static_reasons is not None and record.harness in static_reasons:
+                    continue
                 if force_refresh or record.refresh_due(now):
-                    self._refresh(record.harness, active_probe, timeout_seconds)
+                    if deadline is not None and deadline - time.monotonic() <= 0:
+                        break
+                    self._refresh(
+                        record.harness,
+                        active_probe,
+                        timeout_seconds,
+                        deadline=deadline,
+                    )
             now = self._now()
-            records = self._records(values, now)
+            records = self._apply_static_reasons(
+                self._records(values, now),
+                static_reasons,
+            )
         return EligibilitySnapshot(self.workflow_name, self.workspace, now, records)
 
     def require(
@@ -307,12 +329,27 @@ class HarnessHealth:
         role: str,
         probe: HealthProbe | None = None,
         timeout_seconds: int | None = None,
+        deadline: float | None = None,
+        static_reason: str | None = None,
     ) -> HarnessHealthRecord:
+        if static_reason is not None:
+            snapshot = self.snapshot(
+                (harness,),
+                refresh=False,
+                static_reasons={harness: static_reason},
+            )
+            record = snapshot.record_for(harness)
+            self.record_selection(
+                snapshot,
+                role=role,
+            )
+            raise HarnessHealthError(role, harness, record)
         snapshot = self.snapshot(
             (harness,),
             refresh=True,
             probe=probe,
             timeout_seconds=timeout_seconds,
+            deadline=deadline,
         )
         record = snapshot.record_for(harness)
         if not record.eligible_at(snapshot.evaluated_at):
@@ -320,6 +357,39 @@ class HarnessHealth:
             raise HarnessHealthError(role, harness, record)
         self.record_selection(snapshot, role=role, selected=harness)
         return record
+
+    def static_reasons(self, harnesses: Iterable[Harness]) -> dict[Harness, str]:
+        return {
+            harness: reason
+            for harness in _unique_harnesses(harnesses)
+            if (reason := self.static_reason(harness)) is not None
+        }
+
+    def static_reason(self, harness: Harness) -> str | None:
+        if self.environment is None:
+            return None
+        if any(
+            self.environment.get(key, "").strip().lower() in {"1", "true", "yes"}
+            for key in ("CI", "GITHUB_ACTIONS")
+        ):
+            return "readiness_ci_forbidden"
+        if self.environment.get("HERDR_ENV") != "1":
+            return "not_in_herdr"
+        if not self.environment.get("HERDR_PANE_ID"):
+            return "herdr_pane_id_missing"
+        if not self.environment.get("HERDR_WORKSPACE_ID"):
+            return "herdr_workspace_id_missing"
+        if self.executable_finder("herdr") is None:
+            return "herdr_unavailable"
+        if self.executable_finder(harness.value) is None:
+            return "harness_unavailable"
+        profile = next(
+            (item for item in self.workflow.profiles if item.harness is harness),
+            None,
+        )
+        if profile is None or not profile.context_file.is_file():
+            return "profile_unavailable"
+        return None
 
     def eligibility(
         self,
@@ -329,6 +399,8 @@ class HarnessHealth:
         force_refresh: bool = False,
         probe: HealthProbe | None = None,
         timeout_seconds: int | None = None,
+        deadline: float | None = None,
+        static_reasons: Mapping[Harness, str] | None = None,
     ) -> EligibilitySnapshot:
         return self.snapshot(
             harnesses,
@@ -336,6 +408,8 @@ class HarnessHealth:
             force_refresh=force_refresh,
             probe=probe,
             timeout_seconds=timeout_seconds,
+            deadline=deadline,
+            static_reasons=static_reasons,
         )
 
     def record_selection(
@@ -356,6 +430,31 @@ class HarnessHealth:
                 "eligible": [harness.value for harness in snapshot.eligible_harnesses],
                 "excluded": snapshot.reasons,
             },
+        )
+
+    def run_probe(
+        self,
+        harness: Harness,
+        probe: HealthProbe,
+        *,
+        timeout_seconds: int | None = None,
+        source: str | HealthSource = HealthSource.DOCTOR,
+        force: bool = True,
+        deadline: float | None = None,
+    ) -> Mapping[str, object]:
+        """Run one leased probe, including a forced doctor refresh, and return its raw shape."""
+        self.store.initialize()
+        now = self._now()
+        current = self._records((harness,), now)[0]
+        if not force and not current.refresh_due(now):
+            return {"status": current.status.value, "error_code": current.reason}
+        return self._probe_with_lease(
+            harness,
+            probe,
+            timeout_seconds,
+            source=source,
+            deadline=deadline,
+            force=force,
         )
 
     def record_probe(
@@ -389,7 +488,8 @@ class HarnessHealth:
             cooldown_until,
             failures,
         )
-        self._write(record)
+        if not self._write(record):
+            return self._records((harness,), self._now())[0]
         self._event("harness_health_changed", record, now)
         return record
 
@@ -477,15 +577,64 @@ class HarnessHealth:
             records.append(record)
         return tuple(records)
 
+    @staticmethod
+    def _apply_static_reasons(
+        records: tuple[HarnessHealthRecord, ...],
+        static_reasons: Mapping[Harness, str] | None,
+    ) -> tuple[HarnessHealthRecord, ...]:
+        if not static_reasons:
+            return records
+        return tuple(
+            (
+                replace(
+                    record,
+                    status=HarnessHealthStatus.UNAVAILABLE,
+                    reason=reason,
+                    source="preflight",
+                    expires_at=None,
+                    cooldown_until=None,
+                )
+                if (reason := static_reasons.get(record.harness)) is not None
+                else record
+            )
+            for record in records
+        )
+
     def _refresh(
         self,
         harness: Harness,
         probe: HealthProbe | None,
         timeout_seconds: int | None,
+        *,
+        deadline: float | None = None,
     ) -> None:
         if probe is None or timeout_seconds == 0 or not self.live_probe_allowed:
             return
+        self._probe_with_lease(
+            harness,
+            probe,
+            timeout_seconds,
+            source=HealthSource.PROBE,
+            deadline=deadline,
+        )
+
+    def _probe_with_lease(
+        self,
+        harness: Harness,
+        probe: HealthProbe,
+        timeout_seconds: int | None,
+        *,
+        source: str | HealthSource,
+        deadline: float | None,
+        force: bool = False,
+    ) -> Mapping[str, object]:
         now = self._now()
+        configured_timeout = timeout_seconds or self.probe_timeout_seconds
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining < 5:
+                return {"status": "timeout", "error_code": "timeout"}
+            configured_timeout = min(configured_timeout, int(remaining))
         owner = f"health-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:12]}"
         lease_seconds = max(30.0, float(timeout_seconds or self.probe_timeout_seconds) + 5.0)
         with self._refresh_lock:
@@ -496,16 +645,13 @@ class HarnessHealth:
                 owner=owner,
                 now=now,
                 lease_seconds=lease_seconds,
+                force=force,
             )
         if not acquired:
-            return
+            return {"status": "error", "error_code": "readiness_probe_in_progress"}
         try:
             try:
-                result = probe(
-                    self.workflow,
-                    harness,
-                    timeout_seconds or self.probe_timeout_seconds,
-                )
+                result = probe(self.workflow, harness, configured_timeout)
             except Exception:
                 result = {
                     "status": HarnessHealthStatus.DEGRADED.value,
@@ -514,9 +660,10 @@ class HarnessHealth:
             self.record_probe(
                 harness,
                 result,
-                source=HealthSource.PROBE,
+                source=source,
                 observed_at=self._now(),
             )
+            return result
         finally:
             self.store.release_harness_probe(
                 workflow=self.workflow_name,
@@ -525,8 +672,8 @@ class HarnessHealth:
                 owner=owner,
             )
 
-    def _write(self, record: HarnessHealthRecord) -> None:
-        self.store.upsert_harness_health(
+    def _write(self, record: HarnessHealthRecord) -> bool:
+        return self.store.upsert_harness_health(
             workflow=record.workflow,
             workspace=record.workspace,
             harness=record.harness,

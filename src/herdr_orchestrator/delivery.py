@@ -90,6 +90,7 @@ from herdr_orchestrator.planner import (
 )
 from herdr_orchestrator.protocol import Command, TransportError, run_json
 from herdr_orchestrator.selection import (
+    AUTO_CONTROLLER_ORDER,
     effective_worker_harnesses,
     eligible_worker_harnesses,
     select_controller_harness,
@@ -276,17 +277,23 @@ class StandardizedDelivery(
         self.worker_harnesses = effective_worker_harnesses(config, worker_harnesses)
         self.health = health
         self.readiness_probe = readiness_probe
-        try:
-            self.controller = select_controller_harness(
-                config,
-                worker_harnesses=self.worker_harnesses,
-                override=controller_harness,
-                force_auto=controller_auto,
-                health=health,
-                readiness_probe=readiness_probe,
+        if health is None:
+            try:
+                self.controller = select_controller_harness(
+                    config,
+                    worker_harnesses=self.worker_harnesses,
+                    override=controller_harness,
+                    force_auto=controller_auto,
+                )
+            except HarnessHealthError as exc:
+                raise DeliveryError(str(exc)) from exc
+        else:
+            requested = controller_harness or (
+                config.planner.harness if not controller_auto else None
             )
-        except HarnessHealthError as exc:
-            raise DeliveryError(str(exc)) from exc
+            self.controller = requested or next(
+                harness for harness in AUTO_CONTROLLER_ORDER if harness in self.worker_harnesses
+            )
         self._goal = ""
         self._run_id = ""
         self._run_root = Path()
@@ -322,9 +329,7 @@ class StandardizedDelivery(
                 f"{delivery_config.github_repository}\0"
                 f"{delivery_config.wayfinder.value}\0"
                 f"{delivery_config.max_parallel}\0"
-                f"{delivery_config.review_repair_rounds}\0"
-                f"{self.controller.value}\0"
-                f"{','.join(harness.value for harness in self.worker_harnesses)}"
+                f"{delivery_config.review_repair_rounds}"
             ).encode()
         ).hexdigest()[:12]
         self._run_id = run_id
@@ -352,6 +357,29 @@ class StandardizedDelivery(
             finally:
                 self._journal = None
 
+    def _resolve_health_selection(self) -> None:
+        if self.health is None:
+            return
+        previous = self._previous_state.get("controller")
+        if previous is not None and not isinstance(previous, str):
+            raise DeliveryError("delivery_health_selection_invalid")
+        try:
+            override = self.controller_override
+            force_auto = self.controller_auto
+            if isinstance(previous, str):
+                override = Harness(previous)
+                force_auto = False
+            self.controller = select_controller_harness(
+                self.config,
+                worker_harnesses=self.worker_harnesses,
+                override=override,
+                force_auto=force_auto,
+                health=self.health,
+                readiness_probe=self.readiness_probe,
+            )
+        except (HarnessHealthError, ValueError) as exc:
+            raise DeliveryError(str(exc)) from exc
+
     def _run_claimed(self, run_id: str) -> DeliveryResult:
         if (state_path := self._run_root / "state.json").is_file():
             _safe_delivery_path(state_path, root=self._run_root)
@@ -364,8 +392,9 @@ class StandardizedDelivery(
                 self._write_state("failed", stage="stopped", error="DeliveryStateInvalid")
                 raise DeliveryError("delivery_state_invalid")
             self._previous_state = state
-        self._recover_proxy_responses()
         try:
+            self._resolve_health_selection()
+            self._recover_proxy_responses()
             completed_result = _load_completed_result(self._run_root / "result.json", run_id)
         except Exception as exc:
             self._write_state("failed", stage="stopped", error=type(exc).__name__)
@@ -398,7 +427,7 @@ class StandardizedDelivery(
             )
             return completed_result
         failed_stage = "wayfinder"
-        self._write_state("running", stage="wayfinder")
+        self._write_state("running", stage="wayfinder", controller=self.controller.value)
         try:
             self._delivery_base_commit(
                 GitWorkspace(self.config.workspace, self._run_root, "delivery")
@@ -950,6 +979,21 @@ class StandardizedDelivery(
     ) -> DispatchOutcome:
         if self._legacy_reconstruction_read_only:
             raise DeliveryError("delivery_recovery_conflict:agent.dispatch")
+        if self.health is not None:
+            role = (
+                "controller"
+                if workspace.resolve() == self.config.workspace.resolve()
+                and harness is self.controller
+                else "worker"
+            )
+            try:
+                self.health.require(
+                    harness,
+                    role=role,
+                    probe=self.readiness_probe,
+                )
+            except HarnessHealthError as exc:
+                raise DeliveryError(str(exc)) from exc
         for attempt in range(ARTIFACT_PROMPT_ATTEMPTS):
             if use_principal_proxy:
                 outcome = self._dispatch_with_proxy(

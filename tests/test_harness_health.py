@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import io
+import json
+import subprocess
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from herdr_orchestrator.cli import doctor
 from herdr_orchestrator.config import load_workflow
+from herdr_orchestrator.delivery import DeliveryError, StandardizedDelivery
 from herdr_orchestrator.harness_health import (
     HarnessHealth,
     HarnessHealthError,
@@ -268,6 +274,163 @@ class HarnessHealthTests(unittest.TestCase):
                 health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID).status,
                 HarnessHealthStatus.READY,
             )
+
+    def test_static_preflight_is_effective_only_and_does_not_poison_ready_evidence(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            store = Store(config.state_db)
+            health = HarnessHealth(
+                store,
+                config,
+                environment={"HERDR_ENV": "0"},
+                probe=lambda *_: (_ for _ in ()).throw(AssertionError("probe not expected")),
+            )
+            health.record_probe(Harness.DROID, {"status": "ready"})
+
+            with self.assertRaisesRegex(ValueError, "controller_harness_unavailable:droid"):
+                select_controller_harness(
+                    config,
+                    worker_harnesses=(Harness.DROID,),
+                    health=health,
+                )
+            persisted = store.harness_health_rows(config.name, str(config.workspace))[0]
+            self.assertEqual(persisted["status"], "ready")
+
+    def test_stale_dispatch_evidence_cannot_replace_newer_health(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            health = HarnessHealth(Store(config.state_db), config, clock=lambda: 100.0)
+            health.record_probe(Harness.DROID, {"status": "ready"}, observed_at=100.0)
+            health.record_probe(
+                Harness.DROID,
+                {"status": "unavailable", "error_code": "agent_auth_required"},
+                observed_at=99.0,
+            )
+            current = health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID)
+            self.assertEqual(current.status, HarnessHealthStatus.READY)
+
+    def test_unknown_settled_error_is_degraded_not_ready(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            health = HarnessHealth(Store(config.state_db), config)
+            outcome = DispatchOutcome(
+                "worker",
+                AgentState.DONE,
+                False,
+                "pane",
+                error_code="new_runtime_error",
+                agent_settled=True,
+            )
+            record = health.record_dispatch(Harness.DROID, outcome)
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record.status, HarnessHealthStatus.DEGRADED)
+
+    def test_pending_harness_projection_respects_workspace_affinity(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            store = Store(config.state_db)
+            store.initialize()
+            for workspace, key in (
+                ("/workspace/a", "workspace-a"),
+                ("/workspace/b", "workspace-b"),
+            ):
+                store.enqueue(
+                    NewJob(
+                        workflow=config.name,
+                        workspace=workspace,
+                        title=key,
+                        harness=Harness.DROID,
+                        prompt="task",
+                        dedupe_key=key,
+                        max_attempts=2,
+                    )
+                )
+            self.assertEqual(
+                store.pending_harnesses(config.name, workspace="/workspace/a"),
+                (Harness.DROID,),
+            )
+            with store._connect() as connection:
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE workspace = ?",
+                    ("/workspace/a",),
+                ).fetchone()
+            self.assertEqual(row[0], 1)
+
+    def test_doctor_forces_fresh_health_probe_through_the_shared_store(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            store = Store(config.state_db)
+            calls: list[Harness] = []
+
+            def probe(_workflow, harness, _timeout):
+                calls.append(harness)
+                return {"status": "ready"}
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = doctor(
+                    config,
+                    environ={
+                        "HERDR_ENV": "1",
+                        "HERDR_PANE_ID": "w:p",
+                        "HERDR_WORKSPACE_ID": "w",
+                    },
+                    which=lambda name: f"/bin/{name}",
+                    version_runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                        ["herdr", "--version"],
+                        0,
+                        "herdr 0.8.2\n",
+                        "",
+                    ),
+                    readiness_probe=probe,
+                    selected_harnesses=["droid"],
+                    store=store,
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(calls, [Harness.DROID])
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["harness_health"]["records"][0]["source"], "doctor")
+
+    def test_delivery_worker_dispatch_rechecks_health_before_transport(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            store = Store(config.state_db)
+            health = HarnessHealth(store, config)
+            health.record_probe(Harness.DROID, {"status": "ready"})
+            health.record_probe(
+                Harness.CODEX,
+                {"status": "unavailable", "error_code": "agent_auth_required"},
+            )
+
+            class Dispatcher:
+                def dispatch(self, *args, **kwargs):
+                    raise AssertionError("unhealthy worker must not reach transport")
+
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=Dispatcher(),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID, Harness.CODEX),
+                health=health,
+            )
+            delivery._run_root = root / "delivery"
+            delivery._run_root.mkdir()
+            with self.assertRaisesRegex(DeliveryError, "worker_harness_unavailable:codex"):
+                delivery._run_artifact_dispatch(
+                    config.workspace,
+                    Harness.CODEX,
+                    "task",
+                    delivery._run_root / "artifact.json",
+                    role="worker",
+                    use_principal_proxy=False,
+                    agent_name_override=None,
+                )
 
 
 if __name__ == "__main__":

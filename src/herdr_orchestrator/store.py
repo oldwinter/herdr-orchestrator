@@ -127,6 +127,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     workflow TEXT NOT NULL,
+                    workspace TEXT,
                     title TEXT NOT NULL,
                     harness TEXT NOT NULL,
                     prompt TEXT NOT NULL,
@@ -373,6 +374,7 @@ class Store:
         connection.execute("UPDATE schema_meta SET version = 6")
 
     def _migrate_v6_to_v7(self, connection: sqlite3.Connection) -> None:
+        self._add_column_if_missing(connection, "jobs", "workspace", "TEXT")
         connection.execute("""
             CREATE TABLE IF NOT EXISTS harness_health (
                 workflow TEXT NOT NULL,
@@ -416,15 +418,16 @@ class Store:
             cursor = connection.execute(
                 """
                 INSERT INTO jobs(
-                    workflow, title, harness, prompt, dedupe_key, placement, state,
+                    workflow, workspace, title, harness, prompt, dedupe_key, placement, state,
                     attempts, max_attempts, available_at, receipt_kind, receipt_value,
                     completion_policy, verification_class, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workflow, dedupe_key) DO NOTHING
                 """,
                 (
                     job.workflow,
+                    job.workspace,
                     job.title,
                     job.harness.value,
                     job.prompt,
@@ -753,9 +756,9 @@ class Store:
         retryable_failures: int,
         probe_lease_until: float | None = None,
         probe_owner: str | None = None,
-    ) -> None:
+    ) -> bool:
         with self._transaction() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO harness_health(
                     workflow, workspace, harness, status, reason, source,
@@ -778,6 +781,7 @@ class Store:
                         WHEN excluded.probe_owner IS NULL
                         THEN harness_health.probe_owner
                         ELSE excluded.probe_owner END
+                WHERE excluded.observed_at >= harness_health.observed_at
                 """,
                 (
                     workflow,
@@ -794,6 +798,7 @@ class Store:
                     probe_owner,
                 ),
             )
+        return cursor.rowcount == 1
 
     def ensure_harness_health(
         self,
@@ -825,6 +830,7 @@ class Store:
         owner: str,
         now: float,
         lease_seconds: float,
+        force: bool = False,
     ) -> bool:
         """Atomically reserve one readiness refresh without touching task leases."""
         lease_until = now + lease_seconds
@@ -853,10 +859,16 @@ class Store:
                 status = str(row["status"])
                 expires_at = row["expires_at"]
                 cooldown_until = row["cooldown_until"]
-                if status == "ready" and isinstance(expires_at, (int, float)) and expires_at > now:
+                if (
+                    not force
+                    and status == "ready"
+                    and isinstance(expires_at, (int, float))
+                    and expires_at > now
+                ):
                     return False
                 if (
-                    status in {"degraded", "unavailable"}
+                    not force
+                    and status in {"degraded", "unavailable"}
                     and isinstance(cooldown_until, (int, float))
                     and cooldown_until > now
                 ):
@@ -896,16 +908,23 @@ class Store:
                 (workflow, workspace, harness.value, owner),
             )
 
-    def pending_harnesses(self, workflow: str) -> tuple[Harness, ...]:
+    def pending_harnesses(
+        self,
+        workflow: str,
+        *,
+        workspace: str | None = None,
+    ) -> tuple[Harness, ...]:
+        query = """
+            SELECT DISTINCT harness FROM jobs
+            WHERE workflow = ? AND state = ?
+        """
+        parameters: tuple[object, ...] = (workflow, JobState.PENDING.value)
+        if workspace is not None:
+            query += " AND (workspace = ? OR workspace IS NULL)"
+            parameters += (workspace,)
+        query += " ORDER BY harness"
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT DISTINCT harness FROM jobs
-                WHERE workflow = ? AND state = ?
-                ORDER BY harness
-                """,
-                (workflow, JobState.PENDING.value),
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
         return tuple(Harness(str(row["harness"])) for row in rows)
 
     def claim_blocked_for_resume(

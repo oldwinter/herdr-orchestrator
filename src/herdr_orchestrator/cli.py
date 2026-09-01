@@ -319,6 +319,8 @@ def _command_deliver(config: WorkflowConfig, args: argparse.Namespace) -> int:
                 config.state_db.parent / "telemetry",
                 config.name,
             ),
+            environment=os.environ,
+            executable_finder=shutil.which,
         ),
         readiness_probe=readiness_probe,
     )
@@ -364,11 +366,20 @@ def _command_status(config: WorkflowConfig, args: argparse.Namespace) -> int:
     del args
     store = Store(config.state_db)
     store.initialize()
-    health = HarnessHealth(store, config)
+    health = HarnessHealth(
+        store,
+        config,
+        environment=os.environ,
+        executable_finder=shutil.which,
+    )
     harnesses = [worker.harness for worker in config.workers]
     if config.planner.harness is not None and config.planner.harness not in harnesses:
         harnesses.append(config.planner.harness)
-    health_snapshot = health.snapshot(harnesses, refresh=False)
+    health_snapshot = health.snapshot(
+        harnesses,
+        refresh=False,
+        static_reasons=health.static_reasons(harnesses),
+    )
     jobs = store.jobs(config.name)
     health_by_harness = {record.harness.value: record for record in health_snapshot.records}
     for job in jobs:
@@ -528,6 +539,8 @@ def doctor(
             workflow.state_db.parent / "telemetry",
             workflow.name,
         ),
+        environment=current_environ,
+        executable_finder=which,
     )
     checks = _doctor_system_checks(workflow, current_environ, which, version_runner)
     herdr_path = which("herdr")
@@ -596,6 +609,24 @@ def _doctor_readiness_checks(
     checks: list[dict[str, object]] = []
     readiness_ms = 0
     for harness in harnesses:
+        readiness = health.run_probe(
+            harness,
+            lambda current_workflow, current_harness, current_timeout: _harness_readiness(
+                current_workflow,
+                current_harness,
+                environ,
+                which(current_harness.value),
+                profile_for_harness(
+                    current_workflow.profiles, current_harness
+                ).context_file.is_file(),
+                herdr_path,
+                probe,
+                current_timeout,
+            ),
+            timeout_seconds=probe_timeout_seconds,
+            source="doctor",
+            force=True,
+        )
         harness_checks = _doctor_harness_checks(
             workflow,
             harness,
@@ -604,12 +635,12 @@ def _doctor_readiness_checks(
             herdr_path,
             probe,
             probe_timeout_seconds,
+            readiness=readiness,
         )
         checks.extend(harness_checks)
         readiness_check = next(
             check for check in harness_checks if check["check"] == f"readiness:{harness.value}"
         )
-        health.record_probe(harness, readiness_check)
         duration_ms = readiness_check.get("duration_ms")
         if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
             readiness_ms += duration_ms
@@ -737,12 +768,13 @@ def _doctor_harness_checks(
     herdr_path: str | None,
     probe: ReadinessProbe,
     probe_timeout_seconds: int,
+    readiness: Mapping[str, object] | None = None,
 ) -> list[dict[str, object]]:
     executable = which(harness.value)
     profile = profile_for_harness(workflow.profiles, harness)
     profile_ok = profile.context_file.is_file()
     probe_started = time.monotonic()
-    readiness = _harness_readiness(
+    active_readiness = readiness or _harness_readiness(
         workflow,
         harness,
         environ,
@@ -753,13 +785,13 @@ def _doctor_harness_checks(
         probe_timeout_seconds,
     )
     measured_ms = max(0, int((time.monotonic() - probe_started) * 1000))
-    reported_ms = readiness.get("duration_ms")
+    reported_ms = active_readiness.get("duration_ms")
     duration_ms = (
         int(reported_ms)
         if isinstance(reported_ms, int) and not isinstance(reported_ms, bool)
         else measured_ms
     )
-    status = str(readiness.get("status", "error"))
+    status = str(active_readiness.get("status", "error"))
     return [
         {
             "check": f"harness:{harness.value}",
@@ -775,10 +807,10 @@ def _doctor_harness_checks(
             "check": f"readiness:{harness.value}",
             "ok": status == "ready",
             "status": status,
-            "error_code": readiness.get("error_code"),
-            "error_summary": readiness.get("error_summary"),
+            "error_code": active_readiness.get("error_code"),
+            "error_summary": active_readiness.get("error_summary"),
             "duration_ms": duration_ms,
-            "phase_timings_ms": readiness.get("phase_timings_ms", {}),
+            "phase_timings_ms": active_readiness.get("phase_timings_ms", {}),
         },
     ]
 
@@ -832,7 +864,7 @@ def probe_harness_readiness(
     transport: HerdrTransport | None = None,
 ) -> Mapping[str, object]:
     active_transport = transport or HerdrTransport(workflow.name, workflow.workspace)
-    name = doctor_agent_name(workflow.name, harness)
+    name = doctor_agent_name(workflow.name, harness, workflow.workspace)
     prefix = f"HERDR-DOCTOR-OK harness={harness.value}"
     started = time.monotonic()
     try:
@@ -905,7 +937,7 @@ def smoke(
                 "network, or perform external actions. Finish with one line that starts "
                 f"exactly with: {prefix}"
             )
-            name = smoke_agent_name(workflow.name, harness)
+            name = smoke_agent_name(workflow.name, harness, workflow.workspace)
             outcome = transport.dispatch(
                 harness,
                 prompt,
@@ -1013,6 +1045,8 @@ def _coordinator_from_args(
         config,
         probe=readiness_probe,
         observability=Observability(config.state_db.parent / "telemetry", config.name),
+        environment=os.environ,
+        executable_finder=shutil.which,
     )
     observability = health.observability
     return Coordinator(

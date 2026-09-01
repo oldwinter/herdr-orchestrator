@@ -141,6 +141,7 @@ class Coordinator:
             _, created = self.store.enqueue(
                 NewJob(
                     workflow=self.config.name,
+                    workspace=str(self.config.workspace.resolve()),
                     title=seed.title,
                     harness=seed.harness,
                     prompt=prompt,
@@ -200,6 +201,7 @@ class Coordinator:
         job_id, created = self.store.enqueue(
             NewJob(
                 workflow=self.config.name,
+                workspace=str(self.config.workspace.resolve()),
                 title=title,
                 harness=selected,
                 prompt=prompt,
@@ -671,6 +673,7 @@ class Coordinator:
             health=self.health,
             readiness_probe=self.readiness_probe,
             health_timeout_seconds=health_timeout_seconds,
+            health_deadline=dispatch_deadline,
         )
 
     def _health_timeout_seconds(self, dispatch_deadline: float | None) -> int | None:
@@ -689,7 +692,12 @@ class Coordinator:
     ) -> bool:
         if self.health is None or queue.get(JobState.PENDING.value, 0) <= 0:
             return False
-        pending = set(self.store.pending_harnesses(self.config.name)) & set(self.worker_harnesses)
+        pending = set(
+            self.store.pending_harnesses(
+                self.config.name,
+                workspace=str(self.config.workspace.resolve()),
+            )
+        ) & set(self.worker_harnesses)
         if not pending:
             return False
         return not (
@@ -735,9 +743,22 @@ class Coordinator:
                 "placement": job.placement.value,
             },
         )
-        profile = profile_for_harness(self.config.profiles, job.harness)
         try:
-            timeout_seconds = self._dispatch_timeout(dispatch_deadline)
+            outcome = self._dispatch_job_turn(job, batch_key, dispatch_deadline)
+        except OperationInterrupted:
+            raise
+        except TransportError as exc:
+            outcome = DispatchOutcome(
+                agent_name=job.agent_name,
+                state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
+                member_reused=False,
+                pane_id=None,
+                error_code=exc.code,
+                placement=job.placement,
+                error_summary=exc.summary,
+                agent_settled=exc.agent_settled,
+                correlation_id=job.correlation_id,
+            )
         except _DispatchDeadlineExceeded:
             outcome = DispatchOutcome(
                 agent_name=job.agent_name,
@@ -748,41 +769,16 @@ class Coordinator:
                 placement=job.placement,
                 correlation_id=job.correlation_id,
             )
-        else:
-            completion_identity = _completion_identity(job)
-            task_prompt = (
-                structured_completion_prompt(job.prompt, completion_identity)
-                if completion_identity is not None
-                else job.prompt
-            )
-            prompt = execution_prompt(profile, task_prompt)
-            context = DispatchContext(
+        except Exception:
+            outcome = DispatchOutcome(
+                agent_name=job.agent_name,
+                state=AgentState.UNKNOWN,
+                member_reused=False,
+                pane_id=None,
+                error_code="dispatcher_unhandled_error",
                 placement=job.placement,
-                title=job.title,
-                task_key=job.dedupe_key,
-                batch_key=batch_key,
-                worktree_root=self.config.placement.worktree_root,
-                receipt=job.receipt,
                 correlation_id=job.correlation_id,
-                attempt_progress=lambda progress: self._record_attempt_progress(job, progress),
-                completion_identity=completion_identity,
             )
-            if job.recovery:
-                outcome = self._recover_job(
-                    job,
-                    prompt,
-                    timeout_seconds=timeout_seconds,
-                    context=context,
-                )
-            else:
-                outcome = self.dispatcher.dispatch(
-                    job.harness,
-                    prompt,
-                    timeout_seconds=timeout_seconds,
-                    agent_name=job.agent_name,
-                    context=context,
-                )
-            outcome = replace(outcome, correlation_id=job.correlation_id)
         duration = time.monotonic() - started
         fields = {
             "attempt": job.attempt,
@@ -809,6 +805,49 @@ class Coordinator:
                 fields=fields,
             )
         return outcome
+
+    def _dispatch_job_turn(
+        self,
+        job: ClaimedJob,
+        batch_key: str,
+        dispatch_deadline: float | None,
+    ) -> DispatchOutcome:
+        profile = profile_for_harness(self.config.profiles, job.harness)
+        timeout_seconds = self._dispatch_timeout(dispatch_deadline)
+        completion_identity = _completion_identity(job)
+        task_prompt = (
+            structured_completion_prompt(job.prompt, completion_identity)
+            if completion_identity is not None
+            else job.prompt
+        )
+        prompt = execution_prompt(profile, task_prompt)
+        context = DispatchContext(
+            placement=job.placement,
+            title=job.title,
+            task_key=job.dedupe_key,
+            batch_key=batch_key,
+            worktree_root=self.config.placement.worktree_root,
+            receipt=job.receipt,
+            correlation_id=job.correlation_id,
+            attempt_progress=lambda progress: self._record_attempt_progress(job, progress),
+            completion_identity=completion_identity,
+        )
+        if job.recovery:
+            outcome = self._recover_job(
+                job,
+                prompt,
+                timeout_seconds=timeout_seconds,
+                context=context,
+            )
+        else:
+            outcome = self.dispatcher.dispatch(
+                job.harness,
+                prompt,
+                timeout_seconds=timeout_seconds,
+                agent_name=job.agent_name,
+                context=context,
+            )
+        return replace(outcome, correlation_id=job.correlation_id)
 
     def _recover_job(
         self,
@@ -1059,6 +1098,7 @@ class Coordinator:
             health=self.health,
             readiness_probe=self.readiness_probe,
             health_timeout_seconds=health_timeout_seconds,
+            health_deadline=dispatch_deadline,
         )
 
     def _worker_profiles(
@@ -1077,6 +1117,7 @@ class Coordinator:
         )
         if not allowed_harnesses:
             return
+        controller = self._controller_harness(dispatch_deadline)
         if not self.store.reserve_planner_run(
             self.config.name,
             planner.interval_seconds,
@@ -1084,7 +1125,6 @@ class Coordinator:
             return
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)
         planner.output_file.unlink(missing_ok=True)
-        controller = self._controller_harness(dispatch_deadline)
         profiles = self._worker_profiles(allowed_harnesses)
         outcome = self.dispatcher.dispatch(
             controller,
@@ -1125,6 +1165,7 @@ class Coordinator:
             self.store.enqueue(
                 NewJob(
                     workflow=self.config.name,
+                    workspace=str(self.config.workspace.resolve()),
                     title=task.title,
                     harness=task.harness,
                     prompt=task.prompt,

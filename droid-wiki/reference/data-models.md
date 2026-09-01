@@ -49,7 +49,7 @@ Active contributors: oldwinter, chendongdong
 | Dataclass | 生命周期与关键字段 |
 | --- | --- |
 | `TaskReceipt` | `kind + value`；声明内容级成功条件 |
-| `NewJob` | 入库 packet：workflow、title、harness、prompt、dedupe、attempt budget、placement、receipt |
+| `NewJob` | 入库 packet：workflow、canonical workspace、title、harness、prompt、dedupe、attempt budget、placement、receipt |
 | `ClaimedJob` | claim 后的 job 快照：job id、attempt、agent slot、确定 placement、correlation id |
 | `DispatchContext` | 交给 transport 的 topology、task/batch key、worktree root 与 receipt |
 | `DispatchOutcome` | transport observation：agent state、pane/workspace、error、settlement、verification 与 timings |
@@ -73,8 +73,9 @@ Active contributors: oldwinter, chendongdong
 
 ## SQLite durable queue
 
-当前 schema version 是 **4**。`Store.initialize()` 创建 `schema_meta`、`jobs`、
-`receipts`、`metadata` 和 runnable index，并能按顺序迁移 v1 → v2 → v3 → v4。
+当前 schema version 是 **7**。`Store.initialize()` 创建 `schema_meta`、`jobs`、
+`receipts`、`metadata`、`harness_health` 和 runnable index，并能按顺序迁移 v1 → v2 → v3 → v4
+→ v5 → v6 → v7。
 SQLite 使用 foreign keys、WAL journal 和写事务 `BEGIN IMMEDIATE`。
 
 ### `jobs`
@@ -83,7 +84,7 @@ SQLite 使用 foreign keys、WAL journal 和写事务 `BEGIN IMMEDIATE`。
 
 | 列组 | 列与 SQLite 声明 |
 | --- | --- |
-| 标识 | `id INTEGER PRIMARY KEY AUTOINCREMENT`; `workflow TEXT NOT NULL`; `UNIQUE(workflow, dedupe_key)` |
+| 标识 | `id INTEGER PRIMARY KEY AUTOINCREMENT`; `workflow TEXT NOT NULL`; `workspace TEXT NULL`; `UNIQUE(workflow, dedupe_key)` |
 | 输入 | `title TEXT NOT NULL`, `harness TEXT NOT NULL`, `prompt TEXT NOT NULL`, `dedupe_key TEXT NOT NULL` |
 | 调度 | `placement TEXT NULL`, `state TEXT NOT NULL`, `attempts INTEGER NOT NULL DEFAULT 0`, `max_attempts INTEGER NOT NULL`, `available_at REAL NOT NULL`, `lease_until REAL NULL` |
 | Agent/runtime | `agent_name TEXT NULL`, `execution_path TEXT NULL`, `herdr_workspace_id TEXT NULL`, `correlation_id TEXT NULL` |
