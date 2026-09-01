@@ -716,7 +716,7 @@ class Store:
     def harness_health_rows(
         self,
         workflow: str,
-        workspace: str,
+        workspace: str | Path,
         *,
         harnesses: Iterable[Harness] | None = None,
     ) -> list[dict[str, object]]:
@@ -729,7 +729,8 @@ class Store:
             FROM harness_health
             WHERE workflow = ? AND workspace = ?
         """
-        parameters: tuple[object, ...] = (workflow, workspace)
+        workspace_key = str(workspace)
+        parameters: tuple[object, ...] = (workflow, workspace_key)
         if values is not None and not values:
             return []
         if values is not None:
@@ -745,7 +746,7 @@ class Store:
         self,
         *,
         workflow: str,
-        workspace: str,
+        workspace: str | Path,
         harness: Harness,
         status: str,
         reason: str,
@@ -785,7 +786,7 @@ class Store:
                 """,
                 (
                     workflow,
-                    workspace,
+                    str(workspace),
                     harness.value,
                     status,
                     reason,
@@ -804,7 +805,7 @@ class Store:
         self,
         *,
         workflow: str,
-        workspace: str,
+        workspace: str | Path,
         harness: Harness,
         observed_at: float,
     ) -> None:
@@ -818,14 +819,14 @@ class Store:
                 ) VALUES (?, ?, ?, 'unknown', 'health_unknown', 'none', ?, 0)
                 ON CONFLICT(workflow, workspace, harness) DO NOTHING
                 """,
-                (workflow, workspace, harness.value, observed_at),
+                (workflow, str(workspace), harness.value, observed_at),
             )
 
     def acquire_harness_probe(
         self,
         *,
         workflow: str,
-        workspace: str,
+        workspace: str | Path,
         harness: Harness,
         owner: str,
         now: float,
@@ -843,7 +844,7 @@ class Store:
                 ) VALUES (?, ?, ?, 'unknown', 'health_unknown', 'none', ?, 0)
                 ON CONFLICT(workflow, workspace, harness) DO NOTHING
                 """,
-                (workflow, workspace, harness.value, now),
+                (workflow, str(workspace), harness.value, now),
             )
             row = connection.execute(
                 """
@@ -851,7 +852,7 @@ class Store:
                 FROM harness_health
                 WHERE workflow = ? AND workspace = ? AND harness = ?
                 """,
-                (workflow, workspace, harness.value),
+                (workflow, str(workspace), harness.value),
             ).fetchone()
             active_until = row["probe_lease_until"] if row is not None else None
             active_owner = row["probe_owner"] if row is not None else None
@@ -885,7 +886,7 @@ class Store:
                 SET probe_lease_until = ?, probe_owner = ?
                 WHERE workflow = ? AND workspace = ? AND harness = ?
                 """,
-                (lease_until, owner, workflow, workspace, harness.value),
+                (lease_until, owner, workflow, str(workspace), harness.value),
             )
         return True
 
@@ -893,7 +894,7 @@ class Store:
         self,
         *,
         workflow: str,
-        workspace: str,
+        workspace: str | Path,
         harness: Harness,
         owner: str,
     ) -> None:
@@ -905,16 +906,16 @@ class Store:
                 WHERE workflow = ? AND workspace = ? AND harness = ?
                   AND probe_owner = ?
                 """,
-                (workflow, workspace, harness.value, owner),
+                (workflow, str(workspace), harness.value, owner),
             )
 
     def pending_harnesses(
         self,
         workflow: str,
         *,
-        workspace: str | None = None,
+        workspace: str | Path | None = None,
     ) -> tuple[Harness, ...]:
-        """List pending harnesses; legacy NULL workspace rows remain current-scope compatible."""
+        """List pending harnesses; legacy NULL workspace rows use the current scope."""
         query = """
             SELECT DISTINCT harness FROM jobs
             WHERE workflow = ? AND state = ?
@@ -922,7 +923,7 @@ class Store:
         parameters: tuple[object, ...] = (workflow, JobState.PENDING.value)
         if workspace is not None:
             query += " AND (workspace = ? OR workspace IS NULL)"
-            parameters += (workspace,)
+            parameters += (str(workspace),)
         query += " ORDER BY harness"
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()

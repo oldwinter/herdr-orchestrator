@@ -96,6 +96,10 @@ SQLite 使用 foreign keys、WAL journal 和写事务 `BEGIN IMMEDIATE`。
 表示 topology 尚未决策；claim 只选择 placement 已确定、attempt 未耗尽且可运行或 lease
 已过期的记录。
 
+新 coordinator enqueue 的 job 写入 canonical workspace；迁移保留旧 job 的 `workspace=NULL`。
+按 workspace 查询 pending harness 时，NULL 记录按当前 workflow scope 兼容处理，避免历史任务被
+静默丢弃；新的多 workspace job 不会互相混入。
+
 ### `receipts`
 
 `receipts` 保存每次 outcome observation；blocked job 恢复时可以在**同一个 attempt**

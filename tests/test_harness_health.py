@@ -204,6 +204,7 @@ class HarnessHealthTests(unittest.TestCase):
             store.enqueue(
                 NewJob(
                     workflow=config.name,
+                    workspace=str(config.workspace.resolve()),
                     title="deferred",
                     harness=Harness.DROID,
                     prompt="task",

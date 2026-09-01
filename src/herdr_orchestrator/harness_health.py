@@ -306,15 +306,18 @@ class HarnessHealth:
             for record in records:
                 if static_reasons is not None and record.harness in static_reasons:
                     continue
-                if force_refresh or record.refresh_due(now):
-                    if deadline is not None and deadline - time.monotonic() <= 0:
+                if not (force_refresh or record.refresh_due(now)):
+                    continue
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         break
-                    self._refresh(
-                        record.harness,
-                        active_probe,
-                        timeout_seconds,
-                        deadline=deadline,
-                    )
+                self._refresh(
+                    record.harness,
+                    active_probe,
+                    timeout_seconds,
+                    deadline=deadline,
+                )
             now = self._now()
             records = self._apply_static_reasons(
                 self._records(values, now),
@@ -629,6 +632,8 @@ class HarnessHealth:
         deadline: float | None,
         force: bool = False,
     ) -> Mapping[str, object]:
+        if not self.live_probe_allowed:
+            return {"status": "unavailable", "error_code": "readiness_ci_forbidden"}
         now = self._now()
         configured_timeout = timeout_seconds or self.probe_timeout_seconds
         if deadline is not None:
