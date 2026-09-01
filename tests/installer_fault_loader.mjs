@@ -156,6 +156,15 @@ function instrument(source) {
   );
   result = replaceExact(
     result,
+    "        setRegularFileMode(temporaryPath, actual.mode);\n",
+    "        setRegularFileMode(temporaryPath, actual.mode);\n"
+      + "        __faultMutation(\n"
+      + "          `temporary:target:mode-adjusted:${targetLabel(operation.target)}`,\n"
+      + "          temporaryPath,\n"
+      + "        );\n",
+  );
+  result = replaceExact(
+    result,
     "function removeOwnedJournalTemporary(temporary) {\n"
       + "  unlinkSync(temporary.path);\n"
       + "  fsyncDirectory(dirname(temporary.path));\n"

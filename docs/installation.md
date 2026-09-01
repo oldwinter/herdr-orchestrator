@@ -134,7 +134,12 @@ package before it plans its own update.
 
 Schema version 1 journals written before mode tracking remain valid. Recovery treats a missing
 mode as unknown, preserves the live mode when it replaces that file, and adopts the older
-transaction-specific `.tmp` claim as the current owner claim. New journals record modes.
+transaction-specific `.tmp` claim as the current owner claim. Install and upgrade replay may
+finish a content-proven replacement while carrying the live mode onto its temporary file;
+legacy uninstall replay never authorizes deletion of a regular endpoint whose mode is unknown.
+Old manifests that omit `file_modes` are mode-unverified: existing files are reported as
+`modified` (also listed in `mode_unverified`) and are preserved without overwrite or removal.
+New journals and manifests record modes explicitly.
 
 One owner claim remains next to the journal until the transaction finishes. If the owner
 process is running, concurrent install, upgrade, or uninstall commands stop with

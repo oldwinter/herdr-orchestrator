@@ -231,6 +231,14 @@ function defaultFileMode() {
   return 0o666 & ~process.umask();
 }
 
+function fileModesForManifest(manifest) {
+  return manifest?.file_modes ?? {};
+}
+
+function manifestModesAreUnknown(manifest) {
+  return manifest !== null && manifest.file_modes === undefined;
+}
+
 function directoryHasFiles(path) {
   let entries;
   try {
@@ -678,7 +686,8 @@ function install(options) {
   const desiredFiles = buildDesiredFiles(harnesses, installSkill);
 
   const previousFiles = previous?.files ?? {};
-  const previousFileModes = previous?.file_modes ?? {};
+  const previousFileModes = fileModesForManifest(previous);
+  const legacyModesUnknown = manifestModesAreUnknown(previous);
   const conflicts = [];
   const preserved = [];
   const removals = [];
@@ -707,6 +716,14 @@ function install(options) {
     const currentHash = sha256(readFileSync(target));
     const previousHash = previousFiles[relativePath];
     const previousMode = previousFileModes[relativePath];
+    if (legacyModesUnknown && previousHash !== undefined) {
+      // An old manifest cannot prove the mode of an existing file. Keep the
+      // bytes untouched and retain the legacy manifest until an explicit,
+      // mode-aware ownership record exists.
+      preserved.push(relativePath);
+      manifestFiles[relativePath] = previousHash;
+      continue;
+    }
     const matchesPrevious = (
       previousHash !== undefined
       && currentHash === previousHash
@@ -739,6 +756,11 @@ function install(options) {
     if (!existsSync(target)) {
       continue;
     }
+    if (legacyModesUnknown) {
+      preserved.push(relativePath);
+      manifestFiles[relativePath] = previousHash;
+      continue;
+    }
     const currentMode = regularFileMode(target);
     if (
       sha256(readFileSync(target)) === previousHash
@@ -760,14 +782,16 @@ function install(options) {
     throw new Error(`unmanaged_file_conflict: ${conflicts.sort().join(",")}`);
   }
 
-  for (const relativePath of Object.keys(manifestFiles)) {
-    if (manifestFileModes[relativePath] !== undefined) {
-      continue;
+  if (!legacyModesUnknown) {
+    for (const relativePath of Object.keys(manifestFiles)) {
+      if (manifestFileModes[relativePath] !== undefined) {
+        continue;
+      }
+      const target = join(project, relativePath);
+      manifestFileModes[relativePath] = existsSync(target)
+        ? regularFileMode(target)
+        : defaultFileMode();
     }
-    const target = join(project, relativePath);
-    manifestFileModes[relativePath] = existsSync(target)
-      ? regularFileMode(target)
-      : defaultFileMode();
   }
 
   const manifest = {
@@ -777,7 +801,7 @@ function install(options) {
     harnesses,
     install_skill: installSkill,
     files: manifestFiles,
-    file_modes: manifestFileModes,
+    ...(legacyModesUnknown ? {} : { file_modes: manifestFileModes }),
     unmanaged_files: unmanagedFiles,
   };
   const manifestContent = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
@@ -1113,6 +1137,7 @@ function inspectInstallation(project) {
       manifest_mismatched: [],
       manifest_missing: [],
       missing: [".herdr-orchestrator/manifest.json"],
+      mode_unverified: [],
       modified: [],
       ok: false,
       package_missing: [],
@@ -1121,20 +1146,29 @@ function inspectInstallation(project) {
   }
   const missing = [];
   const modified = [];
-  const manifestFileModes = manifest?.file_modes ?? {};
+  const modeUnverified = [];
+  const manifestModesUnknown = manifestModesAreUnknown(manifest);
+  const manifestFileModes = fileModesForManifest(manifest);
   for (const [relativePath, expectedHash] of Object.entries(manifest?.files ?? {})) {
     assertNoSymlink(project, relativePath);
     const target = join(project, relativePath);
     if (!existsSync(target)) {
       missing.push(relativePath);
-    } else if (
-      sha256(readFileSync(target)) !== expectedHash
-      || (
-        manifestFileModes[relativePath] !== undefined
-        && regularFileMode(target) !== manifestFileModes[relativePath]
-      )
-    ) {
-      modified.push(relativePath);
+    } else {
+      const contentModified = sha256(readFileSync(target)) !== expectedHash;
+      const modeModified = (
+        manifestModesUnknown
+        || (
+          manifestFileModes[relativePath] !== undefined
+          && regularFileMode(target) !== manifestFileModes[relativePath]
+        )
+      );
+      if (manifestModesUnknown) {
+        modeUnverified.push(relativePath);
+      }
+      if (contentModified || modeModified) {
+        modified.push(relativePath);
+      }
     }
   }
   const desiredFiles = buildDesiredFiles(
@@ -1156,15 +1190,21 @@ function inspectInstallation(project) {
     assertNoSymlink(project, relativePath);
     if (!existsSync(target)) {
       packageMissing.push(relativePath);
-    } else if (
-      sha256(readFileSync(target)) !== expectedHash
-      || (
+    } else {
+      const contentModified = sha256(readFileSync(target)) !== expectedHash;
+      const modeModified = (
         manifest?.files?.[relativePath] !== undefined
-        && manifestFileModes[relativePath] !== undefined
-        && regularFileMode(target) !== manifestFileModes[relativePath]
-      )
-    ) {
-      packageModified.push(relativePath);
+        && (
+          manifestModesUnknown
+          || (
+            manifestFileModes[relativePath] !== undefined
+            && regularFileMode(target) !== manifestFileModes[relativePath]
+          )
+        )
+      );
+      if (contentModified || modeModified) {
+        packageModified.push(relativePath);
+      }
     }
     if (declaredFiles[relativePath] === undefined) {
       manifestMissing.push(relativePath);
@@ -1194,6 +1234,7 @@ function inspectInstallation(project) {
     missing: manifest === null
       ? [".herdr-orchestrator/manifest.json"]
       : missing.sort(),
+    mode_unverified: modeUnverified.sort(),
     modified: modified.sort(),
     ok: (
       missing.length === 0
@@ -1336,7 +1377,8 @@ function uninstall(options) {
   const preserved = [];
   const removals = [];
   const originalStates = new Map();
-  const manifestFileModes = manifest.file_modes ?? {};
+  const manifestModesUnknown = manifestModesAreUnknown(manifest);
+  const manifestFileModes = fileModesForManifest(manifest);
   const journalContext = {
     assertGitExcludeSafe,
     gitExcludePath: localExcludePath,
@@ -1348,6 +1390,10 @@ function uninstall(options) {
     const original = observeInstallerTarget(project, target, journalContext);
     originalStates.set(relativePath, original);
     if (original.kind === "absent") {
+      continue;
+    }
+    if (manifestModesUnknown) {
+      preserved.push(relativePath);
       continue;
     }
     if (

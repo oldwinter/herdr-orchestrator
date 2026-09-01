@@ -257,6 +257,210 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             self.assertTrue(workflow.is_file())
             self.assertEqual(workflow.stat().st_mode & 0o777, 0o600)
 
+    def test_legacy_manifest_mode_only_change_is_reported_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+            manifest_path = project / ".herdr-orchestrator/manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("file_modes", None)
+            manifest_path.write_text(
+                f"{json.dumps(manifest, indent=2)}\n",
+                encoding="utf-8",
+            )
+            workflow.chmod(0o600)
+
+            doctor_environment = os.environ.copy()
+            doctor_environment["PYTHON"] = "/bin/false"
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env=doctor_environment,
+            )
+            self.assertEqual(doctor.returncode, 1, doctor.stderr)
+            installation = json.loads(doctor.stdout)["installation"]
+            self.assertFalse(installation["ok"])
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                installation["modified"],
+            )
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                installation["package_modified"],
+            )
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                installation["mode_unverified"],
+            )
+
+            upgrade = self._run(
+                "upgrade",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                "--harness",
+                "codex",
+            )
+            self.assertEqual(upgrade.returncode, 1, upgrade.stderr)
+            upgrade_payload = json.loads(upgrade.stdout)
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                upgrade_payload["preserved"],
+            )
+            self.assertTrue(workflow.is_file())
+            self.assertEqual(workflow.stat().st_mode & 0o777, 0o600)
+
+            uninstall = self._run("uninstall", "--project", str(project))
+            self.assertEqual(uninstall.returncode, 1, uninstall.stderr)
+            uninstall_payload = json.loads(uninstall.stdout)
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                uninstall_payload["preserved"],
+            )
+            self.assertTrue(workflow.is_file())
+            self.assertEqual(workflow.stat().st_mode & 0o777, 0o600)
+
+    def test_legacy_uninstall_recovery_preserves_a_mode_only_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL"] = "journal:published"
+            interrupted = self._run("uninstall", "--project", str(project), env=environment)
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            journal_path = project / ".herdr-orchestrator/install-journal.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            for inventory_name in ("prior_inventory", "desired_inventory"):
+                for item in journal[inventory_name].values():
+                    item["state"].pop("mode", None)
+            for operation in journal["operations"]:
+                operation["original"].pop("mode", None)
+                operation["desired"].pop("mode", None)
+            journal_path.write_text(
+                f"{json.dumps(journal, indent=2)}\n",
+                encoding="utf-8",
+            )
+            workflow.chmod(0o600)
+
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env={**os.environ, "PYTHON": "/bin/false"},
+            )
+            self.assertEqual(doctor.returncode, 1, doctor.stderr)
+            installation = json.loads(doctor.stdout)["installation"]
+            self.assertTrue(installation["journal"]["active"])
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                installation["journal"]["conflicts"],
+            )
+
+            recovered = self._run("uninstall", "--project", str(project))
+            self.assertEqual(
+                recovered.returncode,
+                2,
+                f"{recovered.stderr}\n{recovered.stdout}",
+            )
+            self.assertTrue(recovered.stderr.startswith("installer_recovery_conflict: "))
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                recovered.stderr,
+            )
+            self.assertTrue(workflow.is_file())
+            self.assertEqual(workflow.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(journal_path.is_file())
+
+    def test_legacy_manifest_never_infers_mode_across_umasks(self) -> None:
+        previous_umask = os.umask(0)
+        os.umask(previous_umask)
+        current_default = 0o666 & ~previous_umask
+        for command in ("doctor", "upgrade", "uninstall"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as temporary:
+                project = Path(temporary)
+                (project / ".git").mkdir()
+                restrictive_install = self._run(
+                    "install",
+                    "--project",
+                    str(project),
+                    "--harness",
+                    "droid",
+                    preexec_fn=lambda: os.umask(0o077),
+                )
+                self.assertEqual(restrictive_install.returncode, 0, restrictive_install.stderr)
+                manifest_path = project / ".herdr-orchestrator/manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest.pop("file_modes", None)
+                manifest_path.write_text(
+                    f"{json.dumps(manifest, indent=2)}\n",
+                    encoding="utf-8",
+                )
+                workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+                workflow.chmod(current_default)
+
+                if command == "doctor":
+                    result = self._run(
+                        "doctor",
+                        "--project",
+                        str(project),
+                        env={**os.environ, "PYTHON": "/bin/false"},
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    installation = json.loads(result.stdout)["installation"]
+                    self.assertIn(
+                        ".herdr-orchestrator/workflows/multi-harness.toml",
+                        installation["mode_unverified"],
+                    )
+                    self.assertIn(
+                        ".herdr-orchestrator/workflows/multi-harness.toml",
+                        installation["modified"],
+                    )
+                elif command == "upgrade":
+                    result = self._run(
+                        "upgrade",
+                        "--project",
+                        str(project),
+                        "--harness",
+                        "droid",
+                        "--harness",
+                        "codex",
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(
+                        ".herdr-orchestrator/workflows/multi-harness.toml",
+                        json.loads(result.stdout)["preserved"],
+                    )
+                    self.assertTrue(workflow.is_file())
+                else:
+                    result = self._run("uninstall", "--project", str(project))
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(
+                        ".herdr-orchestrator/workflows/multi-harness.toml",
+                        json.loads(result.stdout)["preserved"],
+                    )
+                    self.assertTrue(workflow.is_file())
+                self.assertEqual(workflow.stat().st_mode & 0o7777, current_default)
+
     def test_git_exclude_preserves_mode_under_a_restrictive_umask(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -304,14 +508,6 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(installed.returncode, 0, installed.stderr)
             workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
-            manifest_path = project / ".herdr-orchestrator/manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            del manifest["file_modes"]
-            manifest_path.write_text(
-                f"{json.dumps(manifest, indent=2)}\n",
-                encoding="utf-8",
-            )
-            workflow.chmod(0o640)
             original = workflow.read_bytes()
             published_environment = os.environ.copy()
             published_environment["HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL"] = (
@@ -466,6 +662,7 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
         self,
         *arguments: str,
         env: dict[str, str] | None = None,
+        preexec_fn=None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [*self._node_command(env), *arguments],
@@ -474,6 +671,7 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             text=True,
             check=False,
             env=env,
+            preexec_fn=preexec_fn,
             timeout=30,
         )
 

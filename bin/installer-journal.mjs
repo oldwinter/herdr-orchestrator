@@ -798,6 +798,23 @@ function isLegacyModeJournal(journal) {
   );
 }
 
+function legacyOriginalStateMatches(actual, original, journal) {
+  if (!stateMatches(actual, original)) {
+    return false;
+  }
+  if (
+    !isLegacyModeJournal(journal)
+    || original.kind !== "regular"
+    || actual.kind !== "regular"
+  ) {
+    return true;
+  }
+  // A v1 uninstall journal cannot prove the historical mode. Never authorize
+  // deletion of a regular endpoint whose mode is unknown; install/upgrade
+  // replay may preserve the live mode on a content-proven replacement.
+  return journal.command !== "uninstall";
+}
+
 function recoverPublishedJournal(project) {
   let journal = readPublishedJournal(project);
   const owners = listJournalOwners(project);
@@ -950,7 +967,7 @@ function inspectEndpoints(project, journal, context) {
     const desired = journal.desired_inventory[key].state;
     if (stateMatches(actual, desired)) {
       states[key] = "desired";
-    } else if (stateMatches(actual, item.state)) {
+    } else if (legacyOriginalStateMatches(actual, item.state, journal)) {
       states[key] = "original";
     } else {
       states[key] = "conflict";
@@ -1002,7 +1019,7 @@ function applyOperation(project, journal, operation, context) {
       }
       return;
     }
-    if (!stateMatches(actual, operation.original)) {
+    if (!legacyOriginalStateMatches(actual, operation.original, journal)) {
       throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
     }
     if (temporary.kind === "regular") {
@@ -1029,7 +1046,7 @@ function applyOperation(project, journal, operation, context) {
     if (stateMatches(actual, operation.desired)) {
       return;
     }
-    if (!stateMatches(actual, operation.original)) {
+    if (!legacyOriginalStateMatches(actual, operation.original, journal)) {
       throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
     }
     unlinkSync(path);
