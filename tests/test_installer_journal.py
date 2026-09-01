@@ -12,7 +12,7 @@ from pathlib import Path
 from herdr_orchestrator import __version__
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-INSTALLER_FAULT_ADAPTER = REPO_ROOT / "tests/installer_fault_adapter.mjs"
+INSTALLER_FAULT_LOADER = REPO_ROOT / "tests/installer_fault_loader.mjs"
 INSTALLER_FAULT_ENV = {
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL",
@@ -52,6 +52,22 @@ class InstallerJournalPackedTests(unittest.TestCase):
                 "package/tests/installer_fault_adapter.mjs",
                 packaged_files,
             )
+            self.assertNotIn(
+                "package/tests/installer_fault_loader.mjs",
+                packaged_files,
+            )
+            journal_source = (extracted / "package/bin/installer-journal.mjs").read_text(
+                encoding="utf-8"
+            )
+            for forbidden in (
+                "HERDR_ORCHESTRATOR_TEST",
+                "TEST_ADAPTER",
+                "installer-test-adapter",
+                "durableMutation",
+                "beforeJournalClaim",
+            ):
+                with self.subTest(forbidden=forbidden):
+                    self.assertNotIn(forbidden, journal_source)
             packed_cli = extracted / "package/bin/herdr-orchestrator.mjs"
 
             def initialize_project(project: Path) -> None:
@@ -149,7 +165,35 @@ class InstallerJournalPackedTests(unittest.TestCase):
                     "files": files,
                 }
 
+            def assert_recovered(
+                project: Path,
+                operation: str,
+                expected_snapshot: dict[str, object],
+                context: str,
+            ) -> None:
+                doctor = run_cli(
+                    project,
+                    ["doctor"],
+                    extra_environment={"PYTHON": "/bin/false"},
+                )
+                self.assertEqual(doctor.returncode, 1, doctor.stderr)
+                installation = json.loads(doctor.stdout)["installation"]
+                self.assertFalse(
+                    installation["journal"]["active"],
+                    f"{context} left an active journal",
+                )
+                if operation == "uninstall":
+                    self.assertFalse(installation["manifest"])
+                else:
+                    self.assertTrue(installation["ok"])
+                self.assertEqual(
+                    snapshot(project),
+                    expected_snapshot,
+                    f"{context} failed to converge",
+                )
+
             mutation_counts: dict[str, int] = {}
+            recovery_mutation_counts: dict[str, int] = {}
             for operation in ("install", "upgrade", "uninstall"):
                 with self.subTest(operation=operation):
                     expected_project = root / f"expected-{operation}"
@@ -184,33 +228,73 @@ class InstallerJournalPackedTests(unittest.TestCase):
                             operation_arguments(operation),
                         )
                         self.assertEqual(recovered.returncode, 0, recovered.stderr)
-                        doctor = run_cli(
+                        assert_recovered(
                             project,
-                            ["doctor"],
-                            extra_environment={"PYTHON": "/bin/false"},
-                        )
-                        self.assertEqual(doctor.returncode, 1, doctor.stderr)
-                        installation = json.loads(doctor.stdout)["installation"]
-                        self.assertFalse(
-                            installation["journal"]["active"],
-                            f"{operation} left an active journal after mutation "
-                            f"{interrupt_after}",
-                        )
-                        if operation == "uninstall":
-                            self.assertFalse(installation["manifest"])
-                        else:
-                            self.assertTrue(installation["ok"])
-                        self.assertEqual(
-                            snapshot(project),
+                            operation,
                             expected_snapshot,
-                            f"{operation} failed to converge after mutation " f"{interrupt_after}",
+                            f"{operation} initial mutation {interrupt_after}",
                         )
                     else:
                         self.fail(f"{operation} exceeded the mutation-matrix bound")
 
+                    for interrupt_after in range(1, 161):
+                        project = root / f"recovery-{operation}-{interrupt_after}"
+                        setup_project(project, operation)
+                        interrupted_base = run_cli(
+                            project,
+                            operation_arguments(operation),
+                            extra_environment={
+                                "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": ("journal:published")
+                            },
+                        )
+                        self.assertEqual(
+                            interrupted_base.returncode,
+                            86,
+                            interrupted_base.stderr,
+                        )
+                        self.assertTrue(
+                            (project / ".herdr-orchestrator/install-journal.json").is_file()
+                        )
+                        interrupted = run_cli(
+                            project,
+                            operation_arguments(operation),
+                            interrupt_after=interrupt_after,
+                        )
+                        if interrupted.returncode != 86:
+                            self.assertEqual(
+                                interrupted.returncode,
+                                0,
+                                interrupted.stderr,
+                            )
+                            assert_recovered(
+                                project,
+                                operation,
+                                expected_snapshot,
+                                f"{operation} terminal recovery mutation " f"{interrupt_after}",
+                            )
+                            recovery_mutation_counts[operation] = interrupt_after - 1
+                            break
+
+                        recovered = run_cli(
+                            project,
+                            operation_arguments(operation),
+                        )
+                        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                        assert_recovered(
+                            project,
+                            operation,
+                            expected_snapshot,
+                            f"{operation} recovery mutation {interrupt_after}",
+                        )
+                    else:
+                        self.fail(f"{operation} recovery exceeded the mutation-matrix bound")
+
             self.assertGreater(mutation_counts["install"], 20)
             self.assertGreater(mutation_counts["upgrade"], 4)
             self.assertGreater(mutation_counts["uninstall"], 15)
+            self.assertGreater(recovery_mutation_counts["install"], 20)
+            self.assertGreater(recovery_mutation_counts["upgrade"], 5)
+            self.assertGreater(recovery_mutation_counts["uninstall"], 15)
 
     def test_current_package_finishes_an_older_package_transaction_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -351,7 +435,7 @@ class InstallerJournalPackedTests(unittest.TestCase):
     ) -> list[str]:
         command = ["node"]
         if env is not None and INSTALLER_FAULT_ENV.intersection(env):
-            command.extend(["--import", str(INSTALLER_FAULT_ADAPTER)])
+            command.extend(["--no-warnings", "--loader", str(INSTALLER_FAULT_LOADER)])
         command.append(str(cli))
         return command
 

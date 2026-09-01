@@ -16,13 +16,15 @@ from herdr_orchestrator import __version__
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI = REPO_ROOT / "bin/herdr-orchestrator.mjs"
 MANAGER_PACKAGE = REPO_ROOT / "packages/herdr-manager"
-INSTALLER_FAULT_ADAPTER = REPO_ROOT / "tests/installer_fault_adapter.mjs"
+INSTALLER_FAULT_LOADER = REPO_ROOT / "tests/installer_fault_loader.mjs"
 INSTALLER_FAULT_ENV = {
     "HERDR_ORCHESTRATOR_TEST_FAIL_ON_JOURNAL_CLAIM",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL",
     "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL_PREFIX",
     "HERDR_ORCHESTRATOR_TEST_JOURNAL_CLAIM_BARRIER",
+    "HERDR_ORCHESTRATOR_TEST_PAUSE_AT_LABEL_PREFIX",
+    "HERDR_ORCHESTRATOR_TEST_PAUSE_BARRIER",
     "HERDR_ORCHESTRATOR_TEST_REWRITE_AFTER_MUTATION",
     "HERDR_ORCHESTRATOR_TEST_REWRITE_AT_LABEL_PREFIX",
 }
@@ -244,6 +246,14 @@ class DistributionCliTests(unittest.TestCase):
                     ],
                 }
             ),
+            "unsupported-harness": lambda journal: (
+                lambda payload: f"{json.dumps(payload, indent=2)}\n".encode()
+            )(
+                {
+                    **json.loads(journal),
+                    "harnesses": ["not-a-harness"],
+                }
+            ),
         }
         commands = {
             "doctor": ["doctor"],
@@ -362,6 +372,8 @@ class DistributionCliTests(unittest.TestCase):
             )
             self.assertGreater(len(journal["operations"]), 0)
             self.assertEqual(journal["progress"]["completed_operations"], 0)
+            owner_claims = list(journal_path.parent.glob(".install-journal.*.owner"))
+            self.assertEqual(len(owner_claims), 1)
             self.assertFalse(
                 (project / ".herdr-orchestrator/workflows/multi-harness.toml").exists()
             )
@@ -376,6 +388,10 @@ class DistributionCliTests(unittest.TestCase):
 
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
             self.assertFalse(journal_path.exists())
+            self.assertEqual(
+                list(journal_path.parent.glob(".install-journal.*.owner")),
+                [],
+            )
             self.assertTrue(
                 (project / ".herdr-orchestrator/workflows/multi-harness.toml").is_file()
             )
@@ -477,6 +493,20 @@ class DistributionCliTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["preserved"], [])
             self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
+
+    def test_uninstall_without_a_manifest_preserves_caller_empty_directories(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            caller_directory = project / ".orchestrator"
+            caller_directory.mkdir()
+
+            uninstall = self._run("uninstall", "--project", str(project))
+
+            self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+            self.assertTrue(caller_directory.is_dir())
 
     def test_doctor_reports_an_active_journal_without_replaying_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2378,7 +2408,7 @@ class DistributionCliTests(unittest.TestCase):
     ) -> list[str]:
         command = ["node"]
         if env is not None and INSTALLER_FAULT_ENV.intersection(env):
-            command.extend(["--import", str(INSTALLER_FAULT_ADAPTER)])
+            command.extend(["--no-warnings", "--loader", str(INSTALLER_FAULT_LOADER)])
         command.append(str(cli))
         return command
 

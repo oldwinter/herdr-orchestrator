@@ -112,19 +112,19 @@ Manifest entries are restricted to the roots above, and symlinked managed paths 
 
 Install, upgrade, and uninstall write `.herdr-orchestrator/install-journal.json` before
 their first owned mutation. The journal records the transaction ID, package version, selected
-harnesses, Skill choice, prior and desired inventories, endpoint digests, ordered operations,
-desired replacement bytes, and durable progress.
+harnesses, Skill choice, prior and desired inventories, endpoint digests and modes, ordered
+operations, desired replacement bytes, and durable progress.
 
 Each regular-file replacement uses a temporary file in the target directory. The installer
-flushes the temporary file, renames it over the validated target, and flushes the directory.
-It rejects symlinks and non-regular targets before planning and again during replay. The
-ownership manifest is the last semantic operation, after managed files and the Git exclude
-block match the desired inventory.
+writes the bytes, sets the recorded mode, flushes the file, renames it over the validated
+target, and flushes the directory. It rejects symlinks and non-regular targets before planning
+and again during replay. The ownership manifest is the last semantic operation, after managed
+files and the Git exclude block match the desired inventory.
 
 The next install, upgrade, or uninstall finishes an active transaction before it performs
 normal ownership classification. Replay checks the complete inventory before it writes. Every
-participant must match either its recorded prior digest or its desired digest. If a path
-matches neither endpoint, the command exits with
+participant must match either its recorded prior digest and mode or its desired digest and
+mode. If a path matches neither endpoint, the command exits with
 `installer_recovery_conflict: <path>`. It leaves both the journal and the conflicting bytes
 unchanged.
 
@@ -132,9 +132,10 @@ Recovery always moves forward to the journal's desired inventory. Desired replac
 are stored in the journal, so a newer package can finish a transaction written by an older
 package before it plans its own update.
 
-Only one setup process can publish a new journal. Concurrent install, upgrade, or uninstall
-commands stop with `installer_transaction_active` after another process claims the transaction;
-the losing process does not change managed targets.
+One owner claim remains next to the journal until the transaction finishes. If the owner
+process is running, concurrent install, upgrade, or uninstall commands stop with
+`installer_transaction_active` before they change the journal or a target. A new process
+atomically adopts a dead owner claim before recovery.
 
 ## Diagnostics
 
@@ -279,7 +280,8 @@ Uninstall removes the manifest after processing it. User-modified managed files 
 place and are listed in the JSON result; they are no longer managed after that point. Uninstall
 first finishes any older active transaction, then journals its own removals. Repeating uninstall
 after journal retirement is safe: the command does not claim or remove bytes when no ownership
-manifest exists, and it reports any bytes left under managed roots as `preserved`.
+manifest exists. It does not remove unjournaled directories, and it reports any bytes left
+under managed roots as `preserved`.
 
 ## Automated npm releases
 

@@ -7,7 +7,6 @@ import {
   lstatSync,
   readdirSync,
   readFileSync,
-  rmdirSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
@@ -23,6 +22,7 @@ import {
   tokenPatchFor,
 } from "../plugins/manager-light/projection.mjs";
 import {
+  INSTALLER_HARNESSES,
   installerFileState,
   inspectInstallerJournal,
   observeInstallerTarget,
@@ -31,7 +31,7 @@ import {
 } from "./installer-journal.mjs";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const HARNESSES = ["droid", "grok", "codex", "pi", "claude", "hermes"];
+const HARNESSES = INSTALLER_HARNESSES;
 const MANAGER_HARNESSES = ["grok", "codex", "claude"];
 const DOCTOR_PROBE_TIMEOUT_OPTION = "--probe-timeout-seconds";
 const DOCTOR_PROBE_TIMEOUT_SECONDS = 30;
@@ -716,7 +716,7 @@ function install(options) {
       if (preservedSet.has(relativePath) || unmanagedSet.has(relativePath)) {
         desired = original;
       } else {
-        desired = installerFileState(content);
+        desired = installerFileState(content, original);
         desiredContent = content;
       }
     } else if (preservedSet.has(relativePath)) {
@@ -731,20 +731,26 @@ function install(options) {
   }
   if (localExcludePath !== null) {
     const target = gitExcludeTarget(localExcludePath);
+    const original = observeInstallerTarget(project, target, journalContext);
     participants.push({
-      desired: installerFileState(localExclude.content),
+      desired: installerFileState(localExclude.content, original),
       desiredContent: localExclude.content,
-      original: observeInstallerTarget(project, target, journalContext),
+      original,
       target,
     });
   }
   const manifestTarget = projectFileTarget(
     ".herdr-orchestrator/manifest.json",
   );
+  const manifestOriginal = observeInstallerTarget(
+    project,
+    manifestTarget,
+    journalContext,
+  );
   participants.push({
-    desired: installerFileState(manifestContent),
+    desired: installerFileState(manifestContent, manifestOriginal),
     desiredContent: manifestContent,
-    original: observeInstallerTarget(project, manifestTarget, journalContext),
+    original: manifestOriginal,
     target: manifestTarget,
   });
   runInstallerTransaction({
@@ -1179,27 +1185,6 @@ function doctor(options) {
   }
 }
 
-function pruneManagedDirectories(project) {
-  for (const relativePath of [
-    ".herdr-orchestrator/profiles/harnesses",
-    ".herdr-orchestrator/profiles",
-    ".herdr-orchestrator/manager",
-    ".herdr-orchestrator/workflows/prompts",
-    ".herdr-orchestrator/workflows",
-    ".herdr-orchestrator",
-    ".agents/skills/herdr-orchestrator",
-    ".orchestrator",
-  ]) {
-    try {
-      rmdirSync(join(project, relativePath));
-    } catch (error) {
-      if (!["ENOENT", "ENOTDIR", "ENOTEMPTY"].includes(error.code)) {
-        throw error;
-      }
-    }
-  }
-}
-
 function writeUninstallResult(project, result) {
   process.stdout.write(`${JSON.stringify({
     ...result,
@@ -1225,11 +1210,9 @@ function uninstall(options) {
   });
   if (!existsSync(manifestPath)) {
     if (recovery.active && recovery.command === "uninstall") {
-      pruneManagedDirectories(project);
       writeUninstallResult(project, recovery.command_result);
       return;
     }
-    pruneManagedDirectories(project);
     const preserved = listManagedRootEntries(project);
     writeUninstallResult(project, {
       local_exclude: unownedLocalExcludeStatus(localExcludePath),
@@ -1283,10 +1266,11 @@ function uninstall(options) {
   }
   if (localExcludePath !== null) {
     const target = gitExcludeTarget(localExcludePath);
+    const original = observeInstallerTarget(project, target, journalContext);
     participants.push({
-      desired: installerFileState(localExclude.content),
+      desired: installerFileState(localExclude.content, original),
       desiredContent: localExclude.content,
-      original: observeInstallerTarget(project, target, journalContext),
+      original,
       target,
     });
   }
@@ -1312,7 +1296,6 @@ function uninstall(options) {
     packageVersion: packageVersion(),
     participants,
   });
-  pruneManagedDirectories(project);
   writeUninstallResult(project, {
     local_exclude: localExclude.status,
     ok: preserved.length === 0,
