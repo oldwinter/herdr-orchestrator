@@ -138,7 +138,7 @@ run --workflow PATH
 
 - 不给 mode：持续轮询；Ctrl-C 打印 `coordinator_stopped` 到 stderr 并正常退出。
 - `--once`：执行一个受 `max_parallel` 与 replica slot 限制的 wave。
-- `--until-idle` 与别名 `--drain`：多 wave 排空有效 worker pool；timeout 默认 3600 秒，CLI 范围 1–86400。
+- `--until-idle` 与别名 `--drain`：多 wave 排空有效 worker pool；timeout 默认 86400 秒，CLI 范围 1–86400。该总 deadline 会截断每个 dispatch 的剩余时间，因此必须长于单任务 `agent_timeout_seconds`。
 - `--once` 与 `--until-idle/--drain` 互斥。
 
 单 wave JSON 同时保留兼容的顶层 state counts 和明确分组：

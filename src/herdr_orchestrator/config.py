@@ -71,7 +71,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             coordinator_raw,
             "agent_timeout_seconds",
             minimum=10,
-            maximum=3600,
+            maximum=86400,
         ),
     )
     if coordinator.lease_seconds < coordinator.agent_timeout_seconds + 90:
