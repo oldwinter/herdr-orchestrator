@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -79,11 +80,12 @@ class QualityBundleRunTests(unittest.TestCase):
     def test_completed_manifest_rejects_an_artifact_digest_mismatch(self) -> None:
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as temporary:
+            spec = self._coverage_spec(88.0)
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
                 invocation_id="digest-mismatch",
-                specs=(self._coverage_spec(88.0),),
+                specs=(spec,),
             )
             payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
             artifact = self._artifact_path(bundle.path, payload, "coverage")
@@ -95,33 +97,34 @@ class QualityBundleRunTests(unittest.TestCase):
             ):
                 quality_bundle.load_completed_manifest(
                     bundle.manifest_path,
+                    expected_specs=(spec,),
                     **_expectations(bundle.manifest_path, expected_commit=commit),
                 )
 
     def test_successful_artifactless_producer_publishes_a_verified_result_fact(self) -> None:
         commit = "d" * 40
         with tempfile.TemporaryDirectory() as temporary:
+            spec = quality_bundle.ProducerSpec(
+                name="lint",
+                commands=(
+                    quality_bundle.CommandSpec(
+                        argv=(sys.executable, "-c", "raise SystemExit(0)"),
+                        tool="python",
+                        version_argv=(sys.executable, "--version"),
+                    ),
+                ),
+                artifacts=(),
+            )
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
                 invocation_id="lint-result",
-                specs=(
-                    quality_bundle.ProducerSpec(
-                        name="lint",
-                        commands=(
-                            quality_bundle.CommandSpec(
-                                argv=(sys.executable, "-c", "raise SystemExit(0)"),
-                                tool="python",
-                                version_argv=(sys.executable, "--version"),
-                            ),
-                        ),
-                        artifacts=(),
-                    ),
-                ),
+                specs=(spec,),
             )
 
             manifest = quality_bundle.load_completed_manifest(
                 bundle.manifest_path,
+                expected_specs=(spec,),
                 **_expectations(bundle.manifest_path, expected_commit=commit),
             )
 
@@ -133,11 +136,12 @@ class QualityBundleRunTests(unittest.TestCase):
     def test_completed_manifest_rejects_incomplete_command_provenance(self) -> None:
         commit = "e" * 40
         with tempfile.TemporaryDirectory() as temporary:
+            spec = self._coverage_spec(90.0)
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
                 invocation_id="missing-tool-version",
-                specs=(self._coverage_spec(90.0),),
+                specs=(spec,),
             )
             payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
             del payload["producers"][0]["commands"][0]["tool_version"]
@@ -149,6 +153,7 @@ class QualityBundleRunTests(unittest.TestCase):
             ):
                 quality_bundle.load_completed_manifest(
                     bundle.manifest_path,
+                    expected_specs=(spec,),
                     **_expectations(bundle.manifest_path, expected_commit=commit),
                 )
 
@@ -178,11 +183,12 @@ class QualityBundleRunTests(unittest.TestCase):
         commit = "9" * 40
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            spec = self._coverage_spec(92.0)
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit=commit,
                 invocation_id="artifact-matrix",
-                specs=(self._coverage_spec(92.0),),
+                specs=(spec,),
             )
             payload = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
             artifacts = payload["producers"][0]["artifacts"]
@@ -207,6 +213,7 @@ class QualityBundleRunTests(unittest.TestCase):
                         ):
                             quality_bundle.load_completed_manifest(
                                 case_bundle / "manifest.json",
+                                expected_specs=(spec,),
                                 **_expectations(
                                     case_bundle / "manifest.json",
                                     expected_commit=commit,
@@ -217,11 +224,12 @@ class QualityBundleRunTests(unittest.TestCase):
         commit = "8" * 40
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            duplicate_spec = self._coverage_spec(90.0)
             duplicate = quality_bundle.run_quality(
                 root=root / "duplicate",
                 commit=commit,
                 invocation_id="duplicate-key",
-                specs=(self._coverage_spec(90.0),),
+                specs=(duplicate_spec,),
             )
             text = duplicate.manifest_path.read_text(encoding="utf-8")
             duplicate_expectations = _expectations(
@@ -238,14 +246,16 @@ class QualityBundleRunTests(unittest.TestCase):
             ):
                 quality_bundle.load_completed_manifest(
                     duplicate.manifest_path,
+                    expected_specs=(duplicate_spec,),
                     **duplicate_expectations,
                 )
 
+            incomplete_spec = self._coverage_spec(90.0)
             incomplete = quality_bundle.run_quality(
                 root=root / "incomplete",
                 commit=commit,
                 invocation_id="missing-producer",
-                specs=(self._coverage_spec(90.0),),
+                specs=(incomplete_spec,),
             )
             payload = json.loads(incomplete.manifest_path.read_text(encoding="utf-8"))
             payload["producers"] = []
@@ -256,6 +266,7 @@ class QualityBundleRunTests(unittest.TestCase):
             ):
                 quality_bundle.load_completed_manifest(
                     incomplete.manifest_path,
+                    expected_specs=(incomplete_spec,),
                     **_expectations(incomplete.manifest_path, expected_commit=commit),
                 )
 
@@ -312,6 +323,17 @@ class QualityBundleRunTests(unittest.TestCase):
             artifacts=(quality_bundle.ArtifactSpec("profile", "tests.pstats", "pstats"),),
         )
         with tempfile.TemporaryDirectory() as temporary:
+            spec = quality_bundle.ProducerSpec(
+                name="profiling",
+                commands=(
+                    quality_bundle.CommandSpec(
+                        argv=(sys.executable, "-c", script),
+                        tool="python",
+                        version_argv=(sys.executable, "--version"),
+                    ),
+                ),
+                artifacts=(quality_bundle.ArtifactSpec("profile", "tests.pstats", "pstats"),),
+            )
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
@@ -333,6 +355,7 @@ class QualityBundleRunTests(unittest.TestCase):
             ):
                 quality_bundle.load_completed_manifest(
                     bundle.manifest_path,
+                    expected_specs=(spec,),
                     **_expectations(bundle.manifest_path, expected_commit=commit),
                 )
 
@@ -342,11 +365,12 @@ class QualityBundleRunTests(unittest.TestCase):
         changed = quality_bundle.SourceIdentity(commit, "2" * 64, False)
         probes = iter((changed,))
         with tempfile.TemporaryDirectory() as temporary:
+            spec = self._coverage_spec(90.0)
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
                 invocation_id="source-mutated",
-                specs=(self._coverage_spec(90.0),),
+                specs=(spec,),
                 source=initial,
                 source_probe=lambda: next(probes),
             )
@@ -360,17 +384,19 @@ class QualityBundleRunTests(unittest.TestCase):
             ):
                 quality_bundle.load_completed_manifest(
                     bundle.manifest_path,
+                    expected_specs=(spec,),
                     **_expectations(bundle.manifest_path, expected_commit=commit),
                 )
 
     def test_artifact_replacement_between_digest_and_parse_is_rejected(self) -> None:
         commit = "3" * 40
         with tempfile.TemporaryDirectory() as temporary:
+            spec = self._coverage_spec(93.0)
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
                 invocation_id="artifact-swap",
-                specs=(self._coverage_spec(93.0),),
+                specs=(spec,),
             )
             manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
             artifact = self._artifact_path(bundle.path, manifest, "coverage")
@@ -393,6 +419,7 @@ class QualityBundleRunTests(unittest.TestCase):
             ):
                 quality_bundle.load_completed_manifest(
                     bundle.manifest_path,
+                    expected_specs=(spec,),
                     **_expectations(bundle.manifest_path, expected_commit=commit),
                 )
 
@@ -414,14 +441,16 @@ class QualityBundleRunTests(unittest.TestCase):
                 side_effect=mutate_after_inspection,
             ),
         ):
+            spec = self._coverage_spec(94.0)
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
                 invocation_id="producer-snapshot",
-                specs=(self._coverage_spec(94.0),),
+                specs=(spec,),
             )
             manifest = quality_bundle.load_completed_manifest(
                 bundle.manifest_path,
+                expected_specs=(spec,),
                 **_expectations(bundle.manifest_path, expected_commit=commit),
             )
 
@@ -542,6 +571,150 @@ class QualityBundleRunTests(unittest.TestCase):
                     expected_specs=(spec,),
                     **_expectations(bundle.manifest_path, expected_commit=commit),
                 )
+
+    def test_manifest_binds_command_plan_and_ending_source_digest(self) -> None:
+        commit = "7" * 40
+        spec = self._coverage_spec(95.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = quality_bundle.run_quality(
+                root=root / "quality",
+                commit=commit,
+                invocation_id="identity-contract",
+                specs=(spec,),
+            )
+            original = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+
+            command_bundle = root / "command" / "runs" / bundle.path.name
+            command_bundle.parent.mkdir(parents=True)
+            shutil.copytree(bundle.path, command_bundle)
+            command_case = command_bundle / "manifest.json"
+            command_payload = json.loads(json.dumps(original))
+            command_payload["producers"][0]["commands"][0]["argv"] = [
+                sys.executable,
+                "-c",
+                "raise SystemExit(0)",
+            ]
+            command_case.write_text(json.dumps(command_payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                quality_bundle.QualityBundleError,
+                "quality_command_mismatch",
+            ):
+                quality_bundle.load_completed_manifest(
+                    command_case,
+                    expected_specs=(spec,),
+                    **_expectations(command_case, expected_commit=commit),
+                )
+
+            count_bundle = root / "count" / "runs" / bundle.path.name
+            count_bundle.parent.mkdir(parents=True)
+            shutil.copytree(bundle.path, count_bundle)
+            count_case = count_bundle / "manifest.json"
+            count_payload = json.loads(json.dumps(original))
+            count_payload["producers"][0]["commands"].append(
+                count_payload["producers"][0]["commands"][0]
+            )
+            count_case.write_text(json.dumps(count_payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                quality_bundle.QualityBundleError,
+                "quality_command_mismatch",
+            ):
+                quality_bundle.load_completed_manifest(
+                    count_case,
+                    expected_specs=(spec,),
+                    **_expectations(count_case, expected_commit=commit),
+                )
+
+            missing_bundle = root / "missing" / "runs" / bundle.path.name
+            missing_bundle.parent.mkdir(parents=True)
+            shutil.copytree(bundle.path, missing_bundle)
+            missing_case = missing_bundle / "manifest.json"
+            missing_payload = json.loads(json.dumps(original))
+            del missing_payload["ending_source_digest"]
+            missing_case.write_text(json.dumps(missing_payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                quality_bundle.QualityBundleError,
+                "quality_manifest_invalid",
+            ):
+                quality_bundle.load_completed_manifest(
+                    missing_case,
+                    expected_specs=(spec,),
+                    **_expectations(missing_case, expected_commit=commit),
+                )
+
+            changed_bundle = root / "changed" / "runs" / bundle.path.name
+            changed_bundle.parent.mkdir(parents=True)
+            shutil.copytree(bundle.path, changed_bundle)
+            changed_case = changed_bundle / "manifest.json"
+            changed_payload = json.loads(json.dumps(original))
+            changed_payload["ending_source_digest"] = "0" * 64
+            changed_case.write_text(json.dumps(changed_payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                quality_bundle.QualityBundleError,
+                "quality_source_changed",
+            ):
+                quality_bundle.load_completed_manifest(
+                    changed_case,
+                    expected_specs=(spec,),
+                    **_expectations(changed_case, expected_commit=commit),
+                )
+
+    def test_manifest_rejects_unexpected_bundle_files(self) -> None:
+        commit = "8" * 40
+        spec = self._coverage_spec(95.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = quality_bundle.run_quality(
+                root=Path(temporary) / "quality",
+                commit=commit,
+                invocation_id="inventory-contract",
+                specs=(spec,),
+            )
+            (bundle.path / "unexpected.txt").write_text("unowned", encoding="utf-8")
+            with self.assertRaisesRegex(
+                quality_bundle.QualityBundleError,
+                "quality_bundle_inventory_invalid",
+            ):
+                quality_bundle.load_completed_manifest(
+                    bundle.manifest_path,
+                    expected_specs=(spec,),
+                    **_expectations(bundle.manifest_path, expected_commit=commit),
+                )
+
+    def test_detect_secrets_inputs_are_after_an_option_separator(self) -> None:
+        command = quality_bundle.PRODUCER_SPECS["security"].commands[0]
+        self.assertEqual(command.argv[-1], "--")
+        with patch.object(quality_bundle, "_tracked_files", return_value=("--exclude-files=^",)):
+            invocation = quality_bundle._expanded_argv(command, Path("/tmp/quality-work"))
+        self.assertEqual(invocation.argv[-2:], ("--", "--exclude-files=^"))
+        self.assertEqual(invocation.input_count, 1)
+        self.assertEqual(
+            invocation.input_sha256,
+            quality_bundle.quality_validation.input_digest(("--exclude-files=^",)),
+        )
+
+    def test_cli_storage_failure_has_a_stable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blocked_root = root / "not-a-directory"
+            blocked_root.write_text("blocked", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "run",
+                    "--root",
+                    str(blocked_root),
+                    "--producer",
+                    "build",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "quality_storage_unavailable")
 
     def test_enforcement_uses_manifest_outcomes_without_a_summary_file(self) -> None:
         commit = "a" * 40

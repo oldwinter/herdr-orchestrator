@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -307,12 +308,126 @@ class QualityCommandTests(unittest.TestCase):
                             capture_output=True,
                             text=True,
                             check=False,
+                            env=environment,
                             timeout=30,
                         )
                         summary = summary_path.read_text(encoding="utf-8")
                         self.assertEqual(summarize.returncode, 1)
                         self.assertIn("NOT VERIFIED", summary)
                         self.assertIn(error_code, summary)
+
+    def test_schema_invalid_verified_artifacts_cannot_pass_summary_or_enforce(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence_root = root / "quality"
+            result_path = root / "base-result.json"
+            commands = root / "bin"
+            commands.mkdir()
+            self._write_full_quality_tools(commands)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{commands}{os.pathsep}{environment['PATH']}"
+            collect = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/quality_bundle.py",
+                    "run",
+                    "--root",
+                    str(evidence_root),
+                    "--all",
+                    "--result",
+                    str(result_path),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+            self.assertEqual(collect.returncode, 0, collect.stderr)
+            base_result = json.loads(result_path.read_text(encoding="utf-8"))
+            base_bundle = Path(base_result["bundle"])
+            base_manifest = json.loads(Path(base_result["manifest"]).read_text(encoding="utf-8"))
+            targets = [
+                (producer["name"], artifact)
+                for producer in base_manifest["producers"]
+                for artifact in producer["artifacts"]
+                if artifact["key"] != "result" and artifact["format"] == "json"
+            ]
+            self.assertEqual(
+                {key for _, artifact in targets for key in (artifact["key"],)},
+                {
+                    "coverage",
+                    "tests",
+                    "stability",
+                    "bandit",
+                    "pip-audit",
+                    "npm-audit-root",
+                    "npm-audit-manager",
+                    "build",
+                },
+            )
+
+            for index, (producer_name, artifact) in enumerate(targets):
+                with self.subTest(producer=producer_name, key=artifact["key"]):
+                    case_root = root / "schema-cases" / str(index)
+                    case_bundle = case_root / "runs" / base_bundle.name
+                    case_bundle.parent.mkdir(parents=True)
+                    shutil.copytree(base_bundle, case_bundle)
+                    case_manifest_path = case_bundle / "manifest.json"
+                    case_manifest = json.loads(case_manifest_path.read_text(encoding="utf-8"))
+                    target = case_bundle / artifact["path"]
+                    target.write_text("{}", encoding="utf-8")
+                    producer = next(
+                        item for item in case_manifest["producers"] if item["name"] == producer_name
+                    )
+                    entry = next(
+                        item for item in producer["artifacts"] if item["key"] == artifact["key"]
+                    )
+                    entry["sha256"] = hashlib.sha256(b"{}").hexdigest()
+                    case_manifest_path.write_text(json.dumps(case_manifest), encoding="utf-8")
+                    case_result = dict(base_result)
+                    case_result["bundle"] = str(case_bundle)
+                    case_result["manifest"] = str(case_manifest_path)
+                    case_result_path = case_root / "result.json"
+                    case_result_path.write_text(json.dumps(case_result), encoding="utf-8")
+                    summary_path = case_root / "summary.md"
+                    summary = subprocess.run(
+                        [
+                            sys.executable,
+                            "scripts/quality_summary.py",
+                            "--result",
+                            str(case_result_path),
+                            "--output",
+                            str(summary_path),
+                        ],
+                        cwd=REPO_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        env=environment,
+                        timeout=30,
+                    )
+                    enforce = subprocess.run(
+                        [
+                            sys.executable,
+                            "scripts/quality_bundle.py",
+                            "enforce",
+                            "--result",
+                            str(case_result_path),
+                            "--require-full",
+                        ],
+                        cwd=REPO_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        env=environment,
+                        timeout=30,
+                    )
+                    rendered = summary_path.read_text(encoding="utf-8")
+                    self.assertEqual(summary.returncode, 1, summary.stderr)
+                    self.assertIn("NOT VERIFIED", rendered)
+                    self.assertNotEqual(enforce.returncode, 0, enforce.stderr)
 
     def test_inventory_failure_is_recorded_without_stopping_later_producers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -742,11 +857,19 @@ class QualityCommandTests(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "for argument in args:\n"
             "    if argument.startswith('--cov-report=json:'):\n"
-            "        pathlib.Path(argument.split('json:', 1)[1]).write_text("
-            "json.dumps({'totals': {'percent_covered': 91.0}}))\n"
+            "        pathlib.Path(argument.split('json:', 1)[1]).write_text(json.dumps({"
+            "'files': {'fixture.py': {'summary': {}}}, 'meta': {"
+            "'branch_coverage': True, 'format': 3, 'show_contexts': False, "
+            "'timestamp': 'now', 'version': '7.0.0'}, "
+            "'totals': {'covered_lines': 1, 'missing_lines': 0, "
+            "'num_statements': 1, 'percent_covered': 91.0}}))\n"
             "    if argument.startswith('--json-report-file='):\n"
-            "        pathlib.Path(argument.split('=', 1)[1]).write_text("
-            "json.dumps({'tests': [{'nodeid': 'fixture', 'outcome': 'passed'}]}))\n"
+            "        pathlib.Path(argument.split('=', 1)[1]).write_text(json.dumps({"
+            "'collectors': [{'nodeid': 'fixture', 'outcome': 'passed', 'result': []}], "
+            "'created': 0.0, 'duration': 0.1, 'environment': {}, 'exitcode': 0, "
+            "'root': '/tmp/fixture', 'summary': {'collected': 1, 'deselected': 0, "
+            "'passed': 1, 'total': 1}, 'tests': [{'nodeid': 'fixture', "
+            "'outcome': 'passed'}]}))\n"
             "if args[1:2] == ['bandit']:\n"
             "    pathlib.Path(args[args.index('-o') + 1]).write_text(json.dumps("
             "{'errors': [], 'generated_at': 'now', 'metrics': {'_totals': {}}, "
@@ -757,7 +880,9 @@ class QualityCommandTests(unittest.TestCase):
             "'fixes': []}))\n"
             "if args[1:3] == ['python', 'scripts/test_stability.py']:\n"
             "    pathlib.Path(args[args.index('--output') + 1]).write_text(json.dumps("
-            "{'executions': [{'exit_code': 0}, {'exit_code': 0}, {'exit_code': 0}], "
+            "{'executions': [{'exit_code': 0, 'run': 1, 'tests': 1, 'duration_seconds': 0.1}, "
+            "{'exit_code': 0, 'run': 2, 'tests': 1, 'duration_seconds': 0.1}, "
+            "{'exit_code': 0, 'run': 3, 'tests': 1, 'duration_seconds': 0.1}], "
             "'runs': 3, 'status': 'passed', 'unstable': []}))\n"
             "if args[1:3] == ['python', 'scripts/profile_tests.py']:\n"
             "    output = pathlib.Path(args[args.index('--output') + 1])\n"
@@ -781,7 +906,9 @@ class QualityCommandTests(unittest.TestCase):
             "'size': 10, 'unpackedSize': 20}]))\n"
             "else:\n"
             "    print(json.dumps({'auditReportVersion': 2, "
-            "'metadata': {'vulnerabilities': {'total': 0}}, 'vulnerabilities': {}}))\n"
+            "'metadata': {'vulnerabilities': {'total': 0}, "
+            "'dependencies': {'prod': 0, 'dev': 0, 'optional': 0}}, "
+            "'vulnerabilities': {}}))\n"
             "raise SystemExit(0)\n",
             encoding="utf-8",
         )

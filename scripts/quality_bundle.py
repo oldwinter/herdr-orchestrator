@@ -21,6 +21,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
+try:
+    from scripts import quality_validation
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    import quality_validation
+
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
 COMMIT = re.compile(r"[0-9a-fA-F]{40}")
@@ -28,6 +34,8 @@ NAME = re.compile(r"[a-z][a-z0-9-]*")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 OUTPUT_DIRECTORY = "${QUALITY_OUTPUT_DIR}"
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+EMPTY_INPUT_SHA256 = hashlib.sha256(b"").hexdigest()
+SOURCE_PROBE_FAILURE_SHA256 = hashlib.sha256(b"quality_source_probe_unavailable").hexdigest()
 
 
 class QualityBundleError(ValueError):
@@ -112,6 +120,7 @@ class QualityManifest:
     started_at: str
     completed_at: str
     source_digest: str
+    ending_source_digest: str
     source_clean: bool
     producers: tuple[ProducerEvidence, ...]
 
@@ -261,17 +270,6 @@ def _assert_artifact_unchanged(path: Path, snapshot: ArtifactSnapshot) -> None:
         raise QualityBundleError("quality_artifact_changed")
 
 
-def _path_has_symlink(root: Path, relative: Path) -> bool:
-    current = root
-    if current.is_symlink():
-        return True
-    for part in relative.parts:
-        current /= part
-        if current.is_symlink():
-            return True
-    return False
-
-
 def _parse_artifact_bytes(data: bytes, parser: str) -> dict[str, object] | None:
     if parser == "json":
         try:
@@ -354,11 +352,7 @@ def _tracked_files() -> tuple[str, ...]:
 def _expanded_argv(command: CommandSpec, output_dir: Path) -> CommandInvocation:
     argv = tuple(argument.replace(OUTPUT_DIRECTORY, str(output_dir)) for argument in command.argv)
     inputs = _tracked_files() if command.include_tracked_files else ()
-    digest = hashlib.sha256()
-    for name in inputs:
-        digest.update(os.fsencode(name))
-        digest.update(b"\0")
-    return CommandInvocation((*argv, *inputs), len(inputs), digest.hexdigest())
+    return CommandInvocation((*argv, *inputs), len(inputs), quality_validation.input_digest(inputs))
 
 
 def _claim_run_directory(pending: Path, final: Path) -> None:
@@ -556,7 +550,7 @@ def run_quality(
             ending_source = source_probe()
         except QualityBundleError:
             source_consistent = False
-            ending_source_digest = "unavailable"
+            ending_source_digest = SOURCE_PROBE_FAILURE_SHA256
         else:
             ending_source_digest = ending_source.digest
             source_consistent = ending_source == source
@@ -678,6 +672,7 @@ def load_completed_manifest(
     invocation_id = _string(payload, "invocation_id", "quality_manifest_invalid")
     run_id = _string(payload, "run_id", "quality_manifest_invalid")
     source_digest = _string(payload, "source_digest", "quality_manifest_invalid")
+    ending_source_digest = _string(payload, "ending_source_digest", "quality_manifest_invalid")
     source_clean = payload.get("source_clean")
     source_consistent = payload.get("source_consistent")
     started_at = _string(payload, "started_at", "quality_manifest_invalid")
@@ -696,9 +691,16 @@ def load_completed_manifest(
         raise QualityBundleError("quality_run_mismatch")
     if SHA256.fullmatch(expected_source_digest) is None or source_digest != expected_source_digest:
         raise QualityBundleError("quality_source_mismatch")
-    if not isinstance(source_clean, bool) or not isinstance(source_consistent, bool):
+    if (
+        not isinstance(source_clean, bool)
+        or not isinstance(source_consistent, bool)
+        or SHA256.fullmatch(source_digest) is None
+        or SHA256.fullmatch(ending_source_digest) is None
+    ):
         raise QualityBundleError("quality_manifest_invalid")
     if not source_consistent:
+        raise QualityBundleError("quality_source_changed")
+    if ending_source_digest != source_digest:
         raise QualityBundleError("quality_source_changed")
     if require_clean and not source_clean:
         raise QualityBundleError("quality_source_not_clean")
@@ -714,6 +716,7 @@ def load_completed_manifest(
     ):
         raise QualityBundleError("quality_run_mismatch")
     bundle_resolved = bundle.resolve()
+    expected_files: set[Path] = {Path("manifest.json")}
 
     required = payload.get("required_producers")
     producers = payload.get("producers")
@@ -726,6 +729,7 @@ def load_completed_manifest(
     ):
         raise QualityBundleError("quality_manifest_invalid")
     spec_source = expected_specs if expected_specs is not None else tuple(PRODUCER_SPECS.values())
+    strict_schema = expected_specs is None
     specs_by_name = {spec.name: spec for spec in spec_source}
     if len(specs_by_name) != len(spec_source) or not set(required).issubset(specs_by_name):
         raise QualityBundleError("quality_producer_invalid")
@@ -754,6 +758,7 @@ def load_completed_manifest(
         producer_ended = _timestamp(raw_producer, "ended_at", "quality_producer_invalid")
         commands = raw_producer.get("commands")
         tool_versions = raw_producer.get("tool_versions")
+        producer_spec = specs_by_name[name]
         if (
             producer_ended < producer_started
             or producer_started < manifest_started
@@ -768,7 +773,22 @@ def load_completed_manifest(
             )
         ):
             raise QualityBundleError("quality_producer_invalid")
-        validated_commands = tuple(_validate_command(command) for command in commands)
+        if len(commands) != len(producer_spec.commands):
+            raise QualityBundleError("quality_command_mismatch")
+        validated_commands = []
+        for command, expected in zip(commands, producer_spec.commands, strict=True):
+            validated = _validate_command(command)
+            try:
+                quality_validation.validate_command_contract(
+                    command,
+                    expected,
+                    _tracked_files,
+                    EMPTY_INPUT_SHA256,
+                )
+            except quality_validation.ValidationError as error:
+                raise QualityBundleError(str(error)) from error
+            validated_commands.append(validated)
+        validated_commands = tuple(validated_commands)
         if any(
             command.started_at < producer_started or command.ended_at > producer_ended
             for command in validated_commands
@@ -788,7 +808,6 @@ def load_completed_manifest(
         if not isinstance(raw_artifacts, list):
             raise QualityBundleError("quality_producer_invalid")
 
-        producer_spec = specs_by_name[name]
         artifact_specs = {
             artifact.key: artifact
             for artifact in (
@@ -809,6 +828,9 @@ def load_completed_manifest(
             raise QualityBundleError("quality_producer_incomplete")
         if verification == "verified" and declared_keys != expected_keys:
             raise QualityBundleError("quality_producer_incomplete")
+
+        producer_fact_path = bundle / "producers" / name / "producer.json"
+        expected_files.add(Path("producers") / name / "producer.json")
 
         artifacts: list[ArtifactEvidence] = []
         seen_artifacts: set[str] = set()
@@ -837,10 +859,11 @@ def load_completed_manifest(
                 or ".." in relative.parts
                 or relative != expected_relative
                 or parser != expected_artifact.parser
-                or _path_has_symlink(bundle, relative)
+                or quality_validation.path_has_symlink(bundle, relative)
             ):
                 raise QualityBundleError("quality_artifact_path_invalid")
             artifact_path = bundle / relative
+            expected_files.add(relative)
             if (
                 artifact_path.is_symlink()
                 or not artifact_path.is_file()
@@ -855,6 +878,13 @@ def load_completed_manifest(
             _assert_artifact_unchanged(artifact_path, snapshot)
             if verified != (verification == "verified"):
                 raise QualityBundleError("quality_artifact_verification_mismatch")
+            if strict_schema and verified and parser == "json" and key != "result":
+                if artifact_payload is None:
+                    raise QualityBundleError("quality_artifact_invalid")
+                try:
+                    quality_validation.validate_artifact_payload(name, key, artifact_payload)
+                except quality_validation.ValidationError as error:
+                    raise QualityBundleError(str(error)) from error
             artifacts.append(
                 ArtifactEvidence(key, artifact_path, digest, verified, artifact_payload)
             )
@@ -876,10 +906,24 @@ def load_completed_manifest(
             or result_payload.get("exit_code") != expected_exit_code
         ):
             raise QualityBundleError("quality_producer_invalid")
+        try:
+            producer_fact_snapshot = _artifact_snapshot(producer_fact_path)
+            producer_fact = _parse_artifact_bytes(producer_fact_snapshot.data, "json")
+            _assert_artifact_unchanged(producer_fact_path, producer_fact_snapshot)
+        except QualityBundleError:
+            raise
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            raise QualityBundleError("quality_producer_invalid") from error
+        if producer_fact != raw_producer:
+            raise QualityBundleError("quality_producer_invalid")
         producer_evidence.append(ProducerEvidence(name, outcome, verification, tuple(artifacts)))
 
     if seen_producers != set(required):
         raise QualityBundleError("quality_producer_incomplete")
+    try:
+        quality_validation.validate_bundle_inventory(bundle, expected_files)
+    except quality_validation.ValidationError as error:
+        raise QualityBundleError(str(error)) from error
     return QualityManifest(
         path,
         commit,
@@ -888,6 +932,7 @@ def load_completed_manifest(
         started_at,
         completed_at,
         source_digest,
+        ending_source_digest,
         source_clean,
         tuple(producer_evidence),
     )
@@ -1034,7 +1079,14 @@ def _security_spec() -> ProducerSpec:
         name="security",
         commands=(
             CommandSpec(
-                argv=("uv", "run", "detect-secrets-hook", "--baseline", ".secrets.baseline"),
+                argv=(
+                    "uv",
+                    "run",
+                    "detect-secrets-hook",
+                    "--baseline",
+                    ".secrets.baseline",
+                    "--",
+                ),
                 tool="detect-secrets",
                 version_argv=("uv", "run", "detect-secrets", "--version"),
                 include_tracked_files=True,
@@ -1429,6 +1481,12 @@ def main() -> int:
             _atomic_write_json(args.result, result_payload)
     except QualityBundleError as error:
         print(str(error), file=sys.stderr)
+        return 2
+    except OSError:
+        print("quality_storage_unavailable", file=sys.stderr)
+        return 2
+    except RuntimeError:
+        print("quality_runtime_failure", file=sys.stderr)
         return 2
     print(bundle.manifest_path)
     return bundle.exit_code
