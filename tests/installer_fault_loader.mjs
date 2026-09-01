@@ -168,14 +168,14 @@ function instrument(source) {
       + "    journal,\n"
       + "    context,\n"
       + "  );\n"
-      + "  preflightEndpoints(project, journal, context, preservedTargets);",
+      + "  const legacyProjectPreserved = legacyProjectPreservationConflict(",
     "  const preservedTargets = legacyPreservedTargets(\n"
       + "    project,\n"
       + "    journal,\n"
       + "    context,\n"
       + "  );\n"
       + "  __faultPauseAfterPreservedDiscovery();\n"
-      + "  preflightEndpoints(project, journal, context, preservedTargets);",
+      + "  const legacyProjectPreserved = legacyProjectPreservationConflict(",
   );
   result = replaceExact(
     result,

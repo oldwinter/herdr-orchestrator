@@ -847,32 +847,32 @@ function legacyPreservedTargets(project, journal, context) {
     }
   }
   if ([...preserved].some((key) => key.startsWith("project:"))) {
-    if (journal.command !== "uninstall") {
+    if (journal.command === "uninstall") {
       for (const operation of journal.operations) {
-        if (!isManifestTarget(operation.target)) {
-          continue;
-        }
-        const actual = observeTarget(project, operation.target, context);
-        if (actual.kind === "regular" && stateMatches(actual, operation.original)) {
+        if (
+          operation.target.scope === "git-exclude"
+          && operation.desired.kind === "regular"
+        ) {
           preserved.add(targetKey(operation.target));
         }
       }
     }
-    for (const operation of journal.operations) {
-      if (operation.target.scope !== "git-exclude") {
-        continue;
-      }
-      const actual = observeTarget(project, operation.target, context);
-      if (
-        operation.desired.kind === "regular"
-        && actual.kind === "regular"
-        && stateMatches(actual, operation.original)
-      ) {
-        preserved.add(targetKey(operation.target));
-      }
-    }
   }
   return preserved;
+}
+
+function legacyProjectPreservationConflict(journal, preservedTargets) {
+  if (journal.command === "uninstall") {
+    return [];
+  }
+  return [...preservedTargets]
+    .filter((key) => key.startsWith("project:"))
+    .filter((key) => {
+      const item = journal.prior_inventory[key];
+      return item !== undefined && !isManifestTarget(item.target);
+    })
+    .map((key) => targetLabel(journal.prior_inventory[key].target))
+    .sort();
 }
 
 function recoverPublishedJournal(project) {
@@ -1026,7 +1026,10 @@ function inspectEndpoints(project, journal, context, preservedTargets = new Set(
   for (const [key, item] of Object.entries(journal.prior_inventory)) {
     const actual = observeTarget(project, item.target, context);
     const desired = journal.desired_inventory[key].state;
-    if (stateMatches(actual, desired)) {
+    if (
+      stateMatches(actual, desired)
+      && !(preservedTargets.has(key) && item.target.scope === "git-exclude")
+    ) {
       states[key] = "desired";
     } else if (preservedTargets.has(key)) {
       if (stateMatches(actual, item.state)) {
@@ -1090,17 +1093,21 @@ function applyOperation(project, journal, operation, context, preservedTargets =
       temporaryPath,
       targetLabel(operation.target),
     );
-    if (preservedTargets.has(targetKey(operation.target))) {
-      if (!stateMatches(actual, operation.original)) {
-        throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
-      }
+    if (
+      stateMatches(actual, operation.desired)
+      && !(preservedTargets.has(targetKey(operation.target))
+        && operation.target.scope === "git-exclude")
+    ) {
       if (temporary.kind === "regular") {
         unlinkSync(temporaryPath);
         fsyncDirectory(dirname(temporaryPath));
       }
       return;
     }
-    if (stateMatches(actual, operation.desired)) {
+    if (preservedTargets.has(targetKey(operation.target))) {
+      if (!stateMatches(actual, operation.original)) {
+        throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
+      }
       if (temporary.kind === "regular") {
         unlinkSync(temporaryPath);
         fsyncDirectory(dirname(temporaryPath));
@@ -1165,9 +1172,18 @@ function verifyDesiredInventory(project, journal, context, preservedTargets = ne
   for (const [key, item] of Object.entries(journal.desired_inventory)) {
     const actual = observeTarget(project, item.target, context);
     if (!stateMatches(actual, item.state)) {
+      const preservedOriginal = (
+        preservedTargets.has(key)
+        && stateMatches(actual, journal.prior_inventory[key].state)
+      );
+      const preservedDesired = (
+        preservedTargets.has(key)
+        && item.target.scope !== "git-exclude"
+        && stateMatches(actual, item.state)
+      );
       if (
-        !preservedTargets.has(key)
-        || !stateMatches(actual, journal.prior_inventory[key].state)
+        !preservedOriginal
+        && !preservedDesired
       ) {
         conflicts.push(targetLabel(item.target));
       }
@@ -1191,9 +1207,18 @@ function verifyDesiredInventoryBeforeManifest(
     }
     const actual = observeTarget(project, item.target, context);
     if (!stateMatches(actual, item.state)) {
+      const preservedOriginal = (
+        preservedTargets.has(key)
+        && stateMatches(actual, journal.prior_inventory[key].state)
+      );
+      const preservedDesired = (
+        preservedTargets.has(key)
+        && item.target.scope !== "git-exclude"
+        && stateMatches(actual, item.state)
+      );
       if (
-        !preservedTargets.has(key)
-        || !stateMatches(actual, journal.prior_inventory[key].state)
+        !preservedOriginal
+        && !preservedDesired
       ) {
         conflicts.push(targetLabel(item.target));
       }
@@ -1210,6 +1235,15 @@ function completeJournal(project, journal, context, owner) {
     journal,
     context,
   );
+  const legacyProjectPreserved = legacyProjectPreservationConflict(
+    journal,
+    preservedTargets,
+  );
+  if (legacyProjectPreserved.length > 0) {
+    throw new Error(
+      `installer_recovery_conflict: ${legacyProjectPreserved.join(",")}`,
+    );
+  }
   preflightEndpoints(project, journal, context, preservedTargets);
   for (let index = 0; index < journal.operations.length; index += 1) {
     const operation = journal.operations[index];
@@ -1230,14 +1264,24 @@ function completeJournal(project, journal, context, owner) {
     }
   }
   verifyDesiredInventory(project, journal, context, preservedTargets);
+  const retainedPreservedTargets = new Set();
   for (const key of preservedTargets) {
     const item = journal.prior_inventory[key];
     if (item === undefined) {
       throw new Error("installer_recovery_conflict: preserved_target_missing");
     }
     const actual = observeTarget(project, item.target, context);
-    if (!stateMatches(actual, item.state)) {
+    if (
+      !stateMatches(actual, item.state)
+      && (
+        item.target.scope === "git-exclude"
+        || !stateMatches(actual, journal.desired_inventory[key].state)
+      )
+    ) {
       throw new Error(`installer_recovery_conflict: ${targetLabel(item.target)}`);
+    }
+    if (stateMatches(actual, item.state)) {
+      retainedPreservedTargets.add(key);
     }
   }
   if (journal.progress.phase !== "verified") {
@@ -1247,12 +1291,12 @@ function completeJournal(project, journal, context, owner) {
   unlinkSync(journalPath(project));
   fsyncDirectory(dirname(journalPath(project)));
   removeJournalOwner(owner);
-  const preservedPaths = [...preservedTargets]
+  const preservedPaths = [...retainedPreservedTargets]
     .filter((key) => key.startsWith("project:"))
     .map((key) => key.slice("project:".length))
     .filter((path) => path !== ".herdr-orchestrator/manifest.json")
     .sort();
-  const preservedExclude = [...preservedTargets]
+  const preservedExclude = [...retainedPreservedTargets]
     .some((key) => key.startsWith("git-exclude:"));
   const commandResult = journal.command_result === null
     ? null
@@ -1431,11 +1475,16 @@ export function inspectInstallerJournal(context) {
     normalizedContext,
     preservedTargets,
   );
+  const legacyProjectConflicts = legacyProjectPreservationConflict(
+    journal,
+    preservedTargets,
+  );
   return {
     active: true,
     command: journal.command,
     conflicts: [
       ...inspection.conflicts,
+      ...legacyProjectConflicts,
       ...journalTemporaryConflicts,
     ].sort(),
     desired_inventory: journal.desired_inventory,

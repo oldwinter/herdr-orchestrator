@@ -136,12 +136,17 @@ Schema version 1 journals written before mode tracking remain valid. Recovery tr
 mode as unknown, preserves the live mode when it replaces that file, and adopts the older
 transaction-specific `.tmp` claim as the current owner claim. Install and upgrade replay may
 finish a content-proven replacement while carrying the live mode onto its temporary file. For
-any command, a digest-matching regular project deletion whose mode is unknown becomes an
-explicit preserved participant: recovery skips that unlink, rechecks the original digest at
-each boundary, and leaves a content mismatch as a recovery conflict. For install and upgrade,
-the prior manifest is retained and the outer command replans and reports the preserved paths;
-for uninstall, the Git exclude block is retained, only the installer manifest is removed, the
-journal is retired, and the command returns a partial result.
+any command, a digest-matching regular project deletion whose mode is unknown is identified as
+an explicit preserved participant and rechecked at each boundary; a content mismatch remains a
+recovery conflict. For install and upgrade, any such project deletion is a deliberate
+compatibility boundary: recovery stops with a stable `installer_recovery_conflict` before any
+additional target or manifest mutation and leaves the journal, owner claim, manifest, and
+current bytes in place.
+It does not infer a historical mode or perform an unprotected successor handoff; it requires
+explicit operator resolution or reconstruction outside automatic recovery. For uninstall, the
+Git exclude block is retained, each digest-matching unknown-mode project deletion is reported as
+preserved and skipped, only the installer manifest is removed, the journal is retired, and the
+command returns a partial result.
 Old manifests that omit `file_modes` are mode-unverified: existing files are reported as
 `modified` (also listed in `mode_unverified`) and are preserved without overwrite or removal.
 New journals and manifests record modes explicitly.

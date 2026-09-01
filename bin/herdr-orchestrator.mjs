@@ -665,8 +665,7 @@ function install(options) {
     gitExcludePath: localExcludePath,
     project,
   };
-  const recovery = reconcileInstallerJournal(journalContext);
-  const recoveryPreserved = recovery.preserved ?? [];
+  reconcileInstallerJournal(journalContext);
   const previous = loadManifest(project);
   const skillRouterExists = directoryHasFiles(join(project, ".agents/skills"));
   const installSkill = options.installSkill ?? (
@@ -886,22 +885,19 @@ function install(options) {
   } else if (options.installSkill === null && previous === null && skillRouterExists) {
     skill = "skipped_existing_router";
   }
-  const allPreserved = [
-    ...new Set([...recoveryPreserved, ...preserved]),
-  ].sort();
   process.stdout.write(`${JSON.stringify({
     harnesses,
     local_exclude: localExclude.status,
     manager: ".herdr-orchestrator/manager",
     manifest: ".herdr-orchestrator/manifest.json",
-    ok: allPreserved.length === 0,
-    preserved: allPreserved,
+    ok: preserved.length === 0,
+    preserved: preserved.sort(),
     project,
     skill,
     unmanaged: unmanaged.sort(),
     workflow: ".herdr-orchestrator/workflows/multi-harness.toml",
   })}\n`);
-  if (allPreserved.length > 0) {
+  if (preserved.length > 0) {
     process.exitCode = 1;
   }
 }

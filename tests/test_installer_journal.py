@@ -1008,15 +1008,24 @@ class InstallerJournalPackedTests(unittest.TestCase):
                 legacy_install,
                 ["install", "--skip-skill", "--harness", "droid"],
             )
-            self.assertEqual(recovered_install.returncode, 1, recovered_install.stderr)
-            install_payload = json.loads(recovered_install.stdout)
+            self.assertEqual(recovered_install.returncode, 2, recovered_install.stderr)
+            self.assertTrue(recovered_install.stderr.startswith("installer_recovery_conflict: "))
             self.assertIn(
                 ".agents/skills/herdr-orchestrator/SKILL.md",
-                install_payload["preserved"],
+                recovered_install.stderr,
             )
             self.assertTrue(skill.is_file())
             self.assertEqual(skill.stat().st_mode & 0o7777, alternate_skill_mode)
-            self.assertFalse(install_journal_path.exists())
+            self.assertTrue(install_journal_path.is_file())
+            self.assertTrue((legacy_install / ".herdr-orchestrator/manifest.json").is_file())
+            install_doctor = run(legacy_install, ["doctor"], {"PYTHON": "/bin/false"})
+            self.assertEqual(install_doctor.returncode, 1, install_doctor.stderr)
+            install_journal_report = json.loads(install_doctor.stdout)["installation"]["journal"]
+            self.assertTrue(install_journal_report["active"])
+            self.assertIn(
+                ".agents/skills/herdr-orchestrator/SKILL.md",
+                install_journal_report["conflicts"],
+            )
 
             legacy_upgrade = root / "legacy-upgrade-removal"
             initialize(legacy_upgrade)
@@ -1059,15 +1068,113 @@ class InstallerJournalPackedTests(unittest.TestCase):
                 legacy_upgrade,
                 ["upgrade", "--harness", "droid"],
             )
-            self.assertEqual(recovered_upgrade.returncode, 1, recovered_upgrade.stderr)
-            upgrade_payload = json.loads(recovered_upgrade.stdout)
+            self.assertEqual(recovered_upgrade.returncode, 2, recovered_upgrade.stderr)
+            self.assertTrue(recovered_upgrade.stderr.startswith("installer_recovery_conflict: "))
             self.assertIn(
                 ".herdr-orchestrator/profiles/harnesses/codex.toml",
-                upgrade_payload["preserved"],
+                recovered_upgrade.stderr,
             )
             self.assertTrue(removed_profile.is_file())
             self.assertEqual(removed_profile.stat().st_mode & 0o7777, alternate_profile_mode)
-            self.assertFalse(upgrade_journal_path.exists())
+            self.assertTrue(upgrade_journal_path.is_file())
+            self.assertTrue((legacy_upgrade / ".herdr-orchestrator/manifest.json").is_file())
+            upgrade_doctor = run(legacy_upgrade, ["doctor"], {"PYTHON": "/bin/false"})
+            self.assertEqual(upgrade_doctor.returncode, 1, upgrade_doctor.stderr)
+            upgrade_journal_report = json.loads(upgrade_doctor.stdout)["installation"]["journal"]
+            self.assertTrue(upgrade_journal_report["active"])
+            self.assertIn(
+                ".herdr-orchestrator/profiles/harnesses/codex.toml",
+                upgrade_journal_report["conflicts"],
+            )
+
+            after_manifest = root / "legacy-upgrade-after-manifest"
+            initialize(after_manifest)
+            installed = run(
+                after_manifest,
+                ["install", "--harness", "droid", "--harness", "codex"],
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            recreated_profile = after_manifest / ".herdr-orchestrator/profiles/harnesses/codex.toml"
+            original_profile = recreated_profile.read_bytes()
+            published = run(
+                after_manifest,
+                ["upgrade", "--harness", "droid"],
+                {"HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": "journal:published"},
+            )
+            self.assertEqual(published.returncode, 86, published.stderr)
+            after_manifest_journal_path = (
+                after_manifest / ".herdr-orchestrator/install-journal.json"
+            )
+            after_manifest_journal = json.loads(
+                after_manifest_journal_path.read_text(encoding="utf-8")
+            )
+            manifest_operation = next(
+                item
+                for item in after_manifest_journal["operations"]
+                if item["target"]["path"] == ".herdr-orchestrator/manifest.json"
+            )
+            published_manifest = run(
+                after_manifest,
+                ["upgrade", "--harness", "droid"],
+                {
+                    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL": (
+                        f"target:{manifest_operation['id']}:"
+                        f"{(after_manifest / '.herdr-orchestrator/manifest.json').resolve()}"
+                    ),
+                },
+            )
+            self.assertEqual(published_manifest.returncode, 86, published_manifest.stderr)
+            recreated_profile.write_bytes(original_profile)
+            recreated_profile.chmod(0o600)
+            after_manifest_journal = json.loads(
+                after_manifest_journal_path.read_text(encoding="utf-8")
+            )
+            journal_artifacts = [
+                after_manifest_journal_path,
+                *(after_manifest / ".herdr-orchestrator").glob(".install-journal.*.owner"),
+            ]
+            for artifact in journal_artifacts:
+                legacy_journal = json.loads(artifact.read_text(encoding="utf-8"))
+                for inventory_name in ("prior_inventory", "desired_inventory"):
+                    for item in legacy_journal[inventory_name].values():
+                        item["state"].pop("mode", None)
+                for operation in legacy_journal["operations"]:
+                    operation["original"].pop("mode", None)
+                    operation["desired"].pop("mode", None)
+                artifact.write_text(
+                    f"{json.dumps(legacy_journal, indent=2)}\n",
+                    encoding="utf-8",
+                )
+            blocked_after_manifest = run(after_manifest, ["upgrade", "--harness", "droid"])
+            self.assertEqual(
+                blocked_after_manifest.returncode,
+                2,
+                f"{blocked_after_manifest.stderr}\n{blocked_after_manifest.stdout}",
+            )
+            self.assertTrue(
+                blocked_after_manifest.stderr.startswith("installer_recovery_conflict: ")
+            )
+            self.assertIn(
+                ".herdr-orchestrator/profiles/harnesses/codex.toml",
+                blocked_after_manifest.stderr,
+            )
+            self.assertTrue((after_manifest / ".herdr-orchestrator/install-journal.json").is_file())
+            manifest_path = after_manifest / ".herdr-orchestrator/manifest.json"
+            self.assertTrue(manifest_path.is_file())
+            self.assertTrue(recreated_profile.is_file())
+            self.assertEqual(recreated_profile.stat().st_mode & 0o7777, 0o600)
+            blocked_doctor = run(
+                after_manifest,
+                ["doctor"],
+                {"PYTHON": "/bin/false"},
+            )
+            self.assertEqual(blocked_doctor.returncode, 1, blocked_doctor.stderr)
+            blocked_installation = json.loads(blocked_doctor.stdout)["installation"]
+            self.assertTrue(blocked_installation["journal"]["active"])
+            self.assertIn(
+                ".herdr-orchestrator/profiles/harnesses/codex.toml",
+                blocked_installation["journal"]["conflicts"],
+            )
 
     def test_current_package_finishes_an_older_package_transaction_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
