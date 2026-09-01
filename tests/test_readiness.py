@@ -200,6 +200,33 @@ class ReadinessMatrixTests(unittest.TestCase):
             ],
         )
 
+    def test_ci_environment_never_runs_a_live_probe(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        environment = _ready_environment()
+        environment = ReadinessEnvironment(
+            environment.managed_pane,
+            environment.executable_available,
+            environment.profile_available,
+            ci=True,
+        )
+
+        matrix = collect_readiness_matrix(
+            workflow,
+            selected_harnesses=["droid"],
+            timeout_seconds=30,
+            environment=environment,
+            build=BuildIdentity("9" * 40, "0.1.6"),
+            probe=lambda *args: self.fail(f"unexpected probe: {args}"),
+            clock=lambda: NOW,
+        )
+        result = matrix.public_json()["results"][0]
+
+        self.assertEqual(result["attempt_count"], 0)
+        self.assertEqual(
+            result["error_code"],
+            ReadinessErrorCode.READINESS_CI_FORBIDDEN.value,
+        )
+
     def test_retry_policy_is_exhaustive_over_public_error_codes(self) -> None:
         workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
         retryable = {

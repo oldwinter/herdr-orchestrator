@@ -109,8 +109,9 @@ just readiness-matrix --harness droid --harness codex
 ```
 
 Matrix 中只有 `ready` row 是 `VERIFIED`。`attempt_count=0` 表示本机环境、executable 或 profile 在
-probe 前不可用；失败、过期和不可解析结果均为 `NOT VERIFIED`。Raw prompt、terminal output、完整
-response 和 provider error summary 不会进入 matrix。
+probe 前不可用；`readiness_ci_forbidden` 表示命令检测到 CI 环境并拒绝 live probe。失败、过期和
+不可解析结果均为 `NOT VERIFIED`。Raw prompt、terminal output、完整 response 和 provider error
+summary 不会进入 matrix。
 
 再读取结构化 agent 状态：
 

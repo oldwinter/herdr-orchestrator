@@ -65,6 +65,7 @@ class ReadinessErrorCode(StrEnum):
     READINESS_PROBE_FAILED = "readiness_probe_failed"
     READINESS_RESULT_INVALID = "readiness_result_invalid"
     READINESS_EVIDENCE_EXPIRED = "readiness_evidence_expired"
+    READINESS_CI_FORBIDDEN = "readiness_ci_forbidden"
 
 
 _RETRYABLE_ERRORS = frozenset(
@@ -113,6 +114,7 @@ _STATUS_BY_ERROR: dict[ReadinessErrorCode, ReadinessStatus] = {
     ReadinessErrorCode.READINESS_PROBE_FAILED: ReadinessStatus.ERROR,
     ReadinessErrorCode.READINESS_RESULT_INVALID: ReadinessStatus.ERROR,
     ReadinessErrorCode.READINESS_EVIDENCE_EXPIRED: ReadinessStatus.EXPIRED,
+    ReadinessErrorCode.READINESS_CI_FORBIDDEN: ReadinessStatus.UNAVAILABLE,
 }
 
 
@@ -133,6 +135,7 @@ class ReadinessEnvironment:
     managed_pane: bool
     executable_available: Mapping[Harness, bool]
     profile_available: Mapping[Harness, bool]
+    ci: bool = False
 
 
 def inspect_readiness_environment(
@@ -151,7 +154,8 @@ def inspect_readiness_environment(
     profile_available = {
         profile.harness: profile.context_file.is_file() for profile in workflow.profiles
     }
-    return ReadinessEnvironment(managed_pane, executable_available, profile_available)
+    ci = _environment_flag(environ.get("CI")) or _environment_flag(environ.get("GITHUB_ACTIONS"))
+    return ReadinessEnvironment(managed_pane, executable_available, profile_available, ci)
 
 
 def resolve_build_identity(
@@ -349,6 +353,8 @@ def _preflight_error(
     environment: ReadinessEnvironment,
     harness: Harness,
 ) -> ReadinessErrorCode | None:
+    if environment.ci:
+        return ReadinessErrorCode.READINESS_CI_FORBIDDEN
     if not environment.managed_pane:
         return ReadinessErrorCode.NOT_IN_HERDR
     if not environment.executable_available.get(harness, False):
@@ -356,6 +362,10 @@ def _preflight_error(
     if not environment.profile_available.get(harness, False):
         return ReadinessErrorCode.PROFILE_UNAVAILABLE
     return None
+
+
+def _environment_flag(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in {"1", "true", "yes"}
 
 
 def _probe_with_retry(

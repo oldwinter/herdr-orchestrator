@@ -246,9 +246,11 @@ just readiness-matrix --harness codex --harness claude
 或 profile 不自动重试。输出不包含 prompt、credential、terminal output、完整 response 或任意
 provider 错误文本。
 
-真实 matrix 只在 operator-controlled Herdr pane 运行，不进入 pull-request CI。它证明当前机器与
-harness 的 dispatch compatibility，不证明 queue 单测、代码质量、部署或产品验收。Issue #39
-单独负责让自动 routing 消费 readiness evidence；这个命令不改变 worker eligibility。
+真实 matrix 只在 operator-controlled Herdr pane 运行，不进入 pull-request CI。检测到 `CI` 或
+`GITHUB_ACTIONS` 时，每个 selected harness 都返回 zero-attempt `readiness_ci_forbidden`，不会调用
+probe。Matrix 证明当前机器与 harness 的 dispatch compatibility，不证明 queue 单测、代码质量、
+部署或产品验收。Issue #39 单独负责让自动 routing 消费 readiness evidence；这个命令不改变
+worker eligibility。
 
 若任务长时间停在 `running`、首次启动 timeout、或 agent 看似启动却没有真实执行，按
 [`docs/runtime-troubleshooting.md`](docs/runtime-troubleshooting.md) 区分 provisioning、
