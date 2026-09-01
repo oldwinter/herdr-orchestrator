@@ -9,6 +9,7 @@ from herdr_orchestrator.catalog import (
     execution_prompt,
     full_profile_payload,
     load_harness_profiles,
+    load_profile_context,
     profile_for_harness,
     render_compact_catalog,
 )
@@ -109,6 +110,38 @@ context_file = "../outside.md"
 
             with self.assertRaisesRegex(CatalogError, "context_path_invalid"):
                 load_harness_profiles(root)
+
+    def test_rejects_invalid_profile_encoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "profile.toml").write_bytes(b"\xff")
+
+            with self.assertRaisesRegex(CatalogError, "profile_invalid_encoding"):
+                load_harness_profiles(root)
+
+    def test_rejects_invalid_context_encoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            context = root / "droid.md"
+            context.write_bytes(b"\xff")
+            (root / "droid.toml").write_text(
+                """
+schema_version = 1
+harness = "droid"
+display_name = "Droid"
+summary = "Summary"
+strengths = ["one"]
+best_for = ["one"]
+avoid_for = ["one"]
+traits = ["one"]
+context_file = "droid.md"
+""",
+                encoding="utf-8",
+            )
+            profile = load_harness_profiles(root)[0]
+
+            with self.assertRaisesRegex(CatalogError, "profile_context_invalid_encoding"):
+                load_profile_context(profile)
 
 
 if __name__ == "__main__":

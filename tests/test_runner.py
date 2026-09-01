@@ -2,26 +2,35 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, suppress
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.herdr import replica_slot_names, worktree_agent_name
 from herdr_orchestrator.model import (
     AgentState,
+    AttemptPhase,
+    AttemptProgress,
+    AttemptRuntime,
     DispatchContext,
     DispatchOutcome,
     Harness,
+    JobState,
     NewJob,
     PlacementTarget,
     ReceiptKind,
     TaskReceipt,
 )
 from herdr_orchestrator.runner import Coordinator
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import Store, StoreError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -89,6 +98,151 @@ class FakeDispatcher:
 
     def close_created_agent(self, name: str) -> None:
         self.closed_created_agents.append(name)
+
+
+class PlannerDispatcher:
+    def __init__(self, output_file: Path) -> None:
+        self.output_file = output_file
+        self.calls: list[Harness] = []
+        self._lock = threading.Lock()
+
+    def dispatch(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        agent_name: str | None = None,
+        context: DispatchContext | None = None,
+    ) -> DispatchOutcome:
+        del prompt, timeout_seconds, agent_name, context
+        with self._lock:
+            self.calls.append(harness)
+        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        self.output_file.write_text('{"tasks": []}', encoding="utf-8")
+        return DispatchOutcome("planner", AgentState.DONE, False, "w1:p1")
+
+
+class ExplodingDispatcher(FakeDispatcher):
+    def dispatch(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        agent_name: str | None = None,
+        context: DispatchContext | None = None,
+    ) -> DispatchOutcome:
+        del harness, prompt, timeout_seconds, agent_name, context
+        raise RuntimeError("dispatcher exploded")
+
+
+class RecoveryDispatcher(FakeDispatcher):
+    def __init__(self, outcome: DispatchOutcome) -> None:
+        super().__init__({})
+        self.outcome = outcome
+        self.recoveries: list[tuple[Harness, str, AttemptRuntime]] = []
+
+    def dispatch(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: int,
+        agent_name: str | None = None,
+        context: DispatchContext | None = None,
+    ) -> DispatchOutcome:
+        del harness, prompt, timeout_seconds, agent_name, context
+        raise AssertionError("recovery must not dispatch a replacement prompt")
+
+    def recover(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: int,
+        agent_name: str,
+        context: DispatchContext,
+        runtime: AttemptRuntime,
+    ) -> DispatchOutcome:
+        del timeout_seconds, agent_name, context
+        self.recoveries.append((harness, prompt, runtime))
+        return self.outcome
+
+
+class LifecycleDispatcher(FakeDispatcher):
+    def __init__(self, state_db: Path, outcome: DispatchOutcome) -> None:
+        super().__init__({})
+        self.state_db = state_db
+        self.outcome = outcome
+        self.persisted_phases: list[str] = []
+
+    def dispatch(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: int,
+        agent_name: str | None = None,
+        context: DispatchContext | None = None,
+    ) -> DispatchOutcome:
+        del harness, prompt, timeout_seconds
+        assert agent_name is not None and context is not None
+        assert context.attempt_progress is not None
+        for progress in (
+            AttemptProgress(
+                AttemptPhase.RUNTIME_ACQUIRED,
+                agent_name,
+                pane_id="w1:p2",
+                herdr_workspace_id="w1",
+                execution_path="/workspace",
+                agent_session_id="session-1",
+                prompt_baseline_sequence=10,
+            ),
+            AttemptProgress(
+                AttemptPhase.PROMPT_ACCEPTED,
+                agent_name,
+                pane_id="w1:p2",
+                herdr_workspace_id="w1",
+                execution_path="/workspace",
+                prompt_accepted_sequence=11,
+                state_change_sequence=11,
+                agent_state=AgentState.WORKING,
+            ),
+            AttemptProgress(
+                AttemptPhase.SETTLED,
+                agent_name,
+                pane_id="w1:p2",
+                agent_state=AgentState.DONE,
+                state_change_sequence=12,
+                agent_settled=True,
+            ),
+            AttemptProgress(
+                AttemptPhase.RECEIPT_OBSERVED,
+                agent_name,
+                pane_id="w1:p2",
+                agent_state=AgentState.DONE,
+                state_change_sequence=12,
+                agent_settled=True,
+            ),
+        ):
+            context.attempt_progress(progress)
+            with closing(sqlite3.connect(self.state_db)) as connection, connection:
+                phase = connection.execute(
+                    "SELECT phase FROM job_attempts ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            self.persisted_phases.append(phase)
+        return self.outcome
+
+
+class ResumeRecoveryDispatcher(RecoveryDispatcher):
+    def __init__(self, outcome: DispatchOutcome) -> None:
+        super().__init__(outcome)
+        self.responses = 0
+
+    def respond(self, *_: object, **__: object) -> DispatchOutcome:
+        self.responses += 1
+        raise AssertionError("accepted resume recovery must not send the response again")
 
 
 class CleanupDispatcher(FakeDispatcher):
@@ -190,6 +344,128 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIn("# Task packet\n\nRead only.", dispatcher.prompts[Harness.DROID])
         self.assertNotIn("Hermes Agent execution profile", dispatcher.prompts[Harness.DROID])
 
+    def test_dispatch_progress_is_committed_before_the_dispatcher_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            dispatcher = LifecycleDispatcher(
+                config.state_db,
+                DispatchOutcome(
+                    "ignored-by-coordinator",
+                    AgentState.DONE,
+                    False,
+                    "w1:p2",
+                    placement=PlacementTarget.TAB,
+                    execution_path="/workspace",
+                    herdr_workspace_id="w1",
+                    agent_settled=True,
+                ),
+            )
+            observed: list[AttemptPhase] = []
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                transition_observer=lambda transition: observed.append(transition.phase),
+            ).run_once()
+
+            with closing(sqlite3.connect(config.state_db)) as connection, connection:
+                attempt = connection.execute("""
+                    SELECT phase, prompt_baseline_sequence, prompt_accepted_sequence,
+                           last_state_change_sequence, agent_session_id
+                    FROM job_attempts
+                    """).fetchone()
+
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(
+            dispatcher.persisted_phases,
+            [
+                AttemptPhase.RUNTIME_ACQUIRED.value,
+                AttemptPhase.PROMPT_ACCEPTED.value,
+                AttemptPhase.SETTLED.value,
+                AttemptPhase.RECEIPT_OBSERVED.value,
+            ],
+        )
+        self.assertEqual(
+            attempt,
+            (AttemptPhase.OUTCOME_COMMITTED.value, 10, 11, 12, "session-1"),
+        )
+
+    def test_settled_unknown_receipt_failure_uses_retry_policy_not_attention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            dispatcher = LifecycleDispatcher(
+                config.state_db,
+                DispatchOutcome(
+                    "settled-worker",
+                    AgentState.UNKNOWN,
+                    False,
+                    "w1:p2",
+                    "task_receipt_missing",
+                    agent_settled=True,
+                ),
+            )
+            observed: list[AttemptPhase] = []
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                transition_observer=lambda transition: observed.append(transition.phase),
+            ).run_once()
+
+            job = store.jobs(config.name)[0]
+
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(job["state"], JobState.PENDING.value)
+        self.assertEqual(job["attempt_phase"], AttemptPhase.ABANDONED.value)
+        self.assertEqual(job["error_code"], "task_receipt_missing")
+        self.assertEqual(observed[-1], AttemptPhase.ABANDONED)
+
+    def test_unsettled_accepted_timeout_observer_reports_attention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            dispatcher = LifecycleDispatcher(
+                config.state_db,
+                DispatchOutcome(
+                    "working-worker",
+                    AgentState.UNKNOWN,
+                    False,
+                    "w1:p2",
+                    "herdr_timeout",
+                    agent_settled=False,
+                ),
+            )
+            observed: list[AttemptPhase] = []
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                transition_observer=lambda transition: observed.append(transition.phase),
+            ).run_once()
+
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(observed[-1], AttemptPhase.ATTENTION)
+
     def test_run_until_idle_drains_replica_limited_jobs_across_waves(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
@@ -223,6 +499,219 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(result["queue_idle"])
         self.assertTrue(result["worker_pool_idle"])
         self.assertTrue(all(0 < timeout <= 10 for timeout in dispatcher.timeouts))
+
+    def test_dispatcher_exception_preserves_claimed_agent_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            coordinator = Coordinator(
+                config,
+                store=store,
+                dispatcher=ExplodingDispatcher({}),
+            )
+
+            result = coordinator.run_once()
+            job = store.jobs(config.name)[0]
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                receipt = connection.execute(
+                    "SELECT agent_name, error_code FROM receipts WHERE job_id = ?",
+                    (job["id"],),
+                ).fetchone()
+
+        expected_name = replica_slot_names(
+            config.name,
+            config.workspace,
+            Harness.DROID,
+            1,
+            PlacementTarget.TAB,
+        )[0]
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(job["agent_name"], expected_name)
+        self.assertEqual(receipt, (expected_name, "dispatcher_unhandled_error"))
+
+    def test_run_once_fences_an_accepted_expired_attempt_without_redispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            with patch("herdr_orchestrator.store.time.time", return_value=100.0):
+                store.enqueue(_job(config.name, Harness.DROID))
+                first = store.claim(
+                    config.name,
+                    limit=1,
+                    lease_seconds=60,
+                    slot_names={Harness.DROID.value: ("owned-droid",)},
+                )[0]
+                store.record_attempt_progress(
+                    first,
+                    AttemptProgress(
+                        AttemptPhase.RUNTIME_ACQUIRED,
+                        first.agent_name,
+                        pane_id="w1:p2",
+                        herdr_workspace_id="w1",
+                        execution_path=str(config.workspace),
+                        agent_session_id="session-1",
+                        prompt_baseline_sequence=10,
+                    ),
+                )
+                store.record_attempt_progress(
+                    first,
+                    AttemptProgress(
+                        AttemptPhase.PROMPT_ACCEPTED,
+                        first.agent_name,
+                        pane_id="w1:p2",
+                        herdr_workspace_id="w1",
+                        execution_path=str(config.workspace),
+                        agent_session_id="session-1",
+                        prompt_accepted_sequence=11,
+                        state_change_sequence=11,
+                        agent_state=AgentState.WORKING,
+                    ),
+                )
+            dispatcher = RecoveryDispatcher(
+                DispatchOutcome(
+                    "owned-droid",
+                    AgentState.UNKNOWN,
+                    True,
+                    "w1:p2",
+                    "unsafe_turn_adoption",
+                    placement=PlacementTarget.TAB,
+                    execution_path=str(config.workspace),
+                    herdr_workspace_id="w1",
+                    agent_settled=False,
+                )
+            )
+            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+
+            with patch("herdr_orchestrator.store.time.time", return_value=161.0):
+                result = coordinator.run_once()
+
+            job = store.jobs(config.name)[0]
+
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(job["attempts"], 1)
+        self.assertEqual(job["attempt_phase"], AttemptPhase.ATTENTION.value)
+        self.assertEqual(job["error_code"], "unsafe_turn_adoption")
+        self.assertEqual(len(dispatcher.recoveries), 1)
+        recovered_harness, recovered_prompt, runtime = dispatcher.recoveries[0]
+        self.assertEqual(recovered_harness, Harness.DROID)
+        self.assertIn("# Task packet\n\nRead only.", recovered_prompt)
+        self.assertEqual(runtime.agent_name, "owned-droid")
+        self.assertEqual(runtime.prompt_accepted_sequence, 11)
+
+    def test_run_once_reconciles_runtime_baseline_before_assuming_unaccepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            with patch("herdr_orchestrator.store.time.time", return_value=100.0):
+                store.enqueue(_job(config.name, Harness.DROID))
+                first = store.claim(config.name, limit=1, lease_seconds=60)[0]
+                store.record_attempt_progress(
+                    first,
+                    AttemptProgress(
+                        AttemptPhase.RUNTIME_ACQUIRED,
+                        first.agent_name,
+                        pane_id="w1:p2",
+                        herdr_workspace_id="w1",
+                        execution_path=str(config.workspace),
+                        agent_session_id="session-1",
+                        prompt_baseline_sequence=10,
+                        state_change_sequence=10,
+                    ),
+                )
+            dispatcher = RecoveryDispatcher(
+                DispatchOutcome(
+                    first.agent_name,
+                    AgentState.UNKNOWN,
+                    True,
+                    "w1:p2",
+                    "unsafe_turn_adoption",
+                    placement=PlacementTarget.TAB,
+                    execution_path=str(config.workspace),
+                    herdr_workspace_id="w1",
+                    agent_settled=False,
+                )
+            )
+
+            with patch("herdr_orchestrator.store.time.time", return_value=161.0):
+                result = Coordinator(config, store=store, dispatcher=dispatcher).run_once()
+
+            with closing(sqlite3.connect(config.state_db)) as connection, connection:
+                attempt = connection.execute("""
+                    SELECT attempt, phase, prompt_baseline_sequence,
+                           prompt_accepted_sequence
+                    FROM job_attempts
+                    """).fetchone()
+
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(len(dispatcher.recoveries), 1)
+        self.assertEqual(
+            attempt,
+            (1, AttemptPhase.ATTENTION.value, 10, None),
+        )
+
+    def test_planner_reservation_is_atomic_across_coordinators(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            planner_prompt_file = root / "planner.md"
+            planner_prompt_file.write_text("Plan one task.", encoding="utf-8")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(
+                    base.planner,
+                    enabled=True,
+                    interval_seconds=60,
+                    prompt_file=planner_prompt_file,
+                    output_file=root / "plans/planner.json",
+                ),
+            )
+            stores = [Store(config.state_db), Store(config.state_db)]
+            for store in stores:
+                store.initialize()
+            dispatcher = PlannerDispatcher(config.planner.output_file)
+            coordinators = [
+                Coordinator(
+                    config,
+                    store=store,
+                    dispatcher=dispatcher,
+                    controller_harness=Harness.DROID,
+                )
+                for store in stores
+            ]
+            barrier = threading.Barrier(2)
+            metadata_float = Store.metadata_float
+
+            def delayed_metadata_float(store: Store, key: str) -> float | None:
+                value = metadata_float(store, key)
+                with suppress(threading.BrokenBarrierError):
+                    barrier.wait(timeout=2)
+                return value
+
+            with (
+                patch.object(Store, "metadata_float", delayed_metadata_float),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                futures = [
+                    executor.submit(coordinator._run_planner_if_due) for coordinator in coordinators
+                ]
+                for future in futures:
+                    future.result()
+
+        self.assertEqual(dispatcher.calls, [Harness.DROID])
 
     def test_run_until_idle_reports_blocked_instead_of_idle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -297,6 +786,86 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(response[0], "droid-worker")
         self.assertEqual(response[2], "Approve this local action.")
         self.assertEqual(response[4], "w1:p2")
+
+    def test_resume_blocked_fences_an_accepted_operation_without_resending(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            with patch("herdr_orchestrator.store.time.time", return_value=50.0):
+                store.enqueue(_job(config.name, Harness.DROID))
+                claimed = store.claim(config.name, limit=1, lease_seconds=30)[0]
+                store.record_outcome(
+                    claimed,
+                    DispatchOutcome(
+                        claimed.agent_name,
+                        AgentState.BLOCKED,
+                        False,
+                        "w1:p2",
+                        "agent_blocked",
+                        correlation_id=claimed.correlation_id,
+                    ),
+                )
+            with patch("herdr_orchestrator.store.time.time", return_value=100.0):
+                first_resume, _ = store.claim_blocked_for_resume(
+                    config.name,
+                    claimed.job_id,
+                    lease_seconds=60,
+                )
+                store.record_attempt_progress(
+                    first_resume,
+                    AttemptProgress(
+                        AttemptPhase.RUNTIME_ACQUIRED,
+                        first_resume.agent_name,
+                        pane_id="w1:p2",
+                        herdr_workspace_id="w1",
+                        execution_path=str(config.workspace),
+                        prompt_baseline_sequence=20,
+                    ),
+                )
+                store.record_attempt_progress(
+                    first_resume,
+                    AttemptProgress(
+                        AttemptPhase.PROMPT_ACCEPTED,
+                        first_resume.agent_name,
+                        pane_id="w1:p2",
+                        herdr_workspace_id="w1",
+                        execution_path=str(config.workspace),
+                        prompt_accepted_sequence=21,
+                        state_change_sequence=21,
+                    ),
+                )
+            dispatcher = ResumeRecoveryDispatcher(
+                DispatchOutcome(
+                    first_resume.agent_name,
+                    AgentState.UNKNOWN,
+                    True,
+                    "w1:p2",
+                    "unsafe_turn_adoption",
+                    placement=PlacementTarget.TAB,
+                    execution_path=str(config.workspace),
+                    herdr_workspace_id="w1",
+                    agent_settled=False,
+                )
+            )
+            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+
+            with patch("herdr_orchestrator.store.time.time", return_value=161.0):
+                result = coordinator.resume_blocked(
+                    claimed.job_id,
+                    "Approve this local action.",
+                )
+            job = store.jobs(config.name)[0]
+
+        self.assertEqual(result["state"], JobState.BLOCKED.value)
+        self.assertEqual(job["attempt_phase"], AttemptPhase.ATTENTION.value)
+        self.assertEqual(job["error_code"], "unsafe_turn_adoption")
+        self.assertEqual(dispatcher.responses, 0)
+        self.assertEqual(len(dispatcher.recoveries), 1)
+        assert dispatcher.recoveries[0][2].prompt_accepted_sequence == 21
 
     def test_run_until_idle_does_not_report_idle_after_the_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -594,6 +1163,61 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result["candidate_count"], 0)
         self.assertEqual(result["skipped_unowned"], 1)
 
+    def test_gc_ignores_pane_ownership_claimed_only_by_a_stale_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary) / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            name = replica_slot_names(
+                config.name,
+                config.workspace,
+                Harness.DROID,
+                1,
+                PlacementTarget.TAB,
+            )[0]
+            claimed = store.claim(
+                config.name,
+                limit=1,
+                lease_seconds=60,
+                slot_names={Harness.DROID.value: (name,)},
+            )[0]
+            store.record_outcome(
+                claimed,
+                DispatchOutcome(
+                    name,
+                    AgentState.DONE,
+                    True,
+                    "reused:pane",
+                    placement=PlacementTarget.TAB,
+                    correlation_id=claimed.correlation_id,
+                ),
+            )
+            with self.assertRaisesRegex(StoreError, "job_lease_lost"):
+                store.record_attempt_progress(
+                    replace(claimed, lease_owner="stale-owner"),
+                    AttemptProgress(
+                        AttemptPhase.PROMPT_ACCEPTED,
+                        name,
+                        pane_id="not-owned:pane",
+                        prompt_accepted_sequence=99,
+                    ),
+                )
+            dispatcher = CleanupDispatcher()
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+            ).gc_succeeded_agents(dry_run=False)
+
+        self.assertEqual(result["candidate_count"], 0)
+        self.assertEqual(result["skipped_unowned"], 1)
+        self.assertEqual(dispatcher.closed, [])
+
     def test_gc_can_preview_owned_failed_agents_but_excludes_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
@@ -753,7 +1377,7 @@ class CoordinatorTests(unittest.TestCase):
             jobs = coordinator.store.jobs(config.name)
             repeated = coordinator.enqueue_prompt_file(
                 harness=None,
-                title="Build again",
+                title="Build",
                 prompt_file=prompt_file,
                 dedupe_key="auto-route",
             )
@@ -769,6 +1393,31 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotIn('"harness": "claude"', dispatcher.prompts[Harness.DROID])
         self.assertIn("Title: Build", dispatcher.prompts[Harness.DROID])
         self.assertEqual(len(dispatcher.closed_created_agents), 1)
+
+    def test_enqueue_prompt_file_rejects_changed_dedupe_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Inspect the repository.", encoding="utf-8")
+            coordinator = Coordinator(config, dispatcher=FakeDispatcher({}))
+            coordinator.enqueue_prompt_file(
+                harness=Harness.PI,
+                title="Inspect",
+                prompt_file=prompt_file,
+                dedupe_key="contract-conflict",
+            )
+
+            with self.assertRaisesRegex(StoreError, "dedupe_contract_conflict"):
+                coordinator.enqueue_prompt_file(
+                    harness=Harness.PI,
+                    title="Changed title",
+                    prompt_file=prompt_file,
+                    dedupe_key="contract-conflict",
+                )
 
     def test_auto_router_timeout_closes_controller_created_for_routing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

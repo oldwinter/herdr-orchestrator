@@ -23,6 +23,9 @@ Selected Markdown profile ── dynamic load ────┤
 ### Workflow loader
 
 解析 TOML，所有相对路径都相对于 workflow 文件所在目录。未知 harness、重复 worker、越界 timeout 和不存在的 prompt 都 fail closed。
+Workflow TOML 是本地控制面的可信输入。为兼容共享运行状态和 tracker 部署，`state_db` 与
+`tracker_root` 可以位于 workspace 外部。`worktree_root`、planner 的 `prompt_file` 与
+`output_file`，以及 delivery 的 `artifact_root` 受 workspace 和 runtime 路径约束。
 
 ### Durable store
 
@@ -36,12 +39,65 @@ pending -> running -> succeeded
 blocked --显式 resume response--> succeeded | blocked
 ```
 
-claim 在 `BEGIN IMMEDIATE` 事务内完成。`running` 任务持有 `lease_until`；coordinator 崩溃后，lease 过期任务可再次 claim。每次 claim 增加 attempt。
+`jobs` 是 queue 的当前投影，并通过 `current_attempt_id` 指向 `job_attempts`。
+`job_attempts` 是 attempt ownership 真源。每条记录保存 immutable fencing token、lease owner、
+lease deadline、harness、agent、pane、workspace、execution root、prompt sequence、phase、error 和
+时间戳。phase 按以下顺序推进：
+
+```text
+claimed -> runtime_acquired -> prompt_accepted -> settled
+        -> receipt_observed -> outcome_committed
+        -> abandoned | attention
+```
+
+pending job 的新 claim 在 `BEGIN IMMEDIATE` 事务内创建 attempt，并增加 `jobs.attempts`。每次
+phase 或 outcome 更新都比较 job、current attempt、fencing token、lease owner 和 operation
+token。旧 coordinator 可以追加 `is_stale=1` 的 audit receipt，但不能修改当前 job 或 attempt。
+
+`running` lease 过期时，coordinator 先在原 attempt 上轮换 lease owner，再检查持久化的 Herdr
+identity、phase 和 sequence。这个 reconciliation 不增加 attempt：
+
+- `claimed` 尚未取得 runtime，或有 durable baseline 的 `runtime_acquired` live snapshot 仍等于
+  baseline 时，旧 operation 进入 `abandoned`；后续 claim 才能创建 replacement。旧 schema
+  缺失 baseline 的 in-flight operation 不能证明未发送，因此进入 `attention`。
+- Herdr 0.8.2 不提供 turn identifier，sequence advance 不能证明 accepted live turn 仍属于原
+  operation。因此 `prompt_accepted` 或 send/callback 模糊窗口进入 `attention`，不重发 prompt。
+- 已持久化 `settled` 或 `receipt_observed` 时，只有 live identity、terminal state 和 exact
+  sequence 都未变化，coordinator 才继续提交原 durable outcome；任何偏差都进入 `attention`。
+  `receipt_observed` 的 `task_verified=true` 直接沿用，包含后续 fatal outcome，不会降级为
+  recovery-unverified。
+
+`attention` receipt 使用 `unsafe_turn_adoption`，明确表示无法证明 turn ownership，而不是普通
+agent question。
+
+Schema v6 为 `jobs`、`job_attempts` 和 `receipts` 增加 completion policy、verification class、
+completion status、有界 evidence summary 和稳定 completion error。Migration 不改写历史 job
+state、attempt、dedupe key 或 receipt。没有 receipt 的历史行投影为 `legacy-unverified`；既有
+output-prefix 和 file receipt 投影为 `receipt-v1`；新协议使用 `structured-v2`。
+
+`structured-v2` identity 只在 claim 后构造，因为此时 job ID、attempt number 和 immutable
+fencing token 才同时存在。Coordinator 把 identity contract 追加到 selected profile 与原始 task
+packet 之后。Enqueue、planner 和 router 类型都没有 identity 字段。Transport 只解析当前 turn
+baseline 之后的一条 envelope，并拒绝 malformed、oversized、duplicate、wrong-job、wrong-attempt、
+wrong-token 和 stale evidence。Evidence summary 在 transport boundary 脱敏并截断，raw output 不进入
+queue logic 或 SQLite。
+
+`receipt_observed` 现在表示 completion evidence 已观察；phase 与完整 typed completion result 使用同一
+fenced SQL update。Durable `receipt_observed` recovery 复用该 result，不重读 terminal output。若 crash
+发生在 settled 与该 atomic update 之间，`receipt-v1` 返回 `task_receipt_recovery_unverified`，
+`structured-v2` 返回 `completion_recovery_unverified`，两者都进入 attention。Envelope 的
+`completed`、`blocked` 或 `failed` 是 attempt-bound machine claim；verification class 与 job state
+分别投影，不能互相替代。
+
+`just status` 的 job 项包含 `current_attempt_id` 和 `attempt_phase`。`blocked` 加
+`attempt_phase=attention` 表示 operator attention，不是可直接回答的 agent 提问。
 
 耗尽 attempt 的 `failed` job 可用显式 `retry` 在原 job id 和 `dedupe_key` 上追加有界 attempt
 budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。普通 queue 不自动回答
 `blocked`；人工审查后可用显式 `resume --response-file` 回答原 agent。resume 必须匹配已记录的
-agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提问仍保持 blocked。
+agent 与 pane，并保持原 attempt。每个 resume 有独立 operation token 和 sequence。未接受的
+operation 以 `abandoned` receipt 收口后，下一次显式 resume 才发送 response；已接受但尚未
+durably settled 的 operation 进入 `attention`，不会自动或人工重复发送。
 
 ### Coordinator
 
@@ -56,16 +112,44 @@ agent 与 pane，保持原 attempt，不重发任务 prompt；失败或再次提
 - enqueue 可声明 output-prefix 或 execution-root file receipt；声明后必须验证通过才能成功。
   output-prefix 只接受当前 turn 新增且不与 prompt 独立行歧义的输出，file receipt 必须在当前
   turn 新建或改变；分别记录 `agent_settled` 与 `task_verified`；
-- `unknown`、timeout 和协议错误按失败与重试策略处理。
+- prompt 接受前的 `unknown`、timeout 和协议错误按失败与重试策略处理。prompt 接受后若 turn
+  仍可能运行，则 job 进入 `attention`，不会自动重试。
+- `structured-v2` task 在 claim 后收到 immutable completion identity；transport 将 fresh envelope
+  parse 为 typed verified 或 verification-failed result，coordinator 和 store 不读取 raw model output；
 - 对必须写 strict JSON 的 turn，settled 后目标 artifact 缺失会在同一已 ready agent 上仅重发
   一次；artifact handshake 防止 startup lifecycle 变化被误认成任务完成。
 
 `run_once` 输出保留兼容的顶层本波计数，并新增 `claimed`、`batch` 和结束时全局 `queue`。
 `run_until_idle` 在有界 timeout 内重复 replica-limited wave，且把剩余 deadline 传给每个
-dispatch，直到当前 worker pool 没有 pending/running/blocked。blocked 会立即返回
-`idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
+dispatch。在没有 blocked job 时，它持续运行到当前 worker pool 没有 pending/running。
+blocked 会立即返回 `idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
 `queue_idle` 明确区分所选 pool 和全局 queue；pool 外任务不会造成假死，也不会被误报为
 全局排空。
+
+### Readiness evidence
+
+`readiness-matrix` 与 durable queue、`doctor` summary、`smoke` 和 routing policy 相互独立。它从当前
+Herdr-managed pane 对每个 enabled 或 repeat-filtered harness 调用既有真实 probe，并输出 schema v1
+matrix。每条结果包含 exact Git commit、package version、workflow、canonical workspace digest、
+harness、source-clean flag、closed status、closed error code、allowlisted phase timings、UTC observation
+time 和 attempt count。Serializer 没有 prompt、credential、pane、terminal output、full response 或
+arbitrary error summary 字段。
+
+Collector 对 transient closed error set 最多重试一次。认证、invalid model、missing executable、
+missing profile 和 unknown result 不重试。每个 selected harness 必须产生一条结果；不能 probe、probe
+失败、结果过期或结果不可解析时都显式输出 `NOT VERIFIED`。只有所有 selected rows 均为当前
+`ready` evidence 时 matrix 才为 `VERIFIED`。
+
+Exact commit 证据还要求 clean 且 stable source。每次 build sample 按 HEAD → porcelain status → HEAD
+读取，拒绝 sample 内 commit drift；collector 在全部 live probes 前后各取一次 sample。Initial
+tracked、staged、untracked 或无法检查的 source 投影为 zero-attempt `readiness_source_dirty`。Probe
+期间 working tree 或 HEAD 改变时，所有 rows 改为 `readiness_source_changed`。因此 probe 执行所见
+bytes 与 recorded commit 不一致时，matrix 不能返回 `VERIFIED`。
+
+真实 matrix 依赖本机登录态，只能由 operator 在 Herdr-managed pane 运行。`CI` 或
+`GITHUB_ACTIONS` 环境返回 zero-attempt `readiness_ci_forbidden`，不会调用 live probe。Matrix 只生产
+compatibility evidence，不持久化 health、不计算 eligibility，也不影响 controller 或 worker
+selection。Readiness-aware routing 仍由 Issue #39 单独拥有。
 
 ### Execution topology
 
@@ -165,9 +249,17 @@ manager 只对当前 Herdr session 可见。
 - prompt submission 使用 Herdr 默认 `agent prompt --wait`，其内部 acceptance handshake
   仍必须观察到 `state_change_seq` 前进；command timeout 后先复查 sequence，已进入
   `working` 就继续等待，未前进则返回 phase-specific `prompt_acceptance_timeout`；
+- transport 在继续下一个 side effect 前，依次持久化 `runtime_acquired`、`prompt_accepted`、
+  `settled` 和 `receipt_observed`。测试 fault injector 只在 transaction commit 后中断；
+- restart recovery 使用 `herdr agent get` 校验 agent、pane、workspace、execution root、可用的
+  session identity、terminal state 和 exact sequence。Herdr 0.8.2 不提供 turn identifier，
+  accepted live turn 不会按 sequence window 推测归属。durable settled snapshot 确认不变后，
+  fatal classifier 可以读取最多 80 行 detection output；只保留 sanitized summary。recovery
+  没有发送 prompt 或 terminal text 的路径；
 - `agent_prompt_stalled` 且仍停在原 idle sequence 时最多重发两次 Enter；仍没有 lifecycle
   变化则快速返回 `agent_turn_not_observed`，不占满整个 agent timeout；
-- 每个 harness 使用独立后台 tab 和 full-size root pane，始终 `--no-focus`，避免多 agent 连续 split 后 TUI 过窄；
+- `tab` 与 `worktree` placement 使用独立后台 tab 和 full-size root pane。`pane` placement
+  复用本批次 tab，并 split 当前面积最大的 pane。创建和 split 命令都使用 `--no-focus`；
 - transport 通过独立 Herdr layout adapter provision tab、批次 pane 或原生 worktree，
   并从 JSON response 读取 workspace/tab/pane ID；
 - 所有 CLI 结果按 JSON schema 读取，不预测 pane ID；
@@ -181,7 +273,7 @@ manager 只对当前 Herdr session 可见。
 
 ### Planner
 
-planner 是可选输入源，不是调度器。启用后，它只能把以下 JSON 写到配置的 runtime 路径：
+planner 是可选输入源，不是调度器。启用后，coordinator 只接受 planner 写入配置 runtime 路径的以下 JSON。planner 进程仍使用所选 harness 的工具，这个输入约束不是安全沙箱：
 
 ```json
 {
@@ -196,7 +288,11 @@ planner 是可选输入源，不是调度器。启用后，它只能把以下 JS
 }
 ```
 
-coordinator 校验 harness、字段长度、任务数量和去重键后才入队。JSON 不接受 shell command 字段。
+coordinator 校验 harness、字段长度、任务数量和去重键后才入队。JSON 拒绝 `command`、`argv`
+等字段，也不把模型提交的 shell 交给 coordinator。这个校验只约束输入数据形状，不提供
+进程或工具沙箱。planner 使用所选 harness 的最高自动化参数运行；六个 harness 没有共同的
+可移植 no-tools 模式，被攻陷的 harness 仍可能使用自身工具。prompt policy 不能改变这一点。
+worktree 只隔离 checkout，不是安全沙箱。
 planner 只能选择当前 workflow catalog 中的 harness。任务 dispatch 时 coordinator 动态加载所选 harness 的完整 profile。
 
 主控 harness 与 worker harness 是两个独立选择：
@@ -231,8 +327,10 @@ route -> wayfinder? -> spec + ticket DAG -> frontier worktrees
 标准交付中的 `blocked` 会读取有限 worker detection output，让独立 proxy controller
 输出严格 decision JSON，再把回答交回原 worker。最多 8 轮。deterministic guard 与
 schema 都要求 secret/production 升级。由于 Herdr 拒绝向已 blocked agent 提交普通
-`agent prompt`，response 通过受控的 pane literal text 加 agent Enter 输入，再按新的
-lifecycle sequence 等待结果；response 本身不进入 decision ledger。
+`agent prompt`，response 通过一次 `herdr pane run` 提交；该 API 原子发送 literal text 与 Enter，
+不存在独立的 staged-text 和 Enter side effect。若 control response timeout 或不可解析，transport
+仍读取 live sequence：已接受就持久化 `prompt_accepted` 并继续等待；无法收敛则原 operation 进入
+`attention`，不会旋转 token 或重发。response 本身不进入 decision ledger。
 
 每次运行的状态、map、plan、routes、receipts、reviews、ledger 和 worktrees 保存在
 `.orchestrator/deliveries/<run-id>/`。最终产物是隔离 integration branch 与 commit，
@@ -244,7 +342,10 @@ Herdr detach 不终止 coordinator 与 agent 进程，因此适合长时间运�
 
 - Herdr server 完整重启会终止 pane 进程；
 - harness 原生 session 是否可恢复取决于对应 Herdr integration；
-- 机器睡眠、重启或网络中断可能让任务 lease 过期后重跑；
+- 机器睡眠、重启或网络中断可能让任务 lease 过期。coordinator 会先 reconciliation，再决定
+  abandon、提交 durable terminal outcome 或 attention；
 - worktree、端口、数据库和 credential 仍可能跨任务共享。
 
-因此任务必须可重试，或者用 `dedupe_key` 与外部系统幂等键保护副作用。默认策略不授权任何外部副作用。
+Herdr 0.8.2 没有 active-turn cancellation command。fencing 只阻止 stale SQLite mutation，
+不能撤销 agent 已产生的外部副作用。因此任务仍必须可重试，或使用外部系统幂等键保护副作用。
+默认策略不授权任何外部副作用。

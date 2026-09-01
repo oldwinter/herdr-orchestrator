@@ -2,43 +2,33 @@ from __future__ import annotations
 
 import sqlite3
 import time
-import uuid
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
+from herdr_orchestrator.attempts import AttemptLedger, StoreError
+from herdr_orchestrator.completion import CompletionPolicy, VerificationClass
 from herdr_orchestrator.model import (
-    AgentState,
+    AttemptPhase,
+    AttemptProgress,
     ClaimedJob,
     DispatchOutcome,
     Harness,
     JobState,
     NewJob,
     PlacementTarget,
-    ReceiptKind,
     TaskReceipt,
 )
-from herdr_orchestrator.observability import sanitize
 
-SCHEMA_VERSION = 4
-
-
-class StoreError(RuntimeError):
-    pass
+SCHEMA_VERSION = 6
+__all__ = ["SCHEMA_VERSION", "Store", "StoreError"]
 
 
 def _nullable_bool(value: object) -> bool | None:
     if value is None:
         return None
     return bool(value)
-
-
-def _bounded_error_summary(value: str | None) -> str | None:
-    if value is None:
-        return None
-    summary = str(sanitize(value))
-    return summary or None
 
 
 def _candidate_slot_names(
@@ -58,13 +48,62 @@ def _candidate_slot_names(
     return names or (f"ho-{harness_value}",)
 
 
-def _receipt_from_row(row: sqlite3.Row) -> TaskReceipt | None:
-    if row["receipt_kind"] is None or row["receipt_value"] is None:
-        return None
-    return TaskReceipt(
-        ReceiptKind(str(row["receipt_kind"])),
-        str(row["receipt_value"]),
+def _job_contract_matches(row: sqlite3.Row, job: NewJob) -> bool:
+    completion_policy = _completion_policy(job.receipt, job.completion_policy)
+    return all(
+        (
+            row["title"] == job.title,
+            row["harness"] == job.harness.value,
+            row["prompt"] == job.prompt,
+            row["placement"] == (job.placement.value if job.placement is not None else None),
+            row["receipt_kind"] == (job.receipt.kind.value if job.receipt is not None else None),
+            row["receipt_value"] == (job.receipt.value if job.receipt is not None else None),
+            row["completion_policy"] == completion_policy.value,
+        )
     )
+
+
+def _partial_job_contract_matches(
+    row: sqlite3.Row,
+    *,
+    title: str,
+    prompt: str,
+    harness: Harness | None,
+    placement: PlacementTarget | None,
+    receipt: TaskReceipt | None,
+    completion_policy: CompletionPolicy | None,
+) -> bool:
+    effective_policy = _completion_policy(receipt, completion_policy)
+    return all(
+        (
+            row["title"] == title,
+            row["prompt"] == prompt,
+            harness is None or row["harness"] == harness.value,
+            placement is None or row["placement"] == placement.value,
+            row["receipt_kind"] == (receipt.kind.value if receipt is not None else None),
+            row["receipt_value"] == (receipt.value if receipt is not None else None),
+            row["completion_policy"] == effective_policy.value,
+        )
+    )
+
+
+def _completion_policy(
+    receipt: TaskReceipt | None,
+    requested: CompletionPolicy | None,
+) -> CompletionPolicy:
+    if requested is None:
+        return (
+            CompletionPolicy.RECEIPT_V1
+            if receipt is not None
+            else CompletionPolicy.LEGACY_UNVERIFIED
+        )
+    if requested is CompletionPolicy.STRUCTURED_V2 and receipt is None:
+        return requested
+    if requested is CompletionPolicy.RECEIPT_V1 and receipt is not None:
+        return requested
+    if requested is CompletionPolicy.LEGACY_UNVERIFIED and receipt is None:
+        return requested
+    raise StoreError("completion_policy_invalid")
 
 
 class Store:
@@ -97,10 +136,16 @@ class Store:
                     herdr_workspace_id TEXT,
                     receipt_kind TEXT,
                     receipt_value TEXT,
+                    completion_policy TEXT NOT NULL DEFAULT 'legacy-unverified',
+                    verification_class TEXT NOT NULL DEFAULT 'unverified',
+                    completion_status TEXT,
+                    completion_evidence_summary TEXT,
+                    completion_error_code TEXT,
                     agent_settled INTEGER,
                     task_verified INTEGER,
                     error_summary TEXT,
                     correlation_id TEXT,
+                    current_attempt_id INTEGER,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(workflow, dedupe_key)
@@ -122,8 +167,19 @@ class Store:
                     herdr_workspace_id TEXT,
                     agent_settled INTEGER,
                     task_verified INTEGER,
+                    completion_policy TEXT NOT NULL DEFAULT 'legacy-unverified',
+                    verification_class TEXT NOT NULL DEFAULT 'unverified',
+                    completion_status TEXT,
+                    completion_evidence_summary TEXT,
+                    completion_error_code TEXT,
                     error_summary TEXT,
                     correlation_id TEXT,
+                    attempt_id INTEGER,
+                    fencing_token TEXT,
+                    operation_token TEXT,
+                    operation_sequence INTEGER,
+                    event_kind TEXT,
+                    is_stale INTEGER NOT NULL DEFAULT 0,
                     observed_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -132,6 +188,8 @@ class Store:
                     updated_at REAL NOT NULL
                 );
                 """)
+            AttemptLedger.create_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 connection.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
@@ -146,50 +204,172 @@ class Store:
                 if version == 3:
                     self._migrate_v3_to_v4(connection)
                     version = 4
+                if version == 4:
+                    self._migrate_v4_to_v5(connection)
+                    version = 5
+                if version == 5:
+                    self._migrate_v5_to_v6(connection)
+                    version = 6
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
-        connection.execute("ALTER TABLE jobs ADD COLUMN placement TEXT")
-        connection.execute("UPDATE jobs SET placement = ?", (PlacementTarget.TAB.value,))
-        connection.execute("ALTER TABLE jobs ADD COLUMN execution_path TEXT")
-        connection.execute("ALTER TABLE jobs ADD COLUMN herdr_workspace_id TEXT")
-        connection.execute("ALTER TABLE receipts ADD COLUMN placement TEXT")
+        self._add_column_if_missing(connection, "jobs", "placement", "TEXT")
         connection.execute(
-            "UPDATE receipts SET placement = ?",
+            "UPDATE jobs SET placement = ? WHERE placement IS NULL",
             (PlacementTarget.TAB.value,),
         )
-        connection.execute("ALTER TABLE receipts ADD COLUMN execution_path TEXT")
-        connection.execute("ALTER TABLE receipts ADD COLUMN herdr_workspace_id TEXT")
+        self._add_column_if_missing(connection, "jobs", "execution_path", "TEXT")
+        self._add_column_if_missing(connection, "jobs", "herdr_workspace_id", "TEXT")
+        self._add_column_if_missing(connection, "receipts", "placement", "TEXT")
+        connection.execute(
+            "UPDATE receipts SET placement = ? WHERE placement IS NULL",
+            (PlacementTarget.TAB.value,),
+        )
+        self._add_column_if_missing(connection, "receipts", "execution_path", "TEXT")
+        self._add_column_if_missing(connection, "receipts", "herdr_workspace_id", "TEXT")
         connection.execute("UPDATE schema_meta SET version = 2")
 
     def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
-        connection.execute("ALTER TABLE jobs ADD COLUMN receipt_kind TEXT")
-        connection.execute("ALTER TABLE jobs ADD COLUMN receipt_value TEXT")
-        connection.execute("ALTER TABLE jobs ADD COLUMN agent_settled INTEGER")
-        connection.execute("ALTER TABLE jobs ADD COLUMN task_verified INTEGER")
-        connection.execute("ALTER TABLE jobs ADD COLUMN error_summary TEXT")
-        connection.execute("ALTER TABLE receipts ADD COLUMN agent_settled INTEGER")
-        connection.execute("ALTER TABLE receipts ADD COLUMN task_verified INTEGER")
-        connection.execute("ALTER TABLE receipts ADD COLUMN error_summary TEXT")
+        self._add_column_if_missing(connection, "jobs", "receipt_kind", "TEXT")
+        self._add_column_if_missing(connection, "jobs", "receipt_value", "TEXT")
+        self._add_column_if_missing(connection, "jobs", "agent_settled", "INTEGER")
+        self._add_column_if_missing(connection, "jobs", "task_verified", "INTEGER")
+        self._add_column_if_missing(connection, "jobs", "error_summary", "TEXT")
+        self._add_column_if_missing(connection, "receipts", "agent_settled", "INTEGER")
+        self._add_column_if_missing(connection, "receipts", "task_verified", "INTEGER")
+        self._add_column_if_missing(connection, "receipts", "error_summary", "TEXT")
         connection.execute("UPDATE schema_meta SET version = 3")
 
     def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
-        connection.execute("ALTER TABLE jobs ADD COLUMN correlation_id TEXT")
-        connection.execute("ALTER TABLE receipts ADD COLUMN correlation_id TEXT")
+        self._add_column_if_missing(connection, "jobs", "correlation_id", "TEXT")
+        self._add_column_if_missing(connection, "receipts", "correlation_id", "TEXT")
         connection.execute("UPDATE schema_meta SET version = 4")
+
+    def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
+        AttemptLedger.migrate_v4_to_v5(connection, self._add_column_if_missing)
+
+    def _migrate_v5_to_v6(self, connection: sqlite3.Connection) -> None:
+        for table in ("jobs", "job_attempts", "receipts"):
+            self._add_column_if_missing(connection, table, "completion_policy", "TEXT")
+            self._add_column_if_missing(connection, table, "verification_class", "TEXT")
+            self._add_column_if_missing(connection, table, "completion_status", "TEXT")
+            self._add_column_if_missing(
+                connection,
+                table,
+                "completion_evidence_summary",
+                "TEXT",
+            )
+            self._add_column_if_missing(connection, table, "completion_error_code", "TEXT")
+        connection.execute(
+            """
+            UPDATE jobs
+            SET completion_policy = CASE
+                    WHEN receipt_kind IS NULL THEN ? ELSE ? END,
+                verification_class = CASE
+                    WHEN receipt_kind IS NULL THEN ?
+                    WHEN task_verified = 1 THEN ?
+                    WHEN task_verified = 0 THEN ?
+                    ELSE ? END,
+                completion_status = CASE
+                    WHEN receipt_kind IS NOT NULL AND task_verified = 1 THEN ?
+                    ELSE NULL END,
+                completion_error_code = CASE
+                    WHEN receipt_kind IS NOT NULL AND task_verified = 0
+                    THEN COALESCE(error_code, 'completion_verification_failed')
+                    ELSE NULL END
+            """,
+            (
+                CompletionPolicy.LEGACY_UNVERIFIED.value,
+                CompletionPolicy.RECEIPT_V1.value,
+                VerificationClass.UNVERIFIED.value,
+                VerificationClass.VERIFIED.value,
+                VerificationClass.VERIFICATION_FAILED.value,
+                VerificationClass.UNVERIFIED.value,
+                "completed",
+            ),
+        )
+        evidence_values = (
+            CompletionPolicy.LEGACY_UNVERIFIED.value,
+            VerificationClass.UNVERIFIED.value,
+            VerificationClass.VERIFIED.value,
+            VerificationClass.VERIFICATION_FAILED.value,
+            VerificationClass.UNVERIFIED.value,
+            "completed",
+        )
+        connection.execute(
+            """
+            UPDATE job_attempts
+            SET completion_policy = (
+                    SELECT jobs.completion_policy
+                    FROM jobs WHERE jobs.id = job_attempts.job_id
+                ),
+                verification_class = CASE
+                    WHEN (
+                        SELECT jobs.completion_policy
+                        FROM jobs WHERE jobs.id = job_attempts.job_id
+                    ) = ? THEN ?
+                    WHEN task_verified = 1 THEN ?
+                    WHEN task_verified = 0 THEN ?
+                    ELSE ? END,
+                completion_status = CASE
+                    WHEN task_verified = 1 THEN ? ELSE NULL END,
+                completion_error_code = CASE
+                    WHEN task_verified = 0
+                    THEN COALESCE(error_code, 'completion_verification_failed')
+                    ELSE NULL END
+            """,
+            evidence_values,
+        )
+        connection.execute(
+            """
+            UPDATE receipts
+            SET completion_policy = (
+                    SELECT jobs.completion_policy FROM jobs WHERE jobs.id = receipts.job_id
+                ),
+                verification_class = CASE
+                    WHEN (
+                        SELECT jobs.completion_policy FROM jobs WHERE jobs.id = receipts.job_id
+                    ) = ? THEN ?
+                    WHEN task_verified = 1 THEN ?
+                    WHEN task_verified = 0 THEN ?
+                    ELSE ? END,
+                completion_status = CASE
+                    WHEN task_verified = 1 THEN ? ELSE NULL END,
+                completion_error_code = CASE
+                    WHEN task_verified = 0
+                    THEN COALESCE(error_code, 'completion_verification_failed')
+                    ELSE NULL END
+            """,
+            evidence_values,
+        )
+        connection.execute("UPDATE schema_meta SET version = 6")
+
+    @staticmethod
+    def _add_column_if_missing(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        declaration: str,
+    ) -> None:
+        columns = {
+            str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
-        with self._connect() as connection:
+        completion_policy = _completion_policy(job.receipt, job.completion_policy)
+        with self._transaction() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO jobs(
                     workflow, title, harness, prompt, dedupe_key, placement, state,
                     attempts, max_attempts, available_at, receipt_kind, receipt_value,
-                    created_at, updated_at
+                    completion_policy, verification_class, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workflow, dedupe_key) DO NOTHING
                 """,
                 (
@@ -204,6 +384,8 @@ class Store:
                     now,
                     job.receipt.kind.value if job.receipt is not None else None,
                     job.receipt.value if job.receipt is not None else None,
+                    completion_policy.value,
+                    VerificationClass.UNVERIFIED.value,
                     now,
                     now,
                 ),
@@ -213,12 +395,53 @@ class Store:
                     raise StoreError("job_id_missing")
                 return cursor.lastrowid, True
             row = connection.execute(
-                "SELECT id FROM jobs WHERE workflow = ? AND dedupe_key = ?",
+                """
+                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value,
+                       completion_policy
+                FROM jobs WHERE workflow = ? AND dedupe_key = ?
+                """,
                 (job.workflow, job.dedupe_key),
             ).fetchone()
             if row is None:
                 raise StoreError("dedupe_lookup_failed")
+            if not _job_contract_matches(row, job):
+                raise StoreError("dedupe_contract_conflict")
             return int(row["id"]), False
+
+    def existing_job_for_enqueue(
+        self,
+        workflow: str,
+        dedupe_key: str,
+        *,
+        title: str,
+        prompt: str,
+        harness: Harness | None,
+        placement: PlacementTarget | None,
+        receipt: TaskReceipt | None,
+        completion_policy: CompletionPolicy | None = None,
+    ) -> tuple[int, Harness] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, title, harness, prompt, placement, receipt_kind, receipt_value,
+                       completion_policy
+                FROM jobs WHERE workflow = ? AND dedupe_key = ?
+                """,
+                (workflow, dedupe_key),
+            ).fetchone()
+        if row is None:
+            return None
+        if not _partial_job_contract_matches(
+            row,
+            title=title,
+            prompt=prompt,
+            harness=harness,
+            placement=placement,
+            receipt=receipt,
+            completion_policy=completion_policy,
+        ):
+            raise StoreError("dedupe_contract_conflict")
+        return int(row["id"]), Harness(str(row["harness"]))
 
     def existing_job(
         self,
@@ -244,6 +467,8 @@ class Store:
         slot_limits: Mapping[str, int] | None = None,
         allowed_harnesses: Iterable[Harness] | None = None,
     ) -> list[ClaimedJob]:
+        if limit <= 0:
+            return []
         now = time.time()
         lease_until = now + lease_seconds
         allowed_values = (
@@ -251,7 +476,6 @@ class Store:
         )
         claimed: list[ClaimedJob] = []
         with self._transaction() as connection:
-            self._expire_exhausted(connection, workflow, now)
             busy_counts, busy_names = self._busy_slots(connection, workflow, now)
             candidates = self._claim_candidates(connection, workflow, now)
             for row in candidates:
@@ -272,21 +496,6 @@ class Store:
                 if len(claimed) >= limit:
                     break
         return claimed
-
-    @staticmethod
-    def _expire_exhausted(
-        connection: sqlite3.Connection,
-        workflow: str,
-        now: float,
-    ) -> None:
-        connection.execute(
-            """
-            UPDATE jobs
-            SET state = ?, error_code = 'lease_expired', lease_until = NULL, updated_at = ?
-            WHERE workflow = ? AND state = ? AND lease_until <= ? AND attempts >= max_attempts
-            """,
-            (JobState.FAILED.value, now, workflow, JobState.RUNNING.value, now),
-        )
 
     @staticmethod
     def _busy_slots(
@@ -322,9 +531,8 @@ class Store:
             SELECT * FROM jobs
             WHERE workflow = ?
               AND placement IS NOT NULL
-              AND attempts < max_attempts
               AND (
-                (state = ? AND available_at <= ?)
+                (state = ? AND available_at <= ? AND attempts < max_attempts)
                 OR (state = ? AND lease_until <= ?)
               )
             ORDER BY created_at, id
@@ -361,145 +569,75 @@ class Store:
         )
         if busy_counts[harness_value] >= limit:
             return None
+        if row["state"] == JobState.RUNNING.value:
+            persisted_name = row["agent_name"]
+            if not isinstance(persisted_name, str) or not persisted_name:
+                raise StoreError("attempt_agent_missing")
+            if persisted_name in busy_names.get(harness_value, set()):
+                return None
+            recovered = AttemptLedger.reclaim(
+                connection,
+                row,
+                now=now,
+                lease_until=lease_until,
+            )
+            busy_counts[harness_value] += 1
+            busy_names.setdefault(harness_value, set()).add(persisted_name)
+            return recovered
         agent_name = next(
             (name for name in names if name not in busy_names.get(harness_value, set())),
             None,
         )
         if agent_name is None:
             return None
-        attempt = int(row["attempts"]) + 1
-        correlation_id = uuid.uuid4().hex
-        connection.execute(
-            """
-            UPDATE jobs
-            SET state = ?, attempts = ?, lease_until = ?, agent_name = ?,
-                error_code = NULL, correlation_id = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                JobState.RUNNING.value,
-                attempt,
-                lease_until,
-                agent_name,
-                correlation_id,
-                now,
-                row["id"],
-            ),
+        claimed = AttemptLedger.create_claim(
+            connection,
+            row,
+            agent_name=agent_name,
+            now=now,
+            lease_until=lease_until,
         )
         busy_counts[harness_value] += 1
         busy_names.setdefault(harness_value, set()).add(agent_name)
-        return ClaimedJob(
-            job_id=int(row["id"]),
-            workflow=str(row["workflow"]),
-            title=str(row["title"]),
-            harness=Harness(harness_value),
-            prompt=str(row["prompt"]),
-            dedupe_key=str(row["dedupe_key"]),
-            attempt=attempt,
-            max_attempts=int(row["max_attempts"]),
-            agent_name=agent_name,
-            placement=PlacementTarget(placement_value),
-            receipt=_receipt_from_row(row),
-            correlation_id=correlation_id,
-        )
+        return claimed
+
+    def record_attempt_progress(
+        self,
+        job: ClaimedJob,
+        progress: AttemptProgress,
+    ) -> None:
+        with self._transaction() as connection:
+            recorded = AttemptLedger.record_progress(
+                connection,
+                job,
+                progress,
+                now=time.time(),
+            )
+        if not recorded:
+            raise StoreError("job_lease_lost")
 
     def record_outcome(self, job: ClaimedJob, outcome: DispatchOutcome) -> JobState:
-        now = time.time()
-        error_code = outcome.error_code
-        if job.receipt is not None and outcome.task_verified is not True and error_code is None:
-            error_code = "task_receipt_missing"
-        elif outcome.task_verified is False and error_code is None:
-            error_code = "task_receipt_invalid"
-        if error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
-            state = JobState.SUCCEEDED
-            available_at = now
-        elif outcome.state is AgentState.BLOCKED:
-            state = JobState.BLOCKED
-            available_at = now
-        elif job.attempt < job.max_attempts:
-            state = JobState.PENDING
-            available_at = now + min(60, 2 ** max(0, job.attempt - 1))
-        else:
-            state = JobState.FAILED
-            available_at = now
-
-        if error_code is None and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
-            error_code = "agent_not_settled"
-        agent_settled = (
-            outcome.agent_settled
-            if outcome.agent_settled is not None
-            else outcome.state in {AgentState.IDLE, AgentState.DONE}
-        )
-        error_summary = _bounded_error_summary(outcome.error_summary)
-        correlation_id = outcome.correlation_id or job.correlation_id
-
         with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT state, attempts FROM jobs WHERE id = ?",
-                (job.job_id,),
-            ).fetchone()
-            if row is None:
-                raise StoreError("job_not_found")
-            if row["state"] != JobState.RUNNING.value or int(row["attempts"]) != job.attempt:
-                raise StoreError("job_lease_lost")
-            connection.execute(
-                """
-                UPDATE jobs
-                SET state = ?, available_at = ?, lease_until = NULL, agent_name = ?,
-                    error_code = ?, execution_path = ?, herdr_workspace_id = ?,
-                    agent_settled = ?, task_verified = ?, error_summary = ?,
-                    correlation_id = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    state.value,
-                    available_at,
-                    outcome.agent_name,
-                    error_code,
-                    outcome.execution_path,
-                    outcome.herdr_workspace_id,
-                    int(agent_settled),
-                    (int(outcome.task_verified) if outcome.task_verified is not None else None),
-                    error_summary,
-                    correlation_id,
-                    now,
-                    job.job_id,
-                ),
+            state, recorded = AttemptLedger.record_outcome(
+                connection,
+                job,
+                outcome,
+                resume=False,
+                now=time.time(),
             )
-            connection.execute(
-                """
-                INSERT INTO receipts(
-                    job_id, attempt, state, agent_name, agent_state,
-                    member_reused, pane_id, error_code, placement,
-                    execution_path, herdr_workspace_id, agent_settled,
-                    task_verified, error_summary, correlation_id, observed_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job.job_id,
-                    job.attempt,
-                    state.value,
-                    outcome.agent_name,
-                    outcome.state.value,
-                    int(outcome.member_reused),
-                    outcome.pane_id,
-                    error_code,
-                    (
-                        outcome.placement.value
-                        if outcome.placement is not None
-                        else job.placement.value
-                    ),
-                    outcome.execution_path,
-                    outcome.herdr_workspace_id,
-                    int(agent_settled),
-                    (int(outcome.task_verified) if outcome.task_verified is not None else None),
-                    error_summary,
-                    correlation_id,
-                    now,
-                ),
-            )
+        if not recorded:
+            raise StoreError("job_lease_lost")
         return state
+
+    def attempt_phase(self, attempt_id: int) -> AttemptPhase:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT phase FROM job_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            raise StoreError("current_attempt_missing")
+        return AttemptPhase(str(row["phase"]))
 
     def status_counts(
         self,
@@ -530,157 +668,29 @@ class Store:
     ) -> tuple[ClaimedJob, str]:
         now = time.time()
         with self._transaction() as connection:
-            row = connection.execute(
-                """
-                SELECT jobs.*, receipts.pane_id AS blocked_pane_id
-                FROM jobs
-                JOIN receipts ON receipts.id = (
-                    SELECT id FROM receipts
-                    WHERE receipts.job_id = jobs.id
-                    ORDER BY id DESC LIMIT 1
-                )
-                WHERE jobs.workflow = ? AND jobs.id = ?
-                """,
-                (workflow, job_id),
-            ).fetchone()
-            if row is None:
-                raise StoreError("job_not_found")
-            if row["state"] != JobState.BLOCKED.value:
-                raise StoreError("job_not_resumable")
-            if row["lease_until"] is not None and float(row["lease_until"]) > now:
-                raise StoreError("job_resume_in_progress")
-            agent_name = row["agent_name"]
-            pane_id = row["blocked_pane_id"]
-            if not isinstance(agent_name, str) or not agent_name:
-                raise StoreError("blocked_agent_missing")
-            if not isinstance(pane_id, str) or not pane_id:
-                raise StoreError("blocked_pane_missing")
-            placement = row["placement"]
-            if not isinstance(placement, str) or not placement:
-                raise StoreError("blocked_placement_missing")
-            connection.execute(
-                """
-                UPDATE jobs
-                SET lease_until = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    now + lease_seconds,
-                    now,
-                    job_id,
-                ),
+            return AttemptLedger.claim_resume(
+                connection,
+                workflow,
+                job_id,
+                lease_seconds=lease_seconds,
+                now=now,
             )
-            job = ClaimedJob(
-                job_id=int(row["id"]),
-                workflow=str(row["workflow"]),
-                title=str(row["title"]),
-                harness=Harness(str(row["harness"])),
-                prompt=str(row["prompt"]),
-                dedupe_key=str(row["dedupe_key"]),
-                attempt=int(row["attempts"]),
-                max_attempts=int(row["max_attempts"]),
-                agent_name=agent_name,
-                placement=PlacementTarget(placement),
-                receipt=(
-                    TaskReceipt(
-                        ReceiptKind(str(row["receipt_kind"])),
-                        str(row["receipt_value"]),
-                    )
-                    if row["receipt_kind"] is not None and row["receipt_value"] is not None
-                    else None
-                ),
-            )
-        return job, pane_id
 
     def record_resume_outcome(
         self,
         job: ClaimedJob,
         outcome: DispatchOutcome,
     ) -> JobState:
-        now = time.time()
-        error_code = outcome.error_code
-        if job.receipt is not None and outcome.task_verified is not True and error_code is None:
-            error_code = "task_receipt_missing"
-        elif outcome.task_verified is False and error_code is None:
-            error_code = "task_receipt_invalid"
-        if error_code is None and outcome.state in {AgentState.IDLE, AgentState.DONE}:
-            state = JobState.SUCCEEDED
-        else:
-            state = JobState.BLOCKED
-        if error_code is None and outcome.state is AgentState.BLOCKED:
-            error_code = "agent_blocked"
-        elif error_code is None and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}:
-            error_code = "agent_not_settled"
-        agent_settled = (
-            outcome.agent_settled
-            if outcome.agent_settled is not None
-            else outcome.state in {AgentState.IDLE, AgentState.DONE}
-        )
-        error_summary = _bounded_error_summary(outcome.error_summary)
-
         with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT state, attempts FROM jobs WHERE id = ?",
-                (job.job_id,),
-            ).fetchone()
-            if row is None:
-                raise StoreError("job_not_found")
-            if row["state"] != JobState.BLOCKED.value or int(row["attempts"]) != job.attempt:
-                raise StoreError("job_lease_lost")
-            connection.execute(
-                """
-                UPDATE jobs
-                SET state = ?, available_at = ?, lease_until = NULL, agent_name = ?,
-                    error_code = ?, execution_path = ?, herdr_workspace_id = ?,
-                    agent_settled = ?, task_verified = ?, error_summary = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    state.value,
-                    now,
-                    outcome.agent_name,
-                    error_code,
-                    outcome.execution_path,
-                    outcome.herdr_workspace_id,
-                    int(agent_settled),
-                    (int(outcome.task_verified) if outcome.task_verified is not None else None),
-                    error_summary,
-                    now,
-                    job.job_id,
-                ),
+            state, recorded = AttemptLedger.record_outcome(
+                connection,
+                job,
+                outcome,
+                resume=True,
+                now=time.time(),
             )
-            connection.execute(
-                """
-                INSERT INTO receipts(
-                    job_id, attempt, state, agent_name, agent_state,
-                    member_reused, pane_id, error_code, placement,
-                    execution_path, herdr_workspace_id, agent_settled,
-                    task_verified, error_summary, observed_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job.job_id,
-                    job.attempt,
-                    state.value,
-                    outcome.agent_name,
-                    outcome.state.value,
-                    int(outcome.member_reused),
-                    outcome.pane_id,
-                    error_code,
-                    (
-                        outcome.placement.value
-                        if outcome.placement is not None
-                        else job.placement.value
-                    ),
-                    outcome.execution_path,
-                    outcome.herdr_workspace_id,
-                    int(agent_settled),
-                    (int(outcome.task_verified) if outcome.task_verified is not None else None),
-                    error_summary,
-                    now,
-                ),
-            )
+        if not recorded:
+            raise StoreError("job_lease_lost")
         return state
 
     def retry_failed(
@@ -711,13 +721,16 @@ class Store:
                 UPDATE jobs
                 SET state = ?, max_attempts = ?, available_at = ?, lease_until = NULL,
                     error_code = NULL, error_summary = NULL, agent_settled = NULL,
-                    task_verified = NULL, correlation_id = NULL, updated_at = ?
+                    task_verified = NULL, verification_class = ?, completion_status = NULL,
+                    completion_evidence_summary = NULL, completion_error_code = NULL,
+                    correlation_id = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     JobState.PENDING.value,
                     max_attempts,
                     now,
+                    VerificationClass.UNVERIFIED.value,
                     now,
                     job_id,
                 ),
@@ -733,11 +746,18 @@ class Store:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, title, harness, placement, state, attempts, max_attempts,
-                       agent_name, error_code, execution_path, herdr_workspace_id,
-                       receipt_kind, receipt_value, agent_settled, task_verified
-                       , error_summary, correlation_id
-                FROM jobs WHERE workflow = ? ORDER BY id
+                SELECT jobs.id, jobs.title, jobs.harness, jobs.placement, jobs.state,
+                       jobs.attempts, jobs.max_attempts, jobs.agent_name,
+                       jobs.error_code, jobs.execution_path, jobs.herdr_workspace_id,
+                       jobs.receipt_kind, jobs.receipt_value, jobs.agent_settled,
+                       jobs.task_verified, jobs.error_summary, jobs.correlation_id,
+                       jobs.completion_policy, jobs.verification_class,
+                       jobs.completion_status, jobs.completion_evidence_summary,
+                       jobs.completion_error_code, jobs.current_attempt_id,
+                       job_attempts.phase AS attempt_phase
+                FROM jobs
+                LEFT JOIN job_attempts ON job_attempts.id = jobs.current_attempt_id
+                WHERE jobs.workflow = ? ORDER BY jobs.id
                 """,
                 (workflow,),
             ).fetchall()
@@ -757,6 +777,7 @@ class Store:
                 JOIN jobs ON jobs.id = receipts.job_id
                 WHERE jobs.workflow = ?
                   AND receipts.member_reused = 0
+                  AND receipts.is_stale = 0
                   AND receipts.pane_id IS NOT NULL
                   AND receipts.placement IN (?, ?)
                 ORDER BY receipts.observed_at, receipts.id
@@ -842,20 +863,49 @@ class Store:
                 (key, str(value), now),
             )
 
+    def reserve_planner_run(
+        self,
+        workflow: str,
+        interval_seconds: int,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        observed_at = time.time() if now is None else now
+        key = f"planner_last_attempt:{workflow}"
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    last_attempt = float(row["value"])
+                except (TypeError, ValueError) as exc:
+                    raise StoreError(f"metadata_invalid_float: {key}") from exc
+                if observed_at - last_attempt < interval_seconds:
+                    return False
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE
+                SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, str(observed_at), observed_at),
+            )
+        return True
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        try:
-            yield connection
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        with closing(sqlite3.connect(self.path, timeout=10)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            try:
+                yield connection
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:

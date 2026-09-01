@@ -14,6 +14,52 @@ let topologyViewportTouched = false;
 let topologyViewportUpdate = false;
 let topologyHasRendered = false;
 let topologyTreeSignature = null;
+let topologyKeyboardNodeIds = [];
+let topologyKeyboardIndex = -1;
+let transportError = "";
+
+const dataRegionIds = ["kanban", "attention-list", "topology", "timeline"];
+
+function record(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function records(value) {
+  return Array.isArray(value) ? value.filter(record) : [];
+}
+
+function values(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function textValue(value, fallback = "") {
+  if (typeof topologyText === "function") return topologyText(value, fallback);
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === "object" || typeof value === "function" || typeof value === "symbol") {
+    return fallback;
+  }
+  try {
+    return String(value);
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function finiteNumber(value) {
+  try {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function epochDate(epoch) {
+  const value = finiteNumber(epoch);
+  if (value === null) return null;
+  const date = new Date(value * 1000);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
 
 const columns = [
   { key: "queued", label: "Queued", states: ["pending"] },
@@ -23,7 +69,7 @@ const columns = [
 ];
 
 function escapeHtml(value) {
-  return String(value ?? "")
+  return textValue(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -32,28 +78,40 @@ function escapeHtml(value) {
 }
 
 function formatTime(epoch) {
-  if (!Number.isFinite(Number(epoch))) return "unknown";
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(Number(epoch) * 1000));
+  const date = epochDate(epoch);
+  if (!date) return "unknown";
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(date);
+  } catch (_error) {
+    return "unknown";
+  }
 }
 
 function formatDateTime(epoch) {
-  if (!Number.isFinite(Number(epoch))) return "unknown";
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(Number(epoch) * 1000));
+  const date = epochDate(epoch);
+  if (!date) return "unknown";
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(date);
+  } catch (_error) {
+    return "unknown";
+  }
 }
 
 function formatAge(epoch, now = Date.now() / 1000) {
-  if (!Number.isFinite(Number(epoch))) return "unknown";
-  const seconds = Math.max(0, Math.round(now - Number(epoch)));
+  const value = finiteNumber(epoch);
+  const current = finiteNumber(now);
+  if (value === null || current === null) return "unknown";
+  const seconds = Math.max(0, Math.round(current - value));
   if (seconds < 60) return `${seconds}s ago`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
@@ -61,8 +119,13 @@ function formatAge(epoch, now = Date.now() / 1000) {
 }
 
 function isoTime(epoch) {
-  if (!Number.isFinite(Number(epoch))) return "";
-  return new Date(Number(epoch) * 1000).toISOString();
+  const date = epochDate(epoch);
+  if (!date) return "";
+  try {
+    return date.toISOString();
+  } catch (_error) {
+    return "";
+  }
 }
 
 function setConnection(mode, label) {
@@ -71,22 +134,71 @@ function setConnection(mode, label) {
   byId("connection-label").textContent = label;
 }
 
-function render(snapshot) {
-  currentSnapshot = snapshot;
-  const summary = snapshot.summary || {};
-  byId("workflow-name").textContent = snapshot.workflow || "Herdr Orchestrator";
-  byId("metric-running").textContent = summary.running ?? "—";
-  byId("metric-attention").textContent = summary.needs_attention ?? "—";
-  byId("metric-pending").textContent = summary.pending ?? "—";
-  byId("metric-agents").textContent = summary.active_agents ?? "—";
-  byId("metric-worktrees").textContent = summary.worktrees ?? "—";
-  byId("metric-succeeded").textContent = summary.succeeded ?? "—";
-  byId("job-total").textContent = `${summary.total ?? 0} jobs`;
-  byId("last-updated").textContent = `Updated ${formatAge(snapshot.generated_at)}`;
+function setDataBusy(isBusy) {
+  dataRegionIds.forEach((id) => {
+    byId(id).setAttribute("aria-busy", String(isBusy));
+  });
+}
 
-  const health = snapshot.source_health || {};
+function showUnavailableState(message) {
+  setConnection("is-offline", "Reconnecting");
   const warning = byId("source-warning");
-  if (health.queue !== "ok" || health.herdr !== "ok") {
+  if (transportError === message) {
+    if (currentSnapshot) {
+      byId("last-updated").textContent = `Last snapshot ${formatAge(currentSnapshot.generated_at)}`;
+    }
+    return;
+  }
+  transportError = message;
+  if (currentSnapshot) {
+    if (warning.classList.contains("is-hidden") || !warning.textContent) {
+      warning.textContent = message;
+      warning.classList.remove("is-hidden");
+    }
+    byId("last-updated").textContent = `Last snapshot ${formatAge(currentSnapshot.generated_at)}`;
+    return;
+  }
+
+  warning.textContent = message;
+  warning.classList.remove("is-hidden");
+
+  setDataBusy(false);
+  byId("kanban").innerHTML =
+    '<div class="empty-state compact error-state" role="status">Queue state unavailable</div>';
+  byId("attention-list").innerHTML =
+    '<div class="empty-state compact error-state" role="status">Alerts unavailable</div>';
+  byId("topology-empty").textContent = "Topology unavailable until a snapshot arrives";
+  byId("topology-empty").classList.remove("is-hidden");
+  byId("timeline").innerHTML =
+    '<div class="empty-state compact error-state" role="status">Lifecycle unavailable</div>';
+}
+
+function render(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    throw new Error("snapshot_invalid");
+  }
+  setDataBusy(false);
+  const summary = record(snapshot.summary) ? snapshot.summary : {};
+  byId("workflow-name").textContent = textValue(snapshot.workflow, "Herdr Orchestrator");
+  byId("metric-running").textContent = textValue(summary.running, "—");
+  byId("metric-attention").textContent = textValue(summary.needs_attention, "—");
+  byId("metric-pending").textContent = textValue(summary.pending, "—");
+  byId("metric-agents").textContent = textValue(summary.active_agents, "—");
+  byId("metric-worktrees").textContent = textValue(summary.worktrees, "—");
+  byId("metric-succeeded").textContent = textValue(summary.succeeded, "—");
+  byId("job-total").textContent = `${textValue(summary.total, "0")} jobs`;
+  byId("last-updated").textContent = transportError
+    ? `Last snapshot ${formatAge(snapshot.generated_at)}`
+    : `Updated ${formatAge(snapshot.generated_at)}`;
+
+  const health = record(snapshot.source_health) ? snapshot.source_health : {};
+  const warning = byId("source-warning");
+  if (transportError) {
+    if (warning.classList.contains("is-hidden") || !warning.textContent) {
+      warning.textContent = transportError;
+      warning.classList.remove("is-hidden");
+    }
+  } else if (health.queue !== "ok" || health.herdr !== "ok") {
     const parts = [];
     if (health.queue !== "ok") parts.push("Queue observation unavailable");
     if (health.herdr !== "ok") {
@@ -98,10 +210,11 @@ function render(snapshot) {
     warning.classList.add("is-hidden");
   }
 
-  renderKanban(snapshot.jobs || []);
-  renderAttention(snapshot.attention || []);
-  renderTopology(snapshot.topology || {}, snapshot.workflow);
-  renderTimeline(snapshot.timeline || []);
+  renderKanban(records(snapshot.jobs));
+  renderAttention(records(snapshot.attention));
+  renderTopology(record(snapshot.topology) ? snapshot.topology : {}, snapshot.workflow);
+  renderTimeline(records(snapshot.timeline));
+  currentSnapshot = snapshot;
 }
 
 function renderKanban(jobs) {
@@ -111,7 +224,7 @@ function renderKanban(jobs) {
       ? selected.map(jobCard).join("")
       : `<div class="empty-state compact">No ${escapeHtml(column.label.toLowerCase())} jobs</div>`;
     return `
-      <section class="kanban-column" aria-label="${escapeHtml(column.label)}">
+      <section class="kanban-column" tabindex="0" aria-label="${escapeHtml(column.label)}">
         <div class="column-heading">
           <span>${escapeHtml(column.label)}</span>
           <span class="column-count">${selected.length}</span>
@@ -123,11 +236,13 @@ function renderKanban(jobs) {
 }
 
 function jobCard(job) {
-  const runtime = job.runtime || {};
+  const runtime = record(job.runtime) ? job.runtime : {};
   const runtimeState = runtime.agent_status;
-  const agentLabel = job.agent_name || "unassigned";
-  const location = runtime.pane_id || job.herdr_workspace_id || "not observed";
-  const drift = (job.drift || []).map((item) => escapeHtml(item.replaceAll("_", " "))).join(" · ");
+  const agentLabel = textValue(job.agent_name, "unassigned");
+  const location = textValue(runtime.pane_id || job.herdr_workspace_id, "not observed");
+  const drift = values(job.drift)
+    .map((item) => escapeHtml(textValue(item).replaceAll("_", " ")))
+    .join(" · ");
   const settled = job.agent_settled === true
     ? "yes"
     : job.agent_settled === false ? "no" : "pending";
@@ -188,10 +303,17 @@ function renderTopology(topology, workflow) {
   topologyCount.title = countParts.join(" · ");
   byId("topology").setAttribute(
     "aria-label",
-    `Interactive Herdr topology: ${countParts.join(", ")}`,
+    `Interactive Herdr topology (read-only): ${countParts.join(", ")}`,
   );
   byId("topology").dataset.nodeCount = String(graph.elements.length);
   renderTopologyTree(projects, graph.contentSignature);
+  const previousNodeId = topologyKeyboardNodeIds[topologyKeyboardIndex];
+  topologyKeyboardNodeIds = graph.elements
+    .filter((element) => element.group === "nodes")
+    .map((element) => element.data.id);
+  topologyKeyboardIndex = previousNodeId
+    ? topologyKeyboardNodeIds.indexOf(previousNodeId)
+    : -1;
 
   const empty = byId("topology-empty");
   if (!graph.elements.length) {
@@ -201,6 +323,8 @@ function renderTopology(topology, workflow) {
     topologyContentSignature = "";
     topologyStructureSignature = "";
     topologyHasRendered = false;
+    topologyKeyboardNodeIds = [];
+    topologyKeyboardIndex = -1;
     clearTopologySelection();
     return;
   }
@@ -259,6 +383,7 @@ function renderTopology(topology, workflow) {
   if (selectedId && !canvas.getElementById(selectedId).empty()) {
     const selected = canvas.getElementById(selectedId);
     selected.select();
+    topologyKeyboardIndex = topologyKeyboardNodeIds.indexOf(selectedId);
     renderTopologyInspector(selected);
   } else {
     clearTopologySelection();
@@ -285,6 +410,7 @@ function ensureTopologyCanvas() {
   topologyCanvas.on("tap", "node", (event) => {
     topologyCanvas.nodes().unselect();
     event.target.select();
+    topologyKeyboardIndex = topologyKeyboardNodeIds.indexOf(event.target.id());
     renderTopologyInspector(event.target);
   });
   topologyCanvas.on("tap", (event) => {
@@ -466,6 +592,18 @@ function zoomTopology(factor) {
   topologyViewportTouched = true;
 }
 
+function selectTopologyNode(index) {
+  if (!topologyCanvas || !topologyKeyboardNodeIds.length) return;
+  const length = topologyKeyboardNodeIds.length;
+  const nextIndex = (index + length) % length;
+  const node = topologyCanvas.getElementById(topologyKeyboardNodeIds[nextIndex]);
+  if (node.empty()) return;
+  topologyCanvas.nodes().unselect();
+  node.select();
+  topologyKeyboardIndex = nextIndex;
+  renderTopologyInspector(node);
+}
+
 function renderTopologyInspector(node) {
   const inspector = byId("topology-inspector");
   const kind = node.data("kindLabel") || "Node";
@@ -479,6 +617,7 @@ function renderTopologyInspector(node) {
 
 function clearTopologySelection() {
   if (topologyCanvas) topologyCanvas.nodes().unselect();
+  topologyKeyboardIndex = -1;
   const inspector = byId("topology-inspector");
   inspector.innerHTML = "";
   inspector.classList.add("is-hidden");
@@ -488,25 +627,44 @@ function renderTopologyTree(projects, signature) {
   if (signature === topologyTreeSignature) return;
   topologyTreeSignature = signature;
   const target = byId("topology-a11y");
-  target.innerHTML = projects.length
-    ? `<h3>Herdr topology text view</h3><ul>${projects.map((project) => `
-      <li>Project: ${escapeHtml(project.label || project.project_id || "Project")}
-        <ul>${(project.worktrees || []).map((worktree) => `
-          <li>Worktree: ${escapeHtml(worktree.label || worktree.workspace_id || "Workspace")}
-            <ul>${(worktree.tabs || []).map((tab) => `
-              <li>Tab: ${escapeHtml(tab.label || tab.tab_id || "Tab")}
-                <ul>${(tab.panes || []).map((pane) => {
-                  const agent = pane.agent;
-                  const state = agent?.agent_status || pane.agent_status || "unknown";
-                  const name = agent?.name || agent?.agent || pane.agent || "shell";
-                  return `<li>Pane: ${escapeHtml(pane.pane_id || "Pane")}, ${escapeHtml(name)}, ${escapeHtml(state)}</li>`;
+  const projectRecords = topologyRecords(projects);
+  target.innerHTML = projectRecords.length
+    ? `<h3>Herdr topology text view</h3><ul>${projectRecords.map((project) => {
+      const projectLabel = topologyText(
+        topologyIdentity(project.label, project.project_id),
+        "Project",
+      );
+      const worktrees = topologyRecords(project.worktrees);
+      return `<li>Project: ${escapeHtml(projectLabel)}
+        <ul>${worktrees.map((worktree) => {
+          const worktreeLabel = topologyText(
+            topologyIdentity(worktree.label, worktree.workspace_id),
+            "Workspace",
+          );
+          const tabs = topologyRecords(worktree.tabs);
+          return `<li>Worktree: ${escapeHtml(worktreeLabel)}
+            <ul>${tabs.map((tab) => {
+              const tabLabel = topologyText(topologyIdentity(tab.label, tab.tab_id), "Tab");
+              const panes = topologyRecords(tab.panes);
+              return `<li>Tab: ${escapeHtml(tabLabel)}
+                <ul>${panes.map((pane) => {
+                  const agent = topologyRecord(pane.agent) ? pane.agent : null;
+                  const state = topologyText(
+                    topologyIdentity(agent?.agent_status, pane.agent_status),
+                    "unknown",
+                  );
+                  const name = agent
+                    ? topologyText(topologyIdentity(agent.name, agent.agent), "agent")
+                    : topologyText(pane.agent, "shell");
+                  const paneId = topologyText(pane.pane_id, "Pane");
+                  return `<li>Pane: ${escapeHtml(paneId)}, ${escapeHtml(name)}, ${escapeHtml(state)}</li>`;
                 }).join("")}</ul>
-              </li>
-            `).join("")}</ul>
-          </li>
-        `).join("")}</ul>
-      </li>
-    `).join("")}</ul>`
+              </li>`;
+            }).join("")}</ul>
+          </li>`;
+        }).join("")}</ul>
+      </li>`;
+    }).join("")}</ul>`
     : "No matching Herdr topology";
 }
 
@@ -535,22 +693,40 @@ async function loadInitial() {
     const payload = await response.json();
     render(payload.snapshot);
   } catch (_error) {
-    byId("last-updated").textContent = "Snapshot is not ready";
+    if (!currentSnapshot) {
+      showUnavailableState("Dashboard snapshot unavailable; reconnecting");
+    }
   }
 }
 
 function connectEvents() {
-  const events = new EventSource("/api/events");
-  events.addEventListener("open", () => setConnection("is-live", "Live"));
+  let events;
+  try {
+    events = new EventSource("/api/events");
+  } catch (_error) {
+    showUnavailableState("Live snapshot stream unavailable; reconnecting");
+    return;
+  }
+  events.addEventListener("open", () => {
+    if (currentSnapshot) {
+      setConnection("is-live", "Live");
+    } else {
+      setConnection(null, "Connected");
+      byId("last-updated").textContent = "Waiting for first snapshot";
+    }
+  });
   events.addEventListener("snapshot", (event) => {
-    render(JSON.parse(event.data));
-    setConnection("is-live", "Live");
+    try {
+      const snapshot = JSON.parse(event.data);
+      transportError = "";
+      render(snapshot);
+      setConnection("is-live", "Live");
+    } catch (_error) {
+      showUnavailableState("Snapshot stream unavailable; reconnecting");
+    }
   });
   events.addEventListener("error", () => {
-    setConnection("is-offline", "Reconnecting");
-    byId("last-updated").textContent = currentSnapshot
-      ? `Last snapshot ${formatAge(currentSnapshot.generated_at)}`
-      : "No snapshot received";
+    showUnavailableState("Live snapshot stream unavailable; reconnecting");
   });
 }
 
@@ -558,7 +734,23 @@ byId("topology-zoom-out").addEventListener("click", () => zoomTopology(0.82));
 byId("topology-fit").addEventListener("click", () => fitTopology());
 byId("topology-zoom-in").addEventListener("click", () => zoomTopology(1.22));
 byId("topology").addEventListener("keydown", (event) => {
-  if (event.key === "+" || event.key === "=") {
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+    event.preventDefault();
+    const index = topologyKeyboardIndex < 0 ? 0 : topologyKeyboardIndex + 1;
+    selectTopologyNode(index);
+  } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const index = topologyKeyboardIndex < 0
+      ? topologyKeyboardNodeIds.length - 1
+      : topologyKeyboardIndex - 1;
+    selectTopologyNode(index);
+  } else if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+    event.preventDefault();
+    selectTopologyNode(topologyKeyboardIndex < 0 ? 0 : topologyKeyboardIndex);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    clearTopologySelection();
+  } else if (event.key === "+" || event.key === "=") {
     event.preventDefault();
     zoomTopology(1.22);
   } else if (event.key === "-") {
@@ -573,7 +765,7 @@ byId("topology").addEventListener("keydown", (event) => {
 loadInitial();
 connectEvents();
 setInterval(() => {
-  if (currentSnapshot) {
+  if (currentSnapshot && !transportError) {
     byId("last-updated").textContent = `Updated ${formatAge(currentSnapshot.generated_at)}`;
   }
 }, 1000);

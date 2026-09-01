@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +13,11 @@ from herdr_orchestrator.catalog import (
     profile_for_harness,
     render_compact_catalog,
 )
+from herdr_orchestrator.completion import (
+    CompletionIdentity,
+    CompletionPolicy,
+    structured_completion_prompt,
+)
 from herdr_orchestrator.herdr import (
     HerdrTransport,
     replica_slot_names,
@@ -20,6 +25,9 @@ from herdr_orchestrator.herdr import (
 )
 from herdr_orchestrator.model import (
     AgentState,
+    AttemptPhase,
+    AttemptProgress,
+    AttemptTransition,
     ClaimedJob,
     DispatchContext,
     DispatchOutcome,
@@ -79,6 +87,10 @@ class _DispatchDeadlineExceeded(RuntimeError):
     pass
 
 
+class OperationInterrupted(RuntimeError):
+    pass
+
+
 class Coordinator:
     def __init__(
         self,
@@ -90,6 +102,7 @@ class Coordinator:
         controller_auto: bool = False,
         worker_harnesses: Iterable[Harness] | None = None,
         observability: Observability | None = None,
+        transition_observer: Callable[[AttemptTransition], None] | None = None,
     ) -> None:
         self.config = config
         self.store = store or Store(config.state_db)
@@ -101,6 +114,7 @@ class Coordinator:
             config.state_db.parent / "telemetry",
             config.name,
         )
+        self.transition_observer = transition_observer
 
     def initialize(self) -> None:
         self.store.initialize()
@@ -140,6 +154,7 @@ class Coordinator:
         dedupe_key: str,
         placement: PlacementTarget | None = None,
         receipt: TaskReceipt | None = None,
+        completion_policy: CompletionPolicy | None = None,
     ) -> tuple[int, bool, Harness]:
         self.initialize()
         if not prompt_file.is_file():
@@ -147,7 +162,16 @@ class Coordinator:
         prompt = prompt_file.read_text(encoding="utf-8").strip()
         if not prompt:
             raise ValueError("prompt_file_empty")
-        existing = self.store.existing_job(self.config.name, dedupe_key)
+        existing = self.store.existing_job_for_enqueue(
+            self.config.name,
+            dedupe_key,
+            title=title,
+            prompt=prompt,
+            harness=harness,
+            placement=placement,
+            receipt=receipt,
+            completion_policy=completion_policy,
+        )
         if existing is not None:
             job_id, existing_harness = existing
             return job_id, False, existing_harness
@@ -169,6 +193,7 @@ class Coordinator:
                     placement,
                 ),
                 receipt=receipt,
+                completion_policy=completion_policy,
             )
         )
         if not created:
@@ -199,6 +224,9 @@ class Coordinator:
         results = {state.value: 0 for state in JobState}
         if not jobs:
             return self._run_report(results, claimed=0)
+        for job in jobs:
+            if not job.recovery:
+                self._observe_transition(job, AttemptPhase.CLAIMED)
         with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="harness") as executor:
             futures = {
                 executor.submit(
@@ -213,17 +241,43 @@ class Coordinator:
                 job = futures[future]
                 try:
                     outcome = future.result()
+                except OperationInterrupted:
+                    raise
                 except Exception:
                     outcome = DispatchOutcome(
-                        agent_name=f"failed-{job.harness.value}",
+                        agent_name=job.agent_name,
                         state=AgentState.UNKNOWN,
                         member_reused=False,
                         pane_id=None,
                         error_code="dispatcher_unhandled_error",
+                        placement=job.placement,
+                        correlation_id=job.correlation_id,
                     )
                 state = self.store.record_outcome(job, outcome)
+                self._observe_transition(job, self.store.attempt_phase(job.attempt_id))
                 results[state.value] += 1
         return self._run_report(results, claimed=len(jobs))
+
+    def _record_attempt_progress(
+        self,
+        job: ClaimedJob,
+        progress: AttemptProgress,
+    ) -> None:
+        self.store.record_attempt_progress(job, progress)
+        self._observe_transition(job, progress.phase)
+
+    def _observe_transition(self, job: ClaimedJob, phase: AttemptPhase) -> None:
+        if self.transition_observer is None:
+            return
+        self.transition_observer(
+            AttemptTransition(
+                job.job_id,
+                job.attempt_id,
+                job.attempt,
+                job.operation_sequence,
+                phase,
+            )
+        )
 
     def _run_report(
         self,
@@ -345,23 +399,39 @@ class Coordinator:
             job_id,
             lease_seconds=self.config.coordinator.lease_seconds,
         )
+        if not job.recovery:
+            self._observe_transition(job, AttemptPhase.CLAIMED)
         context = DispatchContext(
             placement=job.placement,
             title=job.title,
             task_key=job.dedupe_key,
-            batch_key=f"resume-{job.job_id}-{job.attempt}",
+            batch_key=f"resume-{job.job_id}-{job.attempt}-{job.operation_sequence}",
             worktree_root=self.config.placement.worktree_root,
             receipt=job.receipt,
+            correlation_id=job.correlation_id,
+            attempt_progress=lambda progress: self._record_attempt_progress(job, progress),
+            completion_identity=_completion_identity(job),
         )
         try:
-            outcome = responder(
-                job.agent_name,
-                job.harness,
-                response,
-                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-                expected_pane_id=expected_pane_id,
-                context=context,
-            )
+            if job.recovery:
+                outcome = self._recover_job(
+                    job,
+                    response,
+                    timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                    context=context,
+                )
+            else:
+                outcome = responder(
+                    job.agent_name,
+                    job.harness,
+                    response,
+                    timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                    expected_pane_id=expected_pane_id,
+                    context=context,
+                )
+            outcome = replace(outcome, correlation_id=job.correlation_id)
+        except OperationInterrupted:
+            raise
         except Exception:
             outcome = DispatchOutcome(
                 agent_name=job.agent_name,
@@ -370,8 +440,10 @@ class Coordinator:
                 pane_id=expected_pane_id,
                 error_code="resume_unhandled_error",
                 placement=job.placement,
+                correlation_id=job.correlation_id,
             )
         state = self.store.record_resume_outcome(job, outcome)
+        self._observe_transition(job, self.store.attempt_phase(job.attempt_id))
         return {
             "job_id": job.job_id,
             "state": state.value,
@@ -538,21 +610,39 @@ class Coordinator:
                 correlation_id=job.correlation_id,
             )
         else:
-            outcome = self.dispatcher.dispatch(
-                job.harness,
-                execution_prompt(profile, job.prompt),
-                timeout_seconds=timeout_seconds,
-                agent_name=job.agent_name,
-                context=DispatchContext(
-                    placement=job.placement,
-                    title=job.title,
-                    task_key=job.dedupe_key,
-                    batch_key=batch_key,
-                    worktree_root=self.config.placement.worktree_root,
-                    receipt=job.receipt,
-                    correlation_id=job.correlation_id,
-                ),
+            completion_identity = _completion_identity(job)
+            task_prompt = (
+                structured_completion_prompt(job.prompt, completion_identity)
+                if completion_identity is not None
+                else job.prompt
             )
+            prompt = execution_prompt(profile, task_prompt)
+            context = DispatchContext(
+                placement=job.placement,
+                title=job.title,
+                task_key=job.dedupe_key,
+                batch_key=batch_key,
+                worktree_root=self.config.placement.worktree_root,
+                receipt=job.receipt,
+                correlation_id=job.correlation_id,
+                attempt_progress=lambda progress: self._record_attempt_progress(job, progress),
+                completion_identity=completion_identity,
+            )
+            if job.recovery:
+                outcome = self._recover_job(
+                    job,
+                    prompt,
+                    timeout_seconds=timeout_seconds,
+                    context=context,
+                )
+            else:
+                outcome = self.dispatcher.dispatch(
+                    job.harness,
+                    prompt,
+                    timeout_seconds=timeout_seconds,
+                    agent_name=job.agent_name,
+                    context=context,
+                )
             outcome = replace(outcome, correlation_id=job.correlation_id)
         duration = time.monotonic() - started
         fields = {
@@ -579,6 +669,48 @@ class Coordinator:
                 correlation_id=job.correlation_id,
                 fields=fields,
             )
+        return outcome
+
+    def _recover_job(
+        self,
+        job: ClaimedJob,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        context: DispatchContext,
+    ) -> DispatchOutcome:
+        runtime = job.runtime
+        if runtime is None:
+            return DispatchOutcome(
+                agent_name=job.agent_name,
+                state=AgentState.UNKNOWN,
+                member_reused=True,
+                pane_id=runtime.pane_id if runtime is not None else None,
+                error_code="lease_expired_unaccepted",
+                placement=job.placement,
+            )
+        recoverer = getattr(self.dispatcher, "recover", None)
+        if not callable(recoverer):
+            return DispatchOutcome(
+                agent_name=job.agent_name,
+                state=AgentState.UNKNOWN,
+                member_reused=True,
+                pane_id=runtime.pane_id,
+                error_code="unsafe_turn_adoption",
+                placement=job.placement,
+                execution_path=runtime.execution_path,
+                herdr_workspace_id=runtime.herdr_workspace_id,
+            )
+        outcome = recoverer(
+            job.harness,
+            prompt,
+            timeout_seconds=timeout_seconds,
+            agent_name=job.agent_name,
+            context=context,
+            runtime=runtime,
+        )
+        if not isinstance(outcome, DispatchOutcome):
+            raise ValueError("dispatcher_recovery_invalid")
         return outcome
 
     def _slot_names(self) -> dict[str, tuple[str, ...]]:
@@ -779,12 +911,11 @@ class Coordinator:
         planner = self.config.planner
         if not planner.enabled:
             return
-        metadata_key = f"planner_last_attempt:{self.config.name}"
-        now = time.time()
-        last_attempt = self.store.metadata_float(metadata_key)
-        if last_attempt is not None and now - last_attempt < planner.interval_seconds:
+        if not self.store.reserve_planner_run(
+            self.config.name,
+            planner.interval_seconds,
+        ):
             return
-        self.store.set_metadata_float(metadata_key, now)
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)
         planner.output_file.unlink(missing_ok=True)
         controller = self._controller_harness()
@@ -849,6 +980,12 @@ class Coordinator:
         if remaining <= 0:
             raise _DispatchDeadlineExceeded
         return min(timeout_seconds, remaining)
+
+
+def _completion_identity(job: ClaimedJob) -> CompletionIdentity | None:
+    if job.completion_policy is not CompletionPolicy.STRUCTURED_V2:
+        return None
+    return CompletionIdentity(job.job_id, job.attempt, job.fencing_token)
 
 
 def _controller_agent_name(

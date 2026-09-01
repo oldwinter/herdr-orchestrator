@@ -2,7 +2,7 @@
 
 基于 Herdr 的本地优先多 harness 工作流控制面。
 
-它让一个确定性 coordinator 持续派发任务给 Droid、Grok Build、Codex、pi、Claude Code、Hermes 等交互式 agent，同时保留 durable queue、lease、重试、去重和收据。可选 planner agent 只负责提出结构化任务，不拥有调度与执行权限。
+它让一个确定性 coordinator 持续派发任务给 Droid、Grok Build、Codex、pi、Claude Code、Hermes 等交互式 agent，同时保留 durable queue、lease、重试、去重和收据。可选 planner agent 只向 coordinator 提交结构化任务，不拥有 queue 调度权限；planner 进程仍可使用所选 harness 的工具，也不是安全沙箱。
 
 ## Harness catalog，像 Skills 一样两级加载
 
@@ -32,7 +32,7 @@ just catalog-json
 just profile codex
 ```
 
-catalog 的真源是 `profiles/harnesses/*.toml`，完整上下文在同目录 Markdown。planner 只收到当前 workflow 启用 harness 的紧凑 catalog；任务真正 dispatch 前，coordinator 才读取所选 harness 的完整 Markdown profile 并注入 prompt。
+catalog 的真源是 `profiles/harnesses/*.toml`，完整上下文在同目录 Markdown。planner 只收到当前 workflow 启用 harness 的紧凑 catalog；任务真正 dispatch 前，coordinator 才读取所选 harness 的完整 Markdown profile 并注入 prompt。coordinator 只接受经过 schema 校验的 task JSON，并拒绝 `command`、`argv` 等字段；这不限制 planner harness 自己使用工具，也不把进程变成沙箱。
 
 ## 为什么不是让 Herdr 直接当主控
 
@@ -74,6 +74,9 @@ cd /path/to/target-repository
 npx --yes herdr-orchestrator install --project .
 npx --yes herdr-orchestrator doctor --project .
 ```
+
+`doctor` 不是纯静态检查。对于环境与 CLI 均可用的 harness，它会启动或复用 agent，提交一个
+带 output receipt 的真实只读 readiness turn，并在 probe 后关闭本次创建的临时 agent。
 
 安装器默认检测本机可执行的 harness。也可显式固定：
 
@@ -225,6 +228,36 @@ scrollback。验证依据是 agent 成功启动、prompt 被接受、经过 life
 `idle` 或 `done`，并且 detection output 含指定行前缀。临时 tab 会在成功或失败后关闭；
 已存在并被安全复用的 agent 不会被关闭。
 
+## 结构化 readiness matrix
+
+`readiness-matrix` 从当前 Herdr-managed pane 对启用的 harness 运行真实只读 probe。它记录当前
+Git commit、package version、workflow、canonical workspace digest、每个 harness 的稳定状态、
+phase timings、观测时间和 attempt count：
+
+```bash
+just readiness-matrix
+just readiness-matrix --harness codex --harness claude
+```
+
+只有最终状态为 `ready` 的当前证据标记为 `VERIFIED`。失败、缺失、过期或环境不可用的条目均为
+`NOT VERIFIED`。`herdr_timeout`、`timeout`、`prompt_acceptance_timeout`、
+`agent_provider_failed`、`agent_turn_not_observed`、`herdr_invalid_response`、
+`task_receipt_missing` 和 `readiness_probe_failed` 最多重试一次；认证、无效 model、缺少 executable
+或 profile 不自动重试。输出不包含 prompt、credential、terminal output、完整 response 或任意
+provider 错误文本。
+
+Matrix 在所有 probe 前后都读取 HEAD、`git status --porcelain=v1 --untracked-files=all`，再读取
+HEAD 确认同一次 sample 没有跨 commit。Initial tracked modification、staged change、untracked file 或
+无法检查 source state 时，每个 selected harness 都返回 zero-attempt `readiness_source_dirty`。若
+probe 期间 working tree 或 HEAD 改变，所有 rows 改为 `readiness_source_changed`。Dirty 或 drifted
+source 都不能产生 `VERIFIED` 或 exit 0。
+
+真实 matrix 只在 operator-controlled Herdr pane 运行，不进入 pull-request CI。检测到 `CI` 或
+`GITHUB_ACTIONS` 时，每个 selected harness 都返回 zero-attempt `readiness_ci_forbidden`，不会调用
+probe。Matrix 证明当前机器与 harness 的 dispatch compatibility，不证明 queue 单测、代码质量、
+部署或产品验收。Issue #39 单独负责让自动 routing 消费 readiness evidence；这个命令不改变
+worker eligibility。
+
 若任务长时间停在 `running`、首次启动 timeout、或 agent 看似启动却没有真实执行，按
 [`docs/runtime-troubleshooting.md`](docs/runtime-troubleshooting.md) 区分 provisioning、
 prompt acceptance、working 与 settled，不要只根据 pane 存在或最终标题判断。
@@ -255,16 +288,20 @@ merge、发布、发送、删除 worktree、权限变更和生产操作仍必须
 
 ```bash
 # 显式指定 worker
-just enqueue codex review docs/prompts/review.md review-docs-v1
+just enqueue codex review workflows/prompts/codex-architecture.md review-docs-v1
 just enqueue grok build workflows/prompts/grok-build-check.md build-v1
 
-# 可显式覆盖执行拓扑
-just enqueue codex build workflows/prompts/build.md build-v2 --placement worktree
+# 可显式覆盖执行拓扑，即使静态规则会为只读 review 选择 pane
+just enqueue codex review-isolated workflows/prompts/codex-architecture.md review-isolated-v1 --placement worktree
 just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v2 --placement pane
 
 # 需要内容级机器验收时声明 output 或 file receipt（二选一）
 just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v3 \
   --placement pane --receipt-prefix "TASK-OK inspect"
+
+# 新任务可要求绑定当前 job / attempt / fencing token 的 structured-v2 envelope
+just enqueue codex inspect workflows/prompts/codex-architecture.md inspect-v4 \
+  --placement pane --completion-policy structured-v2
 
 # 不指定 worker，由主控读取 compact catalog 后选择
 just enqueue-auto review workflows/prompts/codex-architecture.md review-auto-v1
@@ -272,9 +309,16 @@ just enqueue-auto review workflows/prompts/codex-architecture.md review-auto-v1
 
 参数依次为 `harness`、`title`、`prompt_file`、`dedupe_key`。相同 workflow 下重复的 `dedupe_key` 不会重复入队。
 
-`status` 同时展示 `agent_settled` 与 `task_verified`。未声明 receipt 的兼容任务会得到
-`task_verified = null`；声明了 `--receipt-prefix` 或 `--receipt-file` 的任务只有验证成功才
-能进入 `succeeded`。
+Completion policy 分为 `legacy-unverified`、`receipt-v1` 和 `structured-v2`。未声明 evidence 的
+兼容任务使用 `legacy-unverified`；output-prefix 与 file receipt 使用 `receipt-v1`；显式
+`--completion-policy structured-v2` 的任务由 coordinator 在 claim 后追加 job ID、attempt 和
+fencing token，原始 prompt、planner 或 router 不能覆盖这些字段。
+
+`status` 同时展示 `agent_settled`、兼容字段 `task_verified`、`completion_policy`、
+`verification_class`、`completion_status`、有界 evidence summary 和稳定 completion error。
+历史 `succeeded` 状态不会因 migration 改写。Structured envelope 只证明当前 attempt 产生了声明的
+机器证据；它不证明 code review、产品验收、release 或 deployment。Idempotent task 即使没有改变
+业务文件，也可用当前 attempt identity 报告已存在的正确结果。
 
 ## 排空、重试与回收
 
@@ -402,7 +446,9 @@ artifact、恢复和退出码见
 
 ## 工作流
 
-首个示例是 [`workflows/multi-harness.toml`](workflows/multi-harness.toml)。它声明：
+仓库跟踪多个声明式 workflow。默认多 harness 示例是
+[`workflows/multi-harness.toml`](workflows/multi-harness.toml)，研究示例是
+[`workflows/grok-research.toml`](workflows/grok-research.toml)。多 harness 示例声明：
 
 - coordinator 的轮询、并发、lease 和重试策略；
 - 六个 harness worker，包括 Grok Build；
@@ -418,5 +464,5 @@ artifact、恢复和退出码见
 - 不在普通 queue 模式自动回答 job approval 或需求 question UI；启动期只自动确认精确匹配的 Claude workspace trust；
 - 不自动 push、merge、发布或删除；
 - 不把 pane terminal output 当完整 transcript；
-- 不让 planner 生成并执行任意 shell command；
+- 不把 planner 输出中的 `command` 或 `argv` 字段交给 coordinator 执行；planner harness 自身的工具使用不受这个数据校验保证，worktree 也不是安全沙箱；
 - 不在 v1 内做跨机器分布式调度。

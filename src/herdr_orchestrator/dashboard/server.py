@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from contextlib import closing
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
@@ -14,12 +16,63 @@ from urllib.parse import urlparse, urlsplit
 from herdr_orchestrator.dashboard.observer import HerdrObserver, SqliteObserver
 from herdr_orchestrator.dashboard.projector import RuntimeProjector
 from herdr_orchestrator.model import WorkflowConfig
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import SCHEMA_VERSION
 
 ASSET_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
+}
+
+_STATE_DB_REQUIRED_COLUMNS = {
+    "schema_meta": frozenset({"version"}),
+    "jobs": frozenset(
+        {
+            "id",
+            "workflow",
+            "title",
+            "harness",
+            "dedupe_key",
+            "placement",
+            "state",
+            "attempts",
+            "max_attempts",
+            "available_at",
+            "lease_until",
+            "agent_name",
+            "error_code",
+            "execution_path",
+            "herdr_workspace_id",
+            "receipt_kind",
+            "agent_settled",
+            "task_verified",
+            "error_summary",
+            "correlation_id",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "receipts": frozenset(
+        {
+            "id",
+            "job_id",
+            "attempt",
+            "state",
+            "agent_name",
+            "agent_state",
+            "member_reused",
+            "pane_id",
+            "error_code",
+            "placement",
+            "execution_path",
+            "herdr_workspace_id",
+            "agent_settled",
+            "task_verified",
+            "error_summary",
+            "correlation_id",
+            "observed_at",
+        }
+    ),
 }
 
 
@@ -28,13 +81,27 @@ class SnapshotFeed:
         self._condition = threading.Condition()
         self._event_id = 0
         self._snapshot: dict[str, object] | None = None
+        self._closed = False
 
     def publish(self, snapshot: dict[str, object]) -> int:
         with self._condition:
+            if self._closed:
+                return self._event_id
             self._event_id += 1
             self._snapshot = snapshot
             self._condition.notify_all()
             return self._event_id
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+
+    def is_closed(self) -> bool:
+        with self._condition:
+            return self._closed
 
     def current(self) -> tuple[int, dict[str, object] | None]:
         with self._condition:
@@ -47,15 +114,56 @@ class SnapshotFeed:
         timeout: float,
     ) -> tuple[int, dict[str, object] | None]:
         with self._condition:
+            if self._closed:
+                return self._event_id, None
             if self._snapshot is not None and event_id > self._event_id:
                 return self._event_id, self._snapshot
+            wait_id = min(event_id, self._event_id)
             self._condition.wait_for(
-                lambda: self._event_id > event_id,
+                lambda: self._closed or self._event_id > wait_id,
                 timeout=timeout,
             )
-            if self._event_id <= event_id:
+            if self.is_closed():
+                return self._event_id, None
+            if self._event_id <= wait_id:
                 return event_id, None
             return self._event_id, self._snapshot
+
+
+def _validate_state_db(path: Path) -> None:
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("dashboard_state_db_invalid") from exc
+    if not resolved.is_file():
+        raise ValueError("dashboard_state_db_not_found")
+
+    try:
+        with closing(
+            sqlite3.connect(
+                f"{resolved.as_uri()}?mode=ro",
+                uri=True,
+                timeout=5,
+            )
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            version_row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
+            version = None if version_row is None else int(version_row["version"])
+            columns_by_table = {
+                table: {
+                    str(row["name"])
+                    for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for table in _STATE_DB_REQUIRED_COLUMNS
+            }
+    except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise ValueError("dashboard_state_db_incompatible") from exc
+
+    if version != SCHEMA_VERSION or any(
+        not required.issubset(columns_by_table.get(table, set()))
+        for table, required in _STATE_DB_REQUIRED_COLUMNS.items()
+    ):
+        raise ValueError("dashboard_state_db_incompatible")
 
 
 class DashboardMonitor:
@@ -122,7 +230,7 @@ class DashboardServer:
             raise ValueError("dashboard_port_invalid")
         if not 0.25 <= poll_seconds <= 60:
             raise ValueError("dashboard_poll_seconds_invalid")
-        Store(config.state_db).initialize()
+        _validate_state_db(config.state_db)
         self.config = config
         self.host = host
         self.port = port
@@ -143,6 +251,8 @@ class DashboardServer:
         except OSError as exc:
             raise ValueError("dashboard_bind_failed") from exc
         self.httpd.daemon_threads = True
+        self._state_lock = threading.Lock()
+        self._state = "created"
 
     @property
     def address(self) -> tuple[str, int]:
@@ -150,15 +260,34 @@ class DashboardServer:
         return str(host), int(port)
 
     def serve_forever(self) -> None:
-        self.monitor.start()
+        with self._state_lock:
+            if self._state != "created":
+                return
+            self._state = "serving"
         try:
+            if self.feed.is_closed():
+                return
+            self.monitor.start()
             self.httpd.serve_forever()
         finally:
+            self.feed.close()
             self.monitor.stop()
             self.httpd.server_close()
+            with self._state_lock:
+                self._state = "closed"
 
     def shutdown(self) -> None:
-        self.httpd.shutdown()
+        with self._state_lock:
+            if self._state == "closed":
+                return
+            serving = self._state == "serving"
+            if not serving:
+                self._state = "closed"
+        self.feed.close()
+        if serving:
+            self.httpd.shutdown()
+        else:
+            self.httpd.server_close()
 
 
 def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
@@ -238,9 +367,12 @@ def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
             self.send_header("Connection", "keep-alive")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
+            self.close_connection = True
             try:
                 while True:
                     next_id, snapshot = feed.wait_after(event_id, timeout=15)
+                    if feed.is_closed():
+                        return
                     if snapshot is None:
                         self.wfile.write(b": heartbeat\n\n")
                     else:
@@ -254,7 +386,7 @@ def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
                         )
                         event_id = next_id
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except OSError:
                 return
 
         def _asset(self, name: str) -> None:

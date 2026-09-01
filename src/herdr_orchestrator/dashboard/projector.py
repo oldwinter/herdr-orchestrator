@@ -208,80 +208,144 @@ def _job_attention(
 
 
 def _topology(herdr: HerdrObservation, project_label: str) -> dict[str, object]:
-    agents_by_pane = {
-        str(row["pane_id"]): row for row in herdr.agents if isinstance(row.get("pane_id"), str)
-    }
-    panes_by_tab: dict[str, list[dict[str, object]]] = {}
-    for pane in herdr.panes:
+    agents_by_pane = _agents_by_pane(herdr.agents)
+    panes_by_tab = _panes_by_tab(herdr.panes, agents_by_pane)
+    tabs_by_workspace = _tabs_by_workspace(herdr.tabs, panes_by_tab)
+    worktree_by_workspace = _worktrees_by_workspace(herdr.worktrees)
+    workspaces, worktrees = _project_workspaces(
+        herdr.workspaces,
+        tabs_by_workspace,
+        worktree_by_workspace,
+    )
+    projects = _project_topology(worktrees, project_label)
+    return {"workspaces": workspaces, "projects": projects}
+
+
+def _agents_by_pane(
+    agents: tuple[dict[str, object], ...],
+) -> dict[str, list[dict[str, object]]]:
+    result: dict[str, list[dict[str, object]]] = {}
+    for agent in agents:
+        pane_id = agent.get("pane_id")
+        if isinstance(pane_id, str):
+            result.setdefault(pane_id, []).append(agent)
+    return result
+
+
+def _panes_by_tab(
+    panes: tuple[dict[str, object], ...],
+    agents_by_pane: Mapping[str, list[dict[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    result: dict[str, list[dict[str, object]]] = {}
+    for pane in panes:
         tab_id = pane.get("tab_id")
         if not isinstance(tab_id, str):
             continue
+        candidates = agents_by_pane.get(str(pane.get("pane_id")), [])
+        matching_agent = next(
+            (candidate for candidate in candidates if _same_topology_location(pane, candidate)),
+            None,
+        )
         projected = dict(pane)
-        agent = agents_by_pane.get(str(pane.get("pane_id")))
-        projected["agent"] = dict(agent) if agent is not None else None
-        panes_by_tab.setdefault(tab_id, []).append(projected)
-    tabs_by_workspace: dict[str, list[dict[str, object]]] = {}
-    for tab in herdr.tabs:
+        projected["agent"] = dict(matching_agent) if matching_agent is not None else None
+        result.setdefault(tab_id, []).append(projected)
+    return result
+
+
+def _tabs_by_workspace(
+    tabs: tuple[dict[str, object], ...],
+    panes_by_tab: Mapping[str, list[dict[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    result: dict[str, list[dict[str, object]]] = {}
+    for tab in tabs:
         workspace_id = tab.get("workspace_id")
         tab_id = tab.get("tab_id")
         if not isinstance(workspace_id, str) or not isinstance(tab_id, str):
             continue
         projected = dict(tab)
-        projected["panes"] = panes_by_tab.get(tab_id, [])
-        tabs_by_workspace.setdefault(workspace_id, []).append(projected)
-    worktree_by_workspace = {
+        projected["panes"] = [
+            pane for pane in panes_by_tab.get(tab_id, []) if _same_topology_location(tab, pane)
+        ]
+        result.setdefault(workspace_id, []).append(projected)
+    return result
+
+
+def _worktrees_by_workspace(
+    worktrees: tuple[dict[str, object], ...],
+) -> dict[str, dict[str, object]]:
+    return {
         str(row["open_workspace_id"]): row
-        for row in herdr.worktrees
+        for row in worktrees
         if isinstance(row.get("open_workspace_id"), str)
     }
-    workspaces: list[dict[str, object]] = []
-    worktrees: list[dict[str, object]] = []
-    for workspace in herdr.workspaces:
+
+
+def _project_workspaces(
+    workspaces: tuple[dict[str, object], ...],
+    tabs_by_workspace: Mapping[str, list[dict[str, object]]],
+    worktree_by_workspace: Mapping[str, dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    projected_workspaces: list[dict[str, object]] = []
+    projected_worktrees: list[dict[str, object]] = []
+    for workspace in workspaces:
         workspace_id = workspace.get("workspace_id")
         if not isinstance(workspace_id, str):
             continue
         projected = dict(workspace)
         projected["tabs"] = tabs_by_workspace.get(workspace_id, [])
-        linked_worktree = worktree_by_workspace.get(
-            workspace_id,
-            projected.get("worktree"),
-        )
+        linked_worktree = worktree_by_workspace.get(workspace_id, projected.get("worktree"))
         projected["worktree"] = linked_worktree
-        workspaces.append(projected)
-        worktrees.append(
-            {
-                "worktree_id": workspace_id,
-                "workspace_id": workspace_id,
-                "label": (
-                    linked_worktree.get("label") if isinstance(linked_worktree, dict) else None
-                )
-                or projected.get("label")
-                or workspace_id,
-                "path": (
-                    linked_worktree.get("path") if isinstance(linked_worktree, dict) else None
-                ),
-                "branch": (
-                    linked_worktree.get("branch") if isinstance(linked_worktree, dict) else None
-                ),
-                "is_linked_worktree": bool(
-                    isinstance(linked_worktree, dict)
-                    and linked_worktree.get("is_linked_worktree") is True
-                ),
-                "tabs": projected["tabs"],
-            }
-        )
-    projects = (
-        [
-            {
-                "project_id": f"workflow:{project_label}",
-                "label": project_label,
-                "worktrees": worktrees,
-            }
-        ]
-        if worktrees
-        else []
-    )
-    return {"workspaces": workspaces, "projects": projects}
+        projected_workspaces.append(projected)
+        projected_worktrees.append(_project_worktree(workspace_id, projected, linked_worktree))
+    return projected_workspaces, projected_worktrees
+
+
+def _project_worktree(
+    workspace_id: str,
+    workspace: Mapping[str, object],
+    linked_worktree: object,
+) -> dict[str, object]:
+    linked = linked_worktree if isinstance(linked_worktree, dict) else {}
+    return {
+        "worktree_id": workspace_id,
+        "workspace_id": workspace_id,
+        "label": linked.get("label") or workspace.get("label") or workspace_id,
+        "path": linked.get("path"),
+        "branch": linked.get("branch"),
+        "is_linked_worktree": linked.get("is_linked_worktree") is True,
+        "tabs": workspace["tabs"],
+    }
+
+
+def _project_topology(
+    worktrees: list[dict[str, object]],
+    project_label: str,
+) -> list[dict[str, object]]:
+    if not worktrees:
+        return []
+    return [
+        {
+            "project_id": f"workflow:{project_label}",
+            "label": project_label,
+            "worktrees": worktrees,
+        }
+    ]
+
+
+def _same_topology_location(
+    left: Mapping[str, object],
+    right: Mapping[str, object],
+) -> bool:
+    for field in ("workspace_id", "tab_id"):
+        left_value = left.get(field)
+        right_value = right.get(field)
+        if (
+            isinstance(left_value, str)
+            and isinstance(right_value, str)
+            and left_value != right_value
+        ):
+            return False
+    return True
 
 
 def _timeline(
