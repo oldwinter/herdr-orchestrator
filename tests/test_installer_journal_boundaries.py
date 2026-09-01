@@ -14,6 +14,24 @@ INSTALLER_FAULT_LOADER = REPO_ROOT / "tests/installer_fault_loader.mjs"
 
 
 class InstallerJournalBoundaryTests(unittest.TestCase):
+    def test_runtime_pack_excludes_the_manager_lockfile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            packed = subprocess.run(
+                ["npm", "pack", "--json", "--dry-run", "--pack-destination", temporary],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(packed.returncode, 0, packed.stderr)
+        payload = json.loads(packed.stdout)
+        package = payload[0] if isinstance(payload, list) else payload["herdr-orchestrator"]
+        self.assertNotIn(
+            "packages/herdr-manager/package-lock.json",
+            {entry["path"] for entry in package["files"]},
+        )
+
     def test_mixed_published_and_owner_intents_are_rejected_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

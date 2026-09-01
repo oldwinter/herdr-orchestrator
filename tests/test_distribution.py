@@ -130,31 +130,6 @@ class DistributionCliTests(unittest.TestCase):
             pack["integrity"],
         )
 
-    def test_runtime_pack_excludes_the_manager_lockfile(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            packed = subprocess.run(
-                [
-                    "npm",
-                    "pack",
-                    "--json",
-                    "--dry-run",
-                    "--pack-destination",
-                    temporary,
-                ],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-            self.assertEqual(packed.returncode, 0, packed.stderr)
-            pack = npm_pack_entry(packed.stdout)
-
-        self.assertNotIn(
-            "packages/herdr-manager/package-lock.json",
-            {entry["path"] for entry in pack["files"]},
-        )
-
     def test_npm_pack_entry_accepts_object_and_array_json_shapes(self) -> None:
         package = {"filename": "herdr-orchestrator-0.1.7.tgz"}
         for payload in (
