@@ -30,6 +30,19 @@ INSTALLER_FAULT_ENV = {
 }
 
 
+def npm_pack_entry(stdout: str) -> dict[str, object]:
+    payload = json.loads(stdout)
+    if isinstance(payload, list):
+        if len(payload) != 1:
+            raise AssertionError("npm pack returned an unexpected number of packages")
+        payload = payload[0]
+    if isinstance(payload, dict) and "herdr-orchestrator" in payload:
+        payload = payload["herdr-orchestrator"]
+    if not isinstance(payload, dict):
+        raise AssertionError("npm pack returned an unexpected package shape")
+    return payload
+
+
 class DistributionCliTests(unittest.TestCase):
     def test_install_help_has_no_filesystem_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -108,14 +121,23 @@ class DistributionCliTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(packed.returncode, 0, packed.stderr)
-            pack = json.loads(packed.stdout)["herdr-orchestrator"]
+            pack = npm_pack_entry(packed.stdout)
             self.assertTrue((Path(temporary) / pack["filename"]).is_file())
-        lock = json.loads((MANAGER_PACKAGE / "package-lock.json").read_text(encoding="utf-8"))
+            lock = json.loads((MANAGER_PACKAGE / "package-lock.json").read_text(encoding="utf-8"))
 
         self.assertEqual(
             lock["packages"]["node_modules/herdr-orchestrator"]["integrity"],
             pack["integrity"],
         )
+
+    def test_npm_pack_entry_accepts_object_and_array_json_shapes(self) -> None:
+        package = {"filename": "herdr-orchestrator-0.1.7.tgz"}
+        for payload in (
+            {"herdr-orchestrator": package},
+            [package],
+        ):
+            with self.subTest(payload_type=type(payload).__name__):
+                self.assertEqual(npm_pack_entry(json.dumps(payload)), package)
 
     def test_npm_dependency_audit_covers_both_package_lockfiles(self) -> None:
         security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
