@@ -113,6 +113,9 @@ probe 前不可用；`readiness_ci_forbidden` 表示命令检测到 CI 环境并
 不可解析结果均为 `NOT VERIFIED`。Raw prompt、terminal output、完整 response 和 provider error
 summary 不会进入 matrix。
 
+`readiness_source_dirty` 表示 tracked、staged、untracked 或无法检查的 working tree bytes 与 matrix
+记录的 commit 不一致。先审查并收口 source state；不要删除或隐藏用户改动来取得 `VERIFIED`。
+
 再读取结构化 agent 状态：
 
 ```bash

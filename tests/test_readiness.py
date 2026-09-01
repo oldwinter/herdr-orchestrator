@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 import unittest
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -280,6 +281,14 @@ class ReadinessMatrixTests(unittest.TestCase):
         workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
         paths = {"herdr": "/bin/herdr", "droid": "/bin/droid", "codex": "/bin/codex"}
 
+        def git_runner(
+            argv: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            output = "1" * 40 + "\n" if "rev-parse" in argv else ""
+            return subprocess.CompletedProcess(argv, 0, output, "")
+
         environment = inspect_readiness_environment(
             workflow,
             environ={
@@ -292,12 +301,7 @@ class ReadinessMatrixTests(unittest.TestCase):
         build = resolve_build_identity(
             workflow.workspace,
             "0.1.6",
-            runner=lambda *args, **kwargs: subprocess.CompletedProcess(
-                args[0],
-                0,
-                "1" * 40 + "\n",
-                "",
-            ),
+            runner=git_runner,
         )
 
         self.assertTrue(environment.managed_pane)
@@ -305,6 +309,50 @@ class ReadinessMatrixTests(unittest.TestCase):
         self.assertFalse(environment.executable_available[Harness.PI])
         self.assertTrue(environment.profile_available[Harness.CODEX])
         self.assertEqual(build, BuildIdentity("1" * 40, "0.1.6"))
+
+    def test_dirty_tracked_or_untracked_source_is_not_verified(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        for dirty_kind in ("tracked", "untracked"):
+            with self.subTest(dirty_kind=dirty_kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    workspace = Path(temporary)
+                    tracked = workspace / "tracked.txt"
+                    _git(workspace, "init", "-q")
+                    tracked.write_text("original\n", encoding="utf-8")
+                    _git(workspace, "add", "tracked.txt")
+                    _git(
+                        workspace,
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.invalid",
+                        "commit",
+                        "-qm",
+                        "initial",
+                    )
+                    if dirty_kind == "tracked":
+                        tracked.write_text("modified\n", encoding="utf-8")
+                    else:
+                        (workspace / "untracked.txt").write_text("new\n", encoding="utf-8")
+                    build = resolve_build_identity(workspace, "0.1.6")
+
+                    matrix = collect_readiness_matrix(
+                        workflow,
+                        selected_harnesses=["droid"],
+                        timeout_seconds=30,
+                        environment=_ready_environment(),
+                        build=build,
+                        probe=lambda *args: self.fail(f"unexpected probe: {args}"),
+                        clock=lambda: NOW,
+                    )
+                    result = matrix.public_json()["results"][0]
+
+                self.assertFalse(build.source_clean)
+                self.assertEqual(result["attempt_count"], 0)
+                self.assertEqual(
+                    result["error_code"],
+                    ReadinessErrorCode.READINESS_SOURCE_DIRTY.value,
+                )
 
     def test_rejects_a_filter_outside_the_enabled_harnesses(self) -> None:
         workflow = load_workflow(REPO_ROOT / "workflows/grok-research.toml")
@@ -344,4 +392,14 @@ def _ready_environment() -> ReadinessEnvironment:
         managed_pane=True,
         executable_available={harness: True for harness in Harness},
         profile_available={harness: True for harness in Harness},
+    )
+
+
+def _git(workspace: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
     )

@@ -117,10 +117,14 @@ class CompletionResult:
             return False
         if self.policy is CompletionPolicy.RECEIPT_V1:
             return self.status is CompletionStatus.COMPLETED and self.evidence_summary is None
+        summary_size = (
+            _utf8_size(self.evidence_summary) if isinstance(self.evidence_summary, str) else None
+        )
         return bool(
             isinstance(self.evidence_summary, str)
             and self.evidence_summary
-            and len(self.evidence_summary.encode("utf-8")) <= 300
+            and summary_size is not None
+            and summary_size <= 300
             and "\n" not in self.evidence_summary
             and "\r" not in self.evidence_summary
         )
@@ -375,19 +379,37 @@ class _DuplicateJsonKey(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _WireEnvelope:
+    serialized: str
+    canonical: str
+
+
 def _select_envelope(output_before: str, output_after: str) -> str:
     fresh_lines = lines_after_snapshot(output_before, output_after)
-    if len("\n".join(fresh_lines).encode("utf-8")) > MAX_COMPLETION_OUTPUT_BYTES:
+    fresh_size = _utf8_size("\n".join(fresh_lines))
+    if fresh_size is None:
+        raise _CompletionFailure("completion_output_invalid")
+    if fresh_size > MAX_COMPLETION_OUTPUT_BYTES:
         raise _CompletionFailure("completion_output_oversized")
-    envelopes = [line for line in map(_wire_line, fresh_lines) if line is not None]
+    baseline = Counter(envelope.canonical for envelope in _wire_envelopes(output_before))
+    observed = _wire_envelopes(output_after)
+    envelopes: list[str] = []
+    for envelope in observed:
+        if baseline[envelope.canonical] > 0:
+            baseline[envelope.canonical] -= 1
+        else:
+            envelopes.append(envelope.serialized)
     if not envelopes:
-        stale = any(_wire_line(line) is not None for line in output_after.splitlines())
-        error_code = "completion_envelope_stale" if stale else "completion_envelope_missing"
+        error_code = "completion_envelope_stale" if observed else "completion_envelope_missing"
         raise _CompletionFailure(error_code)
     if len(envelopes) != 1:
         raise _CompletionFailure("completion_envelope_duplicate")
     serialized = envelopes[0]
-    if len(serialized.encode("utf-8")) > MAX_COMPLETION_ENVELOPE_BYTES:
+    serialized_size = _utf8_size(serialized)
+    if serialized_size is None:
+        raise _CompletionFailure("completion_envelope_malformed")
+    if serialized_size > MAX_COMPLETION_ENVELOPE_BYTES:
         raise _CompletionFailure("completion_envelope_oversized")
     return serialized
 
@@ -452,7 +474,10 @@ def _completion_status(value: str) -> CompletionStatus:
 
 
 def _evidence_summary(value: str) -> str:
-    if len(value.encode("utf-8")) > MAX_EVIDENCE_SUMMARY_BYTES:
+    size = _utf8_size(value)
+    if size is None:
+        raise _CompletionFailure("completion_evidence_invalid")
+    if size > MAX_EVIDENCE_SUMMARY_BYTES:
         raise _CompletionFailure("completion_evidence_oversized")
     if not value.strip():
         raise _CompletionFailure("completion_evidence_invalid")
@@ -492,6 +517,34 @@ def _wire_line(line: str) -> str | None:
     if not normalized.startswith(STRUCTURED_COMPLETION_MARKER):
         return None
     return normalized.removeprefix(STRUCTURED_COMPLETION_MARKER)
+
+
+def _wire_envelopes(output: str) -> list[_WireEnvelope]:
+    envelopes: list[_WireEnvelope] = []
+    for line in output.splitlines():
+        serialized = _wire_line(line)
+        if serialized is not None:
+            envelopes.append(_WireEnvelope(serialized, _canonical_envelope(serialized)))
+    return envelopes
+
+
+def _canonical_envelope(serialized: str) -> str:
+    try:
+        payload = json.loads(
+            serialized,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return serialized.strip()
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+def _utf8_size(value: str) -> int | None:
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
 
 
 def lines_after_snapshot(before: str, after: str) -> list[str]:

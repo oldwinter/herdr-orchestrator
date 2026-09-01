@@ -92,6 +92,16 @@ class CompletionProtocolTests(unittest.TestCase):
         cases = {
             "missing": ("", "ordinary output", "completion_envelope_missing"),
             "stale": (valid, valid, "completion_envelope_stale"),
+            "stale whitespace": (
+                f"  {valid}  ",
+                valid,
+                "completion_envelope_stale",
+            ),
+            "stale bullet": (
+                valid,
+                f"\u2022   {valid}",
+                "completion_envelope_stale",
+            ),
             "malformed": ("", "HERDR-COMPLETION-V2 {", "completion_envelope_malformed"),
             "non-finite": (
                 "",
@@ -142,6 +152,11 @@ class CompletionProtocolTests(unittest.TestCase):
             "empty evidence": (
                 "",
                 _envelope(evidence_summary=""),
+                "completion_evidence_invalid",
+            ),
+            "lone surrogate evidence": (
+                "",
+                _envelope(evidence_summary="\ud800"),
                 "completion_evidence_invalid",
             ),
             "boolean job": (

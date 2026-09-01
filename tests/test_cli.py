@@ -235,6 +235,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(report["results"][0]["attempt_count"], 1)
         self.assertEqual(report["commit"], "a" * 40)
 
+    def test_readiness_matrix_returns_not_verified_for_dirty_source(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        output = io.StringIO()
+        environment = ReadinessEnvironment(
+            True,
+            {harness: True for harness in Harness},
+            {harness: True for harness in Harness},
+        )
+
+        with redirect_stdout(output):
+            code = readiness_matrix(
+                config,
+                selected_harnesses=["droid"],
+                probe_timeout_seconds=15,
+                environment=environment,
+                build=BuildIdentity("a" * 40, "0.1.6", source_clean=False),
+                readiness_probe=lambda *args: self.fail(f"unexpected probe: {args}"),
+                clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
+            )
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verification"], "NOT VERIFIED")
+        self.assertFalse(report["source_clean"])
+        self.assertEqual(report["results"][0]["attempt_count"], 0)
+        self.assertEqual(report["results"][0]["error_code"], "readiness_source_dirty")
+
     def test_enqueue_defaults_to_automatic_selection(self) -> None:
         args = build_parser().parse_args(
             [

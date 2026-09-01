@@ -66,6 +66,7 @@ class ReadinessErrorCode(StrEnum):
     READINESS_RESULT_INVALID = "readiness_result_invalid"
     READINESS_EVIDENCE_EXPIRED = "readiness_evidence_expired"
     READINESS_CI_FORBIDDEN = "readiness_ci_forbidden"
+    READINESS_SOURCE_DIRTY = "readiness_source_dirty"
 
 
 _RETRYABLE_ERRORS = frozenset(
@@ -115,6 +116,7 @@ _STATUS_BY_ERROR: dict[ReadinessErrorCode, ReadinessStatus] = {
     ReadinessErrorCode.READINESS_RESULT_INVALID: ReadinessStatus.ERROR,
     ReadinessErrorCode.READINESS_EVIDENCE_EXPIRED: ReadinessStatus.EXPIRED,
     ReadinessErrorCode.READINESS_CI_FORBIDDEN: ReadinessStatus.UNAVAILABLE,
+    ReadinessErrorCode.READINESS_SOURCE_DIRTY: ReadinessStatus.ERROR,
 }
 
 
@@ -122,12 +124,15 @@ _STATUS_BY_ERROR: dict[ReadinessErrorCode, ReadinessStatus] = {
 class BuildIdentity:
     commit: str
     package_version: str
+    source_clean: bool = True
 
     def __post_init__(self) -> None:
         if _COMMIT.fullmatch(self.commit) is None:
             raise ValueError("readiness_commit_invalid")
         if _PACKAGE_VERSION.fullmatch(self.package_version) is None:
             raise ValueError("readiness_package_version_invalid")
+        if not isinstance(self.source_clean, bool):
+            raise ValueError("readiness_source_state_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +170,7 @@ def resolve_build_identity(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> BuildIdentity:
     try:
-        process = runner(
+        commit_process = runner(
             ["git", "rev-parse", "--verify", "HEAD"],
             cwd=workspace,
             capture_output=True,
@@ -175,9 +180,22 @@ def resolve_build_identity(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError("readiness_commit_unavailable") from exc
-    if process.returncode != 0:
+    if commit_process.returncode != 0:
         raise ValueError("readiness_commit_unavailable")
-    return BuildIdentity(process.stdout.strip(), package_version)
+    try:
+        status_process = runner(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        source_clean = False
+    else:
+        source_clean = status_process.returncode == 0 and not status_process.stdout.strip()
+    return BuildIdentity(commit_process.stdout.strip(), package_version, source_clean)
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +294,7 @@ class ReadinessMatrix:
             "schema_version": 1,
             "commit": self.build.commit,
             "package_version": self.build.package_version,
+            "source_clean": self.build.source_clean,
             "workflow": self.workflow,
             "workspace_id": self.workspace_id,
             "observed_at": _timestamp(self.observed_at),
@@ -300,7 +319,7 @@ def collect_readiness_matrix(
     harnesses = _selected_harnesses(workflow, selected_harnesses)
     entries: list[ReadinessEntry] = []
     for harness in harnesses:
-        preflight_error = _preflight_error(environment, harness)
+        preflight_error = _preflight_error(environment, build, harness)
         if preflight_error is not None:
             entries.append(
                 ReadinessEntry(
@@ -351,10 +370,13 @@ def _selected_harnesses(
 
 def _preflight_error(
     environment: ReadinessEnvironment,
+    build: BuildIdentity,
     harness: Harness,
 ) -> ReadinessErrorCode | None:
     if environment.ci:
         return ReadinessErrorCode.READINESS_CI_FORBIDDEN
+    if not build.source_clean:
+        return ReadinessErrorCode.READINESS_SOURCE_DIRTY
     if not environment.managed_pane:
         return ReadinessErrorCode.NOT_IN_HERDR
     if not environment.executable_available.get(harness, False):

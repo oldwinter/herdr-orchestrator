@@ -246,6 +246,11 @@ just readiness-matrix --harness codex --harness claude
 或 profile 不自动重试。输出不包含 prompt、credential、terminal output、完整 response 或任意
 provider 错误文本。
 
+Matrix 在 probe 前同时读取 `git rev-parse HEAD` 和
+`git status --porcelain=v1 --untracked-files=all`。Tracked modification、staged change、untracked file
+或无法检查 source state 时，每个 selected harness 都返回 zero-attempt
+`readiness_source_dirty`；dirty tree 不能产生 `VERIFIED` 或 exit 0。
+
 真实 matrix 只在 operator-controlled Herdr pane 运行，不进入 pull-request CI。检测到 `CI` 或
 `GITHUB_ACTIONS` 时，每个 selected harness 都返回 zero-attempt `readiness_ci_forbidden`，不会调用
 probe。Matrix 证明当前机器与 harness 的 dispatch compatibility，不证明 queue 单测、代码质量、

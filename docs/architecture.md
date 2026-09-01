@@ -131,14 +131,18 @@ blocked 会立即返回 `idle=false`、`reason=blocked`。结果用 `worker_pool
 `readiness-matrix` 与 durable queue、`doctor` summary、`smoke` 和 routing policy 相互独立。它从当前
 Herdr-managed pane 对每个 enabled 或 repeat-filtered harness 调用既有真实 probe，并输出 schema v1
 matrix。每条结果包含 exact Git commit、package version、workflow、canonical workspace digest、
-harness、closed status、closed error code、allowlisted phase timings、UTC observation time 和 attempt
-count。Serializer 没有 prompt、credential、pane、terminal output、full response 或 arbitrary error
-summary 字段。
+harness、source-clean flag、closed status、closed error code、allowlisted phase timings、UTC observation
+time 和 attempt count。Serializer 没有 prompt、credential、pane、terminal output、full response 或
+arbitrary error summary 字段。
 
 Collector 对 transient closed error set 最多重试一次。认证、invalid model、missing executable、
 missing profile 和 unknown result 不重试。每个 selected harness 必须产生一条结果；不能 probe、probe
 失败、结果过期或结果不可解析时都显式输出 `NOT VERIFIED`。只有所有 selected rows 均为当前
 `ready` evidence 时 matrix 才为 `VERIFIED`。
+
+Exact commit 证据还要求 clean source。Collector 在 live probe 前读取 porcelain Git status；tracked、
+staged、untracked 或无法检查的 source 都投影为 zero-attempt `readiness_source_dirty`。因此 working
+tree bytes 与 recorded commit 不一致时，matrix 不能返回 `VERIFIED`。
 
 真实 matrix 依赖本机登录态，只能由 operator 在 Herdr-managed pane 运行。`CI` 或
 `GITHUB_ACTIONS` 环境返回 zero-attempt `readiness_ci_forbidden`，不会调用 live probe。Matrix 只生产
