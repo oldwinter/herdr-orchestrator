@@ -1,4 +1,5 @@
 const MODULE_SUFFIX = "/bin/installer-journal.mjs";
+const CLI_MODULE_SUFFIX = "/bin/herdr-orchestrator.mjs";
 
 const TEST_RUNTIME = String.raw`
 import { createHash as __faultCreateHash } from "node:crypto";
@@ -44,6 +45,13 @@ function __faultBeforeJournalClaim() {
 
 function __faultPauseAfterPreservedDiscovery() {
   const barrier = process.env.HERDR_ORCHESTRATOR_TEST_PRESERVED_DISCOVERY_BARRIER;
+  if (barrier) {
+    __faultWaitAtBarrier(barrier);
+  }
+}
+
+function __faultPauseAfterPlanning() {
+  const barrier = process.env.HERDR_ORCHESTRATOR_TEST_PLANNING_BARRIER;
   if (barrier) {
     __faultWaitAtBarrier(barrier);
   }
@@ -306,13 +314,29 @@ function instrument(source) {
   return `${TEST_RUNTIME}\n${result}`;
 }
 
+function instrumentCli(source) {
+  const newline = source.indexOf("\n");
+  const shebang = source.startsWith("#!") && newline >= 0
+    ? source.slice(0, newline + 1)
+    : "";
+  const body = source.slice(shebang.length);
+  const result = replaceExact(
+    body,
+    "  const manifest = {\n",
+    "  __faultPauseAfterPlanning();\n  const manifest = {\n",
+  );
+  return `${shebang}${TEST_RUNTIME}\n${result}`;
+}
+
 export async function load(url, context, nextLoad) {
   const loaded = await nextLoad(url, context);
-  if (!url.endsWith(MODULE_SUFFIX)) {
+  if (!url.endsWith(MODULE_SUFFIX) && !url.endsWith(CLI_MODULE_SUFFIX)) {
     return loaded;
   }
   return {
     ...loaded,
-    source: instrument(Buffer.from(loaded.source).toString("utf8")),
+    source: url.endsWith(MODULE_SUFFIX)
+      ? instrument(Buffer.from(loaded.source).toString("utf8"))
+      : instrumentCli(Buffer.from(loaded.source).toString("utf8")),
   };
 }

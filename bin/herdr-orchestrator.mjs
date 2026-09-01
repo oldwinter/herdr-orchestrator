@@ -118,6 +118,20 @@ function sha256(content) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+function installerStateEqual(left, right) {
+  return left.kind === right.kind && (
+    left.kind === "absent"
+    || (
+      left.digest === right.digest
+      && left.mode === right.mode
+    )
+  );
+}
+
+function installerTargetLabel(target) {
+  return target.scope === "project" ? target.path : `git-exclude:${target.path}`;
+}
+
 function stageFile(desiredFiles, relativePath, content) {
   desiredFiles.set(relativePath, Buffer.from(content));
 }
@@ -675,6 +689,21 @@ function install(options) {
     process.exitCode = 1;
     return;
   }
+  const plannedOriginals = new Map();
+  const plannedTargetState = (target) => {
+    const key = `${target.scope}:${target.path}`;
+    if (!plannedOriginals.has(key)) {
+      plannedOriginals.set(
+        key,
+        observeInstallerTarget(project, target, journalContext),
+      );
+    }
+    return plannedOriginals.get(key);
+  };
+  const manifestTarget = projectFileTarget(
+    ".herdr-orchestrator/manifest.json",
+  );
+  const plannedManifestOriginal = plannedTargetState(manifestTarget);
   const previous = loadManifest(project);
   const skillRouterExists = directoryHasFiles(join(project, ".agents/skills"));
   const installSkill = options.installSkill ?? (
@@ -714,15 +743,16 @@ function install(options) {
   const unmanagedFiles = {};
   for (const [relativePath, content] of desiredFiles) {
     assertNoSymlink(project, relativePath);
-    const target = join(project, relativePath);
+    const target = projectFileTarget(relativePath);
+    const current = plannedTargetState(target);
     const desiredHash = sha256(content);
-    if (!existsSync(target)) {
+    if (current.kind === "absent") {
       manifestFiles[relativePath] = desiredHash;
       manifestFileModes[relativePath] = defaultFileMode();
       continue;
     }
-    const currentMode = regularFileMode(target);
-    const currentHash = sha256(readFileSync(target));
+    const currentMode = current.mode;
+    const currentHash = current.digest;
     const previousHash = previousFiles[relativePath];
     const previousMode = previousFileModes[relativePath];
     if (legacyModesUnknown && previousHash !== undefined) {
@@ -761,8 +791,9 @@ function install(options) {
       continue;
     }
     assertNoSymlink(project, relativePath);
-    const target = join(project, relativePath);
-    if (!existsSync(target)) {
+    const target = projectFileTarget(relativePath);
+    const current = plannedTargetState(target);
+    if (current.kind === "absent") {
       continue;
     }
     if (legacyModesUnknown) {
@@ -770,9 +801,9 @@ function install(options) {
       manifestFiles[relativePath] = previousHash;
       continue;
     }
-    const currentMode = regularFileMode(target);
+    const currentMode = current.mode;
     if (
-      sha256(readFileSync(target)) === previousHash
+      current.digest === previousHash
       && (
         previousFileModes[relativePath] === undefined
         || currentMode === previousFileModes[relativePath]
@@ -796,9 +827,10 @@ function install(options) {
       if (manifestFileModes[relativePath] !== undefined) {
         continue;
       }
-      const target = join(project, relativePath);
-      manifestFileModes[relativePath] = existsSync(target)
-        ? regularFileMode(target)
+      const target = projectFileTarget(relativePath);
+      const current = plannedTargetState(target);
+      manifestFileModes[relativePath] = current.kind === "regular"
+        ? current.mode
         : defaultFileMode();
     }
   }
@@ -817,6 +849,12 @@ function install(options) {
   const managesSkill = Object.keys(manifestFiles).some((relativePath) =>
     relativePath.startsWith(".agents/skills/herdr-orchestrator/")
   );
+  const localExcludeTarget = localExcludePath === null
+    ? null
+    : gitExcludeTarget(localExcludePath);
+  const plannedLocalExcludeOriginal = localExcludeTarget === null
+    ? null
+    : plannedTargetState(localExcludeTarget);
   const localExclude = desiredLocalGitExclude(
     project,
     localExcludePath,
@@ -835,7 +873,7 @@ function install(options) {
   ];
   for (const relativePath of managedPaths) {
     const target = projectFileTarget(relativePath);
-    const original = observeInstallerTarget(project, target, journalContext);
+    const original = plannedTargetState(target);
     let desired = installerFileState(null);
     let desiredContent = null;
     if (desiredFiles.has(relativePath)) {
@@ -857,8 +895,8 @@ function install(options) {
     });
   }
   if (localExcludePath !== null) {
-    const target = gitExcludeTarget(localExcludePath);
-    const original = observeInstallerTarget(project, target, journalContext);
+    const target = localExcludeTarget;
+    const original = plannedLocalExcludeOriginal;
     participants.push({
       desired: installerFileState(localExclude.content, original),
       desiredContent: localExclude.content,
@@ -866,20 +904,22 @@ function install(options) {
       target,
     });
   }
-  const manifestTarget = projectFileTarget(
-    ".herdr-orchestrator/manifest.json",
-  );
-  const manifestOriginal = observeInstallerTarget(
-    project,
-    manifestTarget,
-    journalContext,
-  );
   participants.push({
-    desired: installerFileState(manifestContent, manifestOriginal),
+    desired: installerFileState(manifestContent, plannedManifestOriginal),
     desiredContent: manifestContent,
-    original: manifestOriginal,
+    original: plannedManifestOriginal,
     target: manifestTarget,
   });
+  for (const participant of participants) {
+    const actual = observeInstallerTarget(
+      project,
+      participant.target,
+      journalContext,
+    );
+    if (!installerStateEqual(actual, participant.original)) {
+      throw new Error(`installer_state_changed: ${installerTargetLabel(participant.target)}`);
+    }
+  }
   runInstallerTransaction({
     ...journalContext,
     command: options.command === "install" ? "install" : "upgrade",

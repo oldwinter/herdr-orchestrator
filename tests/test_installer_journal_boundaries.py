@@ -465,6 +465,63 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
                 self.assertNotIn(relative_workflow, manifest["files"])
                 self.assertIn(relative_workflow, manifest["unmanaged_files"])
 
+    def test_install_planning_rejects_a_concurrent_prior_only_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            barrier = root / "planning-barrier"
+            (project / ".git").mkdir(parents=True)
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            target = project / ".herdr-orchestrator/profiles/harnesses/droid.toml"
+            original = target.read_bytes()
+            manifest_path = project / ".herdr-orchestrator/manifest.json"
+            manifest_before = manifest_path.read_bytes()
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_PLANNING_BARRIER"] = str(barrier)
+            process = subprocess.Popen(
+                [
+                    *self._node_command(environment),
+                    "upgrade",
+                    "--project",
+                    str(project),
+                    "--harness",
+                    "codex",
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not list(barrier.glob("*.ready")) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(list(barrier.glob("*.ready")))
+                self.assertIsNone(process.poll())
+                edited = original + b"concurrent planning edit\n"
+                target.write_bytes(edited)
+            finally:
+                barrier.mkdir(parents=True, exist_ok=True)
+                (barrier / "release").write_text("", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=30)
+
+            self.assertEqual(process.returncode, 2, f"{stderr}\n{stdout}")
+            self.assertEqual(
+                stderr.strip(),
+                "installer_state_changed: " ".herdr-orchestrator/profiles/harnesses/droid.toml",
+            )
+            self.assertEqual(target.read_bytes(), edited)
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
+            self.assertFalse((project / ".herdr-orchestrator/install-journal.json").exists())
+
     def test_legacy_uninstall_retries_when_no_preserved_project_target_remains(
         self,
     ) -> None:
