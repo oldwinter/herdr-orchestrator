@@ -26,7 +26,11 @@ from herdr_orchestrator.delivery_journal import (
     DeliveryEffectState,
     DeliveryJournal,
 )
-from herdr_orchestrator.delivery_protocol import DeliveryPlan, TicketReceipt
+from herdr_orchestrator.delivery_protocol import (
+    DeliveryPlan,
+    DeliveryTicket,
+    TicketReceipt,
+)
 from herdr_orchestrator.delivery_recovery import DeliveryResult
 from herdr_orchestrator.git_workspace import Worktree
 from herdr_orchestrator.model import (
@@ -35,7 +39,7 @@ from herdr_orchestrator.model import (
     Harness,
     TrackerBackend,
 )
-from herdr_orchestrator.tracker import GithubTracker, TrackerTicket
+from herdr_orchestrator.tracker import GithubTracker, TrackerMarkers, TrackerTicket
 
 
 class DeliveryGithubRunner:
@@ -170,6 +174,75 @@ class CompletedLegacyTracker(AdoptingTracker):
                 )
                 if event["event"] == "effect_confirmed" and isinstance(event["operation_key"], str)
             }
+        return super().adopt(
+            plan,
+            references=references,
+            spec_url=spec_url,
+            markers=markers,
+            receipts=receipts,
+            require_closed=require_closed,
+        )
+
+
+class UnmarkedGithubTracker(GithubTracker):
+    def __init__(self, runner: DeliveryGithubRunner) -> None:
+        super().__init__("owner/project", runner=runner)
+        self.delivery_runner = runner
+
+    def publish(
+        self,
+        plan: DeliveryPlan,
+        *,
+        markers: TrackerMarkers | None = None,
+    ) -> dict[str, TrackerTicket]:
+        return super().publish(plan, markers=None)
+
+    def observe_publication(
+        self,
+        plan: DeliveryPlan,
+        *,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
+    ) -> tuple[dict[str, TrackerTicket], str | None] | None:
+        return (dict(self.references), self.spec_url) if self.references else None
+
+    def close(
+        self,
+        ticket: DeliveryTicket,
+        receipt: TicketReceipt,
+        *,
+        marker: str | None = None,
+    ) -> None:
+        super().close(ticket, receipt, marker=None)
+
+    def observe_close(
+        self,
+        ticket: DeliveryTicket,
+        receipt: TicketReceipt,
+        *,
+        marker: str,
+    ) -> bool:
+        reference = self.references[ticket.ticket_id].reference
+        number = int(reference.rsplit("/", 1)[1])
+        return self.delivery_runner.issues[number]["state"] == "CLOSED"
+
+
+class CountingGithubTracker(GithubTracker):
+    def __init__(self, runner: DeliveryGithubRunner) -> None:
+        super().__init__("owner/project", runner=runner)
+        self.adopt_calls = 0
+
+    def adopt(
+        self,
+        plan: DeliveryPlan,
+        *,
+        references: dict[str, TrackerTicket],
+        spec_url: str | None,
+        markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
+        require_closed: bool = False,
+    ) -> dict[str, TrackerTicket]:
+        self.adopt_calls += 1
         return super().adopt(
             plan,
             references=references,
@@ -821,6 +894,125 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
                 (external["publish_mutations"], external["close_mutations"]),
                 mutation_counts,
             )
+
+    def test_completed_legacy_result_confirmation_precedes_marker_adoption(
+        self,
+    ) -> None:
+        for phase in ("first", "replay"):
+            with self.subTest(phase=phase):
+                self._assert_legacy_post_matched_conflict(phase)
+
+    def _assert_legacy_post_matched_conflict(self, phase: str) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            _initialize_repository(repository)
+            config = _workflow(repository)
+            config = replace(
+                config,
+                standardized_delivery=replace(
+                    config.standardized_delivery,
+                    tracker_backend=TrackerBackend.GITHUB,
+                    github_repository="owner/project",
+                ),
+            )
+            goal = repository / "goal.md"
+            goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+            runner = DeliveryGithubRunner()
+            result = StandardizedDelivery(
+                config,
+                dispatcher=CompleteDispatcher(),
+                tracker=UnmarkedGithubTracker(runner),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            ).run(goal)
+            run_root = result.artifact_root
+            self.assertTrue(
+                all("herdr-delivery" not in issue["body"] for issue in runner.issues.values())
+            )
+            (run_root / "journal.jsonl").unlink()
+            (run_root / "run-owner.json").unlink()
+            baseline_edits = runner.edit_count
+            before_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=run_root / "worktrees/integration",
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            if phase == "replay":
+                interrupted = [False]
+                with (
+                    patch.object(
+                        DeliveryJournal,
+                        "_persist_event",
+                        _interrupt_journal(
+                            DeliveryJournal._persist_event,
+                            "effect_confirmed",
+                            "result:publish",
+                            interrupted,
+                        ),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "journal interruption"),
+                ):
+                    StandardizedDelivery(
+                        config,
+                        dispatcher=CompleteDispatcher(),
+                        tracker=CountingGithubTracker(runner),
+                        controller_harness=Harness.DROID,
+                        worker_harnesses=(Harness.DROID,),
+                    ).run(goal)
+                self.assertTrue(interrupted[0])
+                self.assertEqual(runner.edit_count, baseline_edits)
+
+            tracker = CountingGithubTracker(runner)
+            dispatcher = CompleteDispatcher()
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=dispatcher,
+                tracker=tracker,
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            observe = delivery._observe_completed_legacy_result
+            mutated = [False]
+
+            def mutate_after_match(
+                completed: DeliveryResult,
+                result_payload: dict[str, object],
+                path: Path,
+                expected: dict[str, object] | None,
+            ) -> DeliveryEffectObservation:
+                observation = observe(completed, result_payload, path, expected)
+                if observation.state is DeliveryEffectState.MATCHED and not mutated[0]:
+                    mutated[0] = True
+                    (path.parent / "reviews/round-1/standards.json").unlink()
+                return observation
+
+            with (
+                patch.object(
+                    delivery,
+                    "_observe_completed_legacy_result",
+                    side_effect=mutate_after_match,
+                ),
+                self.assertRaisesRegex(
+                    DeliveryError,
+                    "delivery_recovery_conflict:result.publish",
+                ),
+            ):
+                delivery.run(goal)
+
+            after_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=run_root / "worktrees/integration",
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertTrue(mutated[0])
+            self.assertEqual(tracker.adopt_calls, 0)
+            self.assertEqual(dispatcher.prompts, [])
+            self.assertEqual(runner.edit_count, baseline_edits)
+            self.assertEqual(after_head, before_head)
 
 
 if __name__ == "__main__":

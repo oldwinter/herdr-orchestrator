@@ -367,7 +367,7 @@ class StandardizedDelivery(
                 if tracker_intent is None or (
                     isinstance(migration, dict)
                     and migration.get("completed") is True
-                    and not journal.has_confirmation("result:publish")
+                    and not journal.has_confirmation("tracker:publish")
                 ):
                     self._recover_completed_legacy_result(completed_result)
                 self._validate_completed_result(completed_result)

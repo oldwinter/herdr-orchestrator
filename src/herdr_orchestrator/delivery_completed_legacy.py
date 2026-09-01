@@ -9,8 +9,12 @@ from herdr_orchestrator.delivery_journal import (
     DeliveryEffectObservation,
     DeliveryJournal,
 )
-from herdr_orchestrator.delivery_legacy import legacy_migration_payload
+from herdr_orchestrator.delivery_legacy import (
+    completed_legacy_migration,
+    legacy_migration_payload,
+)
 from herdr_orchestrator.delivery_protocol import (
+    DeliveryArtifactError,
     DeliveryPlan,
     TicketReceipt,
     WayfinderMap,
@@ -28,6 +32,7 @@ from herdr_orchestrator.git_workspace import GitWorkspace, GitWorkspaceError, Wo
 from herdr_orchestrator.model import Harness, WorkflowConfig
 from herdr_orchestrator.tracker import (
     DeliveryTracker,
+    TrackerError,
     TrackerMarkers,
     TrackerTicket,
     tracker_markers,
@@ -107,6 +112,7 @@ class CompletedLegacyRecoveryMixin:
     _recover_integrated_tickets: _RecoverIntegratedTickets
     _inspect_completed_legacy_review_history: _InspectLegacyReviewHistory
     _reconstruct_completed_legacy_review_history: _ReconstructLegacyReviewHistory
+    _revalidate_repair_history: Callable[[DeliveryPlan, Worktree, int, str], None]
     _delivery_base_commit: Callable[[GitWorkspace], str]
     _restore_tracker_publication: Callable[[Path, DeliveryPlan], dict[str, TrackerTicket]]
     _publish_tracker: Callable[[DeliveryPlan], dict[str, TrackerTicket]]
@@ -120,13 +126,7 @@ class CompletedLegacyRecoveryMixin:
             self._run_root / "tracker-publication.json",
             plan,
         )
-        if (
-            result.tickets_completed != len(plan.tickets)
-            or set(result.tracker_references) != {ticket.ticket_id for ticket in plan.tickets}
-            or {ticket_id: reference.reference for ticket_id, reference in references.items()}
-            != result.tracker_references
-        ):
-            raise DeliveryError("delivery_result_invalid")
+        self._validate_completed_legacy_identity(plan, references, result)
         spec_url = getattr(self.tracker, "spec_url", None)
         tracker_intent = self._require_journal()._intent_details("tracker:publish")
         markers = (
@@ -213,6 +213,22 @@ class CompletedLegacyRecoveryMixin:
             raise DeliveryError("delivery_result_integration_commit_mismatch")
         return integration
 
+    @staticmethod
+    def _validate_completed_legacy_identity(
+        plan: DeliveryPlan,
+        references: dict[str, TrackerTicket],
+        result: DeliveryResult,
+    ) -> None:
+        ticket_ids = {ticket.ticket_id for ticket in plan.tickets}
+        published = {ticket_id: reference.reference for ticket_id, reference in references.items()}
+        if (
+            result.integration_branch != f"ho/{plan.slug}/integration"
+            or result.tickets_completed != len(plan.tickets)
+            or set(result.tracker_references) != ticket_ids
+            or published != result.tracker_references
+        ):
+            raise DeliveryError("delivery_result_invalid")
+
     def _preflight_completed_legacy_routes(self) -> None:
         routes = self._run_root / "routes"
         if not routes.is_dir():
@@ -290,16 +306,7 @@ class CompletedLegacyRecoveryMixin:
         path = self._run_root / "result.json"
         if _load_completed_result(path, result.run_id) != result:
             raise DeliveryError("delivery_recovery_conflict:result.publish")
-        result_payload = {
-            "run_id": result.run_id,
-            "status": result.status,
-            "tracker_references": result.tracker_references,
-            "integration_branch": result.integration_branch,
-            "integration_commit": result.integration_commit,
-            "tickets_completed": result.tickets_completed,
-            "review_rounds": result.review_rounds,
-            "preconditions": self._result_preconditions(result),
-        }
+        result_payload = self._completed_legacy_result_payload(result)
         details = {**result_payload, "result_sha256": _file_sha256(path)}
         self._require_journal().reconcile(
             DeliveryEffect(
@@ -313,8 +320,86 @@ class CompletedLegacyRecoveryMixin:
                     expected,
                 ),
                 apply=lambda: details,
+                verify_confirmation=lambda confirmation: (
+                    self._verify_completed_legacy_result_confirmation(
+                        result,
+                        confirmation,
+                    )
+                ),
             )
         )
+
+    def _completed_legacy_result_payload(
+        self,
+        result: DeliveryResult,
+    ) -> dict[str, object]:
+        return {
+            "run_id": result.run_id,
+            "status": result.status,
+            "tracker_references": result.tracker_references,
+            "integration_branch": result.integration_branch,
+            "integration_commit": result.integration_commit,
+            "tickets_completed": result.tickets_completed,
+            "review_rounds": result.review_rounds,
+            "preconditions": self._result_preconditions(result),
+        }
+
+    def _verify_completed_legacy_result_confirmation(
+        self,
+        result: DeliveryResult,
+        confirmation: dict[str, object],
+    ) -> None:
+        try:
+            plan = load_delivery_plan(self._run_root / "delivery-plan.json")
+            references = self._restore_tracker_publication(
+                self._run_root / "tracker-publication.json",
+                plan,
+            )
+            self._validate_completed_legacy_identity(plan, references, result)
+            intent = self._require_journal()._intent_details("tracker:publish")
+            if intent is None or not completed_legacy_migration(intent.get("migration")):
+                raise DeliveryError("delivery_recovery_conflict:result.publish")
+            markers = tracker_markers_from_payload(intent.get("markers"), plan)
+            spec_url = getattr(self.tracker, "spec_url", None)
+            receipts = self._preflight_legacy_delivery(
+                plan,
+                references,
+                spec_url,
+                markers,
+                require_closed=True,
+            )
+            if set(receipts) != {ticket.ticket_id for ticket in plan.tickets}:
+                raise DeliveryError("delivery_recovery_conflict:receipt.ticket.accept")
+            git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
+            base_commit = self._delivery_base_commit(git)
+            integration = self._completed_legacy_integration(git, result, base_commit)
+            if any(
+                git.find_merge(integration, receipt.commit) is None for receipt in receipts.values()
+            ):
+                raise DeliveryError("delivery_recovery_conflict:git.integration.merge")
+            self._inspect_completed_legacy_review_history(
+                plan,
+                integration,
+                result.review_rounds,
+                result.integration_commit,
+            )
+            self._revalidate_repair_history(
+                plan,
+                integration,
+                result.review_rounds,
+                result.integration_commit,
+            )
+            self._preflight_completed_legacy_routes()
+            path = self._run_root / "result.json"
+            existing = _load_completed_result(path, result.run_id)
+            expected = {
+                **self._completed_legacy_result_payload(result),
+                "result_sha256": _file_sha256(path),
+            }
+        except (DeliveryArtifactError, DeliveryError, GitWorkspaceError, TrackerError) as exc:
+            raise DeliveryError("delivery_recovery_conflict:result.publish") from exc
+        if existing != result or confirmation != expected:
+            raise DeliveryError("delivery_recovery_conflict:result.publish")
 
     def _observe_completed_legacy_result(
         self,
