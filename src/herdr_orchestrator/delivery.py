@@ -16,6 +16,7 @@ from herdr_orchestrator.catalog import (
     profile_for_harness,
     render_compact_catalog,
 )
+from herdr_orchestrator.delivery_completed_legacy import CompletedLegacyRecoveryMixin
 from herdr_orchestrator.delivery_journal import (
     DeliveryEffect,
     DeliveryEffectObservation,
@@ -247,7 +248,11 @@ class HerdrDeliveryDispatcher:
             return transport
 
 
-class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
+class StandardizedDelivery(
+    DeliveryRecoveryMixin,
+    DeliveryRepairMixin,
+    CompletedLegacyRecoveryMixin,
+):
     def __init__(
         self,
         config: WorkflowConfig,
@@ -277,6 +282,7 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
         self._ledger_lock = threading.Lock()
         self._previous_state: dict[str, object] = {}
         self._journal: DeliveryJournal | None = None
+        self._legacy_reconstruction_read_only = False
         if lease_seconds is not None and (not _finite_number(lease_seconds) or lease_seconds <= 0):
             raise DeliveryError("delivery_lease_seconds_invalid")
         self._lease_seconds = lease_seconds
@@ -355,6 +361,15 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
             raise
         if completed_result is not None:
             try:
+                journal = self._require_journal()
+                tracker_intent = journal._intent_details("tracker:publish")
+                migration = None if tracker_intent is None else tracker_intent.get("migration")
+                if tracker_intent is None or (
+                    isinstance(migration, dict)
+                    and migration.get("completed") is True
+                    and not journal.has_confirmation("result:publish")
+                ):
+                    self._recover_completed_legacy_result(completed_result)
                 self._validate_completed_result(completed_result)
                 self._publish_result(completed_result)
             except Exception as exc:
@@ -573,6 +588,35 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
         if self._journal is not None:
             self._assert_integration_frontier(git, integration)
         head_before = git.validate_commit(integration)
+        self._reconstruct_review_artifacts(
+            plan,
+            integration,
+            round_number,
+            head_before,
+        )
+        _validate_worktree_ownership(
+            git,
+            self._run_root / "worktrees" / "integration",
+            integration,
+        )
+        head_after = git.validate_commit(integration)
+        if head_after != head_before:
+            raise DeliveryError("delivery_review_mutated_integration")
+        return self._revalidate_review(
+            plan,
+            integration,
+            round_number,
+            head_before,
+        )
+
+    def _reconstruct_review_artifacts(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        round_number: int,
+        integration_commit: str,
+    ) -> None:
+        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
         review_root = self._run_root / "reviews" / f"round-{round_number}"
         _safe_delivery_path(review_root, root=self._run_root)
         review_root.mkdir(parents=True, exist_ok=True)
@@ -616,7 +660,7 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
                     journal_context={
                         "round": round_number,
                         "axis": axis,
-                        "integration_commit": head_before,
+                        "integration_commit": integration_commit,
                     },
                 ): axis
                 for axis, output, prompt, harness in routed
@@ -625,20 +669,6 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
                 future.result()
         for axis, output, _, _ in routed:
             load_review_axis(output, axis)
-        _validate_worktree_ownership(
-            git,
-            self._run_root / "worktrees" / "integration",
-            integration,
-        )
-        head_after = git.validate_commit(integration)
-        if head_after != head_before:
-            raise DeliveryError("delivery_review_mutated_integration")
-        return self._revalidate_review(
-            plan,
-            integration,
-            round_number,
-            head_before,
-        )
 
     def _revalidate_review(
         self,
@@ -673,9 +703,17 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
             try:
                 current = git.validate_commit(integration)
                 _, details = observed()
+                current_matches = current == integration_commit or (
+                    (confirmation is not None or self._is_legacy_migration())
+                    and git.is_ancestor(
+                        integration.path,
+                        integration_commit,
+                        current,
+                    )
+                )
             except (DeliveryArtifactError, GitWorkspaceError):
                 return _effect_conflict()
-            if current != integration_commit:
+            if not current_matches:
                 return _effect_conflict()
             return _effect_matched(details)
 
@@ -810,7 +848,7 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
         ) -> DeliveryEffectObservation:
             inspection_supported = False
             inspected: DispatchOutcome | None = None
-            if started:
+            if started or self._legacy_reconstruction_read_only:
                 try:
                     inspection_supported, inspected = self._inspect_delivery_agent(
                         workspace,
@@ -889,6 +927,8 @@ class StandardizedDelivery(DeliveryRecoveryMixin, DeliveryRepairMixin):
         use_principal_proxy: bool,
         agent_name_override: str | None,
     ) -> DispatchOutcome:
+        if self._legacy_reconstruction_read_only:
+            raise DeliveryError("delivery_recovery_conflict:agent.dispatch")
         for attempt in range(ARTIFACT_PROMPT_ATTEMPTS):
             if use_principal_proxy:
                 outcome = self._dispatch_with_proxy(

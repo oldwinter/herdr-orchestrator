@@ -63,6 +63,29 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
         self.assertIn("`abcdef1234567890`", issue)
         self.assertEqual(resumed_references, references)
 
+    def test_rejects_a_human_note_appended_to_a_completed_ticket(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = _plan()
+            tracker = LocalMarkdownTracker(root)
+            references = tracker.publish(plan)
+            receipt = TicketReceipt(
+                ticket_id="01",
+                commit="abcdef1234567890",
+                acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
+                checks=("python -m unittest: passed",),
+                summary="Implemented the slice.",
+            )
+            tracker.close(plan.tickets[0], receipt)
+            issue = Path(references["01"].reference)
+            issue.write_text(
+                issue.read_text(encoding="utf-8") + "Human note.\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(TrackerError, "tracker_artifact_conflict"):
+                LocalMarkdownTracker(root).publish(plan)
+
     def test_refuses_to_overwrite_conflicting_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -463,6 +486,34 @@ class GithubTrackerTests(unittest.TestCase):
         self.assertEqual(runner.close_count, 1)
         self.assertEqual(runner.issues[42]["state"], "CLOSED")
         self.assertIn(markers.ticket("01"), runner.issues[42]["body"])
+
+    def test_completed_run_adoption_requires_the_ticket_to_remain_closed(self) -> None:
+        runner = StatefulGithubRunner()
+        plan = _plan()
+        legacy = GithubTracker("owner/project", runner=runner)
+        references = legacy.publish(plan)
+        receipt = TicketReceipt(
+            ticket_id="01",
+            commit="abcdef1234567890",
+            acceptance=(AcceptanceResult("The behavior works.", True, "test passes"),),
+            checks=("python -m unittest: passed",),
+            summary="Implemented the slice.",
+        )
+        legacy.close(plan.tickets[0], receipt)
+        runner.issues[42]["state"] = "OPEN"
+        edit_count = runner.edit_count
+
+        with self.assertRaisesRegex(TrackerError, "github_adoption_conflict"):
+            GithubTracker("owner/project", runner=runner).adopt(
+                plan,
+                references=references,
+                spec_url=legacy.spec_url,
+                markers=tracker_markers("3" * 12, plan),
+                receipts={"01": receipt},
+                require_closed=True,
+            )
+
+        self.assertEqual(runner.edit_count, edit_count)
 
     def test_legacy_adoption_rejects_a_human_modified_completed_body_before_edits(
         self,

@@ -332,6 +332,7 @@ class CrashOnceTracker:
         plan: object,
         *,
         markers: object,
+        receipts: object | None = None,
     ) -> tuple[dict[str, TrackerTicket], str | None] | None:
         references = self.external.get("references")
         spec_url = self.external.get("spec_url")
@@ -508,6 +509,7 @@ class CrashAfterCloseTracker:
         plan: object,
         *,
         markers: object,
+        receipts: object | None = None,
     ) -> tuple[dict[str, TrackerTicket], str | None] | None:
         return (
             {"01": TrackerTicket("01", "https://tracker.example/tickets/01")},
@@ -563,6 +565,7 @@ class CrashAfterFirstOfTwoTracker:
         plan: object,
         *,
         markers: object,
+        receipts: object | None = None,
     ) -> tuple[dict[str, TrackerTicket], str | None]:
         return (
             {
@@ -633,6 +636,7 @@ class StableTracker:
         plan: object,
         *,
         markers: object,
+        receipts: object | None = None,
     ) -> tuple[dict[str, TrackerTicket], str | None] | None:
         if not self.external.get("published"):
             return None
@@ -664,6 +668,7 @@ class AdoptingTracker(StableTracker):
         spec_url: str | None,
         markers: object,
         receipts: dict[str, TicketReceipt] | None = None,
+        require_closed: bool = False,
     ) -> dict[str, TrackerTicket]:
         self.adopt_calls += 1
         self.external["published"] = True
@@ -679,6 +684,7 @@ class AdoptingTracker(StableTracker):
         spec_url: str | None,
         markers: object,
         receipts: dict[str, TicketReceipt],
+        require_closed: bool = False,
     ) -> None:
         return None
 
@@ -687,6 +693,7 @@ class AdoptingTracker(StableTracker):
         plan: object,
         *,
         markers: object,
+        receipts: object | None = None,
     ) -> tuple[dict[str, TrackerTicket], str | None] | None:
         return (
             None
@@ -694,6 +701,7 @@ class AdoptingTracker(StableTracker):
             else super().observe_publication(
                 plan,
                 markers=markers,
+                receipts=receipts,
             )
         )
 

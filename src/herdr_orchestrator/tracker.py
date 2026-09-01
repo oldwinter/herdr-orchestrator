@@ -133,6 +133,7 @@ class DeliveryTracker(Protocol):
         spec_url: str | None,
         markers: TrackerMarkers,
         receipts: dict[str, TicketReceipt] | None = None,
+        require_closed: bool = False,
     ) -> dict[str, TrackerTicket]: ...
 
     def inspect_adoption(
@@ -143,6 +144,7 @@ class DeliveryTracker(Protocol):
         spec_url: str | None,
         markers: TrackerMarkers,
         receipts: dict[str, TicketReceipt],
+        require_closed: bool = False,
     ) -> None: ...
 
     def observe_publication(
@@ -150,6 +152,7 @@ class DeliveryTracker(Protocol):
         plan: DeliveryPlan,
         *,
         markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
     ) -> tuple[dict[str, TrackerTicket], str | None] | None: ...
 
     def observe_close(
@@ -225,7 +228,7 @@ class LocalMarkdownTracker:
             _safe_tracker_path(path)
             if path.exists():
                 existing = _read_tracker_text(path)
-                if existing != ready_content and not _completed_ticket_matches(
+                if existing != ready_content and not _exact_completed_ticket(
                     existing,
                     ticket,
                 ):
@@ -262,6 +265,7 @@ class LocalMarkdownTracker:
         spec_url: str | None,
         markers: TrackerMarkers,
         receipts: dict[str, TicketReceipt] | None = None,
+        require_closed: bool = False,
     ) -> dict[str, TrackerTicket]:
         self.inspect_adoption(
             plan,
@@ -269,6 +273,7 @@ class LocalMarkdownTracker:
             spec_url=spec_url,
             markers=markers,
             receipts={} if receipts is None else receipts,
+            require_closed=require_closed,
         )
         self.references = dict(references)
         return dict(references)
@@ -281,6 +286,7 @@ class LocalMarkdownTracker:
         spec_url: str | None,
         markers: TrackerMarkers,
         receipts: dict[str, TicketReceipt],
+        require_closed: bool = False,
     ) -> None:
         if spec_url is not None:
             raise TrackerError("local_tracker_adoption_invalid")
@@ -303,10 +309,16 @@ class LocalMarkdownTracker:
             if not path.is_file():
                 raise TrackerError("local_tracker_adoption_conflict")
             content = _read_tracker_text(path)
-            expected = {render_ticket(ticket)}
             receipt = receipts.get(ticket.ticket_id)
-            if receipt is not None:
-                expected.add(render_ticket(ticket, receipt=receipt))
+            completed = None if receipt is None else render_ticket(ticket, receipt=receipt)
+            if require_closed:
+                if completed is None:
+                    raise TrackerError("local_tracker_adoption_conflict")
+                expected = {completed}
+            else:
+                expected = {render_ticket(ticket)}
+                if completed is not None:
+                    expected.add(completed)
             if content not in expected:
                 raise TrackerError("local_tracker_adoption_conflict")
         if expected_references != references:
@@ -317,6 +329,7 @@ class LocalMarkdownTracker:
         plan: DeliveryPlan,
         *,
         markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
     ) -> tuple[dict[str, TrackerTicket], str | None] | None:
         feature_root = _safe_tracker_path(self.root, plan.slug)
         spec_path = _safe_tracker_path(feature_root, "spec.md")
@@ -334,7 +347,11 @@ class LocalMarkdownTracker:
             if not path.is_file():
                 return None
             body = _read_tracker_text(path)
-            if body != render_ticket(ticket) and not _completed_ticket_matches(body, ticket):
+            expected = {render_ticket(ticket)}
+            receipt = (receipts or {}).get(ticket.ticket_id)
+            if receipt is not None:
+                expected.add(render_ticket(ticket, receipt=receipt))
+            if body not in expected:
                 raise TrackerError("local_tracker_observation_conflict")
             references[ticket.ticket_id] = TrackerTicket(ticket.ticket_id, str(path))
         return references, None
@@ -475,6 +492,7 @@ class GithubTracker:
         spec_url: str | None,
         markers: TrackerMarkers,
         receipts: dict[str, TicketReceipt] | None = None,
+        require_closed: bool = False,
     ) -> dict[str, TrackerTicket]:
         receipt_map = {} if receipts is None else receipts
         edits = self._adoption_edits(
@@ -483,6 +501,7 @@ class GithubTracker:
             spec_url=spec_url,
             markers=markers,
             receipts=receipt_map,
+            require_closed=require_closed,
         )
         for edit in edits:
             self._run_with_body(
@@ -508,6 +527,7 @@ class GithubTracker:
         spec_url: str | None,
         markers: TrackerMarkers,
         receipts: dict[str, TicketReceipt],
+        require_closed: bool = False,
     ) -> None:
         self._adoption_edits(
             plan,
@@ -515,6 +535,7 @@ class GithubTracker:
             spec_url=spec_url,
             markers=markers,
             receipts=receipts,
+            require_closed=require_closed,
         )
 
     def _adoption_edits(
@@ -525,6 +546,7 @@ class GithubTracker:
         spec_url: str | None,
         markers: TrackerMarkers,
         receipts: dict[str, TicketReceipt],
+        require_closed: bool,
     ) -> tuple[_GithubAdoptionEdit, ...]:
         expected_ids = {ticket.ticket_id for ticket in plan.tickets}
         if (
@@ -564,6 +586,7 @@ class GithubTracker:
                 legacy_body,
                 markers.ticket(ticket.ticket_id),
                 completed_body=completed_body,
+                require_closed=require_closed,
             )
             if edit is not None:
                 edits.append(edit)
@@ -577,6 +600,7 @@ class GithubTracker:
         marker: str,
         *,
         completed_body: str | None = None,
+        require_closed: bool = False,
     ) -> _GithubAdoptionEdit | None:
         issue_number = _github_issue_number(self.repository, reference)
         if issue_number is None:
@@ -585,15 +609,16 @@ class GithubTracker:
         marked_body = _marked_body(marker, legacy_body)
         if issue.url != reference or issue.title != title:
             raise TrackerError("github_adoption_conflict")
-        if issue.body == marked_body and issue.state == "OPEN":
+        if not require_closed and issue.body == marked_body and issue.state == "OPEN":
             return None
-        if issue.body == legacy_body and issue.state == "OPEN":
+        if not require_closed and issue.body == legacy_body and issue.state == "OPEN":
             return _GithubAdoptionEdit(issue_number, marked_body)
         if completed_body is not None:
             marked_completed = _marked_body(marker, completed_body)
-            if issue.body == marked_completed and issue.state in {"OPEN", "CLOSED"}:
+            completed_states = {"CLOSED"} if require_closed else {"OPEN", "CLOSED"}
+            if issue.body == marked_completed and issue.state in completed_states:
                 return None
-            if issue.body == completed_body and issue.state in {"OPEN", "CLOSED"}:
+            if issue.body == completed_body and issue.state in completed_states:
                 return _GithubAdoptionEdit(issue_number, marked_completed)
         raise TrackerError("github_adoption_conflict")
 
@@ -602,6 +627,7 @@ class GithubTracker:
         plan: DeliveryPlan,
         *,
         markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt] | None = None,
     ) -> tuple[dict[str, TrackerTicket], str | None] | None:
         spec = self._find_marked_issue(markers.spec)
         if spec is None:
@@ -625,9 +651,19 @@ class GithubTracker:
                 f"## Parent\n\n{spec.url}\n\n"
                 f"{render_ticket(ticket, blocker_references=blocker_references)}",
             )
-            if issue.title != ticket.title or (
-                issue.body != ready and not _completed_ticket_matches(issue.body, ticket)
-            ):
+            receipt = (receipts or {}).get(ticket.ticket_id)
+            completed = (
+                None
+                if receipt is None
+                else _marked_body(
+                    markers.ticket(ticket.ticket_id),
+                    f"## Parent\n\n{spec.url}\n\n{render_ticket(ticket, receipt=receipt)}",
+                )
+            )
+            exact_state = (issue.body == ready and issue.state == "OPEN") or (
+                completed is not None and issue.body == completed and issue.state == "CLOSED"
+            )
+            if issue.title != ticket.title or not exact_state:
                 raise TrackerError("github_marker_conflict")
             references[ticket.ticket_id] = TrackerTicket(ticket.ticket_id, issue.url)
         return references, spec.url
@@ -1099,16 +1135,27 @@ def _write_once_or_match(path: Path, content: str) -> None:
     _write_tracker_text(path, content)
 
 
-def _completed_ticket_matches(content: str, ticket: DeliveryTicket) -> bool:
-    blockers = ", ".join(ticket.blocked_by) if ticket.blocked_by else "None — can start immediately"
-    required = {
-        f"# {ticket.ticket_id} — {ticket.title}",
-        f"**What to build:** {ticket.what_to_build}",
-        f"**Blocked by:** {blockers}",
-        "**Status:** completed",
-        *(f"- [x] {criterion}" for criterion in ticket.acceptance_criteria),
-    }
-    return required.issubset(set(content.splitlines()))
+def _exact_completed_ticket(content: str, ticket: DeliveryTicket) -> bool:
+    prefix = [
+        (
+            "**Status:** completed"
+            if line == "**Status:** ready-for-agent"
+            else line.replace("- [ ] ", "- [x] ", 1) if line.startswith("- [ ] ") else line
+        )
+        for line in render_ticket(ticket).splitlines()
+    ]
+    lines = content.splitlines()
+    tail = lines[len(prefix) :]
+    return (
+        lines[: len(prefix)] == prefix
+        and len(tail) == 6
+        and tail[:3] == ["", "## Completion receipt", ""]
+        and re.fullmatch(r"- Commit: `[^`\r\n]+`", tail[3]) is not None
+        and tail[4].startswith("- Checks: ")
+        and tail[4] != "- Checks: "
+        and tail[5].startswith("- Summary: ")
+        and tail[5] != "- Summary: "
+    )
 
 
 def _slug(value: str) -> str:

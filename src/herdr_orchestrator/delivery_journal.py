@@ -236,6 +236,12 @@ class DeliveryJournal:
         self._mark_started(effect)
         return self._apply_and_confirm(effect)
 
+    def record_intent(self, effect: DeliveryEffect) -> None:
+        self._validate_effect(effect)
+        started, confirmation = self._prepare_effect(effect)
+        if started or confirmation is not None:
+            raise self.error_type("delivery_journal_invalid")
+
     def _validate_effect(self, effect: DeliveryEffect) -> None:
         if (
             re.fullmatch(r"[a-z][a-z0-9:.-]{0,127}", effect.key) is None
@@ -361,6 +367,11 @@ class DeliveryJournal:
         with self._lock:
             intent, _, _ = self._operation(operation_key)
             return intent is not None
+
+    def has_confirmation(self, operation_key: str) -> bool:
+        with self._lock:
+            _, _, confirmation = self._operation(operation_key)
+            return confirmation is not None
 
     def _intent_details(self, operation_key: str) -> dict[str, object] | None:
         with self._lock:

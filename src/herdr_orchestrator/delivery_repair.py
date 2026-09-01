@@ -23,8 +23,10 @@ from herdr_orchestrator.delivery_protocol import (
     DeliveryArtifactError,
     DeliveryPlan,
     FindingSeverity,
+    RepairReceipt,
     ReviewReport,
     load_repair_receipt,
+    load_review_axis,
     load_review_verdict,
 )
 from herdr_orchestrator.delivery_recovery import (
@@ -62,6 +64,16 @@ class _Review(Protocol):
     ) -> ReviewReport: ...
 
 
+class _RevalidateReview(Protocol):
+    def __call__(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        round_number: int,
+        integration_commit: str,
+    ) -> ReviewReport: ...
+
+
 class _DispatchArtifact(Protocol):
     def __call__(
         self,
@@ -93,17 +105,32 @@ class _DispatchWithProxy(Protocol):
     ) -> DispatchOutcome: ...
 
 
+class _ReconstructReviewArtifacts(Protocol):
+    def __call__(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        round_number: int,
+        integration_commit: str,
+    ) -> None: ...
+
+
 class DeliveryRepairMixin:
     config: WorkflowConfig
     controller: Harness
+    worker_harnesses: tuple[Harness, ...]
     _run_root: Path
     _journal: DeliveryJournal | None
     _record: _Record
     _review: _Review
+    _revalidate_review: _RevalidateReview
     _dispatch_artifact: _DispatchArtifact
     _select_worker: _SelectWorker
     _dispatch_with_proxy: _DispatchWithProxy
+    _reconstruct_review_artifacts: _ReconstructReviewArtifacts
+    _preflight_legacy_agent: Callable[[Path, Harness, str], None]
     _require_journal: Callable[[], DeliveryJournal]
+    _is_legacy_migration: Callable[[], bool]
 
     def _review_and_repair(self, plan: DeliveryPlan, integration: Worktree) -> int:
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
@@ -364,6 +391,379 @@ class DeliveryRepairMixin:
         _safe_delivery_path(path, root=self._run_root)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _revalidate_repair_history(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        review_rounds: int,
+        integration_commit: str,
+    ) -> None:
+        journal = self._require_journal()
+        attempts = self._repair_attempts()
+        if review_rounds != attempts + 1:
+            raise DeliveryError("delivery_result_review_rounds_invalid")
+        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
+        expected_review_commit: str | None = None
+        for round_number in range(1, review_rounds + 1):
+            review = journal.require_confirmed(f"review:accept:{round_number}")
+            review_commit = review.get("integration_commit")
+            if (
+                not isinstance(review_commit, str)
+                or (expected_review_commit is not None and review_commit != expected_review_commit)
+                or (round_number == review_rounds and review_commit != integration_commit)
+            ):
+                raise DeliveryError("delivery_recovery_conflict:review.accept")
+            report = self._revalidate_review(
+                plan,
+                integration,
+                round_number,
+                review_commit,
+            )
+            must_fix = self._revalidate_adjudication(
+                plan,
+                report,
+                round_number,
+            )
+            if round_number <= attempts:
+                if not must_fix:
+                    raise DeliveryError("delivery_recovery_conflict:repair.commit")
+                expected_review_commit = self._revalidate_repair_round(
+                    git,
+                    integration,
+                    round_number,
+                    review_commit,
+                )
+            elif must_fix:
+                raise DeliveryError("delivery_result_review_gate_failed")
+
+    def _revalidate_adjudication(
+        self,
+        plan: DeliveryPlan,
+        report: ReviewReport,
+        round_number: int,
+    ) -> dict[str, object]:
+        findings = _finding_map(report)
+        if not findings:
+            verdict_file = self._run_root / "reviews" / f"round-{round_number}" / "verdict.json"
+            if verdict_file.exists():
+                raise DeliveryError("delivery_recovery_conflict:review.adjudicate")
+            return {}
+        verdict_file = self._run_root / "reviews" / f"round-{round_number}" / "verdict.json"
+        try:
+            journal = self._require_journal()
+            key = f"agent:artifact:judge-{round_number}"
+            if not journal.has_intent(key) and not self._is_legacy_migration():
+                journal.require_confirmed(key)
+            self._dispatch_artifact(
+                self.config.workspace,
+                self.controller,
+                review_verdict_prompt(plan, findings, verdict_file),
+                verdict_file,
+                role=f"judge-{round_number}",
+            )
+            journal.require_confirmed(key)
+            verdict = load_review_verdict(
+                verdict_file,
+                candidates=tuple(findings),
+            )
+        except (DeliveryArtifactError, DeliveryError) as exc:
+            raise DeliveryError("delivery_recovery_conflict:review.adjudicate") from exc
+        return {
+            finding_id: findings[finding_id]
+            for finding_id in verdict.accepted
+            if findings[finding_id].severity is FindingSeverity.MUST_FIX
+        }
+
+    def _revalidate_repair_round(
+        self,
+        git: GitWorkspace,
+        integration: Worktree,
+        round_number: int,
+        before: str,
+    ) -> str:
+        journal = self._require_journal()
+        operation_key = f"repair:commit:{round_number}"
+        intent = journal._intent_details(operation_key)
+        confirmation = journal.require_confirmed(operation_key)
+        receipt_file = self._repair_receipt_path(round_number)
+        expected_receipt = str(receipt_file.relative_to(self._run_root))
+        if intent != {
+            "round": round_number,
+            "before_commit": before,
+            "receipt": expected_receipt,
+        }:
+            raise DeliveryError("delivery_recovery_conflict:repair.commit")
+        try:
+            receipt = load_repair_receipt(
+                receipt_file,
+                round_number=round_number,
+                before_commit=before,
+            )
+            parents = git.parents(integration.path, receipt.commit)
+            current = git.head(integration)
+        except (DeliveryArtifactError, GitWorkspaceError) as exc:
+            raise DeliveryError("delivery_recovery_conflict:repair.commit") from exc
+        expected = {
+            "round": round_number,
+            "before_commit": before,
+            "commit": receipt.commit,
+            "receipt_sha256": _file_sha256(receipt_file),
+        }
+        if (
+            confirmation != expected
+            or parents != (before,)
+            or not git.is_ancestor(integration.path, receipt.commit, current)
+        ):
+            raise DeliveryError("delivery_recovery_conflict:repair.commit")
+        return receipt.commit
+
+    def _inspect_completed_legacy_review_history(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        review_rounds: int,
+        integration_commit: str,
+    ) -> tuple[str, ...]:
+        attempts = self._repair_attempts()
+        if self._repair_inflight() is not None or review_rounds != attempts + 1:
+            raise DeliveryError("delivery_result_review_rounds_invalid")
+        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
+        review_commits = self._legacy_review_commits(
+            git,
+            integration,
+            review_rounds,
+            integration_commit,
+        )
+        for round_number, review_commit in enumerate(review_commits, 1):
+            self._inspect_completed_legacy_review_round(
+                plan,
+                integration,
+                git,
+                round_number,
+                review_commit,
+                integration_commit,
+                needs_repair=round_number <= attempts,
+            )
+        return review_commits
+
+    def _legacy_review_commits(
+        self,
+        git: GitWorkspace,
+        integration: Worktree,
+        review_rounds: int,
+        integration_commit: str,
+    ) -> tuple[str, ...]:
+        review_commits: list[str] = []
+        prior_repair: str | None = None
+        for round_number in range(1, review_rounds):
+            receipt = self._legacy_repair_receipt(round_number)
+            if prior_repair is not None and receipt.before_commit != prior_repair:
+                raise DeliveryError("delivery_recovery_conflict:repair.commit")
+            try:
+                parents = git.parents(integration.path, receipt.commit)
+            except GitWorkspaceError as exc:
+                raise DeliveryError("delivery_recovery_conflict:repair.commit") from exc
+            if parents != (receipt.before_commit,):
+                raise DeliveryError("delivery_recovery_conflict:repair.commit")
+            review_commits.append(receipt.before_commit)
+            prior_repair = receipt.commit
+        if prior_repair is not None and prior_repair != integration_commit:
+            raise DeliveryError("delivery_recovery_conflict:repair.commit")
+        review_commits.append(integration_commit)
+        return tuple(review_commits)
+
+    def _inspect_completed_legacy_review_round(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        git: GitWorkspace,
+        round_number: int,
+        review_commit: str,
+        integration_commit: str,
+        *,
+        needs_repair: bool,
+    ) -> None:
+        try:
+            if not git.is_ancestor(
+                integration.path,
+                review_commit,
+                integration_commit,
+            ):
+                raise DeliveryError("delivery_recovery_conflict:review.accept")
+            report = self._load_legacy_review_report(round_number)
+        except (DeliveryArtifactError, GitWorkspaceError) as exc:
+            raise DeliveryError("delivery_recovery_conflict:review.accept") from exc
+        for harness in self.worker_harnesses:
+            for axis in ("standards", "spec"):
+                self._preflight_legacy_agent(
+                    integration.path,
+                    harness,
+                    f"review-{axis}-{round_number}",
+                )
+        must_fix = self._inspect_legacy_adjudication(plan, report, round_number)
+        if needs_repair:
+            if not must_fix:
+                raise DeliveryError("delivery_recovery_conflict:repair.commit")
+            for harness in self.worker_harnesses:
+                self._preflight_legacy_agent(
+                    integration.path,
+                    harness,
+                    f"repair-{round_number}",
+                )
+        elif must_fix:
+            raise DeliveryError("delivery_result_review_gate_failed")
+
+    def _load_legacy_review_report(self, round_number: int) -> ReviewReport:
+        review_root = self._run_root / "reviews" / f"round-{round_number}"
+        return ReviewReport(
+            standards=load_review_axis(review_root / "standards.json", "standards"),
+            spec=load_review_axis(review_root / "spec.json", "spec"),
+        )
+
+    def _inspect_legacy_adjudication(
+        self,
+        plan: DeliveryPlan,
+        report: ReviewReport,
+        round_number: int,
+    ) -> dict[str, object]:
+        findings = _finding_map(report)
+        if not findings:
+            verdict_file = self._run_root / "reviews" / f"round-{round_number}" / "verdict.json"
+            if verdict_file.exists():
+                raise DeliveryError("delivery_recovery_conflict:review.adjudicate")
+            return {}
+        self._preflight_legacy_agent(
+            self.config.workspace,
+            self.controller,
+            f"judge-{round_number}",
+        )
+        try:
+            verdict = load_review_verdict(
+                self._run_root / "reviews" / f"round-{round_number}" / "verdict.json",
+                candidates=tuple(findings),
+            )
+        except DeliveryArtifactError as exc:
+            raise DeliveryError("delivery_recovery_conflict:review.adjudicate") from exc
+        return {
+            finding_id: findings[finding_id]
+            for finding_id in verdict.accepted
+            if findings[finding_id].severity is FindingSeverity.MUST_FIX
+        }
+
+    def _reconstruct_completed_legacy_review_history(
+        self,
+        plan: DeliveryPlan,
+        integration: Worktree,
+        review_commits: tuple[str, ...],
+    ) -> None:
+        git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
+        for round_number, review_commit in enumerate(review_commits, 1):
+            self._reconstruct_review_artifacts(
+                plan,
+                integration,
+                round_number,
+                review_commit,
+            )
+            report = self._revalidate_review(
+                plan,
+                integration,
+                round_number,
+                review_commit,
+            )
+            self._revalidate_adjudication(plan, report, round_number)
+            if round_number < len(review_commits):
+                self._confirm_legacy_repair_round(
+                    git,
+                    integration,
+                    round_number,
+                    review_commit,
+                )
+        self._revalidate_repair_history(
+            plan,
+            integration,
+            len(review_commits),
+            review_commits[-1],
+        )
+
+    def _confirm_legacy_repair_round(
+        self,
+        git: GitWorkspace,
+        integration: Worktree,
+        round_number: int,
+        before: str,
+    ) -> None:
+        receipt = self._legacy_repair_receipt(round_number)
+        if receipt.before_commit != before:
+            raise DeliveryError("delivery_recovery_conflict:repair.commit")
+        receipt_file = self._run_root / "repairs" / f"round-{round_number}.json"
+        details: dict[str, object] = {
+            "round": round_number,
+            "before_commit": before,
+            "commit": receipt.commit,
+            "receipt_sha256": _file_sha256(receipt_file),
+        }
+        self._require_journal().reconcile(
+            DeliveryEffect(
+                key=f"repair:commit:{round_number}",
+                kind="repair.commit",
+                intent={
+                    "round": round_number,
+                    "before_commit": before,
+                    "receipt": str(receipt_file.relative_to(self._run_root)),
+                },
+                observe=lambda expected, started: _effect_matched(details),
+                apply=lambda: details,
+            )
+        )
+        self._revalidate_repair_round(
+            git,
+            integration,
+            round_number,
+            before,
+        )
+
+    def _legacy_repair_receipt(self, round_number: int) -> RepairReceipt:
+        receipt_file = self._run_root / "repairs" / f"round-{round_number}.json"
+        _safe_delivery_path(receipt_file, root=self._run_root)
+        try:
+            payload = json.loads(receipt_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DeliveryError("delivery_recovery_conflict:repair.commit") from exc
+        before = payload.get("before_commit") if isinstance(payload, dict) else None
+        if not isinstance(before, str):
+            raise DeliveryError("delivery_recovery_conflict:repair.commit")
+        try:
+            return load_repair_receipt(
+                receipt_file,
+                round_number=round_number,
+                before_commit=before,
+            )
+        except DeliveryArtifactError as exc:
+            raise DeliveryError("delivery_recovery_conflict:repair.commit") from exc
+
+    def _repair_result_preconditions(
+        self,
+        review_rounds: int,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        journal = self._require_journal()
+        repairs: dict[str, object] = {}
+        for round_number in range(1, review_rounds):
+            repair = journal.require_confirmed(f"repair:commit:{round_number}")
+            repairs[str(round_number)] = {
+                "commit": repair.get("commit"),
+                "receipt_sha256": repair.get("receipt_sha256"),
+            }
+        adjudications: dict[str, object] = {}
+        for round_number in range(1, review_rounds + 1):
+            key = f"agent:artifact:judge-{round_number}"
+            if journal.has_intent(key):
+                adjudication = journal.require_confirmed(key)
+                adjudications[str(round_number)] = {
+                    "artifact_sha256": adjudication.get("artifact_sha256"),
+                    "prompt_sha256": adjudication.get("prompt_sha256"),
+                }
+        return repairs, adjudications
 
     def _complete_repair_attempt(self, round_number: int, commit: str) -> None:
         inflight = self._repair_inflight()

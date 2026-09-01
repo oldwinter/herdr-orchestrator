@@ -21,7 +21,11 @@ from herdr_orchestrator.delivery_journal import (
     DeliveryEffectState,
     DeliveryJournal,
 )
-from herdr_orchestrator.delivery_legacy import legacy_migration_payload
+from herdr_orchestrator.delivery_legacy import (
+    completed_legacy_migration,
+    existing_ticket_receipts,
+    legacy_migration_payload,
+)
 from herdr_orchestrator.delivery_prompts import (
     implementation_prompt,
 )
@@ -29,12 +33,10 @@ from herdr_orchestrator.delivery_protocol import (
     DeliveryArtifactError,
     DeliveryPlan,
     DeliveryTicket,
-    FindingSeverity,
     ReviewFinding,
     ReviewReport,
     TicketReceipt,
     load_delivery_plan,
-    load_review_verdict,
     load_ticket_receipt,
     load_tracker_publication,
     validate_artifact_path,
@@ -148,6 +150,8 @@ class DeliveryRecoveryMixin:
     _repair_inflight: Callable[[], tuple[int, str] | None]
     _delivery_base_commit: Callable[[GitWorkspace], str]
     _revalidate_review: _RevalidateReview
+    _revalidate_repair_history: Callable[[DeliveryPlan, Worktree, int, str], None]
+    _repair_result_preconditions: Callable[[int], tuple[dict[str, object], dict[str, object]]]
 
     def _validate_completed_result(self, result: DeliveryResult) -> None:
         plan = load_delivery_plan(self._run_root / "delivery-plan.json")
@@ -287,23 +291,12 @@ class DeliveryRecoveryMixin:
             )
             self._merge_ticket(git, integration, implemented)
             self._close_ticket(plan, ticket, implemented.receipt)
-        report = self._revalidate_review(
+        self._revalidate_repair_history(
             plan,
             integration,
             result.review_rounds,
             result.integration_commit,
         )
-        findings = _finding_map(report)
-        if findings:
-            verdict = load_review_verdict(
-                self._run_root / "reviews" / f"round-{result.review_rounds}" / "verdict.json",
-                candidates=tuple(findings),
-            )
-            if any(
-                findings[finding_id].severity is FindingSeverity.MUST_FIX
-                for finding_id in verdict.accepted
-            ):
-                raise DeliveryError("delivery_result_review_gate_failed")
 
     def _result_preconditions(self, result: DeliveryResult) -> dict[str, object]:
         journal = self._require_journal()
@@ -330,10 +323,13 @@ class DeliveryRecoveryMixin:
                 "merge_commit": merge.get("integration_commit"),
                 "close_status": close.get("status"),
             }
+        repairs, adjudications = self._repair_result_preconditions(result.review_rounds)
         return {
             "review_round": result.review_rounds,
             "review_commit": result.integration_commit,
             "tickets": tickets,
+            "repairs": repairs,
+            "adjudications": adjudications,
         }
 
     def _observe_result(
@@ -344,6 +340,10 @@ class DeliveryRecoveryMixin:
         expected: dict[str, object] | None,
         started: bool,
     ) -> DeliveryEffectObservation:
+        try:
+            self._revalidate_result_prerequisites(result)
+        except (DeliveryArtifactError, DeliveryError):
+            return _effect_conflict()
         existing = _load_completed_result(path, result.run_id)
         if existing is None:
             return _effect_absent() if expected is None else _effect_conflict()
@@ -361,9 +361,17 @@ class DeliveryRecoveryMixin:
                 "delivery_secret_material_rejected: remove secret material before retry"
             )
         path = self._run_root / "tracker-publication.json"
+        journal = self._journal
+        try:
+            observation_receipts = existing_ticket_receipts(
+                self._run_root,
+                plan,
+                confirmed=None if journal is None else journal.has_confirmation,
+            )
+        except DeliveryArtifactError as exc:
+            raise DeliveryError("delivery_recovery_conflict:receipt.ticket.accept") from exc
         if path.is_file():
             references = self._restore_tracker_publication(path, plan)
-            journal = self._journal
             if journal is not None:
                 recorded = journal._intent_details("tracker:publish")
                 spec_url = getattr(self.tracker, "spec_url", None)
@@ -376,6 +384,7 @@ class DeliveryRecoveryMixin:
                         spec_url,
                         markers,
                     )
+                    observation_receipts = migration_receipts
                     recorded = {
                         "markers": markers.payload(),
                         "migration": legacy_migration_payload(
@@ -389,19 +398,23 @@ class DeliveryRecoveryMixin:
                 else:
                     markers = tracker_markers_from_payload(recorded.get("markers"), plan)
                 migration = recorded.get("migration")
+                migration_completed = completed_legacy_migration(migration)
                 if migration is not None:
                     migration_receipts = self._preflight_legacy_delivery(
                         plan,
                         references,
                         spec_url,
                         markers,
+                        require_closed=migration_completed,
                     )
+                    observation_receipts = migration_receipts
                     if migration != legacy_migration_payload(
                         self._run_root,
                         references,
                         spec_url,
                         migration_receipts,
                         file_sha256=_file_sha256,
+                        completed=migration_completed,
                     ):
                         raise DeliveryError("delivery_recovery_conflict:tracker.publish")
                 apply = (
@@ -412,6 +425,7 @@ class DeliveryRecoveryMixin:
                         references,
                         spec_url,
                         migration_receipts,
+                        migration_completed,
                     )
                     if migration is not None
                     else partial(self._publish_tracker_effect, plan, markers)
@@ -425,6 +439,7 @@ class DeliveryRecoveryMixin:
                             self._observe_tracker_publication,
                             plan,
                             markers,
+                            observation_receipts,
                         ),
                         apply=apply,
                     )
@@ -458,6 +473,7 @@ class DeliveryRecoveryMixin:
                         self._observe_tracker_publication,
                         plan,
                         markers,
+                        observation_receipts,
                     ),
                     apply=partial(self._publish_tracker_effect, plan, markers),
                 )
@@ -477,11 +493,16 @@ class DeliveryRecoveryMixin:
         self,
         plan: DeliveryPlan,
         markers: TrackerMarkers,
+        receipts: dict[str, TicketReceipt],
         expected: dict[str, object] | None,
         started: bool,
     ) -> DeliveryEffectObservation:
         try:
-            observed = self.tracker.observe_publication(plan, markers=markers)
+            observed = self.tracker.observe_publication(
+                plan,
+                markers=markers,
+                receipts=receipts,
+            )
         except TrackerError:
             return _effect_conflict()
         if observed is None:
@@ -522,6 +543,7 @@ class DeliveryRecoveryMixin:
         references: dict[str, TrackerTicket],
         spec_url: str | None,
         receipts: dict[str, TicketReceipt] | None,
+        require_closed: bool,
     ) -> dict[str, object]:
         adopted = self.tracker.adopt(
             plan,
@@ -529,6 +551,7 @@ class DeliveryRecoveryMixin:
             spec_url=spec_url,
             markers=markers,
             receipts=receipts,
+            require_closed=require_closed,
         )
         if adopted != references:
             raise DeliveryError("delivery_tracker_adoption_conflict")
@@ -544,6 +567,8 @@ class DeliveryRecoveryMixin:
         references: dict[str, TrackerTicket],
         spec_url: str | None,
         markers: TrackerMarkers,
+        *,
+        require_closed: bool = False,
     ) -> dict[str, TicketReceipt]:
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
         base_commit = self._delivery_base_commit(git)
@@ -614,6 +639,7 @@ class DeliveryRecoveryMixin:
             spec_url=spec_url,
             markers=markers,
             receipts=receipts,
+            require_closed=require_closed,
         )
         return receipts
 
