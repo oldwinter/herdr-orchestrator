@@ -1,6 +1,6 @@
 {
   "name": "herdr-orchestrator",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Install and run durable multi-harness orchestration over Herdr",
   "keywords": [
     "agents",

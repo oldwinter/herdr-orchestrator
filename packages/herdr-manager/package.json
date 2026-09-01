@@ -1,6 +1,6 @@
 {
   "name": "herdr-manager",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Start a manual Herdr manager session with one npx command",
   "keywords": [
     "agents",
@@ -20,7 +20,7 @@
     "README.md"
   ],
   "dependencies": {
-    "herdr-orchestrator": "0.1.6"
+    "herdr-orchestrator": "0.1.7"
   },
   "engines": {
     "node": ">=20"
