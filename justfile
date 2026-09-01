@@ -17,6 +17,10 @@ install-manager:
 doctor *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}} "$@"
 
+[positional-arguments]
+readiness-matrix *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator readiness-matrix --workflow {{workflow}} "$@"
+
 test:
     @mkdir -p .orchestrator/quality
     @PYTHONPATH=src uv run pytest tests --durations=0 --json-report --json-report-file=.orchestrator/quality/tests.json

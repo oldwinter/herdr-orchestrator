@@ -131,6 +131,10 @@ github_repository = "owner/repo"
 The explicit run authorizes creation of one spec issue and its ticket issues, followed by
 ticket updates and closure. It does not authorize push, pull requests, branch merges,
 releases, or deployment.
+Before the first issue mutation, the run journal persists a random publication nonce and one
+exact marker for the spec and each ticket. A retry searches all issue states for those exact
+markers and reuses only one issue with the expected repository, title, body, and state. Duplicate,
+closed, or conflicting matches stop instead of expanding the run's tracker authority.
 Before a GitHub call, the coordinator rejects deterministic high-confidence secret material in
 the goal or accepted plan with `delivery_secret_material_rejected`. The error contains no secret,
 and the goal guard runs before model dispatch. Direct `GithubTracker.publish` calls apply the
@@ -146,22 +150,33 @@ artifact root fails closed.
 
 | Artifact | Meaning |
 | --- | --- |
-| `state.json` | Current or terminal stage |
+| `state.json` | Derived current or terminal stage projection |
 | `decision-ledger.jsonl` | Controller routes and decisions |
+| `journal.jsonl` | Monotonic owner and side-effect intent/start/confirmation records |
+| `run-owner.json` | Current owner token, renewal time, lease deadline, and release state |
 | `delivery-plan.json` | Accepted spec, seams, and ticket DAG |
 | `git-base.json` | Pinned source repository and base commit |
 | `tracker-publication.json` | Published ticket references and GitHub spec identity |
 | `repair-state.json` | Completed repair count and any in-flight repair |
-| `run.lock` | Exclusive claim for one active coordinator |
+| `run.lock` | Same-host process lock protecting owner acquisition |
 | `wayfinder-*.json`, `wayfinder/` | Optional decision map and resolutions |
 | `routes/` | Strict worker choices |
 | `receipts/` | Ticket acceptance and commit evidence |
+| `repairs/` | Commit-bound repair receipts |
 | `reviews/` | Axis reports and verdicts |
 | `worktrees/` | Ticket and integration checkouts |
 
-`state.json` records `wayfinder`, `spec-and-tickets`, `tracker-publish`, `implementation`, and
-`final-review` while the run is active. A completed run records `status=succeeded` and
-`stage=complete`. An escalation records `status=blocked`; other failures record `status=failed`.
+The owner lease is acquired before controller, tracker, Git, worker, review, repair, or result
+effects. The same-host lock rejects a concurrent process before it can append intent or mutate an
+adapter. A process that dies leaves an active owner record; another process may recover it only
+after the deadline. Every bounded external call renews the lease.
+
+`journal.jsonl` is the recovery source of truth. Each external effect records intent before its
+first mutation, a started event immediately before the call, and confirmation only after a
+read-only observer matches the result. Sequence numbers are contiguous and duplicate JSON keys,
+changed intent, missing ownership, and malformed records fail closed. `state.json` records
+`wayfinder`, `spec-and-tickets`, `tracker-publish`, `implementation`, and
+`final-review` for operators, but it does not authorize replay on its own.
 
 Exit codes:
 
@@ -169,16 +184,17 @@ Exit codes:
 - `2`: validation, dispatch, git, tracker, DAG, receipt, or review failure.
 - `3`: principal-proxy escalation for a protected category.
 
-`delivery_tracker_publish_interrupted` means that a GitHub publish may have changed the remote
-before its identity was saved. The coordinator stops so an operator can reconcile those issues.
-
 Failures preserve worktrees and artifacts. Inspect `state.json` and the ledger before retry.
-The command refuses conflicting local tracker artifacts rather than overwriting them. A retry
-reuses the pinned base, validates worktree ownership, and skips ticket commits already merged
-into integration. Review reports are deleted before each fresh review turn and a missing report
-is retried once on the same agent.
+Recovery compares the journal with tracker bodies/state, worktree ownership and branch identity,
+Git ancestry, named Herdr agent state, receipt digests, review artifact digests and integration
+commit, repair receipts, and the final result. A conflicting human or concurrent change stops with
+`delivery_recovery_conflict:<effect>` and preserves the journal. Frontier advancement requires
+the ticket receipt and integration merge confirmations. Tracker close requires both of those
+confirmations and its own durable intent.
 
-The coordinator persists tracker identity after `publish` returns. Local Markdown and GitHub
-references can then be restored without publishing again. If a GitHub publish stops before that
-identity is persisted, the retry fails with `delivery_tracker_publish_interrupted`; reconcile
-the remote issues before starting another delivery attempt.
+A pre-journal run with `tracker-publication.json` is migrated only when its persisted repository
+references and exact legacy issue bodies still match. Migration journals a new nonce before
+editing those same issues in place to add markers. Existing worktrees, receipts, merge commits,
+and closed local tracker tickets are then adopted through their read-only observers. Ambiguous
+legacy state stops instead of creating replacement issues or attributing an unrelated commit to
+the run.
