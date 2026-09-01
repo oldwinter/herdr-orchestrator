@@ -11,6 +11,13 @@ from unittest.mock import patch
 
 import pytest
 
+from herdr_orchestrator.completion import (
+    CompletionIdentity,
+    CompletionPolicy,
+    CompletionResult,
+    CompletionStatus,
+    VerificationClass,
+)
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.herdr import HerdrTransport
 from herdr_orchestrator.model import (
@@ -530,6 +537,99 @@ def test_recovery_preserves_durable_verified_receipt() -> None:
     assert outcome.error_code is None
     assert outcome.task_verified is True
     assert outcome.agent_settled is True
+
+
+def test_recovery_preserves_durable_structured_completion() -> None:
+    completion = CompletionResult(
+        CompletionPolicy.STRUCTURED_V2,
+        VerificationClass.VERIFIED,
+        CompletionStatus.COMPLETED,
+        "Focused tests passed",
+        None,
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        runtime = AttemptRuntime(
+            "owned-codex",
+            "w1:p2",
+            "w1",
+            str(workspace),
+            "session-1",
+            10,
+            11,
+            12,
+            AttemptPhase.RECEIPT_OBSERVED,
+            AgentState.DONE,
+            True,
+            True,
+            completion,
+        )
+        runner = FakeRunner([{"agent": _agent(workspace, AgentState.DONE, 12)}])
+
+        outcome = _transport(workspace, runner).recover(
+            Harness.CODEX,
+            "must not be sent",
+            timeout_seconds=30,
+            agent_name="owned-codex",
+            context=DispatchContext(
+                PlacementTarget.TAB,
+                "Recover",
+                "recover-structured",
+                completion_identity=CompletionIdentity(41, 2, "fence-current"),
+            ),
+            runtime=runtime,
+        )
+
+    assert outcome.state is AgentState.DONE
+    assert outcome.error_code is None
+    assert outcome.task_verified is True
+    assert outcome.completion == completion
+    assert runner.calls == [["herdr", "agent", "get", "owned-codex"]]
+
+
+def test_recovery_rejects_structured_settlement_without_durable_evidence() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(temporary)
+        runtime = AttemptRuntime(
+            "owned-codex",
+            "w1:p2",
+            "w1",
+            str(workspace),
+            "session-1",
+            10,
+            11,
+            12,
+            AttemptPhase.SETTLED,
+            AgentState.DONE,
+            True,
+            None,
+        )
+        runner = FakeRunner([{"agent": _agent(workspace, AgentState.DONE, 12)}])
+        progress: list[AttemptProgress] = []
+
+        outcome = _transport(workspace, runner).recover(
+            Harness.CODEX,
+            "must not be sent",
+            timeout_seconds=30,
+            agent_name="owned-codex",
+            context=DispatchContext(
+                PlacementTarget.TAB,
+                "Recover",
+                "recover-structured-unverified",
+                attempt_progress=progress.append,
+                completion_identity=CompletionIdentity(41, 2, "fence-current"),
+            ),
+            runtime=runtime,
+        )
+
+    assert outcome.state is AgentState.DONE
+    assert outcome.error_code == "completion_recovery_unverified"
+    assert outcome.task_verified is False
+    assert outcome.completion is not None
+    assert outcome.completion.verification is VerificationClass.VERIFICATION_FAILED
+    assert [event.phase for event in progress] == [AttemptPhase.RECEIPT_OBSERVED]
+    assert progress[0].completion == outcome.completion
+    assert runner.calls == [["herdr", "agent", "get", "owned-codex"]]
 
 
 def test_recovery_preserves_verified_receipt_with_settled_fatal_error() -> None:

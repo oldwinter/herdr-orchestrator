@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import herdr_orchestrator.cli as cli_module
 from herdr_orchestrator.cli import build_parser, doctor, probe_harness_readiness, smoke
+from herdr_orchestrator.completion import CompletionPolicy
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.delivery import DeliveryEscalation
 from herdr_orchestrator.model import (
@@ -219,6 +220,25 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.receipt_prefix, "MOCK-OK harness=pi")
         self.assertIsNone(args.receipt_file)
+
+    def test_enqueue_accepts_structured_completion_policy(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "enqueue",
+                "--workflow",
+                "workflow.toml",
+                "--title",
+                "Inspect",
+                "--prompt-file",
+                "task.md",
+                "--dedupe-key",
+                "inspect-v2",
+                "--completion-policy",
+                "structured-v2",
+            ]
+        )
+
+        self.assertEqual(args.completion_policy, CompletionPolicy.STRUCTURED_V2.value)
 
     def test_run_accepts_separate_controller_and_worker_overrides(self) -> None:
         args = build_parser().parse_args(

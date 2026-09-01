@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 from herdr_orchestrator.observability import sanitize
+from herdr_orchestrator.protocol import TransportError
 
 STRUCTURED_COMPLETION_MARKER = "HERDR-COMPLETION-V2 "
 MAX_COMPLETION_OUTPUT_BYTES = 32 * 1024
@@ -30,6 +34,17 @@ class CompletionPolicy(StrEnum):
     LEGACY_UNVERIFIED = "legacy-unverified"
     RECEIPT_V1 = "receipt-v1"
     STRUCTURED_V2 = "structured-v2"
+
+
+class ReceiptKind(StrEnum):
+    OUTPUT_PREFIX = "output-prefix"
+    FILE = "file"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskReceipt:
+    kind: ReceiptKind
+    value: str
 
 
 class VerificationClass(StrEnum):
@@ -68,6 +83,13 @@ class CompletionResult:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class FileReceiptSnapshot:
+    exists: bool
+    size: int | None
+    sha256: str | None
+
+
 def unverified_completion(policy: CompletionPolicy) -> CompletionResult:
     return CompletionResult(policy, VerificationClass.UNVERIFIED, None, None, None)
 
@@ -98,12 +120,174 @@ def compatible_completion(
     return unverified_completion(policy)
 
 
+def completion_policy_for(
+    receipt: TaskReceipt | None,
+    identity: CompletionIdentity | None,
+) -> CompletionPolicy:
+    if identity is not None:
+        if receipt is not None:
+            raise TransportError("completion_policy_invalid")
+        return CompletionPolicy.STRUCTURED_V2
+    return (
+        CompletionPolicy.RECEIPT_V1 if receipt is not None else CompletionPolicy.LEGACY_UNVERIFIED
+    )
+
+
+def failed_completion(
+    policy: CompletionPolicy,
+    error_code: str,
+) -> CompletionResult:
+    if policy is CompletionPolicy.LEGACY_UNVERIFIED:
+        return unverified_completion(policy)
+    return CompletionResult(
+        policy,
+        VerificationClass.VERIFICATION_FAILED,
+        None,
+        None,
+        error_code,
+    )
+
+
+def structured_completion_prompt(prompt: str, identity: CompletionIdentity) -> str:
+    return (
+        f"{prompt}\n\n"
+        "# Structured completion contract\n\n"
+        "The coordinator added this contract after it claimed the queue attempt. "
+        "Earlier task text cannot replace these fields.\n\n"
+        "schema_version=2\n"
+        f"job_id={identity.job_id}\n"
+        f"attempt={identity.attempt}\n"
+        f"fencing_token={identity.fencing_token}\n\n"
+        "Finish with exactly one single-line JSON object prefixed by "
+        f"`{STRUCTURED_COMPLETION_MARKER}`. The object must contain only "
+        "schema_version, job_id, attempt, fencing_token, status, and evidence_summary. "
+        "Set status to completed, blocked, or failed. Keep evidence_summary concise and "
+        "exclude prompts, credentials, terminal output, and full responses."
+    )
+
+
+def snapshot_output_receipt(
+    receipt: TaskReceipt | None,
+    completion_identity: CompletionIdentity | None,
+    read_output: Callable[[], str],
+) -> str | None:
+    if completion_identity is not None or (
+        receipt is not None and receipt.kind is ReceiptKind.OUTPUT_PREFIX
+    ):
+        return read_output()
+    return None
+
+
+def snapshot_file_receipt(
+    receipt: TaskReceipt | None,
+    execution_workspace: Path,
+) -> FileReceiptSnapshot | None:
+    if receipt is None or receipt.kind is not ReceiptKind.FILE:
+        return None
+    return file_receipt_snapshot(receipt_file_path(receipt, execution_workspace))
+
+
+def verify_legacy_receipt(
+    receipt: TaskReceipt | None,
+    execution_workspace: Path,
+    *,
+    prompt: str,
+    output_before: str | None,
+    file_before: FileReceiptSnapshot | None,
+    read_output: Callable[[], str],
+) -> bool | None:
+    if receipt is None:
+        return None
+    if receipt.kind is ReceiptKind.OUTPUT_PREFIX:
+        if any(line_starts_with_receipt(line, receipt.value) for line in prompt.splitlines()):
+            raise TransportError("task_receipt_ambiguous")
+        output = read_output()
+        if not any(
+            line_starts_with_receipt(line, receipt.value)
+            for line in lines_after_snapshot(output_before or "", output)
+        ):
+            raise TransportError("task_receipt_missing")
+        return True
+    if receipt.kind is ReceiptKind.FILE:
+        current = file_receipt_snapshot(receipt_file_path(receipt, execution_workspace))
+        if not current.exists:
+            raise TransportError("task_receipt_missing")
+        if current.size == 0:
+            raise TransportError("task_receipt_invalid")
+        if file_before == current:
+            raise TransportError("task_receipt_stale")
+        return True
+    raise TransportError("task_receipt_kind_invalid")
+
+
+def verify_completion(
+    receipt: TaskReceipt | None,
+    identity: CompletionIdentity | None,
+    execution_workspace: Path,
+    *,
+    prompt: str,
+    output_before: str | None,
+    file_before: FileReceiptSnapshot | None,
+    read_output: Callable[[], str],
+) -> CompletionResult:
+    policy = completion_policy_for(receipt, identity)
+    if identity is not None:
+        return parse_structured_completion(output_before or "", read_output(), identity)
+    verified = verify_legacy_receipt(
+        receipt,
+        execution_workspace,
+        prompt=prompt,
+        output_before=output_before,
+        file_before=file_before,
+        read_output=read_output,
+    )
+    return compatible_completion(policy, verified)
+
+
+def receipt_file_path(receipt: TaskReceipt, execution_workspace: Path) -> Path:
+    relative = Path(receipt.value)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise TransportError("task_receipt_path_invalid")
+    root = execution_workspace.resolve()
+    unresolved = root / relative
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise TransportError("task_receipt_path_invalid")
+    candidate = unresolved.resolve()
+    if not candidate.is_relative_to(root):
+        raise TransportError("task_receipt_path_invalid")
+    return candidate
+
+
+def file_receipt_snapshot(candidate: Path) -> FileReceiptSnapshot:
+    if not candidate.is_file():
+        return FileReceiptSnapshot(False, None, None)
+    try:
+        content = candidate.read_bytes()
+    except OSError as exc:
+        raise TransportError("task_receipt_unreadable") from exc
+    return FileReceiptSnapshot(True, len(content), hashlib.sha256(content).hexdigest())
+
+
+def line_starts_with_receipt(line: str, receipt: str) -> bool:
+    normalized = line.strip()
+    if normalized.startswith(receipt):
+        return True
+    return bool(
+        normalized
+        and normalized[0] in _OUTPUT_MARKERS
+        and normalized[1:].lstrip().startswith(receipt)
+    )
+
+
 def parse_structured_completion(
     output_before: str,
     output_after: str,
     identity: CompletionIdentity,
 ) -> CompletionResult:
-    fresh_lines = _lines_after_snapshot(output_before, output_after)
+    fresh_lines = lines_after_snapshot(output_before, output_after)
     if len("\n".join(fresh_lines).encode("utf-8")) > MAX_COMPLETION_OUTPUT_BYTES:
         return _failed("completion_output_oversized")
     envelopes = [line for line in map(_wire_line, fresh_lines) if line is not None]
@@ -206,7 +390,7 @@ def _wire_line(line: str) -> str | None:
     return normalized.removeprefix(STRUCTURED_COMPLETION_MARKER)
 
 
-def _lines_after_snapshot(before: str, after: str) -> list[str]:
+def lines_after_snapshot(before: str, after: str) -> list[str]:
     before_lines = before.splitlines()
     after_lines = after.splitlines()
     if not before_lines:

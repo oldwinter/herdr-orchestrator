@@ -18,6 +18,7 @@ from herdr_orchestrator.catalog import (
     profiles_for_workers,
     render_compact_catalog,
 )
+from herdr_orchestrator.completion import CompletionPolicy
 from herdr_orchestrator.config import ConfigError, load_workflow
 from herdr_orchestrator.dashboard import DashboardServer
 from herdr_orchestrator.delivery import (
@@ -143,6 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--receipt-file",
         help="Require this non-empty path relative to the task execution root.",
     )
+    enqueue.add_argument(
+        "--completion-policy",
+        choices=[item.value for item in CompletionPolicy],
+        help="Select the completion evidence contract for this job.",
+    )
     _add_selection_arguments(enqueue)
 
     deliver = subparsers.add_parser("deliver")
@@ -224,6 +230,11 @@ def _command_enqueue(config: WorkflowConfig, args: argparse.Namespace) -> int:
         dedupe_key=args.dedupe_key,
         placement=None if args.placement == "auto" else PlacementTarget(args.placement),
         receipt=_task_receipt_from_args(args),
+        completion_policy=(
+            CompletionPolicy(args.completion_policy)
+            if getattr(args, "completion_policy", None) is not None
+            else None
+        ),
     )
     print(
         json.dumps(

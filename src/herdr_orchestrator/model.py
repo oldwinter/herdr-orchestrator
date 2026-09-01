@@ -5,7 +5,17 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from herdr_orchestrator.completion import CompletionPolicy, CompletionResult
+from herdr_orchestrator.completion import (
+    CompletionIdentity,
+    CompletionPolicy,
+    CompletionResult,
+)
+from herdr_orchestrator.completion import (
+    ReceiptKind as ReceiptKind,
+)
+from herdr_orchestrator.completion import (
+    TaskReceipt as TaskReceipt,
+)
 
 
 class Harness(StrEnum):
@@ -81,11 +91,6 @@ class PlacementTarget(StrEnum):
     TAB = "tab"
     PANE = "pane"
     WORKTREE = "worktree"
-
-
-class ReceiptKind(StrEnum):
-    OUTPUT_PREFIX = "output-prefix"
-    FILE = "file"
 
 
 class TrackerBackend(StrEnum):
@@ -198,12 +203,6 @@ class NewJob:
 
 
 @dataclass(frozen=True, slots=True)
-class TaskReceipt:
-    kind: ReceiptKind
-    value: str
-
-
-@dataclass(frozen=True, slots=True)
 class ClaimedJob:
     job_id: int
     workflow: str
@@ -277,6 +276,7 @@ class DispatchContext:
     receipt: TaskReceipt | None = None
     correlation_id: str = ""
     attempt_progress: Callable[[AttemptProgress], None] | None = None
+    completion_identity: CompletionIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)

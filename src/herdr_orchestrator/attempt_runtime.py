@@ -6,6 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from herdr_orchestrator.completion import (
+    CompletionPolicy,
+    CompletionResult,
+    compatible_completion,
+    completion_policy_for,
+    failed_completion,
+)
 from herdr_orchestrator.model import (
     AgentState,
     AttemptPhase,
@@ -27,7 +34,6 @@ AMBIGUOUS_RESPONSE_SUBMISSION_ERRORS = frozenset(
         "timeout",
     }
 )
-OUTPUT_RECEIPT_UI_MARKERS = {"\u26ec", "⧬", "⏺", "•", "●", "◆", "◇", "✦"}
 
 
 class RecoveryHost(Protocol):
@@ -64,17 +70,6 @@ class _RecoveryObservation:
 
 def elapsed_ms(started: float) -> int:
     return max(0, int((time.monotonic() - started) * 1000))
-
-
-def line_starts_with_receipt(line: str, receipt: str) -> bool:
-    normalized = line.strip()
-    if normalized.startswith(receipt):
-        return True
-    return bool(
-        normalized
-        and normalized[0] in OUTPUT_RECEIPT_UI_MARKERS
-        and normalized[1:].lstrip().startswith(receipt)
-    )
 
 
 def prompt_acceptance_summary(
@@ -169,6 +164,7 @@ class AttemptReporter:
         task_verified: bool | None,
         *,
         sequence: int | None = None,
+        completion: CompletionResult | None = None,
     ) -> None:
         self._emit(
             AttemptProgress(
@@ -182,6 +178,7 @@ class AttemptReporter:
                 member_reused=self.member_reused,
                 agent_settled=state in {AgentState.IDLE, AgentState.DONE},
                 task_verified=task_verified,
+                completion=completion,
             )
         )
 
@@ -253,36 +250,30 @@ def recover_turn(
                 error_summary=exc.summary,
                 agent_settled=True,
             )
-        verified = (
-            None
-            if context.receipt is None
-            else runtime.task_verified if runtime.phase is AttemptPhase.RECEIPT_OBSERVED else False
-        )
+        completion = _recovered_completion(context, runtime)
         if runtime.phase is not AttemptPhase.RECEIPT_OBSERVED:
-            reporter.receipt_observed(state, verified, sequence=sequence)
+            reporter.receipt_observed(
+                state,
+                completion.task_verified,
+                sequence=sequence,
+                completion=completion,
+            )
         return DispatchOutcome(
             agent_name,
             state,
             True,
             pane_id,
-            error_code=(
-                "agent_blocked"
-                if state is AgentState.BLOCKED
-                else (
-                    "task_receipt_recovery_unverified"
-                    if context.receipt is not None and verified is not True
-                    else None
-                )
-            ),
+            error_code=("agent_blocked" if state is AgentState.BLOCKED else completion.error_code),
             placement=context.placement,
             execution_path=runtime.execution_path,
             herdr_workspace_id=runtime.herdr_workspace_id,
-            task_verified=verified,
+            task_verified=completion.task_verified,
             agent_settled=(
                 runtime.agent_settled
                 if runtime.agent_settled is not None
                 else state in {AgentState.IDLE, AgentState.DONE}
             ),
+            completion=completion,
         )
     except TransportError as exc:
         return _recovery_outcome(
@@ -293,6 +284,37 @@ def recover_turn(
             error_summary=exc.summary,
             agent_settled=False,
         )
+
+
+def _recovered_completion(
+    context: DispatchContext,
+    runtime: AttemptRuntime,
+) -> CompletionResult:
+    policy = completion_policy_for(context.receipt, context.completion_identity)
+    if runtime.phase is AttemptPhase.RECEIPT_OBSERVED:
+        if runtime.completion is not None:
+            if runtime.completion.policy is policy:
+                return runtime.completion
+            return failed_completion(policy, "completion_policy_mismatch")
+        return compatible_completion(
+            policy,
+            runtime.task_verified,
+            (
+                "task_receipt_recovery_unverified"
+                if policy is CompletionPolicy.RECEIPT_V1
+                else "completion_recovery_unverified"
+            ),
+        )
+    if policy is CompletionPolicy.LEGACY_UNVERIFIED:
+        return compatible_completion(policy, None)
+    return failed_completion(
+        policy,
+        (
+            "task_receipt_recovery_unverified"
+            if policy is CompletionPolicy.RECEIPT_V1
+            else "completion_recovery_unverified"
+        ),
+    )
 
 
 def _initial_recovery_observation(
@@ -516,6 +538,7 @@ def _recovery_outcome(
     error_summary: str | None = None,
     agent_settled: bool | None = None,
 ) -> DispatchOutcome:
+    completion = _recovered_completion(context, runtime)
     return DispatchOutcome(
         runtime.agent_name,
         state,
@@ -525,7 +548,8 @@ def _recovery_outcome(
         placement=context.placement,
         execution_path=runtime.execution_path,
         herdr_workspace_id=runtime.herdr_workspace_id,
-        task_verified=runtime.task_verified,
+        task_verified=completion.task_verified,
         error_summary=error_summary,
         agent_settled=agent_settled,
+        completion=completion,
     )
