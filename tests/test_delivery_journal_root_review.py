@@ -23,6 +23,7 @@ from test_delivery_journal import (
 from herdr_orchestrator.delivery import DeliveryError, StandardizedDelivery
 from herdr_orchestrator.delivery_journal import (
     DeliveryEffectObservation,
+    DeliveryEffectState,
     DeliveryJournal,
 )
 from herdr_orchestrator.delivery_protocol import DeliveryPlan, TicketReceipt
@@ -445,6 +446,79 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
                     delivery,
                     "_observe_result",
                     side_effect=mutate_before_confirmation,
+                ),
+                self.assertRaisesRegex(
+                    DeliveryError,
+                    "delivery_recovery_conflict:result.publish",
+                ),
+            ):
+                delivery.run(goal)
+            self.assertTrue(mutated[0])
+
+    def test_result_confirmation_rechecks_after_matched_observation(self) -> None:
+        for phase in ("first", "replay"):
+            for mutation in ("receipt", "tracker-close"):
+                with self.subTest(phase=phase, mutation=mutation):
+                    self._assert_post_matched_result_conflict(phase, mutation)
+
+    def _assert_post_matched_result_conflict(
+        self,
+        phase: str,
+        mutation: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            _initialize_repository(repository)
+            config = _workflow(repository)
+            goal = repository / "goal.md"
+            goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+            external: dict[str, object] = {}
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=CompleteDispatcher(),
+                tracker=StableTracker(external),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            if phase == "replay":
+                delivery.run(goal)
+                delivery = StandardizedDelivery(
+                    config,
+                    dispatcher=CompleteDispatcher(),
+                    tracker=StableTracker(external),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                )
+            observe = delivery._observe_result
+            mutated = [False]
+
+            def mutate_after_match(
+                result: DeliveryResult,
+                result_payload: dict[str, object],
+                path: Path,
+                expected: dict[str, object] | None,
+                started: bool,
+            ) -> DeliveryEffectObservation:
+                observation = observe(
+                    result,
+                    result_payload,
+                    path,
+                    expected,
+                    started,
+                )
+                if observation.state is DeliveryEffectState.MATCHED and not mutated[0]:
+                    mutated[0] = True
+                    if mutation == "receipt":
+                        (path.parent / "receipts/ticket-01.json").unlink()
+                    else:
+                        external["closed"] = False
+                return observation
+
+            with (
+                patch.object(
+                    delivery,
+                    "_observe_result",
+                    side_effect=mutate_after_match,
                 ),
                 self.assertRaisesRegex(
                     DeliveryError,

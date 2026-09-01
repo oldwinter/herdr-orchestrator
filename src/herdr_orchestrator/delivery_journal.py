@@ -30,6 +30,7 @@ class DeliveryEffect:
     intent: dict[str, object]
     observe: Callable[[dict[str, object] | None, bool], DeliveryEffectObservation]
     apply: Callable[[], dict[str, object]]
+    verify_confirmation: Callable[[dict[str, object]], None] | None = None
 
 
 class DeliveryEffectState(StrEnum):
@@ -295,7 +296,9 @@ class DeliveryJournal:
     ) -> dict[str, object]:
         if observation.state is not DeliveryEffectState.MATCHED or observed != expected:
             self._record_conflict(effect, "confirmation_mismatch")
-        return dict(confirmation.details)
+        details = dict(confirmation.details)
+        self._verify_confirmation(effect, details)
+        return details
 
     def _confirm_observed(
         self,
@@ -311,6 +314,7 @@ class DeliveryJournal:
                 observed,
                 self.clock(),
             )
+        self._verify_confirmation(effect, observed)
         return observed
 
     def _require_absent_observation(
@@ -342,9 +346,24 @@ class DeliveryJournal:
             if confirmation is not None:
                 if confirmation.details != result:
                     raise self.error_type(f"delivery_recovery_conflict:{effect.kind}")
-                return dict(confirmation.details)
-            self._append_effect_locked("effect_confirmed", effect, result, self.clock())
-        return result
+                confirmed = dict(confirmation.details)
+            else:
+                self._append_effect_locked("effect_confirmed", effect, result, self.clock())
+                confirmed = result
+        self._verify_confirmation(effect, confirmed)
+        return confirmed
+
+    def _verify_confirmation(
+        self,
+        effect: DeliveryEffect,
+        details: dict[str, object],
+    ) -> None:
+        if effect.verify_confirmation is None:
+            return
+        try:
+            effect.verify_confirmation(dict(details))
+        except self.error_type:
+            self._record_conflict(effect, "post_confirmation_conflict")
 
     def _record_conflict(self, effect: DeliveryEffect, reason: str) -> None:
         with self._lock:

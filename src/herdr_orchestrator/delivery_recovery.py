@@ -93,14 +93,6 @@ class _ImplementedTicket:
     receipt: TicketReceipt
 
 
-class _Record(Protocol):
-    def __call__(self, event: str, details: dict[str, object]) -> None: ...
-
-
-class _SelectWorker(Protocol):
-    def __call__(self, title: str, prompt: str, dedupe_key: str) -> Harness: ...
-
-
 class _DispatchWithProxy(Protocol):
     def __call__(
         self,
@@ -122,16 +114,6 @@ class _InspectAgent(Protocol):
     ) -> tuple[bool, DispatchOutcome | None]: ...
 
 
-class _RevalidateReview(Protocol):
-    def __call__(
-        self,
-        plan: DeliveryPlan,
-        integration: Worktree,
-        round_number: int,
-        integration_commit: str,
-    ) -> ReviewReport: ...
-
-
 class DeliveryRecoveryMixin:
     config: WorkflowConfig
     controller: Harness
@@ -141,15 +123,15 @@ class DeliveryRecoveryMixin:
     _run_id: str
     _journal: DeliveryJournal | None
     _previous_state: dict[str, object]
-    _record: _Record
-    _select_worker: _SelectWorker
+    _record: Callable[[str, dict[str, object]], None]
+    _select_worker: Callable[[str, str, str], Harness]
     _dispatch_with_proxy: _DispatchWithProxy
     _inspect_delivery_agent: _InspectAgent
     _delivery_agent_name: Callable[[Path, Harness, str], str]
     _repair_attempts: Callable[[], int]
     _repair_inflight: Callable[[], tuple[int, str] | None]
     _delivery_base_commit: Callable[[GitWorkspace], str]
-    _revalidate_review: _RevalidateReview
+    _revalidate_review: Callable[[DeliveryPlan, Worktree, int, str], ReviewReport]
     _revalidate_repair_history: Callable[[DeliveryPlan, Worktree, int, str], None]
     _repair_result_preconditions: Callable[[int], tuple[dict[str, object], dict[str, object]]]
 
@@ -242,9 +224,31 @@ class DeliveryRecoveryMixin:
                     path,
                 ),
                 apply=publish,
+                verify_confirmation=partial(
+                    self._verify_result_confirmation,
+                    result,
+                    result_payload,
+                    path,
+                ),
             )
         )
         if payload != {**result_payload, "result_sha256": _file_sha256(path)}:
+            raise DeliveryError("delivery_recovery_conflict:result.publish")
+
+    def _verify_result_confirmation(
+        self,
+        result: DeliveryResult,
+        result_payload: dict[str, object],
+        path: Path,
+        confirmation: dict[str, object],
+    ) -> None:
+        try:
+            self._revalidate_result_prerequisites(result)
+            existing = _load_completed_result(path, result.run_id)
+            expected = {**result_payload, "result_sha256": _file_sha256(path)}
+        except (DeliveryArtifactError, DeliveryError) as exc:
+            raise DeliveryError("delivery_recovery_conflict:result.publish") from exc
+        if existing != result or confirmation != expected:
             raise DeliveryError("delivery_recovery_conflict:result.publish")
 
     def _revalidate_result_prerequisites(self, result: DeliveryResult) -> None:
