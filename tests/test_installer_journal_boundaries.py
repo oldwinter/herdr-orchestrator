@@ -14,6 +14,93 @@ INSTALLER_FAULT_LOADER = REPO_ROOT / "tests/installer_fault_loader.mjs"
 
 
 class InstallerJournalBoundaryTests(unittest.TestCase):
+    def test_mixed_published_and_owner_intents_are_rejected_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL"] = "journal:published"
+            interrupted = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                env=environment,
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            directory = project / ".herdr-orchestrator"
+            journal_path = directory / "install-journal.json"
+            owner = next(directory.glob(".install-journal.*.owner"))
+            owner_before = owner.read_bytes()
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            for inventory_name in ("prior_inventory", "desired_inventory"):
+                for item in journal[inventory_name].values():
+                    item["state"].pop("mode", None)
+            for operation in journal["operations"]:
+                operation["original"].pop("mode", None)
+                operation["desired"].pop("mode", None)
+            journal_path.unlink()
+            journal_path.write_text(
+                f"{json.dumps(journal, indent=2)}\n",
+                encoding="utf-8",
+            )
+            journal_before = journal_path.read_bytes()
+
+            doctor = self._run("doctor", "--project", str(project))
+            self.assertEqual(doctor.returncode, 2)
+            self.assertEqual(doctor.stderr.strip(), "installer_journal_invalid")
+            recovered = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(recovered.returncode, 2)
+            self.assertEqual(recovered.stderr.strip(), "installer_journal_invalid")
+            self.assertEqual(owner.read_bytes(), owner_before)
+            self.assertEqual(journal_path.read_bytes(), journal_before)
+            self.assertFalse((project / ".herdr-orchestrator/manifest.json").exists())
+
+    def test_partial_manifest_mode_map_is_rejected_without_mutation(self) -> None:
+        for command, arguments in {
+            "doctor": ["doctor"],
+            "upgrade": ["upgrade", "--harness", "droid"],
+            "uninstall": ["uninstall"],
+        }.items():
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as temporary:
+                project = Path(temporary)
+                (project / ".git").mkdir()
+                installed = self._run(
+                    "install",
+                    "--project",
+                    str(project),
+                    "--harness",
+                    "droid",
+                )
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+                workflow.chmod(0o600)
+                manifest_path = project / ".herdr-orchestrator/manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                del manifest["file_modes"][".herdr-orchestrator/workflows/multi-harness.toml"]
+                manifest_path.write_text(
+                    f"{json.dumps(manifest, indent=2)}\n",
+                    encoding="utf-8",
+                )
+
+                result = self._run(
+                    *arguments,
+                    "--project",
+                    str(project),
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("manifest_invalid", result.stderr)
+                self.assertTrue(workflow.is_file())
+                self.assertEqual(workflow.stat().st_mode & 0o777, 0o600)
+
     def test_install_after_uninstall_reinstalls_skill_with_only_empty_router_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

@@ -255,9 +255,25 @@ class DistributionCliTests(unittest.TestCase):
         self.assertEqual(result.stderr.strip(), "manifest_invalid")
 
     def test_malformed_installer_journal_fails_closed_for_every_reader(self) -> None:
+        def mixed_modes(journal: bytes) -> bytes:
+            payload = json.loads(journal)
+            for inventory_name in ("prior_inventory", "desired_inventory"):
+                for item in payload[inventory_name].values():
+                    item["state"].pop("mode", None)
+            for operation in payload["operations"]:
+                operation["original"].pop("mode", None)
+                operation["desired"].pop("mode", None)
+            next(
+                operation
+                for operation in payload["operations"]
+                if operation["desired"]["kind"] == "regular"
+            )["desired"]["mode"] = 0o777
+            return f"{json.dumps(payload, indent=2)}\n".encode()
+
         corruptions = {
             "invalid-json": lambda journal: b"{",
             "invalid-utf8": lambda journal: journal + b"\xff",
+            "mixed-modes": mixed_modes,
             "digest-mismatch": lambda journal: (
                 lambda payload: f"{json.dumps(payload, indent=2)}\n".encode()
             )(

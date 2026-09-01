@@ -42,6 +42,9 @@ files = ["src"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "--strict-config --strict-markers"
+markers = [
+    "installer_crash_matrix: exhaustive packed installer interruption matrix",
+]
 
 [tool.coverage.run]
 branch = true

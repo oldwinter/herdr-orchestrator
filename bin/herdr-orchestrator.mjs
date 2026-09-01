@@ -171,6 +171,13 @@ function loadManifest(project) {
   ) {
     throw new Error("manifest_invalid");
   }
+  if (
+    manifest.file_modes !== undefined
+    && JSON.stringify(Object.keys(manifest.file_modes).sort())
+      !== JSON.stringify(Object.keys(manifest.files).sort())
+  ) {
+    throw new Error("manifest_invalid");
+  }
   const unmanagedFiles = manifest.unmanaged_files ?? {};
   for (const [relativePath, hash] of Object.entries({
     ...manifest.files,

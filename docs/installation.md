@@ -141,6 +141,10 @@ process is running, concurrent install, upgrade, or uninstall commands stop with
 `installer_transaction_active` before they change the journal or a target. A new process
 atomically adopts a dead owner claim before recovery.
 
+`just test-installer-crash-matrix` runs the packed interruption matrix. `just check` and CI run
+this matrix once as a required gate. The repeated coverage and stability suites exclude only
+this marked test; all other installer tests remain in those suites.
+
 ## Diagnostics
 
 ```bash

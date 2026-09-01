@@ -61,6 +61,20 @@ function stateMatches(left, right) {
   );
 }
 
+function persistedStateEqual(left, right) {
+  return (
+    left.kind === right.kind
+    && (
+      left.kind === "absent"
+      || (
+        left.digest === right.digest
+        && Object.hasOwn(left, "mode") === Object.hasOwn(right, "mode")
+        && left.mode === right.mode
+      )
+    )
+  );
+}
+
 function stateForContent(content, mode) {
   return {
     digest: sha256(content),
@@ -485,8 +499,8 @@ function validateJournal(value) {
     const original = validateState(item.original);
     const desired = validateState(item.desired);
     if (
-      !stateMatches(original, priorInventory[key].state)
-      || !stateMatches(desired, desiredInventory[key].state)
+      !persistedStateEqual(original, priorInventory[key].state)
+      || !persistedStateEqual(desired, desiredInventory[key].state)
     ) {
       throw new Error("installer_journal_invalid");
     }
@@ -500,6 +514,16 @@ function validateJournal(value) {
     decodeDesiredContent(operation);
     return operation;
   });
+  const regularStates = [
+    ...Object.values(priorInventory).map((item) => item.state),
+    ...Object.values(desiredInventory).map((item) => item.state),
+    ...operations.flatMap((operation) => [operation.original, operation.desired]),
+  ].filter((state) => state.kind === "regular");
+  if (
+    new Set(regularStates.map((state) => Object.hasOwn(state, "mode"))).size > 1
+  ) {
+    throw new Error("installer_journal_invalid");
+  }
   if (
     value.progress.completed_operations < 0
     || value.progress.completed_operations > operations.length
@@ -558,6 +582,12 @@ function serializeJournal(journal) {
     schema_version: journal.schema_version,
     transaction_id: journal.transaction_id,
   };
+}
+
+function immutableJournalIntent(journal) {
+  const value = serializeJournal(journal);
+  delete value.progress;
+  return JSON.stringify(value);
 }
 
 function journalPath(project) {
@@ -793,6 +823,19 @@ function recoverPublishedJournal(project) {
     artifact: temporary,
     journal: readOwnedJournalTemporary(temporary),
   }));
+  const intentReference = journal ?? ownerRecords[0]?.journal
+    ?? temporaryRecords[0]?.journal;
+  if (
+    intentReference !== undefined
+    && [...ownerRecords, ...temporaryRecords].some(
+      (record) => (
+        immutableJournalIntent(record.journal)
+        !== immutableJournalIntent(intentReference)
+      ),
+    )
+  ) {
+    throw new Error("installer_journal_invalid");
+  }
   if (
     journal !== null
     && [...ownerRecords, ...temporaryRecords].some(
@@ -1149,12 +1192,18 @@ export function inspectInstallerJournal(context) {
   for (const owner of owners) {
     try {
       const candidate = readJournalOwner(owner);
+      if (immutableJournalIntent(candidate) !== immutableJournalIntent(journal)) {
+        throw new Error("installer_journal_invalid");
+      }
       if (candidate.transaction_id !== journal.transaction_id) {
         journalTemporaryConflicts.push(
           `journal-owner:${basename(owner.path)}`,
         );
       }
-    } catch {
+    } catch (error) {
+      if (error.message === "installer_journal_invalid") {
+        throw error;
+      }
       journalTemporaryConflicts.push(
         `journal-owner:${basename(owner.path)}`,
       );
@@ -1163,12 +1212,18 @@ export function inspectInstallerJournal(context) {
   for (const temporary of temporaries) {
     try {
       const candidate = readOwnedJournalTemporary(temporary);
+      if (immutableJournalIntent(candidate) !== immutableJournalIntent(journal)) {
+        throw new Error("installer_journal_invalid");
+      }
       if (candidate.transaction_id !== journal.transaction_id) {
         journalTemporaryConflicts.push(
           `journal-temporary:${basename(temporary.path)}`,
         );
       }
-    } catch {
+    } catch (error) {
+      if (error.message === "installer_journal_invalid") {
+        throw error;
+      }
       journalTemporaryConflicts.push(
         `journal-temporary:${basename(temporary.path)}`,
       );

@@ -24,7 +24,16 @@ INSTALLER_FAULT_ENV = {
 }
 
 
+def installer_crash_matrix(function):
+    try:
+        import pytest
+    except ModuleNotFoundError:
+        return function
+    return pytest.mark.installer_crash_matrix(function)
+
+
 class InstallerJournalPackedTests(unittest.TestCase):
+    @installer_crash_matrix
     def test_packed_installer_recovers_after_every_durable_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -227,18 +236,19 @@ class InstallerJournalPackedTests(unittest.TestCase):
                 )
 
             def unique_mutation_cutoffs(
-                labels: list[str],
+                events: list[dict[str, str | None]],
                 project: Path,
             ) -> list[tuple[int, str]]:
                 project_prefix = str(project.resolve())
-                seen: set[str] = set()
+                seen: set[tuple[str, str | None]] = set()
                 cutoffs: list[tuple[int, str]] = []
-                for index, label in enumerate(labels, start=1):
-                    normalized = label.replace(project_prefix, "<project>")
-                    if normalized in seen:
+                for index, event in enumerate(events, start=1):
+                    normalized = event["label"].replace(project_prefix, "<project>")
+                    transition = (normalized, event["fingerprint"])
+                    if transition in seen:
                         continue
-                    seen.add(normalized)
-                    cutoffs.append((index, normalized))
+                    seen.add(transition)
+                    cutoffs.append((index, f"{normalized}:{event['fingerprint']}"))
                 return cutoffs
 
             mutation_counts: dict[str, int] = {}
@@ -259,12 +269,16 @@ class InstallerJournalPackedTests(unittest.TestCase):
                     )
                     self.assertEqual(expected_run.returncode, 0, expected_run.stderr)
                     expected_snapshot = snapshot(expected_project)
-                    initial_labels = initial_mutation_log.read_text(encoding="utf-8").splitlines()
-                    self.assertGreater(len(initial_labels), 0)
+                    initial_events = [
+                        json.loads(line)
+                        for line in initial_mutation_log.read_text(encoding="utf-8").splitlines()
+                    ]
+                    self.assertGreater(len(initial_events), 0)
                     initial_cutoffs = unique_mutation_cutoffs(
-                        initial_labels,
+                        initial_events,
                         expected_project,
                     )
+                    self.assertEqual(len(initial_cutoffs), len(initial_events))
 
                     def run_initial_cutoff(
                         cutoff: tuple[int, str],
@@ -355,12 +369,19 @@ class InstallerJournalPackedTests(unittest.TestCase):
                         expected_snapshot,
                         f"{operation} recovery label discovery",
                     )
-                    recovery_labels = recovery_mutation_log.read_text(encoding="utf-8").splitlines()
-                    self.assertIn("journal:published:recovered", recovery_labels)
+                    recovery_events = [
+                        json.loads(line)
+                        for line in recovery_mutation_log.read_text(encoding="utf-8").splitlines()
+                    ]
+                    self.assertIn(
+                        "journal:published:recovered",
+                        [event["label"] for event in recovery_events],
+                    )
                     recovery_cutoffs = unique_mutation_cutoffs(
-                        recovery_labels,
+                        recovery_events,
                         recovery_discovery_project,
                     )
+                    self.assertEqual(len(recovery_cutoffs), len(recovery_events))
 
                     def run_recovery_cutoff(
                         cutoff: tuple[int, str],

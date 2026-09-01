@@ -44,6 +44,10 @@ jobs:
         id: lint
         continue-on-error: true
         run: just lint
+      - name: Installer crash matrix
+        id: installer-matrix
+        continue-on-error: true
+        run: just test-installer-crash-matrix
       - name: Branch-aware coverage
         id: coverage
         continue-on-error: true
@@ -90,14 +94,16 @@ jobs:
         env:
           BUILD: ${{ steps.build.outcome }}
           COVERAGE: ${{ steps.coverage.outcome }}
+          INSTALLER_MATRIX: ${{ steps.installer-matrix.outcome }}
           LINT: ${{ steps.lint.outcome }}
           PROFILING: ${{ steps.profiling.outcome }}
           SECURITY: ${{ steps.security.outcome }}
           STABILITY: ${{ steps.stability.outcome }}
         run: |
-          printf 'lint=%s coverage=%s stability=%s security=%s build=%s profiling=%s\n' \
-            "$LINT" "$COVERAGE" "$STABILITY" "$SECURITY" "$BUILD" "$PROFILING"
+          printf 'lint=%s installer_matrix=%s coverage=%s stability=%s security=%s build=%s profiling=%s\n' \
+            "$LINT" "$INSTALLER_MATRIX" "$COVERAGE" "$STABILITY" "$SECURITY" "$BUILD" "$PROFILING"
           test "$LINT" = success
+          test "$INSTALLER_MATRIX" = success
           test "$COVERAGE" = success
           test "$STABILITY" = success
           test "$SECURITY" = success

@@ -17,6 +17,8 @@ TEST_COMMAND = (
     "pytest",
     "tests",
     "-q",
+    "-m",
+    "not installer_crash_matrix",
     "-p",
     "no:cacheprovider",
     "--json-report",

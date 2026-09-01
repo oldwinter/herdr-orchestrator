@@ -27,7 +27,10 @@ test:
 
 test-coverage:
     @mkdir -p .orchestrator/quality
-    @PYTHONPATH=src uv run pytest tests --durations=0 --cov=herdr_orchestrator --cov-branch --cov-report=term-missing --cov-report=json:.orchestrator/quality/coverage.json --cov-fail-under=80 --json-report --json-report-file=.orchestrator/quality/tests.json
+    @PYTHONPATH=src uv run pytest tests -m "not installer_crash_matrix" --durations=0 --cov=herdr_orchestrator --cov-branch --cov-report=term-missing --cov-report=json:.orchestrator/quality/coverage.json --cov-fail-under=80 --json-report --json-report-file=.orchestrator/quality/tests.json
+
+test-installer-crash-matrix:
+    @PYTHONPATH=src uv run pytest tests/test_installer_journal.py -q -m installer_crash_matrix
 
 test-stability:
     @PYTHONPATH=src uv run python scripts/test_stability.py --runs 3 --output .orchestrator/quality/stability.json
@@ -75,6 +78,7 @@ check:
     @uv sync --locked
     @PYTHONPATH=src {{python}} -m compileall -q src tests scripts
     @just lint
+    @just test-installer-crash-matrix
     @just test-coverage
     @just test-stability
     @just security

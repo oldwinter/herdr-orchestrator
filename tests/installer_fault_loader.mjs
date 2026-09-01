@@ -1,10 +1,12 @@
 const MODULE_SUFFIX = "/bin/installer-journal.mjs";
 
 const TEST_RUNTIME = String.raw`
+import { createHash as __faultCreateHash } from "node:crypto";
 import {
   appendFileSync as __faultAppendFileSync,
   existsSync as __faultExistsSync,
   mkdirSync as __faultMkdirSync,
+  readFileSync as __faultReadFileSync,
   writeFileSync as __faultWriteFileSync,
 } from "node:fs";
 import { join as __faultJoin } from "node:path";
@@ -62,7 +64,16 @@ function __faultMutation(label, path = null) {
   __faultMutationCount += 1;
   const mutationLog = process.env.HERDR_ORCHESTRATOR_TEST_MUTATION_LOG;
   if (mutationLog) {
-    __faultAppendFileSync(mutationLog, label + "\n");
+    let fingerprint = null;
+    if (path !== null && __faultExistsSync(path)) {
+      fingerprint = __faultCreateHash("sha256")
+        .update(__faultReadFileSync(path))
+        .digest("hex");
+    }
+    __faultAppendFileSync(
+      mutationLog,
+      JSON.stringify({ fingerprint, label }) + "\n",
+    );
   }
   const pausePrefix =
     process.env.HERDR_ORCHESTRATOR_TEST_PAUSE_AT_LABEL_PREFIX;
@@ -133,7 +144,7 @@ function instrument(source) {
       + "      content,\n"
       + "      mode,\n"
       + "    );\n"
-      + "    __faultMutation(__faultTemporaryLabel(path, temporaryPath));\n"
+      + "    __faultMutation(__faultTemporaryLabel(path, temporaryPath), temporaryPath);\n"
       + "    temporaryCreated = true;",
   );
   result = replaceExact(
@@ -197,7 +208,7 @@ function instrument(source) {
       + "      journalContent(journal),\n"
       + "      replacementMode(path),\n"
       + "    );\n"
-      + "    __faultMutation(\"temporary:journal:owner:created\");\n"
+      + "    __faultMutation(\"temporary:journal:owner:created\", owner.path);\n"
       + "    try {",
   );
   result = replaceExact(
