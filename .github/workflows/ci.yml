@@ -40,6 +40,10 @@ jobs:
           uv sync --locked
       - name: Compile
         run: PYTHONPATH=src uv run python -m compileall -q src tests scripts
+      - name: Installer crash matrix
+        id: installer-matrix
+        continue-on-error: true
+        run: just test-installer-crash-matrix
       - name: Collect quality bundle
         id: quality
         continue-on-error: true
@@ -105,12 +109,19 @@ jobs:
       - name: Enforce quality manifest
         if: always()
         env:
+          INSTALLER_MATRIX: ${{ steps.installer-matrix.outcome }}
           RESULT_PATH: ${{ steps.bundle.outputs.result }}
         run: |
+          set +e
           python3 scripts/quality_bundle.py enforce \
             --result "$RESULT_PATH" \
             --require-full \
             --require-clean
+          quality_status=$?
+          set -e
+          printf 'quality=%s installer_matrix=%s\n' "$quality_status" "$INSTALLER_MATRIX"
+          test "$INSTALLER_MATRIX" = success
+          exit "$quality_status"
 
   pr-review:
     if: always() && github.event_name == 'pull_request'

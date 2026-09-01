@@ -228,6 +228,36 @@ scrollback。验证依据是 agent 成功启动、prompt 被接受、经过 life
 `idle` 或 `done`，并且 detection output 含指定行前缀。临时 tab 会在成功或失败后关闭；
 已存在并被安全复用的 agent 不会被关闭。
 
+## 结构化 readiness matrix
+
+`readiness-matrix` 从当前 Herdr-managed pane 对启用的 harness 运行真实只读 probe。它记录当前
+Git commit、package version、workflow、canonical workspace digest、每个 harness 的稳定状态、
+phase timings、观测时间和 attempt count：
+
+```bash
+just readiness-matrix
+just readiness-matrix --harness codex --harness claude
+```
+
+只有最终状态为 `ready` 的当前证据标记为 `VERIFIED`。失败、缺失、过期或环境不可用的条目均为
+`NOT VERIFIED`。`herdr_timeout`、`timeout`、`prompt_acceptance_timeout`、
+`agent_provider_failed`、`agent_turn_not_observed`、`herdr_invalid_response`、
+`task_receipt_missing` 和 `readiness_probe_failed` 最多重试一次；认证、无效 model、缺少 executable
+或 profile 不自动重试。输出不包含 prompt、credential、terminal output、完整 response 或任意
+provider 错误文本。
+
+Matrix 在所有 probe 前后都读取 HEAD、`git status --porcelain=v1 --untracked-files=all`，再读取
+HEAD 确认同一次 sample 没有跨 commit。Initial tracked modification、staged change、untracked file 或
+无法检查 source state 时，每个 selected harness 都返回 zero-attempt `readiness_source_dirty`。若
+probe 期间 working tree 或 HEAD 改变，所有 rows 改为 `readiness_source_changed`。Dirty 或 drifted
+source 都不能产生 `VERIFIED` 或 exit 0。
+
+真实 matrix 只在 operator-controlled Herdr pane 运行，不进入 pull-request CI。检测到 `CI` 或
+`GITHUB_ACTIONS` 时，每个 selected harness 都返回 zero-attempt `readiness_ci_forbidden`，不会调用
+probe。Matrix 证明当前机器与 harness 的 dispatch compatibility，不证明 queue 单测、代码质量、
+部署或产品验收。Issue #39 单独负责让自动 routing 消费 readiness evidence；这个命令不改变
+worker eligibility。
+
 若任务长时间停在 `running`、首次启动 timeout、或 agent 看似启动却没有真实执行，按
 [`docs/runtime-troubleshooting.md`](docs/runtime-troubleshooting.md) 区分 provisioning、
 prompt acceptance、working 与 settled，不要只根据 pane 存在或最终标题判断。
@@ -269,15 +299,26 @@ just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v2 --placem
 just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v3 \
   --placement pane --receipt-prefix "TASK-OK inspect"
 
+# 新任务可要求绑定当前 job / attempt / fencing token 的 structured-v2 envelope
+just enqueue codex inspect workflows/prompts/codex-architecture.md inspect-v4 \
+  --placement pane --completion-policy structured-v2
+
 # 不指定 worker，由主控读取 compact catalog 后选择
 just enqueue-auto review workflows/prompts/codex-architecture.md review-auto-v1
 ```
 
 参数依次为 `harness`、`title`、`prompt_file`、`dedupe_key`。相同 workflow 下重复的 `dedupe_key` 不会重复入队。
 
-`status` 同时展示 `agent_settled` 与 `task_verified`。未声明 receipt 的兼容任务会得到
-`task_verified = null`；声明了 `--receipt-prefix` 或 `--receipt-file` 的任务只有验证成功才
-能进入 `succeeded`。
+Completion policy 分为 `legacy-unverified`、`receipt-v1` 和 `structured-v2`。未声明 evidence 的
+兼容任务使用 `legacy-unverified`；output-prefix 与 file receipt 使用 `receipt-v1`；显式
+`--completion-policy structured-v2` 的任务由 coordinator 在 claim 后追加 job ID、attempt 和
+fencing token，原始 prompt、planner 或 router 不能覆盖这些字段。
+
+`status` 同时展示 `agent_settled`、兼容字段 `task_verified`、`completion_policy`、
+`verification_class`、`completion_status`、有界 evidence summary 和稳定 completion error。
+历史 `succeeded` 状态不会因 migration 改写。Structured envelope 只证明当前 attempt 产生了声明的
+机器证据；它不证明 code review、产品验收、release 或 deployment。Idempotent task 即使没有改变
+业务文件，也可用当前 attempt identity 报告已存在的正确结果。
 
 ## 排空、重试与回收
 
@@ -285,7 +326,7 @@ just enqueue-auto review workflows/prompts/codex-architecture.md review-auto-v1
 多条任务需要多波。普通运行优先使用：
 
 ```bash
-just run-until-idle --drain-timeout-seconds 3600
+just run-until-idle --drain-timeout-seconds 86400
 
 # failed job 原 id / dedupe_key 保持不变，只追加一次 attempt budget
 just retry 42 --extra-attempts 1

@@ -39,7 +39,7 @@ harness 仍可能使用自身工具。prompt policy 不能改变这一点。work
 | `max_parallel` | integer，1–16 | 单轮最大并发 |
 | `lease_seconds` | integer，30–86400 | running lease |
 | `max_attempts` | integer，1–10 | 总 claim 次数 |
-| `agent_timeout_seconds` | integer，10–3600 | 单次完整派发 deadline，包含 topology provisioning、agent 启动、prompt、settlement 与 receipt 验证 |
+| `agent_timeout_seconds` | integer，10–86400 | 单次完整派发 deadline，包含 topology provisioning、agent 启动、prompt、settlement 与 receipt 验证。到期后 coordinator 停止等待并记 `herdr_timeout`，不会杀死已在跑的 Herdr agent；lease 过期后同一任务可能被重新 claim |
 
 `lease_seconds` 必须至少比 `agent_timeout_seconds` 长 90 秒，为 agent 启动、Herdr 控制请求和收据提交留出窗口，防止同一任务在旧 turn 尚未结束时被重复 claim。
 

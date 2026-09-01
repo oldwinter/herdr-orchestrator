@@ -1007,6 +1007,8 @@ def _coverage_spec() -> ProducerSpec:
                     "run",
                     "pytest",
                     "tests",
+                    "-m",
+                    "not installer_crash_matrix",
                     "--durations=0",
                     "--cov=herdr_orchestrator",
                     "--cov-branch",

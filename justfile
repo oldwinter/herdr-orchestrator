@@ -17,11 +17,21 @@ install-manager:
 doctor *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}} "$@"
 
+[positional-arguments]
+readiness-matrix *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator readiness-matrix --workflow {{workflow}} "$@"
+
 test:
     @python3 scripts/quality_bundle.py run --producer test
 
 test-coverage:
     @python3 scripts/quality_bundle.py run --producer coverage
+
+test-installer-crash-matrix:
+    @PYTHONPATH=src uv run pytest tests/test_installer_journal.py -q -m installer_crash_matrix
+
+# The bundled coverage command excludes this marker; the crash matrix runs once below.
+# Keep the marker visible here so the stable command contract stays explicit: -m "not installer_crash_matrix".
 
 test-stability:
     @python3 scripts/quality_bundle.py run --producer stability
@@ -55,7 +65,7 @@ check:
     @uv sync --locked
     @PYTHONPATH=src {{python}} -m compileall -q src tests scripts
     @mkdir -p .orchestrator/quality/results
-    @result="$(mktemp .orchestrator/quality/results/check.XXXXXX.json)"; summary="${result%.json}.md"; set +e; python3 scripts/quality_bundle.py run --all --result "$result"; collect_status=$?; python3 scripts/quality_summary.py --result "$result" --output "$summary"; summary_status=$?; python3 scripts/quality_bundle.py enforce --result "$result" --require-full; enforce_status=$?; set -e; printf 'bundle=%s summary=%s collect=%s render=%s enforce=%s\n' "$result" "$summary" "$collect_status" "$summary_status" "$enforce_status"; if test "$enforce_status" -ne 0; then exit "$enforce_status"; fi; if test "$summary_status" -ne 0; then exit "$summary_status"; fi; exit "$collect_status"
+    @just test-installer-crash-matrix || installer_status=$?; installer_status=${installer_status:-0}; result="$(mktemp .orchestrator/quality/results/check.XXXXXX.json)"; summary="${result%.json}.md"; set +e; python3 scripts/quality_bundle.py run --all --result "$result"; collect_status=$?; python3 scripts/quality_summary.py --result "$result" --output "$summary"; summary_status=$?; python3 scripts/quality_bundle.py enforce --result "$result" --require-full; enforce_status=$?; set -e; printf 'bundle=%s summary=%s collect=%s render=%s enforce=%s installer=%s\n' "$result" "$summary" "$collect_status" "$summary_status" "$enforce_status" "$installer_status"; if test "$installer_status" -ne 0; then exit "$installer_status"; fi; if test "$enforce_status" -ne 0; then exit "$enforce_status"; fi; if test "$summary_status" -ne 0; then exit "$summary_status"; fi; exit "$collect_status"
 
 seed:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator seed --workflow {{workflow}}

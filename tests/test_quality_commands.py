@@ -520,6 +520,24 @@ class QualityCommandTests(unittest.TestCase):
             {"result", "tests"},
         )
 
+    def test_installer_crash_matrix_is_enforced_once_outside_repeated_gates(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        stability = (REPO_ROOT / "scripts/test_stability.py").read_text(encoding="utf-8")
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        installer_tests = (REPO_ROOT / "tests/test_installer_journal.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("test-installer-crash-matrix:", justfile)
+        self.assertEqual(justfile.count("@just test-installer-crash-matrix"), 1)
+        self.assertIn('-m "not installer_crash_matrix"', justfile)
+        self.assertIn('"not installer_crash_matrix"', stability)
+        self.assertIn("@installer_crash_matrix", installer_tests)
+        self.assertIn("- name: Installer crash matrix", workflow)
+        self.assertIn("id: installer-matrix", workflow)
+        self.assertIn("INSTALLER_MATRIX: ${{ steps.installer-matrix.outcome }}", workflow)
+        self.assertIn('test "$INSTALLER_MATRIX" = success', workflow)
+
     def test_security_skips_editable_package_and_propagates_pip_audit_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

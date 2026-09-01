@@ -37,7 +37,9 @@ The npm package has no runtime npm dependencies. Its executable:
 5. writes an ownership manifest with a SHA-256 hash for every managed file;
 6. adds installer-managed roots to this repository's Git-local `info/exclude` without editing
    a tracked `.gitignore` or hiding an unmanaged Skill;
-7. carries the Python package and invokes it with its packaged `src/` on `PYTHONPATH`.
+7. records the prior and desired inventories in a transaction journal before it changes a
+   managed file, the ownership manifest, or the Git exclude block;
+8. carries the Python package and invokes it with its packaged `src/` on `PYTHONPATH`.
 
 Setup commands reject options they do not define.
 
@@ -83,7 +85,8 @@ independently installed Skill remains untouched.
 
 | Path | Ownership |
 | --- | --- |
-| `.herdr-orchestrator/manifest.json` | Installer ownership and content hashes |
+| `.herdr-orchestrator/manifest.json` | Installer ownership, content hashes, and file modes |
+| `.herdr-orchestrator/install-journal.json` | Active install, upgrade, or uninstall transaction |
 | `.herdr-orchestrator/workflows/` | Portable project-relative workflow and prompts |
 | `.herdr-orchestrator/profiles/` | Profiles for selected harnesses |
 | `.herdr-orchestrator/manager/` | Fixed policy workspace for a manual manager session |
@@ -105,6 +108,82 @@ Managed files changed by the user are preserved on reinstall, upgrade, and unins
 partial reconciliation returns exit code `1` and reports those paths in `preserved`.
 Manifest entries are restricted to the roots above, and symlinked managed paths are rejected.
 
+## Installer recovery
+
+Install, upgrade, and uninstall write `.herdr-orchestrator/install-journal.json` before
+their first owned mutation. The journal records the transaction ID, package version, selected
+harnesses, Skill choice, prior and desired inventories, endpoint digests and modes, ordered
+operations, desired replacement bytes, and durable progress.
+
+Each regular-file replacement uses a temporary file in the target directory. The installer
+writes the bytes, sets the recorded mode, flushes the file, renames it over the validated
+target, and flushes the directory. It rejects symlinks and non-regular targets before planning
+and again during replay. The ownership manifest is the last semantic operation, after managed
+files and the Git exclude block match the desired inventory.
+
+The next install, upgrade, or uninstall finishes an active transaction before it performs
+normal ownership classification. Replay checks the complete inventory before it writes. Every
+participant must match either its recorded prior digest and mode or its desired digest and
+mode. If a path matches neither endpoint, the command exits with
+`installer_recovery_conflict: <path>`. It leaves both the journal and the conflicting bytes
+unchanged.
+
+Recovery always moves forward to the journal's desired inventory. Desired replacement bytes
+are stored in the journal, so a newer package can finish a transaction written by an older
+package before it plans its own update.
+
+Schema version 1 journals written before mode tracking remain valid. Recovery treats a missing
+mode as unknown, preserves the live mode when it replaces that file, and adopts the older
+transaction-specific `.tmp` claim as the current owner claim. Install and upgrade replay may
+finish a content-proven replacement while carrying the live mode onto its temporary file. For
+any command, a digest-matching regular project deletion whose mode is unknown is identified as
+an explicit preserved participant and rechecked at each boundary; a content mismatch remains a
+recovery conflict. For install and upgrade, any such project deletion is a deliberate
+compatibility boundary: recovery stops with a stable `installer_recovery_conflict` before any
+additional target or manifest mutation and leaves the journal, owner claim, manifest, and
+current bytes in place.
+It does not infer a historical mode or perform an unprotected successor handoff; it requires
+explicit operator resolution or reconstruction outside automatic recovery. For uninstall, the
+Git exclude block is retained, each digest-matching unknown-mode project deletion is reported as
+preserved and skipped, only the installer manifest is removed, the journal is retired, and the
+command returns a partial result.
+If install or upgrade is the entry point that completes such a partial legacy uninstall, it
+returns that result with `recovered_command: "uninstall"` and does not start a new transaction;
+the caller must invoke install or upgrade again explicitly. If all initially preserved project
+targets disappear before retirement while the Git exclude block is still retained, recovery
+returns a bounded conflict and keeps the journal; the next retry re-evaluates the live inventory
+and removes the block when no retained project path remains. That frozen-set condition is recorded
+as `progress.recovery_conflict: "legacy_exclude_coupling"`, so `doctor` continues to report
+`journal-recovery:legacy_exclude_coupling` until a retry clears the marker or finds a new conflict.
+If the exclude endpoint is already at its desired bytes while preserved project paths remain, or
+is in any third state, recovery likewise stops with a conflict rather than claiming that the
+block was retained.
+An unjournaled file that appears under a managed root is also a conflict participant; doctor
+reports the same `git-exclude:<path>` conflict and recovery leaves the journal and exclude
+untouched until that caller entry is resolved.
+Old manifests that omit `file_modes` are mode-unverified: existing files are reported as
+`modified` (also listed in `mode_unverified`) and are preserved without overwrite or removal.
+New journals and manifests record modes explicitly.
+
+Install, upgrade, and uninstall bind each planning observation to the transaction's original inventory.
+If a managed file, manifest, or Git exclude changes while the plan is being assembled, the
+command stops with `installer_state_changed: <path>` before publishing a journal or mutating
+the changed bytes.
+Mode-aware uninstall also rescans managed roots after publishing its journal and before each
+coupled mutation. A newly unjournaled path is reported as `installer_recovery_conflict:
+git-exclude:<path>` and leaves the journal and Git exclude in place until that caller entry is
+resolved.
+
+One owner claim remains next to the journal until the transaction finishes. If the owner
+process is running, concurrent install, upgrade, or uninstall commands stop with
+`installer_transaction_active` before they change the journal or a target. A new process
+atomically adopts a dead owner claim before recovery.
+
+`just test-installer-crash-matrix` runs the packed interruption matrix and legacy-removal
+chains. `just check` and CI run these marked tests once as a required gate. The repeated
+coverage and stability suites exclude only these heavy marked tests; all other installer tests
+remain in those suites.
+
 ## Diagnostics
 
 ```bash
@@ -113,7 +192,8 @@ npx --yes herdr-orchestrator doctor --project .
 
 `doctor` returns one JSON document with:
 
-- `installation`: missing or modified managed files;
+- `installation`: the package inventory, ownership-manifest claims, actual file digests, the
+  managed Git exclude block, and any active journal;
 - `runtime`: Python, Herdr, Git, profile checks, and a bounded real readiness turn for every
   selected harness;
 - top-level `ok`: true only when both layers are healthy.
@@ -122,6 +202,8 @@ Exit code `1` means the installation or runtime needs attention. In particular, 
 must run inside a Herdr pane with the expected `HERDR_*` environment. A harness readiness
 status is one of `ready`, `auth_required`, `model_invalid`, `timeout`, `unavailable`, or
 `error`; an executable in `PATH` alone is not ready. Doctor closes only probe agents it created.
+Doctor never replays an installer transaction. An active journal makes installation health
+false and remains available for the next install, upgrade, or uninstall command.
 
 ## Manual manager
 
@@ -242,7 +324,13 @@ catalog. Unchanged profiles that are no longer selected are removed. Modified fi
 reported and retained.
 
 Uninstall removes the manifest after processing it. User-modified managed files remain in
-place and are listed in the JSON result; they are no longer managed after that point.
+place and are listed in the JSON result; they are no longer managed after that point. A content
+or mode change counts as a modification. Uninstall first finishes any older active transaction,
+then journals its own removals. Repeating uninstall after journal retirement is safe: the
+command does not claim or remove bytes when no ownership manifest exists. It does not remove
+unjournaled directories, and it reports any bytes left under managed roots as `preserved`.
+Empty `.agents/skills` directories do not count as an existing Skill router during a later
+install.
 
 ## Automated npm releases
 

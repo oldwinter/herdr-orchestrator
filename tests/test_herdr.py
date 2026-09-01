@@ -2346,7 +2346,6 @@ class HerdrTransportTests(unittest.TestCase):
                 [
                     _result({"agent": blocked}),
                     _result({"type": "ok"}),
-                    _result({"type": "ok"}),
                     _result(
                         {
                             "agent": {
@@ -2387,15 +2386,13 @@ class HerdrTransportTests(unittest.TestCase):
             [
                 "herdr",
                 "pane",
-                "send-text",
+                "run",
                 "w1:p9",
                 "Approve this local action.",
             ],
         )
-        self.assertEqual(
-            runner.calls[2],
-            ["herdr", "agent", "send-keys", "blocked-worker", "enter"],
-        )
+        self.assertEqual(runner.calls[2][0:3], ["herdr", "agent", "get"])
+        self.assertFalse(any(call[0:3] == ["herdr", "agent", "send-keys"] for call in runner.calls))
         self.assertFalse(any(call[0:3] == ["herdr", "agent", "prompt"] for call in runner.calls))
 
     def test_blocked_response_respects_an_expired_timeout(self) -> None:
