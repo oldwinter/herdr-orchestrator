@@ -230,7 +230,7 @@ class Coordinator:
         self.initialize()
         self._run_planner_if_due(dispatch_deadline)
         self._assign_pending_placements(dispatch_deadline)
-        eligible_workers = self._eligible_worker_harnesses()
+        eligible_workers = self._eligible_worker_harnesses(dispatch_deadline=dispatch_deadline)
         batch_key = f"run-{time.time_ns()}"
         slot_names = self._slot_names()
         jobs = self.store.claim(
@@ -399,7 +399,7 @@ class Coordinator:
                     worker_pool_idle=False,
                     queue_idle=queue_idle,
                 )
-            if self._capacity_degraded(last_queue):
+            if self._capacity_degraded(last_queue, dispatch_deadline=deadline):
                 return self._drain_report(
                     aggregate,
                     idle=False,
@@ -659,21 +659,42 @@ class Coordinator:
             probe=self.readiness_probe,
         )
 
-    def _eligible_worker_harnesses(self) -> tuple[Harness, ...]:
+    def _eligible_worker_harnesses(
+        self,
+        *,
+        dispatch_deadline: float | None = None,
+    ) -> tuple[Harness, ...]:
+        health_timeout_seconds = self._health_timeout_seconds(dispatch_deadline)
         return eligible_worker_harnesses(
             self.config,
             self.worker_harnesses,
             health=self.health,
             readiness_probe=self.readiness_probe,
+            health_timeout_seconds=health_timeout_seconds,
         )
 
-    def _capacity_degraded(self, queue: dict[str, int]) -> bool:
+    def _health_timeout_seconds(self, dispatch_deadline: float | None) -> int | None:
+        if self.health is None or dispatch_deadline is None:
+            return None
+        remaining = dispatch_deadline - time.monotonic()
+        if remaining < 5:
+            return 0
+        return min(self.health.probe_timeout_seconds, int(remaining))
+
+    def _capacity_degraded(
+        self,
+        queue: dict[str, int],
+        *,
+        dispatch_deadline: float | None = None,
+    ) -> bool:
         if self.health is None or queue.get(JobState.PENDING.value, 0) <= 0:
             return False
         pending = set(self.store.pending_harnesses(self.config.name)) & set(self.worker_harnesses)
         if not pending:
             return False
-        return not (pending & set(self._eligible_worker_harnesses()))
+        return not (
+            pending & set(self._eligible_worker_harnesses(dispatch_deadline=dispatch_deadline))
+        )
 
     def _record_health(self, harness: Harness, outcome: DispatchOutcome) -> None:
         if self.health is not None:
@@ -853,7 +874,7 @@ class Coordinator:
         return names
 
     def _assign_pending_placements(self, dispatch_deadline: float | None) -> None:
-        eligible = set(self._eligible_worker_harnesses())
+        eligible = set(self._eligible_worker_harnesses(dispatch_deadline=dispatch_deadline))
         for row in self.store.unplaced_jobs(
             self.config.name,
             allowed_harnesses=self.worker_harnesses,
@@ -903,7 +924,7 @@ class Coordinator:
         dedupe_key: str,
         dispatch_deadline: float | None = None,
     ) -> PlacementTarget:
-        controller = self._controller_harness()
+        controller = self._controller_harness(dispatch_deadline)
         digest = hashlib.sha256(f"{self.config.name}\0topology\0{dedupe_key}".encode()).hexdigest()[
             :12
         ]
@@ -957,14 +978,17 @@ class Coordinator:
         title: str,
         prompt: str,
         dedupe_key: str,
+        dispatch_deadline: float | None = None,
     ) -> Harness:
-        controller = self._controller_harness()
+        controller = self._controller_harness(dispatch_deadline)
         controller_name = _controller_agent_name(
             self.config.name,
             self.config.workspace,
             controller,
         )
-        allowed_harnesses = self._eligible_worker_harnesses()
+        allowed_harnesses = self._eligible_worker_harnesses(
+            dispatch_deadline=dispatch_deadline,
+        )
         if not allowed_harnesses:
             snapshot = self._health_snapshot(refresh=False)
             reasons = ",".join(
@@ -1025,7 +1049,8 @@ class Coordinator:
             raise ValueError("dispatcher_controller_cleanup_unsupported")
         closer(controller_name)
 
-    def _controller_harness(self) -> Harness:
+    def _controller_harness(self, dispatch_deadline: float | None = None) -> Harness:
+        health_timeout_seconds = self._health_timeout_seconds(dispatch_deadline)
         return select_controller_harness(
             self.config,
             worker_harnesses=self.worker_harnesses,
@@ -1033,6 +1058,7 @@ class Coordinator:
             force_auto=self.controller_auto,
             health=self.health,
             readiness_probe=self.readiness_probe,
+            health_timeout_seconds=health_timeout_seconds,
         )
 
     def _worker_profiles(
@@ -1046,17 +1072,19 @@ class Coordinator:
         planner = self.config.planner
         if not planner.enabled:
             return
+        allowed_harnesses = self._eligible_worker_harnesses(
+            dispatch_deadline=dispatch_deadline,
+        )
+        if not allowed_harnesses:
+            return
         if not self.store.reserve_planner_run(
             self.config.name,
             planner.interval_seconds,
         ):
             return
-        allowed_harnesses = self._eligible_worker_harnesses()
-        if not allowed_harnesses:
-            return
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)
         planner.output_file.unlink(missing_ok=True)
-        controller = self._controller_harness()
+        controller = self._controller_harness(dispatch_deadline)
         profiles = self._worker_profiles(allowed_harnesses)
         outcome = self.dispatcher.dispatch(
             controller,

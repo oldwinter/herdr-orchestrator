@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import threading
@@ -119,7 +120,16 @@ class HarnessHealthRecord:
     probe_lease_until: float | None = None
 
     def __post_init__(self) -> None:
-        if not self.workflow or not self.workspace or not self.reason:
+        if (
+            not self.workflow
+            or not self.workspace
+            or not self.reason
+            or not math.isfinite(self.observed_at)
+            or any(
+                value is not None and not math.isfinite(value)
+                for value in (self.expires_at, self.cooldown_until, self.probe_lease_until)
+            )
+        ):
             raise ValueError("harness_health_record_invalid")
         if _REASON.fullmatch(self.reason) is None:
             raise ValueError("harness_health_reason_invalid")
@@ -271,10 +281,11 @@ class HarnessHealth:
         harnesses: Iterable[Harness],
         *,
         refresh: bool = False,
+        force_refresh: bool = False,
         probe: HealthProbe | None = None,
         timeout_seconds: int | None = None,
     ) -> EligibilitySnapshot:
-        if timeout_seconds is not None and not 5 <= timeout_seconds <= 300:
+        if timeout_seconds is not None and timeout_seconds != 0 and not 5 <= timeout_seconds <= 300:
             raise ValueError("harness_health_probe_timeout_invalid")
         values = _unique_harnesses(harnesses)
         now = self._now()
@@ -283,7 +294,7 @@ class HarnessHealth:
         if refresh:
             active_probe = probe or self.probe
             for record in records:
-                if record.refresh_due(now):
+                if force_refresh or record.refresh_due(now):
                     self._refresh(record.harness, active_probe, timeout_seconds)
             now = self._now()
             records = self._records(values, now)
@@ -315,12 +326,14 @@ class HarnessHealth:
         harnesses: Iterable[Harness],
         *,
         refresh: bool = False,
+        force_refresh: bool = False,
         probe: HealthProbe | None = None,
         timeout_seconds: int | None = None,
     ) -> EligibilitySnapshot:
         return self.snapshot(
             harnesses,
             refresh=refresh,
+            force_refresh=force_refresh,
             probe=probe,
             timeout_seconds=timeout_seconds,
         )
@@ -407,7 +420,7 @@ class HarnessHealth:
             AgentState.IDLE,
             AgentState.DONE,
         }
-        if settled and code not in _HARD_FAILURES and code not in _RETRYABLE_FAILURES:
+        if settled and not code:
             result: Mapping[str, object] = {"status": HarnessHealthStatus.READY.value}
         elif code in _HARD_FAILURES:
             result = {"status": HarnessHealthStatus.UNAVAILABLE.value, "error_code": code}
@@ -470,7 +483,7 @@ class HarnessHealth:
         probe: HealthProbe | None,
         timeout_seconds: int | None,
     ) -> None:
-        if probe is None or not self.live_probe_allowed:
+        if probe is None or timeout_seconds == 0 or not self.live_probe_allowed:
             return
         now = self._now()
         owner = f"health-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:12]}"
@@ -578,6 +591,13 @@ def _record_from_row(row: Mapping[str, object]) -> HarnessHealthRecord:
         harness = Harness(str(row["harness"]))
     except ValueError as exc:
         raise ValueError("harness_health_row_invalid") from exc
+    observed_at = _required_float(row.get("observed_at"))
+    expires_at = _optional_float(row.get("expires_at"))
+    cooldown_until = _optional_float(row.get("cooldown_until"))
+    if not math.isfinite(observed_at) or any(
+        value is not None and not math.isfinite(value) for value in (expires_at, cooldown_until)
+    ):
+        raise ValueError("harness_health_time_invalid")
     return HarnessHealthRecord(
         str(row["workflow"]),
         str(row["workspace"]),
@@ -585,9 +605,9 @@ def _record_from_row(row: Mapping[str, object]) -> HarnessHealthRecord:
         status,
         _bounded_reason(str(row["reason"])) or HEALTH_UNKNOWN,
         _bounded_reason(str(row["source"])) or HealthSource.NONE.value,
-        _required_float(row.get("observed_at")),
-        _optional_float(row.get("expires_at")),
-        _optional_float(row.get("cooldown_until")),
+        observed_at,
+        expires_at,
+        cooldown_until,
         _required_int(row.get("retryable_failures", 0)),
         _optional_float(row.get("probe_lease_until")),
     )
@@ -636,7 +656,10 @@ def _coerce_time(value: object) -> float:
         return value.timestamp()
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValueError("harness_health_clock_invalid")
-    return float(value)
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError("harness_health_clock_invalid")
+    return converted
 
 
 def _optional_float(value: object) -> float | None:
@@ -644,7 +667,10 @@ def _optional_float(value: object) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValueError("harness_health_float_invalid")
-    return float(value)
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError("harness_health_float_invalid")
+    return converted
 
 
 def _required_float(value: object) -> float:

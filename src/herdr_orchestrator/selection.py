@@ -48,18 +48,29 @@ def select_controller_harness(
     executable_finder: ExecutableFinder = shutil.which,
     health: HarnessHealth | None = None,
     readiness_probe: HealthProbe | None = None,
+    health_timeout_seconds: int | None = None,
 ) -> Harness:
     requested = None if force_auto else (override or config.planner.harness)
     if requested is not None:
         if health is not None:
-            health.require(requested, role="controller", probe=readiness_probe)
+            health.require(
+                requested,
+                role="controller",
+                probe=readiness_probe,
+                timeout_seconds=health_timeout_seconds,
+            )
         return requested
 
     candidates = tuple(dict.fromkeys(worker_harnesses))
     eligible = set(candidates)
     snapshot: EligibilitySnapshot | None = None
     if health is not None:
-        snapshot = health.snapshot(candidates, refresh=True, probe=readiness_probe)
+        snapshot = health.snapshot(
+            candidates,
+            refresh=True,
+            probe=readiness_probe,
+            timeout_seconds=health_timeout_seconds,
+        )
         eligible = set(snapshot.eligible_harnesses)
     for harness in AUTO_CONTROLLER_ORDER:
         if harness in eligible and (
@@ -84,11 +95,17 @@ def eligible_worker_harnesses(
     *,
     health: HarnessHealth | None = None,
     readiness_probe: HealthProbe | None = None,
+    health_timeout_seconds: int | None = None,
 ) -> tuple[Harness, ...]:
     """Return the configured worker pool filtered through one health snapshot."""
     requested = tuple(dict.fromkeys(worker_harnesses))
     if health is None:
         return requested
-    snapshot = health.snapshot(requested, refresh=True, probe=readiness_probe)
+    snapshot = health.snapshot(
+        requested,
+        refresh=True,
+        probe=readiness_probe,
+        timeout_seconds=health_timeout_seconds,
+    )
     health.record_selection(snapshot, role="worker")
     return tuple(harness for harness in requested if harness in snapshot.eligible_harnesses)
