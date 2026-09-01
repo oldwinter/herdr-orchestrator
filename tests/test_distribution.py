@@ -91,6 +91,32 @@ class DistributionCliTests(unittest.TestCase):
         self.assertRegex(resolved["resolved"], r"^https://")
         self.assertRegex(resolved["integrity"], r"^sha512-")
 
+    def test_manager_lock_integrity_matches_the_local_runtime_tarball(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            packed = subprocess.run(
+                [
+                    "npm",
+                    "pack",
+                    "--json",
+                    "--pack-destination",
+                    temporary,
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(packed.returncode, 0, packed.stderr)
+            pack = json.loads(packed.stdout)["herdr-orchestrator"]
+            self.assertTrue((Path(temporary) / pack["filename"]).is_file())
+        lock = json.loads((MANAGER_PACKAGE / "package-lock.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            lock["packages"]["node_modules/herdr-orchestrator"]["integrity"],
+            pack["integrity"],
+        )
+
     def test_npm_dependency_audit_covers_both_package_lockfiles(self) -> None:
         security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1482,6 +1508,7 @@ class DistributionCliTests(unittest.TestCase):
             manifest = json.loads(original_manifest)
             workflow_path = ".herdr-orchestrator/workflows/multi-harness.toml"
             del manifest["files"][workflow_path]
+            del manifest["file_modes"][workflow_path]
             manifest_path.write_text(
                 f"{json.dumps(manifest, indent=2)}\n",
                 encoding="utf-8",

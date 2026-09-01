@@ -85,7 +85,7 @@ independently installed Skill remains untouched.
 
 | Path | Ownership |
 | --- | --- |
-| `.herdr-orchestrator/manifest.json` | Installer ownership and content hashes |
+| `.herdr-orchestrator/manifest.json` | Installer ownership, content hashes, and file modes |
 | `.herdr-orchestrator/install-journal.json` | Active install, upgrade, or uninstall transaction |
 | `.herdr-orchestrator/workflows/` | Portable project-relative workflow and prompts |
 | `.herdr-orchestrator/profiles/` | Profiles for selected harnesses |
@@ -131,6 +131,10 @@ unchanged.
 Recovery always moves forward to the journal's desired inventory. Desired replacement bytes
 are stored in the journal, so a newer package can finish a transaction written by an older
 package before it plans its own update.
+
+Schema version 1 journals written before mode tracking remain valid. Recovery treats a missing
+mode as unknown, preserves the live mode when it replaces that file, and adopts the older
+transaction-specific `.tmp` claim as the current owner claim. New journals record modes.
 
 One owner claim remains next to the journal until the transaction finishes. If the owner
 process is running, concurrent install, upgrade, or uninstall commands stop with
@@ -277,11 +281,13 @@ catalog. Unchanged profiles that are no longer selected are removed. Modified fi
 reported and retained.
 
 Uninstall removes the manifest after processing it. User-modified managed files remain in
-place and are listed in the JSON result; they are no longer managed after that point. Uninstall
-first finishes any older active transaction, then journals its own removals. Repeating uninstall
-after journal retirement is safe: the command does not claim or remove bytes when no ownership
-manifest exists. It does not remove unjournaled directories, and it reports any bytes left
-under managed roots as `preserved`.
+place and are listed in the JSON result; they are no longer managed after that point. A content
+or mode change counts as a modification. Uninstall first finishes any older active transaction,
+then journals its own removals. Repeating uninstall after journal retirement is safe: the
+command does not claim or remove bytes when no ownership manifest exists. It does not remove
+unjournaled directories, and it reports any bytes left under managed roots as `preserved`.
+Empty `.agents/skills` directories do not count as an existing Skill router during a later
+install.
 
 ## Automated npm releases
 

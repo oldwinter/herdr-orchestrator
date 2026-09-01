@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from herdr_orchestrator import __version__
@@ -264,7 +266,14 @@ class InstallerJournalPackedTests(unittest.TestCase):
                         expected_project,
                     )
 
-                    for interrupt_after, mutation_label in initial_cutoffs:
+                    def run_initial_cutoff(
+                        cutoff: tuple[int, str],
+                        *,
+                        operation: str = operation,
+                        template: Path = template,
+                        expected_snapshot: dict[str, object] = expected_snapshot,
+                    ) -> None:
+                        interrupt_after, mutation_label = cutoff
                         project = root / f"{operation}-{interrupt_after}"
                         shutil.copytree(template, project)
                         interrupted = run_cli(
@@ -288,6 +297,11 @@ class InstallerJournalPackedTests(unittest.TestCase):
                             expected_snapshot,
                             f"{operation} initial mutation {mutation_label}",
                         )
+
+                    with ThreadPoolExecutor(
+                        max_workers=min(8, len(initial_cutoffs)),
+                    ) as executor:
+                        list(executor.map(run_initial_cutoff, initial_cutoffs))
                     mutation_counts[operation] = len(initial_cutoffs)
 
                     recovery_base = root / f"recovery-base-{operation}"
@@ -347,7 +361,15 @@ class InstallerJournalPackedTests(unittest.TestCase):
                         recovery_labels,
                         recovery_discovery_project,
                     )
-                    for interrupt_after, mutation_label in recovery_cutoffs:
+
+                    def run_recovery_cutoff(
+                        cutoff: tuple[int, str],
+                        *,
+                        operation: str = operation,
+                        recovery_base: Path = recovery_base,
+                        expected_snapshot: dict[str, object] = expected_snapshot,
+                    ) -> None:
+                        interrupt_after, mutation_label = cutoff
                         project = root / f"recovery-{operation}-{interrupt_after}"
                         shutil.copytree(recovery_base, project)
                         relocate_active_journal(project)
@@ -372,6 +394,11 @@ class InstallerJournalPackedTests(unittest.TestCase):
                             expected_snapshot,
                             f"{operation} recovery mutation {mutation_label}",
                         )
+
+                    with ThreadPoolExecutor(
+                        max_workers=min(8, len(recovery_cutoffs)),
+                    ) as executor:
+                        list(executor.map(run_recovery_cutoff, recovery_cutoffs))
                     recovery_mutation_counts[operation] = len(recovery_cutoffs)
 
                     recovered_publication_project = root / f"recovered-publication-{operation}"
@@ -482,6 +509,203 @@ class InstallerJournalPackedTests(unittest.TestCase):
             self.assertGreater(recovery_mutation_counts["install"], 20)
             self.assertGreater(recovery_mutation_counts["upgrade"], 5)
             self.assertGreater(recovery_mutation_counts["uninstall"], 15)
+
+    def test_current_package_recovers_pre_owner_pre_mode_v1_journals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package_directory = root / "package"
+            extracted = root / "extracted"
+            package_directory.mkdir()
+            extracted.mkdir()
+            packed = subprocess.run(
+                [
+                    "npm",
+                    "pack",
+                    "--silent",
+                    "--pack-destination",
+                    str(package_directory),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(packed.returncode, 0, packed.stderr)
+            tarball = package_directory / packed.stdout.strip().splitlines()[-1]
+            with tarfile.open(tarball) as archive:
+                archive.extractall(extracted, filter="data")
+            packed_cli = extracted / "package/bin/herdr-orchestrator.mjs"
+
+            def run_cli(
+                project: Path,
+                arguments: list[str],
+                *,
+                extra_environment: dict[str, str] | None = None,
+                interrupt: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                environment = os.environ.copy()
+                if extra_environment is not None:
+                    environment.update(extra_environment)
+                if interrupt:
+                    environment["HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL"] = "journal:published"
+                return subprocess.run(
+                    [
+                        *self._node_command(packed_cli, environment),
+                        *arguments,
+                        "--project",
+                        str(project),
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                    timeout=30,
+                )
+
+            def setup(project: Path, operation: str) -> None:
+                initialized = subprocess.run(
+                    ["git", "init", "--quiet", str(project)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(initialized.returncode, 0, initialized.stderr)
+                if operation in {"upgrade", "uninstall"}:
+                    installed = run_cli(
+                        project,
+                        ["install", "--harness", "droid"],
+                    )
+                    self.assertEqual(installed.returncode, 0, installed.stderr)
+
+            def strip_manifest_modes(project: Path) -> None:
+                manifest_path = project / ".herdr-orchestrator/manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest.pop("file_modes", None)
+                manifest_path.write_text(
+                    f"{json.dumps(manifest, indent=2)}\n",
+                    encoding="utf-8",
+                )
+
+            def arguments(operation: str) -> list[str]:
+                if operation == "install":
+                    return ["install", "--harness", "droid"]
+                if operation == "upgrade":
+                    return [
+                        "upgrade",
+                        "--harness",
+                        "droid",
+                        "--harness",
+                        "codex",
+                    ]
+                return ["uninstall"]
+
+            def snapshot(project: Path) -> dict[str, object]:
+                files = {
+                    path.relative_to(project).as_posix(): (
+                        path.stat().st_mode & 0o7777,
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                    for root_name in (
+                        ".herdr-orchestrator",
+                        ".orchestrator",
+                        ".agents/skills/herdr-orchestrator",
+                    )
+                    for path in sorted((project / root_name).rglob("*"))
+                    if path.is_file()
+                }
+                return {
+                    "exclude": (project / ".git/info/exclude").read_bytes(),
+                    "files": files,
+                }
+
+            def prepare_legacy_input(project: Path, operation: str) -> None:
+                if operation in {"upgrade", "uninstall"}:
+                    strip_manifest_modes(project)
+                if operation == "upgrade":
+                    (project / ".herdr-orchestrator/workflows/multi-harness.toml").chmod(0o600)
+
+            def downgrade(project: Path, claim_state: str) -> None:
+                directory = project / ".herdr-orchestrator"
+                journal_path = directory / "install-journal.json"
+                owner = next(directory.glob(".install-journal.*.owner"))
+                journal = json.loads(journal_path.read_text(encoding="utf-8"))
+                for inventory_name in ("prior_inventory", "desired_inventory"):
+                    for item in journal[inventory_name].values():
+                        item["state"].pop("mode", None)
+                for operation_item in journal["operations"]:
+                    operation_item["original"].pop("mode", None)
+                    operation_item["desired"].pop("mode", None)
+                    if (
+                        operation_item["target"].get("path") == ".herdr-orchestrator/manifest.json"
+                        and operation_item["desired"].get("kind") == "regular"
+                    ):
+                        content = base64.b64decode(operation_item["desired_content_base64"])
+                        manifest = json.loads(content)
+                        manifest.pop("file_modes", None)
+                        content = f"{json.dumps(manifest, indent=2)}\n".encode()
+                        digest = hashlib.sha256(content).hexdigest()
+                        operation_item["desired"]["digest"] = digest
+                        operation_item["desired_content_base64"] = base64.b64encode(
+                            content
+                        ).decode()
+                        journal["desired_inventory"]["project:.herdr-orchestrator/manifest.json"][
+                            "state"
+                        ]["digest"] = digest
+                journal_path.write_text(
+                    f"{json.dumps(journal, indent=2)}\n",
+                    encoding="utf-8",
+                )
+                if claim_state == "published-only":
+                    owner.unlink()
+                else:
+                    owner.rename(owner.with_name(owner.name.removesuffix(".owner") + ".tmp"))
+                if claim_state == "temporary-only":
+                    journal_path.unlink()
+
+            for operation in ("install", "upgrade", "uninstall"):
+                expected_project = root / f"expected-{operation}"
+                setup(expected_project, operation)
+                prepare_legacy_input(expected_project, operation)
+                expected = run_cli(expected_project, arguments(operation))
+                self.assertEqual(expected.returncode, 0, expected.stderr)
+                expected_snapshot = snapshot(expected_project)
+                for claim_state in (
+                    "published-and-temporary",
+                    "temporary-only",
+                    "published-only",
+                ):
+                    with self.subTest(
+                        operation=operation,
+                        claim_state=claim_state,
+                    ):
+                        project = root / f"legacy-{operation}-{claim_state}"
+                        setup(project, operation)
+                        prepare_legacy_input(project, operation)
+                        interrupted = run_cli(
+                            project,
+                            arguments(operation),
+                            interrupt=True,
+                        )
+                        self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+                        downgrade(project, claim_state)
+
+                        recovered = run_cli(project, arguments(operation))
+
+                        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                        doctor = run_cli(
+                            project,
+                            ["doctor"],
+                            extra_environment={"PYTHON": "/bin/false"},
+                        )
+                        self.assertEqual(doctor.returncode, 1, doctor.stderr)
+                        installation = json.loads(doctor.stdout)["installation"]
+                        self.assertFalse(installation["journal"]["active"])
+                        self.assertEqual(snapshot(project), expected_snapshot)
+                        repeated = run_cli(project, arguments(operation))
+                        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                        self.assertEqual(snapshot(project), expected_snapshot)
 
     def test_current_package_finishes_an_older_package_transaction_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -145,6 +145,14 @@ function loadManifest(project) {
     || manifest.files === null
     || Array.isArray(manifest.files)
     || (
+      manifest.file_modes !== undefined
+      && (
+        typeof manifest.file_modes !== "object"
+        || manifest.file_modes === null
+        || Array.isArray(manifest.file_modes)
+      )
+    )
+    || (
       manifest.unmanaged_files !== undefined
       && (
         typeof manifest.unmanaged_files !== "object"
@@ -172,6 +180,16 @@ function loadManifest(project) {
       throw new Error(`manifest_entry_invalid: ${relativePath}`);
     }
   }
+  for (const [relativePath, mode] of Object.entries(manifest.file_modes ?? {})) {
+    if (
+      manifest.files[relativePath] === undefined
+      || !Number.isInteger(mode)
+      || mode < 0
+      || mode > 0o7777
+    ) {
+      throw new Error(`manifest_entry_invalid: ${relativePath}`);
+    }
+  }
   if (Object.keys(unmanagedFiles).some((path) => manifest.files[path] !== undefined)) {
     throw new Error("manifest_invalid");
   }
@@ -192,6 +210,40 @@ function isManagedPath(relativePath) {
     || relativePath.startsWith(".agents/skills/herdr-orchestrator/")
     || relativePath === ".orchestrator/.gitignore"
   );
+}
+
+function regularFileMode(path) {
+  const status = lstatSync(path);
+  if (status.isSymbolicLink() || !status.isFile()) {
+    throw new Error(`managed_path_not_regular: ${path}`);
+  }
+  return status.mode & 0o7777;
+}
+
+function defaultFileMode() {
+  return 0o666 & ~process.umask();
+}
+
+function directoryHasFiles(path) {
+  let entries;
+  try {
+    const status = lstatSync(path);
+    if (status.isSymbolicLink() || !status.isDirectory()) {
+      return true;
+    }
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+  return entries.some((entry) => {
+    const entryPath = join(path, entry.name);
+    return entry.isDirectory() && !entry.isSymbolicLink()
+      ? directoryHasFiles(entryPath)
+      : true;
+  });
 }
 
 function assertNoSymlink(project, relativePath) {
@@ -600,7 +652,7 @@ function install(options) {
   };
   reconcileInstallerJournal(journalContext);
   const previous = loadManifest(project);
-  const skillRouterExists = existsSync(join(project, ".agents/skills"));
+  const skillRouterExists = directoryHasFiles(join(project, ".agents/skills"));
   const installSkill = options.installSkill ?? (
     previous === null ? !skillRouterExists : previousSkillPreference(previous)
   );
@@ -619,6 +671,7 @@ function install(options) {
   const desiredFiles = buildDesiredFiles(harnesses, installSkill);
 
   const previousFiles = previous?.files ?? {};
+  const previousFileModes = previous?.file_modes ?? {};
   const conflicts = [];
   const preserved = [];
   const removals = [];
@@ -632,6 +685,7 @@ function install(options) {
     unmanaged.push(skillPath);
   }
   const manifestFiles = {};
+  const manifestFileModes = {};
   const unmanagedFiles = {};
   for (const [relativePath, content] of desiredFiles) {
     assertNoSymlink(project, relativePath);
@@ -639,10 +693,18 @@ function install(options) {
     const desiredHash = sha256(content);
     if (!existsSync(target)) {
       manifestFiles[relativePath] = desiredHash;
+      manifestFileModes[relativePath] = defaultFileMode();
       continue;
     }
+    const currentMode = regularFileMode(target);
     const currentHash = sha256(readFileSync(target));
     const previousHash = previousFiles[relativePath];
+    const previousMode = previousFileModes[relativePath];
+    const matchesPrevious = (
+      previousHash !== undefined
+      && currentHash === previousHash
+      && (previousMode === undefined || currentMode === previousMode)
+    );
     if (previousHash === undefined) {
       if (currentHash !== desiredHash) {
         conflicts.push(relativePath);
@@ -650,11 +712,15 @@ function install(options) {
         unmanaged.push(relativePath);
         unmanagedFiles[relativePath] = desiredHash;
       }
-    } else if (previousHash !== undefined && currentHash !== previousHash) {
+    } else if (!matchesPrevious) {
       preserved.push(relativePath);
       manifestFiles[relativePath] = previousHash;
+      if (previousMode !== undefined) {
+        manifestFileModes[relativePath] = previousMode;
+      }
     } else {
       manifestFiles[relativePath] = desiredHash;
+      manifestFileModes[relativePath] = currentMode;
     }
   }
   for (const [relativePath, previousHash] of Object.entries(previousFiles)) {
@@ -666,15 +732,35 @@ function install(options) {
     if (!existsSync(target)) {
       continue;
     }
-    if (sha256(readFileSync(target)) === previousHash) {
+    const currentMode = regularFileMode(target);
+    if (
+      sha256(readFileSync(target)) === previousHash
+      && (
+        previousFileModes[relativePath] === undefined
+        || currentMode === previousFileModes[relativePath]
+      )
+    ) {
       removals.push(relativePath);
     } else {
       preserved.push(relativePath);
       manifestFiles[relativePath] = previousHash;
+      if (previousFileModes[relativePath] !== undefined) {
+        manifestFileModes[relativePath] = previousFileModes[relativePath];
+      }
     }
   }
   if (conflicts.length > 0) {
     throw new Error(`unmanaged_file_conflict: ${conflicts.sort().join(",")}`);
+  }
+
+  for (const relativePath of Object.keys(manifestFiles)) {
+    if (manifestFileModes[relativePath] !== undefined) {
+      continue;
+    }
+    const target = join(project, relativePath);
+    manifestFileModes[relativePath] = existsSync(target)
+      ? regularFileMode(target)
+      : defaultFileMode();
   }
 
   const manifest = {
@@ -684,6 +770,7 @@ function install(options) {
     harnesses,
     install_skill: installSkill,
     files: manifestFiles,
+    file_modes: manifestFileModes,
     unmanaged_files: unmanagedFiles,
   };
   const manifestContent = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
@@ -1027,12 +1114,19 @@ function inspectInstallation(project) {
   }
   const missing = [];
   const modified = [];
+  const manifestFileModes = manifest?.file_modes ?? {};
   for (const [relativePath, expectedHash] of Object.entries(manifest?.files ?? {})) {
     assertNoSymlink(project, relativePath);
     const target = join(project, relativePath);
     if (!existsSync(target)) {
       missing.push(relativePath);
-    } else if (sha256(readFileSync(target)) !== expectedHash) {
+    } else if (
+      sha256(readFileSync(target)) !== expectedHash
+      || (
+        manifestFileModes[relativePath] !== undefined
+        && regularFileMode(target) !== manifestFileModes[relativePath]
+      )
+    ) {
       modified.push(relativePath);
     }
   }
@@ -1055,7 +1149,14 @@ function inspectInstallation(project) {
     assertNoSymlink(project, relativePath);
     if (!existsSync(target)) {
       packageMissing.push(relativePath);
-    } else if (sha256(readFileSync(target)) !== expectedHash) {
+    } else if (
+      sha256(readFileSync(target)) !== expectedHash
+      || (
+        manifest?.files?.[relativePath] !== undefined
+        && manifestFileModes[relativePath] !== undefined
+        && regularFileMode(target) !== manifestFileModes[relativePath]
+      )
+    ) {
       packageModified.push(relativePath);
     }
     if (declaredFiles[relativePath] === undefined) {
@@ -1228,6 +1329,7 @@ function uninstall(options) {
   const preserved = [];
   const removals = [];
   const originalStates = new Map();
+  const manifestFileModes = manifest.file_modes ?? {};
   const journalContext = {
     assertGitExcludeSafe,
     gitExcludePath: localExcludePath,
@@ -1241,7 +1343,13 @@ function uninstall(options) {
     if (original.kind === "absent") {
       continue;
     }
-    if (original.digest === expectedHash) {
+    if (
+      original.digest === expectedHash
+      && (
+        manifestFileModes[relativePath] === undefined
+        || original.mode === manifestFileModes[relativePath]
+      )
+    ) {
       removals.push(relativePath);
     } else {
       preserved.push(relativePath);

@@ -29,13 +29,15 @@ export const INSTALLER_HARNESSES = Object.freeze([
 ]);
 
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const MAX_PID = 2_147_483_647;
+const PID_PATTERN = /^[1-9][0-9]{0,9}$/;
 const INSTALLER_HARNESS_SET = new Set(INSTALLER_HARNESSES);
 const TRANSACTION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const JOURNAL_TEMPORARY_PATTERN =
-  /^\.install-journal\.([0-9a-f-]{36})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.tmp$/;
+  /^\.install-journal\.([0-9a-f-]{36})\.([0-9]+)\.([0-9a-f-]{36})\.tmp$/;
 const JOURNAL_OWNER_PATTERN =
-  /^\.install-journal\.([0-9a-f-]{36})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.owner$/;
+  /^\.install-journal\.([0-9a-f-]{36})\.([0-9]+)\.([0-9a-f-]{36})\.owner$/;
 
 function sha256(content) {
   return createHash("sha256").update(content).digest("hex");
@@ -48,7 +50,14 @@ function isPlainObject(value) {
 function stateMatches(left, right) {
   return left.kind === right.kind && (
     left.kind === "absent"
-    || (left.digest === right.digest && left.mode === right.mode)
+    || (
+      left.digest === right.digest
+      && (
+        left.mode === undefined
+        || right.mode === undefined
+        || left.mode === right.mode
+      )
+    )
   );
 }
 
@@ -72,16 +81,21 @@ function validateState(value) {
     if (
       typeof value.digest !== "string"
       || !DIGEST_PATTERN.test(value.digest)
-      || !Number.isInteger(value.mode)
-      || value.mode < 0
-      || value.mode > 0o7777
+      || (
+        Object.hasOwn(value, "mode")
+        && (
+          !Number.isInteger(value.mode)
+          || value.mode < 0
+          || value.mode > 0o7777
+        )
+      )
     ) {
       throw new Error("installer_journal_invalid");
     }
     return {
       digest: value.digest,
       kind: "regular",
-      mode: value.mode,
+      ...(Object.hasOwn(value, "mode") ? { mode: value.mode } : {}),
     };
   }
   if (Object.hasOwn(value, "digest") || Object.hasOwn(value, "mode")) {
@@ -279,6 +293,17 @@ function atomicReplace(path, content, temporaryPath, mode) {
     }
     throw error;
   }
+}
+
+function setRegularFileMode(path, mode) {
+  const descriptor = openSync(path, "r");
+  try {
+    fchmodSync(descriptor, mode);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  fsyncDirectory(dirname(path));
 }
 
 function assertProjectTargetSafe(project, relativePath) {
@@ -557,7 +582,7 @@ function journalOwnerPath(project, transactionId) {
   );
 }
 
-function listJournalArtifacts(project, pattern) {
+function listJournalArtifacts(project, pattern, kind) {
   const directory = dirname(journalPath(project));
   let names;
   try {
@@ -577,20 +602,36 @@ function listJournalArtifacts(project, pattern) {
     ) {
       return [];
     }
+    const pid = Number(match[2]);
+    if (
+      !PID_PATTERN.test(match[2])
+      || !Number.isSafeInteger(pid)
+      || pid > MAX_PID
+    ) {
+      return [{
+        invalid: true,
+        kind,
+        path: join(directory, name),
+        pid: null,
+        transactionId: match[1],
+      }];
+    }
     return [{
+      invalid: false,
+      kind,
       path: join(directory, name),
-      pid: Number(match[2]),
+      pid,
       transactionId: match[1],
     }];
   });
 }
 
 function listJournalTemporaries(project) {
-  return listJournalArtifacts(project, JOURNAL_TEMPORARY_PATTERN);
+  return listJournalArtifacts(project, JOURNAL_TEMPORARY_PATTERN, "temporary");
 }
 
 function listJournalOwners(project) {
-  return listJournalArtifacts(project, JOURNAL_OWNER_PATTERN);
+  return listJournalArtifacts(project, JOURNAL_OWNER_PATTERN, "owner");
 }
 
 function persistJournal(project, journal) {
@@ -698,6 +739,35 @@ function adoptJournalOwner(project, artifact) {
   return owner;
 }
 
+function adoptLegacyPublishedJournal(project, journal) {
+  const owner = {
+    path: journalOwnerPath(project, journal.transaction_id),
+    pid: process.pid,
+    transactionId: journal.transaction_id,
+  };
+  try {
+    renameSync(journalPath(project), owner.path);
+  } catch (error) {
+    if (["EEXIST", "ENOENT"].includes(error.code)) {
+      throw new Error("installer_transaction_active");
+    }
+    throw error;
+  }
+  fsyncDirectory(dirname(owner.path));
+  return owner;
+}
+
+function isLegacyModeJournal(journal) {
+  const regularStates = [
+    ...Object.values(journal.prior_inventory).map((item) => item.state),
+    ...Object.values(journal.desired_inventory).map((item) => item.state),
+  ].filter((state) => state.kind === "regular");
+  return (
+    regularStates.length > 0
+    && regularStates.every((state) => state.mode === undefined)
+  );
+}
+
 function recoverPublishedJournal(project) {
   let journal = readPublishedJournal(project);
   const owners = listJournalOwners(project);
@@ -705,6 +775,12 @@ function recoverPublishedJournal(project) {
   const artifacts = [...owners, ...temporaries];
   if (journal === null && artifacts.length === 0) {
     return null;
+  }
+  const invalidArtifact = artifacts.find((artifact) => artifact.invalid);
+  if (invalidArtifact !== undefined) {
+    throw new Error(
+      `installer_journal_${invalidArtifact.kind}_conflict: ${basename(invalidArtifact.path)}`,
+    );
   }
   if (artifacts.some((artifact) => processIsAlive(artifact.pid))) {
     throw new Error("installer_transaction_active");
@@ -717,10 +793,20 @@ function recoverPublishedJournal(project) {
     artifact: temporary,
     journal: readOwnedJournalTemporary(temporary),
   }));
+  if (
+    journal !== null
+    && [...ownerRecords, ...temporaryRecords].some(
+      (record) => record.journal.transaction_id !== journal.transaction_id,
+    )
+  ) {
+    throw new Error("installer_journal_owner_conflict: transaction");
+  }
   let claimRecord = null;
   if (journal === null) {
     if (ownerRecords.length === 1) {
       claimRecord = ownerRecords[0];
+    } else if (ownerRecords.length === 0 && temporaryRecords.length === 1) {
+      claimRecord = temporaryRecords[0];
     } else if (ownerRecords.length === 0) {
       throw new Error("installer_journal_owner_conflict: missing");
     } else {
@@ -737,10 +823,23 @@ function recoverPublishedJournal(project) {
     if (matchingOwners.length === 1) {
       claimRecord = matchingOwners[0];
     } else {
-      throw new Error("installer_journal_owner_conflict: missing");
+      const matchingTemporaries = temporaryRecords.filter(
+        (record) => record.journal.transaction_id === journal.transaction_id,
+      );
+      if (matchingTemporaries.length === 1) {
+        claimRecord = matchingTemporaries[0];
+      } else if (matchingTemporaries.length > 1) {
+        throw new Error("installer_journal_owner_conflict: multiple");
+      } else if (isLegacyModeJournal(journal)) {
+        claimRecord = null;
+      } else {
+        throw new Error("installer_journal_owner_conflict: missing");
+      }
     }
   }
-  const owner = adoptJournalOwner(project, claimRecord.artifact);
+  const owner = claimRecord === null
+    ? adoptLegacyPublishedJournal(project, journal)
+    : adoptJournalOwner(project, claimRecord.artifact);
   if (!existsSync(journalPath(project))) {
     try {
       linkSync(owner.path, journalPath(project));
@@ -864,6 +963,13 @@ function applyOperation(project, journal, operation, context) {
       throw new Error(`installer_recovery_conflict: ${targetLabel(operation.target)}`);
     }
     if (temporary.kind === "regular") {
+      if (
+        operation.desired.mode === undefined
+        && actual.kind === "regular"
+        && temporary.mode !== actual.mode
+      ) {
+        setRegularFileMode(temporaryPath, actual.mode);
+      }
       renameSync(temporaryPath, path);
       fsyncDirectory(dirname(path));
       return;
@@ -873,7 +979,8 @@ function applyOperation(project, journal, operation, context) {
       path,
       content,
       temporaryPath,
-      operation.desired.mode,
+      operation.desired.mode
+        ?? (actual.kind === "regular" ? actual.mode : replacementMode(path)),
     );
   } else {
     if (stateMatches(actual, operation.desired)) {
@@ -998,6 +1105,19 @@ export function inspectInstallerJournal(context) {
   const project = resolve(context.project);
   const owners = listJournalOwners(project);
   const temporaries = listJournalTemporaries(project);
+  const invalidArtifact = [...owners, ...temporaries].find(
+    (artifact) => artifact.invalid,
+  );
+  if (invalidArtifact !== undefined) {
+    return {
+      active: true,
+      conflicts: [
+        `journal-${invalidArtifact.kind}:${basename(invalidArtifact.path)}`,
+      ],
+      invalid: true,
+      publication: invalidArtifact.kind,
+    };
+  }
   let journal = readPublishedJournal(project);
   let publication = "published";
   const journalTemporaryConflicts = [];
@@ -1089,10 +1209,20 @@ export function inspectInstallerJournal(context) {
 
 export function runInstallerTransaction(spec) {
   const project = resolve(spec.project);
+  const journalOwners = listJournalOwners(project);
+  const journalTemporaries = listJournalTemporaries(project);
+  const invalidArtifact = [...journalOwners, ...journalTemporaries].find(
+    (artifact) => artifact.invalid,
+  );
+  if (invalidArtifact !== undefined) {
+    throw new Error(
+      `installer_journal_${invalidArtifact.kind}_conflict: ${basename(invalidArtifact.path)}`,
+    );
+  }
   if (
     readPublishedJournal(project) !== null
-    || listJournalOwners(project).length > 0
-    || listJournalTemporaries(project).length > 0
+    || journalOwners.length > 0
+    || journalTemporaries.length > 0
   ) {
     throw new Error("installer_transaction_active");
   }

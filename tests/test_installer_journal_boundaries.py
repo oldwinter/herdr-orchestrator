@@ -14,6 +14,162 @@ INSTALLER_FAULT_LOADER = REPO_ROOT / "tests/installer_fault_loader.mjs"
 
 
 class InstallerJournalBoundaryTests(unittest.TestCase):
+    def test_install_after_uninstall_reinstalls_skill_with_only_empty_router_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            skill = project / ".agents/skills/herdr-orchestrator/SKILL.md"
+            self.assertTrue(skill.is_file())
+
+            uninstalled = self._run("uninstall", "--project", str(project))
+
+            self.assertEqual(uninstalled.returncode, 0, uninstalled.stderr)
+            self.assertFalse(skill.exists())
+            self.assertTrue((project / ".agents/skills").is_dir())
+            self.assertTrue((project / ".agents/skills/herdr-orchestrator").is_dir())
+
+            reinstalled = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+
+            self.assertEqual(reinstalled.returncode, 0, reinstalled.stderr)
+            self.assertTrue(skill.is_file())
+            self.assertEqual(json.loads(reinstalled.stdout)["skill"], "managed")
+
+    def test_malformed_owner_pid_returns_a_stable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            environment = os.environ.copy()
+            environment["HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL"] = "journal:published"
+            interrupted = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+                env=environment,
+            )
+            self.assertEqual(interrupted.returncode, 86, interrupted.stderr)
+            owner = next((project / ".herdr-orchestrator").glob(".install-journal.*.owner"))
+            parts = owner.name.split(".")
+            malformed = owner.with_name(
+                ".".join(
+                    [
+                        "",
+                        "install-journal",
+                        parts[2],
+                        "9" * 100,
+                        parts[4],
+                        "owner",
+                    ]
+                )
+            )
+            owner.rename(malformed)
+
+            doctor_environment = os.environ.copy()
+            doctor_environment["PYTHON"] = "/bin/false"
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env=doctor_environment,
+            )
+            self.assertEqual(doctor.returncode, 1, doctor.stderr)
+            installation = json.loads(doctor.stdout)["installation"]
+            self.assertTrue(installation["journal"]["invalid"])
+            self.assertTrue(installation["journal"]["conflicts"])
+
+            contender = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(contender.returncode, 2)
+            self.assertTrue(contender.stderr.startswith("installer_journal_owner_conflict:"))
+            self.assertTrue(malformed.is_file())
+
+    def test_mode_only_change_is_reported_and_uninstall_preserves_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / ".git").mkdir()
+            installed = self._run(
+                "install",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+            workflow.chmod(0o600)
+
+            doctor_environment = os.environ.copy()
+            doctor_environment["PYTHON"] = "/bin/false"
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env=doctor_environment,
+            )
+            self.assertEqual(doctor.returncode, 1, doctor.stderr)
+            installation = json.loads(doctor.stdout)["installation"]
+            self.assertFalse(installation["ok"])
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                installation["modified"],
+            )
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                installation["package_modified"],
+            )
+
+            upgrade = self._run(
+                "upgrade",
+                "--project",
+                str(project),
+                "--harness",
+                "droid",
+            )
+            self.assertEqual(upgrade.returncode, 1, upgrade.stderr)
+            upgrade_payload = json.loads(upgrade.stdout)
+            self.assertFalse(upgrade_payload["ok"])
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                upgrade_payload["preserved"],
+            )
+            self.assertTrue(workflow.is_file())
+            self.assertEqual(workflow.stat().st_mode & 0o777, 0o600)
+
+            uninstall = self._run(
+                "uninstall",
+                "--project",
+                str(project),
+            )
+
+            self.assertEqual(uninstall.returncode, 1, uninstall.stderr)
+            payload = json.loads(uninstall.stdout)
+            self.assertIn(
+                ".herdr-orchestrator/workflows/multi-harness.toml",
+                payload["preserved"],
+            )
+            self.assertTrue(workflow.is_file())
+            self.assertEqual(workflow.stat().st_mode & 0o777, 0o600)
+
     def test_git_exclude_preserves_mode_under_a_restrictive_umask(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -61,6 +217,13 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(installed.returncode, 0, installed.stderr)
             workflow = project / ".herdr-orchestrator/workflows/multi-harness.toml"
+            manifest_path = project / ".herdr-orchestrator/manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            del manifest["file_modes"]
+            manifest_path.write_text(
+                f"{json.dumps(manifest, indent=2)}\n",
+                encoding="utf-8",
+            )
             workflow.chmod(0o640)
             original = workflow.read_bytes()
             published_environment = os.environ.copy()

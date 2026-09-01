@@ -173,6 +173,7 @@ function instrument(source) {
     "  fsyncDirectory(dirname(owner.path));\n"
       + "  __faultMutation(`journal:owner:adopted:${owner.transactionId}`, owner.path);\n"
       + "  return owner;",
+    2,
   );
   result = replaceExact(
     result,
