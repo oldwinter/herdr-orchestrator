@@ -153,6 +153,12 @@ the caller must invoke install or upgrade again explicitly. If all initially pre
 targets disappear before retirement while the Git exclude block is still retained, recovery
 returns a bounded conflict and keeps the journal; the next retry re-evaluates the live inventory
 and removes the block when no retained project path remains.
+If the exclude endpoint is already at its desired bytes while preserved project paths remain, or
+is in any third state, recovery likewise stops with a conflict rather than claiming that the
+block was retained.
+An unjournaled file that appears under a managed root is also a conflict participant; doctor
+reports the same `git-exclude:<path>` conflict and recovery leaves the journal and exclude
+untouched until that caller entry is resolved.
 Old manifests that omit `file_modes` are mode-unverified: existing files are reported as
 `modified` (also listed in `mode_unverified`) and are preserved without overwrite or removal.
 New journals and manifests record modes explicitly.

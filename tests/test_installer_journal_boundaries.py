@@ -545,6 +545,8 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
                 for path in project_removals:
                     if path.exists():
                         path.unlink()
+                caller_file = project / ".herdr-orchestrator/caller-owned.txt"
+                caller_file.write_bytes(b"caller bytes\n")
             finally:
                 barrier.mkdir(parents=True, exist_ok=True)
                 (barrier / "release").write_text("", encoding="utf-8")
@@ -554,9 +556,27 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
             self.assertTrue(stderr.startswith("installer_recovery_conflict: git-exclude:"))
             self.assertTrue(journal_path.is_file())
             self.assertEqual(exclude.read_bytes(), exclude_before)
+            doctor = self._run(
+                "doctor",
+                "--project",
+                str(project),
+                env={**os.environ, "PYTHON": "/bin/false"},
+            )
+            self.assertEqual(doctor.returncode, 1, doctor.stderr)
+            installation = json.loads(doctor.stdout)["installation"]
+            self.assertTrue(installation["journal"]["active"])
+            self.assertIn(
+                "git-exclude:.herdr-orchestrator/caller-owned.txt",
+                installation["journal"]["conflicts"],
+            )
 
             repeated = self._run("uninstall", "--project", str(project))
-            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertEqual(repeated.returncode, 2, repeated.stderr)
+            self.assertTrue(journal_path.is_file())
+            self.assertTrue(caller_file.is_file())
+            caller_file.unlink()
+            converged = self._run("uninstall", "--project", str(project))
+            self.assertEqual(converged.returncode, 0, converged.stderr)
             self.assertFalse(journal_path.exists())
             self.assertNotIn(b"herdr-orchestrator:begin", exclude.read_bytes())
 

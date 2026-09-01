@@ -875,6 +875,133 @@ function legacyProjectPreservationConflict(journal, preservedTargets) {
     .sort();
 }
 
+function listLiveManagedEntries(project, journal) {
+  const known = new Set([
+    ...Object.values(journal.prior_inventory),
+    ...Object.values(journal.desired_inventory),
+  ]
+    .filter((item) => item.target.scope === "project")
+    .map((item) => item.target.path));
+  const transactionToken = journal.transaction_id;
+  const operationTemporaryNames = new Set();
+  for (const operation of journal.operations) {
+    if (operation.desired.kind !== "regular" || operation.target.scope !== "project") {
+      continue;
+    }
+    operationTemporaryNames.add(
+      basename(
+        targetTemporaryPath(
+          join(project, operation.target.path),
+          journal,
+          operation,
+        ),
+      ),
+    );
+  }
+  const ignored = (name, relativePath) => (
+    relativePath === INSTALLER_JOURNAL_RELATIVE_PATH
+    || (
+      operationTemporaryNames.has(name)
+      || (
+        (JOURNAL_OWNER_PATTERN.test(name) || JOURNAL_TEMPORARY_PATTERN.test(name))
+        && name.includes(transactionToken)
+      )
+    )
+  );
+  const entries = [];
+  const visit = (relativeDirectory) => {
+    const directory = join(project, relativeDirectory);
+    let directoryEntries;
+    try {
+      const status = lstatSync(directory);
+      if (status.isSymbolicLink() || !status.isDirectory()) {
+        const name = basename(relativeDirectory);
+        if (!known.has(relativeDirectory) && !ignored(name, relativeDirectory)) {
+          entries.push(relativeDirectory);
+        }
+        return;
+      }
+      directoryEntries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
+    for (const entry of directoryEntries) {
+      const child = `${relativeDirectory}/${entry.name}`;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        visit(child);
+      } else if (!known.has(child) && !ignored(entry.name, child)) {
+        entries.push(child);
+      }
+    }
+  };
+  for (const root of [
+    ".herdr-orchestrator",
+    ".orchestrator",
+    ".agents/skills/herdr-orchestrator",
+  ]) {
+    visit(root);
+  }
+  return entries.sort();
+}
+
+function legacyExcludeCouplingConflict(project, journal, context, preservedTargets) {
+  if (journal.command !== "uninstall") {
+    return null;
+  }
+  if (!isLegacyModeJournal(journal)) {
+    return null;
+  }
+  const hasGitExcludeParticipant = Object.values(journal.prior_inventory)
+    .some((item) => item.target.scope === "git-exclude");
+  if (!hasGitExcludeParticipant) {
+    return null;
+  }
+  const unjournaled = listLiveManagedEntries(project, journal);
+  if (unjournaled.length > 0) {
+    return unjournaled.map((path) => `git-exclude:${path}`).join(",");
+  }
+  const projectKeys = [...preservedTargets].filter((key) => {
+    const item = journal.prior_inventory[key];
+    return (
+      key.startsWith("project:")
+      && item !== undefined
+      && !isManifestTarget(item.target)
+    );
+  });
+  const excludeKey = [...preservedTargets].find((key) => {
+    const item = journal.prior_inventory[key];
+    return item?.target.scope === "git-exclude";
+  });
+  if (projectKeys.length === 0 || excludeKey === undefined) {
+    return null;
+  }
+  const retainedProjects = projectKeys.filter((key) => {
+    const item = journal.prior_inventory[key];
+    const actual = observeTarget(project, item.target, context);
+    return stateMatches(actual, item.state);
+  });
+  if (retainedProjects.length === 0) {
+    const exclude = journal.prior_inventory[excludeKey];
+    return targetLabel(exclude.target);
+  }
+  return null;
+}
+
+function assertLegacyExcludeCoupling(project, journal, context, preservedTargets) {
+  const conflict = legacyExcludeCouplingConflict(
+    project,
+    journal,
+    context,
+    preservedTargets,
+  );
+  if (conflict !== null) {
+    throw new Error(`installer_recovery_conflict: ${conflict}`);
+  }
+}
+
 function recoverPublishedJournal(project) {
   let journal = readPublishedJournal(project);
   const owners = listJournalOwners(project);
@@ -1245,11 +1372,16 @@ function completeJournal(project, journal, context, owner) {
     );
   }
   preflightEndpoints(project, journal, context, preservedTargets);
+  assertLegacyExcludeCoupling(project, journal, context, preservedTargets);
   for (let index = 0; index < journal.operations.length; index += 1) {
     const operation = journal.operations[index];
+    if (operation.target.scope === "git-exclude") {
+      assertLegacyExcludeCoupling(project, journal, context, preservedTargets);
+    }
     if (
       isManifestTarget(operation.target)
     ) {
+      assertLegacyExcludeCoupling(project, journal, context, preservedTargets);
       verifyDesiredInventoryBeforeManifest(
         project,
         journal,
@@ -1284,23 +1416,7 @@ function completeJournal(project, journal, context, owner) {
       retainedPreservedTargets.add(key);
     }
   }
-  const retainedProjectCount = [...retainedPreservedTargets]
-    .filter((key) => key.startsWith("project:"))
-    .filter((key) => {
-      const item = journal.prior_inventory[key];
-      return item !== undefined && !isManifestTarget(item.target);
-    }).length;
-  const retainedExcludeKey = [...retainedPreservedTargets].find((key) => {
-    const item = journal.prior_inventory[key];
-    return item?.target.scope === "git-exclude";
-  });
-  if (retainedProjectCount === 0 && retainedExcludeKey !== undefined) {
-    throw new Error(
-      `installer_recovery_conflict: ${targetLabel(
-        journal.prior_inventory[retainedExcludeKey].target,
-      )}`,
-    );
-  }
+  assertLegacyExcludeCoupling(project, journal, context, preservedTargets);
   if (journal.progress.phase !== "verified") {
     journal.progress.phase = "verified";
     persistJournal(project, journal);
@@ -1496,12 +1612,19 @@ export function inspectInstallerJournal(context) {
     journal,
     preservedTargets,
   );
+  const legacyExcludeConflict = legacyExcludeCouplingConflict(
+    project,
+    journal,
+    normalizedContext,
+    preservedTargets,
+  );
   return {
     active: true,
     command: journal.command,
     conflicts: [
       ...inspection.conflicts,
       ...legacyProjectConflicts,
+      ...(legacyExcludeConflict === null ? [] : [legacyExcludeConflict]),
       ...journalTemporaryConflicts,
     ].sort(),
     desired_inventory: journal.desired_inventory,
