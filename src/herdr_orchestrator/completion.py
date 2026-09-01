@@ -9,7 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from herdr_orchestrator.observability import sanitize
-from herdr_orchestrator.protocol import TransportError
+from herdr_orchestrator.protocol import ERROR_CODE, TransportError
 
 STRUCTURED_COMPLETION_MARKER = "HERDR-COMPLETION-V2 "
 MAX_COMPLETION_OUTPUT_BYTES = 32 * 1024
@@ -65,6 +65,20 @@ class CompletionIdentity:
     attempt: int
     fencing_token: str
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.job_id) is not int
+            or self.job_id < 1
+            or type(self.attempt) is not int
+            or self.attempt < 1
+            or not isinstance(self.fencing_token, str)
+            or not 1 <= len(self.fencing_token) <= 256
+            or self.fencing_token.strip() != self.fencing_token
+            or "\n" in self.fencing_token
+            or "\r" in self.fencing_token
+        ):
+            raise ValueError("completion_identity_invalid")
+
 
 @dataclass(frozen=True, slots=True)
 class CompletionResult:
@@ -73,6 +87,43 @@ class CompletionResult:
     status: CompletionStatus | None
     evidence_summary: str | None
     error_code: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.policy, CompletionPolicy) or not isinstance(
+            self.verification, VerificationClass
+        ):
+            raise ValueError("completion_result_invalid")
+        if self.verification is VerificationClass.UNVERIFIED:
+            valid = all(
+                value is None for value in (self.status, self.evidence_summary, self.error_code)
+            )
+        elif self.verification is VerificationClass.VERIFICATION_FAILED:
+            valid = bool(
+                self.policy is not CompletionPolicy.LEGACY_UNVERIFIED
+                and self.status is None
+                and self.evidence_summary is None
+                and isinstance(self.error_code, str)
+                and ERROR_CODE.fullmatch(self.error_code)
+            )
+        else:
+            valid = self._verified_result_is_valid()
+        if not valid:
+            raise ValueError("completion_result_invalid")
+
+    def _verified_result_is_valid(self) -> bool:
+        if self.policy is CompletionPolicy.LEGACY_UNVERIFIED or self.error_code is not None:
+            return False
+        if not isinstance(self.status, CompletionStatus):
+            return False
+        if self.policy is CompletionPolicy.RECEIPT_V1:
+            return self.status is CompletionStatus.COMPLETED and self.evidence_summary is None
+        return bool(
+            isinstance(self.evidence_summary, str)
+            and self.evidence_summary
+            and len(self.evidence_summary.encode("utf-8")) <= 300
+            and "\n" not in self.evidence_summary
+            and "\r" not in self.evidence_summary
+        )
 
     @property
     def task_verified(self) -> bool | None:

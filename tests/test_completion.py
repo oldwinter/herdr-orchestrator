@@ -14,6 +14,56 @@ from herdr_orchestrator.completion import (
 
 
 class CompletionProtocolTests(unittest.TestCase):
+    def test_completion_types_reject_contradictory_state(self) -> None:
+        invalid_results = (
+            (
+                CompletionPolicy.LEGACY_UNVERIFIED,
+                VerificationClass.VERIFIED,
+                CompletionStatus.COMPLETED,
+                None,
+                None,
+            ),
+            (
+                CompletionPolicy.STRUCTURED_V2,
+                VerificationClass.VERIFIED,
+                None,
+                "tests passed",
+                None,
+            ),
+            (
+                CompletionPolicy.STRUCTURED_V2,
+                VerificationClass.UNVERIFIED,
+                None,
+                "unexpected evidence",
+                None,
+            ),
+            (
+                CompletionPolicy.RECEIPT_V1,
+                VerificationClass.VERIFICATION_FAILED,
+                None,
+                None,
+                None,
+            ),
+        )
+        for arguments in invalid_results:
+            with (
+                self.subTest(arguments=arguments),
+                self.assertRaisesRegex(ValueError, "completion_result_invalid"),
+            ):
+                CompletionResult(*arguments)
+
+        invalid_identities = (
+            (0, 1, "fence"),
+            (1, 0, "fence"),
+            (1, 1, "fence\nreplacement"),
+        )
+        for arguments in invalid_identities:
+            with (
+                self.subTest(arguments=arguments),
+                self.assertRaisesRegex(ValueError, "completion_identity_invalid"),
+            ):
+                CompletionIdentity(*arguments)
+
     def test_parses_one_current_attempt_envelope(self) -> None:
         identity = CompletionIdentity(job_id=41, attempt=2, fencing_token="fence-current")
         output = (
@@ -43,6 +93,23 @@ class CompletionProtocolTests(unittest.TestCase):
             "missing": ("", "ordinary output", "completion_envelope_missing"),
             "stale": (valid, valid, "completion_envelope_stale"),
             "malformed": ("", "HERDR-COMPLETION-V2 {", "completion_envelope_malformed"),
+            "non-finite": (
+                "",
+                (
+                    'HERDR-COMPLETION-V2 {"schema_version":2,"job_id":41,"attempt":2,'
+                    '"fencing_token":"fence-current","status":"completed",'
+                    '"evidence_summary":NaN}'
+                ),
+                "completion_envelope_malformed",
+            ),
+            "missing field": (
+                "",
+                (
+                    'HERDR-COMPLETION-V2 {"schema_version":2,"job_id":41,"attempt":2,'
+                    '"fencing_token":"fence-current","status":"completed"}'
+                ),
+                "completion_envelope_invalid",
+            ),
             "duplicate": ("", f"{valid}\n{valid}", "completion_envelope_duplicate"),
             "oversized output": (
                 "",
@@ -66,6 +133,11 @@ class CompletionProtocolTests(unittest.TestCase):
                 "",
                 _envelope(evidence_summary="x" * 1_001),
                 "completion_evidence_oversized",
+            ),
+            "oversized envelope": (
+                "",
+                _envelope(evidence_summary="x" * 2_050),
+                "completion_envelope_oversized",
             ),
             "empty evidence": (
                 "",

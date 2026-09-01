@@ -179,6 +179,75 @@ class CompletionStoreTests(unittest.TestCase):
                 self.assertEqual(status["verification_class"], VerificationClass.VERIFIED.value)
                 self.assertIs(status["task_verified"], True)
 
+    def test_structured_recovery_without_durable_evidence_enters_attention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "state.db")
+            store.initialize()
+            store.enqueue(
+                NewJob(
+                    workflow="example",
+                    title="structured recovery",
+                    harness=Harness.CODEX,
+                    prompt="Do the task",
+                    dedupe_key="structured-recovery",
+                    max_attempts=2,
+                    placement=PlacementTarget.TAB,
+                    completion_policy=CompletionPolicy.STRUCTURED_V2,
+                )
+            )
+            claimed = store.claim("example", limit=1, lease_seconds=60)[0]
+            for progress in (
+                AttemptProgress(
+                    AttemptPhase.RUNTIME_ACQUIRED,
+                    claimed.agent_name,
+                    agent_state=AgentState.IDLE,
+                ),
+                AttemptProgress(
+                    AttemptPhase.PROMPT_ACCEPTED,
+                    claimed.agent_name,
+                    agent_state=AgentState.WORKING,
+                ),
+                AttemptProgress(
+                    AttemptPhase.SETTLED,
+                    claimed.agent_name,
+                    agent_state=AgentState.DONE,
+                    agent_settled=True,
+                ),
+            ):
+                store.record_attempt_progress(claimed, progress)
+            failed = CompletionResult(
+                CompletionPolicy.STRUCTURED_V2,
+                VerificationClass.VERIFICATION_FAILED,
+                None,
+                None,
+                "completion_recovery_unverified",
+            )
+
+            state = store.record_outcome(
+                claimed,
+                DispatchOutcome(
+                    claimed.agent_name,
+                    AgentState.DONE,
+                    True,
+                    "w1:p2",
+                    error_code="completion_recovery_unverified",
+                    placement=claimed.placement,
+                    agent_settled=True,
+                    completion=failed,
+                    correlation_id=claimed.correlation_id,
+                ),
+            )
+            status = store.jobs("example")[0]
+
+        self.assertEqual(state, JobState.BLOCKED)
+        self.assertEqual(status["attempt_phase"], AttemptPhase.ATTENTION.value)
+        self.assertEqual(status["attempts"], 1)
+        self.assertEqual(status["error_code"], "completion_recovery_unverified")
+        self.assertEqual(
+            status["verification_class"],
+            VerificationClass.VERIFICATION_FAILED.value,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

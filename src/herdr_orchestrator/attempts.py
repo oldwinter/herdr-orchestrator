@@ -968,6 +968,7 @@ class AttemptLedger:
             and outcome.state in {AgentState.WORKING, AgentState.UNKNOWN}
         )
         needs_attention = accepted_unsettled or normalized.error_code in {
+            "completion_recovery_unverified",
             "unsafe_turn_adoption",
             "task_receipt_recovery_unverified",
         }
