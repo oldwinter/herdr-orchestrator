@@ -48,6 +48,26 @@ def expected_branch_coverage(commands: Sequence[object]) -> bool:
     return any("--cov-branch" in getattr(command, "argv", ()) for command in commands)
 
 
+def expected_coverage_threshold(commands: Sequence[object]) -> float | None:
+    for command in commands:
+        argv = getattr(command, "argv", ())
+        for argument in argv:
+            if isinstance(argument, str) and argument.startswith("--cov-fail-under="):
+                try:
+                    return float(argument.partition("=")[2])
+                except ValueError:
+                    return None
+    return None
+
+
+def expected_build_command(commands: Sequence[object]) -> str | None:
+    for command in commands:
+        argv = getattr(command, "argv", ())
+        if "scripts/build_metrics.py" in argv:
+            return "npm pack --dry-run --json"
+    return None
+
+
 def path_has_symlink(root: Path, relative: Path) -> bool:
     current = root
     if current.is_symlink():
@@ -76,6 +96,31 @@ def _nonempty_text(value: object) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _branch_totals_valid(totals: dict[str, object]) -> bool:
+    required = (
+        "num_branches",
+        "num_partial_branches",
+        "covered_branches",
+        "missing_branches",
+        "percent_branches_covered",
+    )
+    if not all(name in totals for name in required):
+        return False
+    counts = tuple(totals[name] for name in required[:4])
+    if not all(_nonnegative_integer(value) for value in counts):
+        return False
+    num_branches, partial, covered, missing = counts
+    percent = totals[required[-1]]
+    if not _finite_number(percent) or percent < 0 or percent > 100:
+        return False
+    expected_percent = 100.0 if num_branches == 0 else 100.0 * covered / num_branches
+    return (
+        partial <= num_branches
+        and covered + missing == num_branches
+        and abs(percent - expected_percent) < 0.01
+    )
+
+
 def validate_artifact_payload(
     producer: str,
     key: str,
@@ -84,6 +129,8 @@ def validate_artifact_payload(
     expected_runs: int | None = None,
     expected_exit_code: int | None = None,
     expected_branch: bool = False,
+    coverage_threshold: float | None = None,
+    build_command: str | None = None,
 ) -> None:
     """Validate known producer output before treating it as verified evidence."""
     valid = True
@@ -108,6 +155,7 @@ def validate_artifact_payload(
             and _finite_number(percent)
             and isinstance(percent, (int, float))
             and 0 <= percent <= 100
+            and (coverage_threshold is None or percent >= coverage_threshold)
         )
         if valid:
             for name, value in totals.items():
@@ -138,6 +186,8 @@ def validate_artifact_payload(
                     isinstance(file_payload, dict) and isinstance(file_payload.get("summary"), dict)
                     for file_payload in files.values()
                 )
+            if valid and expected_branch:
+                valid = _branch_totals_valid(totals)
     elif key == "tests" and producer in {"coverage", "test"}:
         tests = payload.get("tests")
         summary = payload.get("summary")
@@ -163,6 +213,7 @@ def validate_artifact_payload(
                 isinstance(test, dict)
                 and _nonempty_text(test.get("nodeid"))
                 and _nonempty_text(test.get("outcome"))
+                and test.get("outcome") == "passed"
                 for test in tests
             )
         )
@@ -177,7 +228,7 @@ def validate_artifact_payload(
                 and isinstance(collected, int)
                 and isinstance(deselected, int)
                 and total > 0
-                and passed <= total
+                and passed == total
                 and collected >= total
                 and deselected <= collected
             )
@@ -200,6 +251,7 @@ def validate_artifact_payload(
                 isinstance(item, dict)
                 and item.get("run") == index
                 and _nonnegative_integer(item.get("tests"))
+                and item.get("tests") > 0
                 and _finite_number(item.get("duration_seconds"))
                 and isinstance(item.get("exit_code"), int)
                 and not isinstance(item.get("exit_code"), bool)
@@ -265,6 +317,7 @@ def validate_artifact_payload(
     elif producer == "build" and key == "build":
         valid = (
             _nonempty_text(payload.get("command"))
+            and (build_command is None or payload.get("command") == build_command)
             and isinstance(payload.get("status"), str)
             and payload.get("status") in {"passed", "failed"}
             and isinstance(payload.get("exit_code"), int)

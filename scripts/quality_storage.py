@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import shutil
@@ -16,6 +17,62 @@ from pathlib import Path
 from quality_validation import QualityBundleError
 
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+
+
+def atomic_write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(payload, output, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary)
+        raise
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary)
+        raise
+
+
+def json_bytes(payload: object) -> bytes:
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+
+
+def reclaim_pending(pending: Path) -> None:
+    owner = pending / "owner.json"
+    if pending.is_symlink() or not pending.is_dir() or not owner.is_file():
+        raise QualityBundleError("quality_run_reused")
+    try:
+        owner_pid = int(json.loads(owner.read_text(encoding="utf-8"))["pid"])
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        raise QualityBundleError("quality_run_reused") from error
+    if owner_pid <= 0 or owner_pid == os.getpid():
+        raise QualityBundleError("quality_run_reused")
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        raise QualityBundleError("quality_run_reused") from error
+    else:
+        raise QualityBundleError("quality_run_reused")
+    shutil.rmtree(pending)
 
 
 @dataclass(frozen=True)
@@ -142,6 +199,25 @@ def publish_results(
     paths = [default_path]
     if requested_path is not None and requested_path != default_path:
         paths.append(requested_path)
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    locks: list[tuple[Path, int]] = []
+    try:
+        for path in paths:
+            lock = path.with_name(f".{path.name}.quality-lock")
+            descriptor = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                os.close(descriptor)
+                raise OSError("quality_result_busy") from error
+            locks.append((lock, descriptor))
+    except OSError as error:
+        for _, descriptor in locks:
+            os.close(descriptor)
+        with suppress(OSError, shutil.Error):
+            shutil.rmtree(bundle_path)
+        raise
     new_paths = [path for path in paths if not path.exists()]
     try:
         for path in paths:
@@ -150,6 +226,15 @@ def publish_results(
         for path in new_paths:
             with suppress(OSError):
                 path.unlink()
+        for path in paths:
+            try:
+                if path.is_file() and path.stat().st_size == 0:
+                    path.unlink()
+            except OSError:
+                pass
         with suppress(OSError, shutil.Error):
             shutil.rmtree(bundle_path)
         raise
+    finally:
+        for _, descriptor in locks:
+            os.close(descriptor)

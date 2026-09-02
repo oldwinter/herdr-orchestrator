@@ -12,7 +12,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import uuid
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -39,7 +38,6 @@ COMMIT = re.compile(r"[0-9a-fA-F]{40}")
 NAME = re.compile(r"[a-z][a-z0-9-]*")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 OUTPUT_DIRECTORY = "${QUALITY_OUTPUT_DIR}"
-MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 1800
 
 
@@ -158,39 +156,9 @@ def _run_id(commit: str, invocation_id: str, source_digest: str) -> str:
     return f"{commit[:12].lower()}-{hashlib.sha256(identity).hexdigest()[:20]}"
 
 
-def _atomic_write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(payload, output, indent=2, sort_keys=True)
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        with suppress(FileNotFoundError):
-            os.unlink(temporary)
-        raise
-
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(data)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        with suppress(FileNotFoundError):
-            os.unlink(temporary)
-        raise
-
-
-def _json_bytes(payload: object) -> bytes:
-    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+_atomic_write_json = _quality_storage.atomic_write_json
+_atomic_write_bytes = _quality_storage.atomic_write_bytes
+_json_bytes = _quality_storage.json_bytes
 
 
 def _artifact_path(output_dir: Path, spec: ArtifactSpec) -> Path:
@@ -258,8 +226,13 @@ def _claim_run_directory(pending: Path, final: Path) -> None:
         raise QualityBundleError("quality_run_reused")
     try:
         pending.mkdir()
-    except FileExistsError as error:
-        raise QualityBundleError("quality_run_reused") from error
+    except FileExistsError:
+        _quality_storage.reclaim_pending(pending)
+        try:
+            pending.mkdir()
+        except FileExistsError as error:
+            raise QualityBundleError("quality_run_reused") from error
+    _atomic_write_json(pending / "owner.json", {"pid": os.getpid()})
     if final.exists():
         raise QualityBundleError("quality_run_reused")
 
@@ -272,6 +245,7 @@ def run_quality(
     specs: Sequence[ProducerSpec],
     source: SourceIdentity | None = None,
     source_probe: Callable[[], SourceIdentity] | None = None,
+    reuse_completed: bool = False,
 ) -> CompletedBundle:
     """Run producer specs and atomically publish one completed bundle."""
     if source is None:
@@ -289,8 +263,23 @@ def run_quality(
     runs_root.mkdir(parents=True, exist_ok=True)
     pending = pending_root / run_id
     final = runs_root / run_id
+    if reuse_completed and final.is_dir():
+        manifest = load_completed_manifest(
+            final / "manifest.json",
+            expected_commit=commit,
+            expected_invocation_id=invocation_id,
+            expected_run_id=run_id,
+            expected_source_digest=source.digest,
+            expected_specs=specs,
+            source_probe=source_probe,
+        )
+        passed = enforce_manifest(
+            manifest, required_producers=tuple(producer.name for producer in manifest.producers)
+        ) == 0
+        return CompletedBundle(final, final / "manifest.json", passed, 0 if passed else 1)
     _claim_run_directory(pending, final)
     (pending / "producers").mkdir()
+    _atomic_write_json(pending / "owner.json", {"pid": os.getpid()})
     started_at = _utc_now()
     producer_payloads: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -387,6 +376,8 @@ def run_quality(
             None,
         )
         expected_branch = _quality_validation.expected_branch_coverage(producer.commands)
+        coverage_threshold = _quality_validation.expected_coverage_threshold(producer.commands)
+        build_command = _quality_validation.expected_build_command(producer.commands)
         for artifact in producer.artifacts:
             try:
                 path = _artifact_path(work_dir, artifact)
@@ -405,6 +396,8 @@ def run_quality(
                             else None
                         ),
                         expected_branch=expected_branch,
+                        coverage_threshold=coverage_threshold,
+                        build_command=build_command,
                     )
                     if _quality_validation.finding_count(artifact.key, payload):
                         producer_passed = False
@@ -483,6 +476,8 @@ def run_quality(
         all_passed = False
         if bundle_exit_code == 0:
             bundle_exit_code = 1
+    with suppress(OSError):
+        (pending / "owner.json").unlink()
     manifest = {
         "commit": commit.lower(),
         "completed_at": _utc_now(),
@@ -758,6 +753,10 @@ def load_completed_manifest(
             validated_commands[0].exit_code if len(validated_commands) == 1 else None
         )
         expected_branch = _quality_validation.expected_branch_coverage(producer_spec.commands)
+        coverage_threshold = _quality_validation.expected_coverage_threshold(
+            producer_spec.commands
+        )
+        build_command = _quality_validation.expected_build_command(producer_spec.commands)
         if any(
             command.started_at < producer_started or command.ended_at > producer_ended
             for command in validated_commands
@@ -851,6 +850,8 @@ def load_completed_manifest(
                         command_exit_code if key in {"tests", "stability", "build"} else None
                     ),
                     expected_branch=expected_branch,
+                    coverage_threshold=coverage_threshold,
+                    build_command=build_command,
                 )
             if verified != (verification == "verified"):
                 raise QualityBundleError("quality_artifact_verification_mismatch")
@@ -1460,6 +1461,7 @@ def main() -> int:
             specs=specs,
             source=source,
             source_probe=_git_source_identity,
+            reuse_completed=True,
         )
         result_payload = _result_payload(
             bundle,

@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -929,6 +930,131 @@ class QualityBundleRunTests(unittest.TestCase):
             with self.assertRaisesRegex(quality_bundle.QualityBundleError, "quality_run_mismatch"):
                 quality_bundle.load_run_result(result_path, expected_root=root / "other-quality")
 
+    def test_result_publication_claim_is_exclusive_across_failures(self) -> None:
+        second_writer_started = Event()
+        first_writer_attempted = Event()
+        release_second_writer = Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared = root / "shared-result.json"
+            bundles = {label: root / f"bundle-{label}" for label in ("a", "b")}
+            defaults = {label: root / f"default-{label}.json" for label in ("a", "b")}
+
+            def publish(label: str) -> str:
+                bundle = bundles[label]
+                bundle.mkdir()
+                (bundle / "marker").write_text(label, encoding="utf-8")
+                if label == "a":
+                    first_writer_attempted.set()
+
+                def write_json(path: Path, payload: object) -> None:
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    if path == defaults["b"]:
+                        second_writer_started.set()
+                        release_second_writer.wait(timeout=5)
+                    if path == shared and label == "a":
+                        raise OSError("injected publication failure")
+
+                try:
+                    quality_bundle._quality_storage.publish_results(
+                        bundle_path=bundle,
+                        default_path=defaults[label],
+                        requested_path=shared,
+                        payload={"writer": label},
+                        write_json=write_json,
+                    )
+                except OSError:
+                    return "failed"
+                return "passed"
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                second = executor.submit(publish, "b")
+                self.assertTrue(second_writer_started.wait(timeout=5))
+                first = executor.submit(publish, "a")
+                self.assertTrue(first_writer_attempted.wait(timeout=5))
+                release_second_writer.set()
+                outcomes = sorted((first.result(timeout=5), second.result(timeout=5)))
+
+            self.assertEqual(outcomes, ["failed", "passed"])
+            self.assertTrue(shared.is_file())
+            self.assertEqual(sum(bundle.is_dir() for bundle in bundles.values()), 1)
+
+    def test_persistent_unlocked_result_lock_is_reclaimed_after_owner_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            result = root / "result.json"
+            lock = result.with_name(f".{result.name}.quality-lock")
+            lock.touch()
+
+            quality_bundle._quality_storage.publish_results(
+                bundle_path=bundle,
+                default_path=result,
+                requested_path=None,
+                payload={"ok": True},
+                write_json=lambda path, payload: path.write_text(
+                    json.dumps(payload), encoding="utf-8"
+                ),
+            )
+
+            self.assertTrue(result.is_file())
+            self.assertTrue(lock.exists())
+
+    def test_completed_bundle_can_be_adopted_after_finalize_crash(self) -> None:
+        commit = "2" * 40
+        spec = self._coverage_spec(90.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "quality"
+            original_replace = quality_bundle.os.replace
+
+            def crash_after_finalize(source: str | bytes, destination: str | bytes) -> None:
+                original_replace(source, destination)
+                if Path(destination).parent.name == "runs":
+                    raise RuntimeError("injected finalize crash")
+
+            with patch.object(quality_bundle.os, "replace", side_effect=crash_after_finalize):
+                with self.assertRaisesRegex(RuntimeError, "injected finalize crash"):
+                    quality_bundle.run_quality(
+                        root=root,
+                        commit=commit,
+                        invocation_id="finalize-crash",
+                        specs=(spec,),
+                    )
+
+            adopted = quality_bundle.run_quality(
+                root=root,
+                commit=commit,
+                invocation_id="finalize-crash",
+                specs=(spec,),
+                reuse_completed=True,
+            )
+            self.assertTrue(adopted.passed)
+            self.assertTrue(adopted.manifest_path.is_file())
+
+    def test_orphan_pending_run_is_reclaimed_for_retry(self) -> None:
+        commit = "3" * 40
+        spec = self._coverage_spec(90.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "quality"
+            source = quality_bundle.SourceIdentity(
+                commit, hashlib.sha256(f"fixture\0{commit}".encode()).hexdigest(), True
+            )
+            run_id = quality_bundle._run_id(commit, "orphan-pending", source.digest)
+            pending = root / ".pending" / run_id
+            pending.mkdir(parents=True)
+            (pending / "owner.json").write_text(json.dumps({"pid": 999999999}), encoding="utf-8")
+            (pending / "partial").write_text("incomplete", encoding="utf-8")
+            bundle = quality_bundle.run_quality(
+                root=root,
+                commit=commit,
+                invocation_id="orphan-pending",
+                specs=(spec,),
+                source=source,
+            )
+
+        self.assertTrue(bundle.passed)
+
     def test_coverage_display_and_branch_flags_are_semantically_bound(self) -> None:
         payload = {
             "meta": {
@@ -945,6 +1071,35 @@ class QualityBundleRunTests(unittest.TestCase):
             quality_bundle._validate_artifact_payload(
                 "coverage", "coverage", payload, expected_branch=True
             )
+        payload["totals"].update(
+            {
+                "num_branches": 4,
+                "num_partial_branches": 0,
+                "covered_branches": 4,
+                "missing_branches": 0,
+                "percent_branches_covered": 100.0,
+            }
+        )
+        payload["totals"]["percent_covered_display"] = "90"
+        payload["meta"]["branch_coverage"] = True
+        quality_bundle._validate_artifact_payload(
+            "coverage", "coverage", payload, expected_branch=True
+        )
+        for field in (
+            "num_branches",
+            "num_partial_branches",
+            "covered_branches",
+            "missing_branches",
+            "percent_branches_covered",
+        ):
+            branch_payload = json.loads(json.dumps(payload))
+            branch_payload["totals"].pop(field)
+            with self.subTest(missing_branch_field=field), self.assertRaisesRegex(
+                quality_bundle.QualityBundleError, "quality_artifact_invalid"
+            ):
+                quality_bundle._validate_artifact_payload(
+                    "coverage", "coverage", branch_payload, expected_branch=True
+                )
         payload["totals"]["percent_covered_display"] = "90"
         payload["meta"]["branch_coverage"] = False
         with self.assertRaisesRegex(quality_bundle.QualityBundleError, "quality_artifact_invalid"):
