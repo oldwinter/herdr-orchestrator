@@ -10,8 +10,8 @@ Active contributors: oldwinter, chendongdong
 | 组件 | 本地要求 | 用途 |
 | --- | --- | --- |
 | Python | 3.12+ | `src/herdr_orchestrator/` 与质量脚本 |
-| Node.js | 20+；CI 使用 24 | npm wrapper、Dashboard JS 测试与打包 |
-| `uv` | CI 固定 0.12.5 | 按 `uv.lock` 安装 Python 与开发工具 |
+| Node.js | 20+；CI 使用 26.8.1 | npm wrapper、Dashboard JS 测试与打包 |
+| `uv` | CI 固定 0.12.7 | 按 `uv.lock` 安装 Python 与开发工具 |
 | `just` | 源码 checkout 必需 | 仓库稳定命令入口 `justfile` |
 | Herdr | 0.8.2+，仅真实运行检查 | `doctor`、`smoke` 和交互式 agent |
 
@@ -21,8 +21,8 @@ Active contributors: oldwinter, chendongdong
 uv sync --locked
 ```
 
-不要用一次非锁定安装“修复”依赖漂移。开发容器会自动执行同一命令，并提供 Python 3.12
-与 Node.js 24；但容器不会替代主机上的 Herdr 和已登录 harness CLI。仅测试可选 exporter
+不要用一次非锁定安装“修复”依赖漂移。CI 使用 Python 3.14.7 与 Node.js 26.8.1；
+开发容器保留 Python 3.12 兼容下限并使用 Node.js 26。容器不会替代主机上的 Herdr 和已登录 harness CLI。仅测试可选 exporter
 时才从 `.env.example` 准备本地环境，真实 `.env` 绝不能提交。
 
 可选安装 Git hooks：
