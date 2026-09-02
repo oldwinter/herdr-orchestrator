@@ -209,6 +209,7 @@ class HarnessHealthTests(unittest.TestCase):
                 config,
                 probe=probe,
                 allow_live_probe=True,
+                isolate_probes=False,
                 probe_timeout_seconds=5,
             )
             deadline = time.monotonic() + 5.1

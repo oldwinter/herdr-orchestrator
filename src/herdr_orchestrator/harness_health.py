@@ -750,10 +750,10 @@ class HarnessHealth:
         deadline_exhausted = False
         if deadline is not None:
             remaining = deadline - time.monotonic()
-            if remaining < 5:
+            if remaining <= PROBE_COMMIT_GRACE_SECONDS:
                 deadline_exhausted = True
             else:
-                configured_timeout = min(configured_timeout, int(remaining))
+                configured_timeout = min(configured_timeout, max(1, int(remaining)))
         probe_deadline = deadline or (time.monotonic() + configured_timeout)
         owner = f"health-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:12]}"
         lease_seconds = max(30.0, float(timeout_seconds or self.probe_timeout_seconds) + 5.0)
