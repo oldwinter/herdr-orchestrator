@@ -247,8 +247,8 @@ Pull request 代码不会进入 persistent self-hosted runner；OIDC publish 也
 本地 `just security` 执行三类检查：
 
 1. `detect-secrets-hook` 对 Git 已跟踪及未忽略的新文件使用 `.secrets.baseline`；
-2. Bandit 扫描 `src/` 的 medium/high 结果，JSON 写入 `.orchestrator/quality/bandit.json`；
-3. `pip-audit --local` 写入 `.orchestrator/quality/pip-audit.json`。
+2. Bandit 扫描 `src/` 的 medium/high 结果，JSON 写入 run-scoped bundle；
+3. `pip-audit --local` 写入同一 run-scoped bundle。
 
 CI 即使先以 `continue-on-error` 收集各类证据，最后也会检查 security outcome 并使 gate 失败。质量 JSON/摘要作为 run artifact 保留 14 天；PR automation 只发布摘要。默认分支失败时，`security-insight` 只写 commit 和 Actions run link，并按标题复用一个 issue，不把 exploit 或原始 terminal 内容复制到公开正文。
 

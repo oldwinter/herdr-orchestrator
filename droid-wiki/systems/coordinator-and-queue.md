@@ -55,12 +55,13 @@ tests/test_cli.py             # queue CLI 参数、scope 与默认安全行为
 
 ## 数据持久化与事务边界
 
-[`src/herdr_orchestrator/store.py`](../../src/herdr_orchestrator/store.py) 当前维护 schema version 4：
+[`src/herdr_orchestrator/store.py`](../../src/herdr_orchestrator/store.py) 当前维护 schema version 8：
 
 - `jobs` 保存最新投影，包括 durable 状态、attempt budget、可运行时间、lease、agent identity、placement、验证结果和 correlation ID。
 - `receipts` 对每次 dispatch outcome 追加不可变观察记录；同一 job 的 blocked turn 与后续 resume 可以在同一 attempt 下产生多条记录。
-- `metadata` 保存 planner 上次尝试时间等轻量调度元数据。
-- `schema_meta` 驱动 v1 → v2 → v3 → v4 的顺序迁移。
+- `metadata` 保存按 workflow/workspace 隔离的 planner 上次尝试时间等轻量调度元数据。
+- `harness_health` 保存按 workflow/workspace/harness 隔离的 readiness evidence 与 probe fence。
+- `schema_meta` 驱动 v1 → v2 → v3 → v4 → v5 → v6 → v7 → v8 的顺序迁移。
 
 连接启用 foreign keys 和 WAL。`claim`、`record_outcome`、blocked claim 与 resume outcome 使用 `BEGIN IMMEDIATE`，避免多个 coordinator 同时选择同一候选。`UNIQUE(workflow, dedupe_key)` 和 `ON CONFLICT DO NOTHING` 令 seed/enqueue 幂等；重复请求返回原 job ID，不重新运行自动 router。
 
@@ -79,7 +80,7 @@ tests/test_cli.py             # queue CLI 参数、scope 与默认安全行为
 7. future 完成后调用 `Store.record_outcome()`。未处理的 dispatcher 异常被折叠为 `AgentState.UNKNOWN` + `dispatcher_unhandled_error`，不会被算作成功。
 8. 返回本 wave 的状态计数、claimed 数以及整个 workflow 的 queue 快照。
 
-默认策略来自 [`workflows/multi-harness.toml`](../../workflows/multi-harness.toml)：`max_parallel = 6`、`lease_seconds = 900`、`max_attempts = 2`、`agent_timeout_seconds = 300`。这些是配置值而非 Store 内部常量。
+默认策略来自 [`workflows/multi-harness.toml`](../../workflows/multi-harness.toml)：`max_parallel = 6`、`lease_seconds = 32400`、`max_attempts = 2`、`agent_timeout_seconds = 28800`。这些是配置值而非 Store 内部常量。
 
 ## Claim、lease 与 replica
 

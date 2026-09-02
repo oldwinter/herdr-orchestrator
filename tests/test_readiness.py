@@ -1,387 +1,423 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import tempfile
-import threading
 import unittest
-from dataclasses import replace
+from collections import Counter
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock
 
 from herdr_orchestrator.config import load_workflow
-from herdr_orchestrator.model import AgentState, DispatchOutcome, Harness
-from herdr_orchestrator.readiness import HarnessHealthRegistry
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.model import Harness
+from herdr_orchestrator.readiness import (
+    BuildIdentity,
+    ReadinessEntry,
+    ReadinessEnvironment,
+    ReadinessErrorCode,
+    ReadinessPhaseTimings,
+    ReadinessStatus,
+    ReadinessVerification,
+    collect_readiness_matrix,
+    inspect_readiness_environment,
+    resolve_build_identity,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+NOW = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
 
 
-class HarnessHealthRegistryTests(unittest.TestCase):
-    def test_concurrent_registries_share_one_durable_probe_lease(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
-            )
-            started = threading.Event()
-            release = threading.Event()
-            calls = [0]
-
-            def probe(
-                workflow: object,
-                harness: Harness,
-                timeout: int,
-            ) -> dict[str, object]:
-                del workflow, harness, timeout
-                calls[0] += 1
-                started.set()
-                release.wait(timeout=2)
-                return {"status": "ready", "error_code": None, "error_summary": None}
-
-            first = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                probe=probe,
-                executable_finder=lambda command: f"/bin/{command}",
-                clock=lambda: 100.0,
-            )
-            second = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                probe=probe,
-                executable_finder=lambda command: f"/bin/{command}",
-                clock=lambda: 100.0,
-            )
-            first_result: list[tuple[Harness, ...]] = []
-            thread = threading.Thread(
-                target=lambda: first_result.append(first.eligible((Harness.GROK,)))
-            )
-            thread.start()
-            self.assertTrue(started.wait(timeout=2))
-
-            concurrent = second.eligible((Harness.GROK,))
-            release.set()
-            thread.join(timeout=2)
-
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(calls, [1])
-        self.assertEqual(concurrent, ())
-        self.assertEqual(first_result, [(Harness.GROK,)])
-
-    def test_fresh_evidence_survives_registry_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
-            )
-            first = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                clock=lambda: 100.0,
-            )
-            first.record_probe(
-                Harness.GROK,
-                {"status": "ready", "error_code": None, "error_summary": None},
-            )
-
-            restarted = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                clock=lambda: 200.0,
-            )
-
-            self.assertEqual(
-                restarted.eligible((Harness.GROK,), refresh=False),
-                (Harness.GROK,),
-            )
-
-    def test_refreshes_share_the_callers_deadline(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            monotonic = [0.0]
-            timeouts: list[int] = []
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
-            )
-
-            def probe(
-                workflow: object,
-                harness: Harness,
-                timeout: int,
-            ) -> dict[str, object]:
-                del workflow, harness
-                timeouts.append(timeout)
-                monotonic[0] += 8.0
-                return {
-                    "status": "timeout",
-                    "error_code": "herdr_timeout",
-                    "error_summary": None,
-                }
-
-            health = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                probe=probe,
-                executable_finder=lambda command: f"/bin/{command}",
-                clock=lambda: 100.0,
-                monotonic=lambda: monotonic[0],
-            )
-
-            eligible = health.eligible(
-                (Harness.DROID, Harness.GROK),
-                deadline=10.0,
-            )
-
-        self.assertEqual(eligible, ())
-        self.assertEqual(timeouts, [10, 2])
-
-    def test_dispatch_evidence_is_scoped_by_canonical_execution_workspace(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=root / "state.db",
-            )
-            health = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                clock=lambda: 100.0,
-            )
-            outcome = DispatchOutcome(
-                "worker",
-                AgentState.DONE,
-                False,
-                "w1:p1",
-                agent_settled=True,
-            )
-
-            health.record_dispatch(
-                Harness.GROK,
-                outcome,
-                workspace=root / "worktree-a",
-            )
-            matching = health.projection(
-                (Harness.GROK,),
-                workspace=root / "worktree-a/../worktree-a",
-            )[0]
-            distinct = health.projection(
-                (Harness.GROK,),
-                workspace=root / "worktree-b",
-            )[0]
-
-        self.assertEqual(matching["status"], "ready")
-        self.assertTrue(matching["eligible"])
-        self.assertEqual(distinct["status"], "unknown")
-        self.assertFalse(distinct["eligible"])
-
-    def test_expired_ready_evidence_projects_as_unknown(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            clock = [100.0]
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
-            )
-            health = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                clock=lambda: clock[0],
-            )
-            health.record_probe(
-                Harness.GROK,
-                {"status": "ready", "error_code": None, "error_summary": None},
-            )
-
-            clock[0] = 1901.0
-            projection = health.projection((Harness.GROK,))[0]
-
-        self.assertEqual(projection["status"], "unknown")
-        self.assertEqual(projection["reason_code"], "readiness_expired")
-        self.assertFalse(projection["eligible"])
-
-    def test_health_observations_emit_privacy_safe_metrics_and_transitions(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
-            )
-            observability = MagicMock()
-            health = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                observability=observability,
-                clock=lambda: 100.0,
-            )
-            result = {
-                "status": "timeout",
-                "error_code": "herdr_timeout",
-                "error_summary": "private terminal output",
-            }
-
-            health.record_probe(Harness.GROK, result)
-            health.record_probe(Harness.GROK, result)
-
-        event_names = [call.args[0] for call in observability.event.call_args_list]
-        self.assertEqual(event_names.count("harness_health_observed"), 2)
-        self.assertEqual(event_names.count("harness_health_transition"), 1)
-        transition_fields = observability.event.call_args_list[1].kwargs["fields"]
-        self.assertEqual(transition_fields["harness"], "grok")
-        self.assertEqual(transition_fields["status"], "degraded")
-        self.assertEqual(transition_fields["reason_code"], "herdr_timeout")
-        self.assertNotIn("error_summary", transition_fields)
-        observability.metric.assert_called()
-
-    def test_observability_failure_does_not_change_health_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
-            )
-            observability = MagicMock()
-            observability.event.side_effect = RuntimeError("exporter failed")
-            health = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                observability=observability,
-                clock=lambda: 100.0,
-            )
-
-            health.record_probe(
-                Harness.GROK,
-                {"status": "ready", "error_code": None, "error_summary": None},
-            )
-            projection = health.projection((Harness.GROK,))[0]
-
-        self.assertEqual(projection["status"], "ready")
-        self.assertTrue(projection["eligible"])
-
-    def test_dispatch_classification_separates_harness_and_task_failures(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            clock = [100.0]
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
-            )
-            health = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                executable_finder=lambda command: f"/bin/{command}",
-                clock=lambda: clock[0],
-            )
-
-            health.record_probe(
+class ReadinessMatrixTests(unittest.TestCase):
+    def test_readiness_entry_rejects_mismatched_status_and_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "readiness_entry_invalid"):
+            ReadinessEntry(
                 Harness.DROID,
-                {"status": "ready", "error_code": None, "error_summary": None},
+                ReadinessStatus.UNAVAILABLE,
+                ReadinessErrorCode.READINESS_SOURCE_DIRTY,
+                ReadinessPhaseTimings(),
+                NOW,
+                0,
             )
-            health.record_dispatch(
-                Harness.DROID,
-                _outcome(AgentState.BLOCKED, "agent_blocked"),
-            )
-            blocked = health.projection((Harness.DROID,))[0]
-            health.record_dispatch(
-                Harness.DROID,
-                _outcome(AgentState.DONE, "task_receipt_missing"),
-            )
-            receipt_failure = health.projection((Harness.DROID,))[0]
-            health.record_dispatch(
-                Harness.DROID,
-                _outcome(AgentState.UNKNOWN, "agent_provider_failed"),
-            )
-            provider_failure = health.projection((Harness.DROID,))[0]
-            health.record_dispatch(
-                Harness.DROID,
-                _outcome(AgentState.UNKNOWN, "agent_auth_required"),
-            )
-            auth_failure = health.projection((Harness.DROID,))[0]
-            health.record_dispatch(
-                Harness.DROID,
-                _outcome(AgentState.UNKNOWN, "agent_model_invalid"),
-            )
-            invalid_model = health.projection((Harness.DROID,))[0]
-            health.record_dispatch(
-                Harness.DROID,
-                _outcome(AgentState.UNKNOWN, "prompt_acceptance_timeout"),
-            )
-            prompt_timeout = health.projection((Harness.DROID,))[0]
-            health.record_dispatch(
-                Harness.DROID,
-                _outcome(AgentState.UNKNOWN, "agent_turn_not_observed"),
-            )
-            turn_not_observed = health.projection((Harness.DROID,))[0]
-            health.record_dispatch(
-                Harness.DROID,
-                DispatchOutcome(
-                    "agent",
-                    AgentState.DONE,
-                    False,
-                    "w1:p1",
-                    agent_settled=False,
-                ),
-            )
-            unsettled = health.projection((Harness.DROID,))[0]
 
-        self.assertEqual(blocked["status"], "ready")
-        self.assertTrue(blocked["eligible"])
-        self.assertEqual(receipt_failure["status"], "ready")
-        self.assertTrue(receipt_failure["eligible"])
-        self.assertEqual(provider_failure["status"], "degraded")
-        self.assertEqual(provider_failure["reason_code"], "agent_provider_failed")
-        self.assertFalse(provider_failure["eligible"])
-        self.assertEqual(auth_failure["status"], "unavailable")
-        self.assertEqual(auth_failure["reason_code"], "agent_auth_required")
-        self.assertFalse(auth_failure["eligible"])
-        self.assertNotIn("error_summary", auth_failure)
-        self.assertEqual(invalid_model["status"], "unavailable")
-        self.assertEqual(prompt_timeout["status"], "degraded")
-        self.assertEqual(turn_not_observed["status"], "degraded")
-        self.assertEqual(unsettled["status"], "degraded")
+    def test_classifies_every_result_and_retries_only_retryable_failures(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        calls: Counter[Harness] = Counter()
 
-    def test_ready_evidence_expires_and_failure_cooldown_bounds_refresh(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            clock = [100.0]
-            probes = [
-                {"status": "ready", "error_code": None, "error_summary": None},
+        def probe(config: object, harness: Harness, timeout_seconds: int) -> dict[str, object]:
+            del config, timeout_seconds
+            calls[harness] += 1
+            if harness is Harness.DROID:
+                return _probe("ready", None, total=7)
+            if harness is Harness.GROK:
+                if calls[harness] == 1:
+                    return _probe("timeout", "herdr_timeout", total=30_000)
+                return _probe("ready", None, total=12)
+            if harness is Harness.CODEX:
+                return _probe("auth_required", "agent_auth_required")
+            if harness is Harness.PI:
+                return _probe("model_invalid", "agent_model_invalid")
+            if harness is Harness.CLAUDE:
+                return _probe("error", "agent_provider_failed")
+            raise RuntimeError("credential=secret prompt=private terminal=full response=raw")
+
+        matrix = collect_readiness_matrix(
+            workflow,
+            selected_harnesses=None,
+            timeout_seconds=30,
+            environment=_ready_environment(),
+            build=BuildIdentity("a" * 40, "0.1.6"),
+            probe=probe,
+            clock=lambda: NOW,
+        )
+        payload = matrix.public_json()
+        results = {item["harness"]: item for item in payload["results"]}
+
+        self.assertEqual(
+            list(results),
+            ["droid", "grok", "codex", "pi", "claude", "hermes"],
+        )
+        self.assertEqual(calls[Harness.DROID], 1)
+        self.assertEqual(calls[Harness.GROK], 2)
+        self.assertEqual(calls[Harness.CODEX], 1)
+        self.assertEqual(calls[Harness.PI], 1)
+        self.assertEqual(calls[Harness.CLAUDE], 2)
+        self.assertEqual(calls[Harness.HERMES], 2)
+        self.assertEqual(results["droid"]["verification"], ReadinessVerification.VERIFIED.value)
+        self.assertEqual(results["grok"]["status"], ReadinessStatus.READY.value)
+        self.assertEqual(results["grok"]["attempt_count"], 2)
+        self.assertEqual(results["grok"]["phase_timings_ms"], {"total": 12})
+        self.assertEqual(results["codex"]["attempt_count"], 1)
+        self.assertEqual(results["pi"]["attempt_count"], 1)
+        self.assertEqual(results["claude"]["attempt_count"], 2)
+        self.assertEqual(results["hermes"]["attempt_count"], 2)
+        self.assertEqual(
+            results["hermes"]["error_code"],
+            ReadinessErrorCode.READINESS_PROBE_FAILED.value,
+        )
+        self.assertEqual(payload["verification"], ReadinessVerification.NOT_VERIFIED.value)
+        self.assertEqual(payload["commit"], "a" * 40)
+        self.assertEqual(payload["package_version"], "0.1.6")
+        self.assertEqual(payload["workflow"], workflow.name)
+        self.assertRegex(str(payload["workspace_id"]), r"^[a-f0-9]{16}$")
+        serialized = json.dumps(payload, sort_keys=True)
+        for forbidden in ("secret", "private", "terminal", "full response", "error_summary"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_expired_or_invalid_probe_evidence_is_not_verified(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        cases = (
+            (
+                _probe("ready", None, observed_at=NOW - timedelta(seconds=1)),
+                ReadinessStatus.EXPIRED,
+                ReadinessErrorCode.READINESS_EVIDENCE_EXPIRED,
+            ),
+            (
                 {
-                    "status": "timeout",
-                    "error_code": "herdr_timeout",
-                    "error_summary": "private terminal output",
+                    "status": "ready",
+                    "error_code": None,
+                    "phase_timings_ms": {"arbitrary": 3},
                 },
-                {"status": "ready", "error_code": None, "error_summary": None},
-            ]
-            config = replace(
-                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                ReadinessStatus.ERROR,
+                ReadinessErrorCode.READINESS_RESULT_INVALID,
+            ),
+            (
+                {"status": "ready", "error_code": None, "phase_timings_ms": {}},
+                ReadinessStatus.ERROR,
+                ReadinessErrorCode.READINESS_RESULT_INVALID,
+            ),
+            (
+                {"status": "provider-private-status", "error_code": "raw-private-code"},
+                ReadinessStatus.ERROR,
+                ReadinessErrorCode.READINESS_RESULT_INVALID,
+            ),
+        )
+        for raw, expected_status, expected_error in cases:
+            with self.subTest(raw=raw):
+                matrix = collect_readiness_matrix(
+                    workflow,
+                    selected_harnesses=["droid"],
+                    timeout_seconds=30,
+                    environment=_ready_environment(),
+                    build=BuildIdentity("b" * 40, "0.1.6"),
+                    probe=lambda *args, result=raw: result,
+                    clock=lambda: NOW,
+                )
+                result = matrix.public_json()["results"][0]
+                self.assertEqual(result["status"], expected_status.value)
+                self.assertEqual(result["error_code"], expected_error.value)
+                self.assertEqual(
+                    result["verification"],
+                    ReadinessVerification.NOT_VERIFIED.value,
+                )
+                self.assertEqual(result["attempt_count"], 1)
+
+    def test_unavailable_environment_emits_complete_zero_attempt_matrix(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        called = False
+
+        def probe(*args: object) -> dict[str, object]:
+            nonlocal called
+            called = True
+            raise AssertionError(args)
+
+        available = {harness: True for harness in Harness}
+        profile_available = {harness: True for harness in Harness}
+        profile_available[Harness.CODEX] = False
+        matrix = collect_readiness_matrix(
+            workflow,
+            selected_harnesses=["droid", "codex"],
+            timeout_seconds=30,
+            environment=ReadinessEnvironment(
+                managed_pane=False,
+                executable_available=available,
+                profile_available=profile_available,
+            ),
+            build=BuildIdentity("c" * 40, "0.1.6"),
+            probe=probe,
+            clock=lambda: NOW,
+        )
+        results = matrix.public_json()["results"]
+
+        self.assertFalse(called)
+        self.assertEqual([item["harness"] for item in results], ["droid", "codex"])
+        self.assertEqual([item["attempt_count"] for item in results], [0, 0])
+        self.assertEqual(
+            [item["error_code"] for item in results],
+            [
+                ReadinessErrorCode.NOT_IN_HERDR.value,
+                ReadinessErrorCode.NOT_IN_HERDR.value,
+            ],
+        )
+
+    def test_missing_executable_and_profile_do_not_probe(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        available = {harness: True for harness in Harness}
+        profiles = {harness: True for harness in Harness}
+        available[Harness.DROID] = False
+        profiles[Harness.CODEX] = False
+
+        matrix = collect_readiness_matrix(
+            workflow,
+            selected_harnesses=["droid", "codex"],
+            timeout_seconds=30,
+            environment=ReadinessEnvironment(True, available, profiles),
+            build=BuildIdentity("e" * 40, "0.1.6"),
+            probe=lambda *args: self.fail(f"unexpected probe: {args}"),
+            clock=lambda: NOW,
+        )
+
+        self.assertEqual(
+            [item["error_code"] for item in matrix.public_json()["results"]],
+            [
+                ReadinessErrorCode.HARNESS_UNAVAILABLE.value,
+                ReadinessErrorCode.PROFILE_UNAVAILABLE.value,
+            ],
+        )
+
+    def test_ci_environment_never_runs_a_live_probe(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        environment = _ready_environment()
+        environment = ReadinessEnvironment(
+            environment.managed_pane,
+            environment.executable_available,
+            environment.profile_available,
+            ci=True,
+        )
+
+        matrix = collect_readiness_matrix(
+            workflow,
+            selected_harnesses=["droid"],
+            timeout_seconds=30,
+            environment=environment,
+            build=BuildIdentity("9" * 40, "0.1.6"),
+            probe=lambda *args: self.fail(f"unexpected probe: {args}"),
+            clock=lambda: NOW,
+        )
+        result = matrix.public_json()["results"][0]
+
+        self.assertEqual(result["attempt_count"], 0)
+        self.assertEqual(
+            result["error_code"],
+            ReadinessErrorCode.READINESS_CI_FORBIDDEN.value,
+        )
+
+    def test_retry_policy_is_exhaustive_over_public_error_codes(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        retryable = {
+            "herdr_timeout": "timeout",
+            "timeout": "timeout",
+            "prompt_acceptance_timeout": "timeout",
+            "agent_provider_failed": "error",
+            "agent_turn_not_observed": "error",
+            "herdr_invalid_response": "error",
+            "task_receipt_missing": "error",
+            "readiness_probe_failed": "error",
+        }
+        nonretryable = {
+            "agent_auth_failed": "auth_required",
+            "agent_auth_required": "auth_required",
+            "agent_model_invalid": "model_invalid",
+            "herdr_unavailable": "unavailable",
+        }
+        for error_code, status in {**retryable, **nonretryable}.items():
+            with self.subTest(error_code=error_code):
+                calls = 0
+
+                def probe(
+                    *args: object,
+                    current_status: str = status,
+                    current_error: str = error_code,
+                ) -> dict[str, object]:
+                    nonlocal calls
+                    del args
+                    calls += 1
+                    return _probe(current_status, current_error)
+
+                matrix = collect_readiness_matrix(
+                    workflow,
+                    selected_harnesses=["droid"],
+                    timeout_seconds=30,
+                    environment=_ready_environment(),
+                    build=BuildIdentity("f" * 40, "0.1.6"),
+                    probe=probe,
+                    clock=lambda: NOW,
+                )
+
+                expected_calls = 2 if error_code in retryable else 1
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(
+                    matrix.public_json()["results"][0]["attempt_count"],
+                    expected_calls,
+                )
+
+    def test_inspects_managed_environment_and_exact_build_identity(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        paths = {"herdr": "/bin/herdr", "droid": "/bin/droid", "codex": "/bin/codex"}
+
+        def git_runner(
+            argv: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            output = "1" * 40 + "\n" if "rev-parse" in argv else ""
+            return subprocess.CompletedProcess(argv, 0, output, "")
+
+        environment = inspect_readiness_environment(
+            workflow,
+            environ={
+                "HERDR_ENV": "1",
+                "HERDR_PANE_ID": "w1:p1",
+                "HERDR_WORKSPACE_ID": "w1",
+            },
+            which=paths.get,
+        )
+        build = resolve_build_identity(
+            workflow.workspace,
+            "0.1.6",
+            runner=git_runner,
+        )
+
+        self.assertTrue(environment.managed_pane)
+        self.assertTrue(environment.executable_available[Harness.DROID])
+        self.assertFalse(environment.executable_available[Harness.PI])
+        self.assertTrue(environment.profile_available[Harness.CODEX])
+        self.assertEqual(build, BuildIdentity("1" * 40, "0.1.6"))
+
+    def test_dirty_tracked_or_untracked_source_is_not_verified(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        for dirty_kind in ("tracked", "untracked"):
+            with self.subTest(dirty_kind=dirty_kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    workspace = Path(temporary)
+                    tracked = workspace / "tracked.txt"
+                    _git(workspace, "init", "-q")
+                    tracked.write_text("original\n", encoding="utf-8")
+                    _git(workspace, "add", "tracked.txt")
+                    _git(
+                        workspace,
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.invalid",
+                        "commit",
+                        "-qm",
+                        "initial",
+                    )
+                    if dirty_kind == "tracked":
+                        tracked.write_text("modified\n", encoding="utf-8")
+                    else:
+                        (workspace / "untracked.txt").write_text("new\n", encoding="utf-8")
+                    build = resolve_build_identity(workspace, "0.1.6")
+
+                    matrix = collect_readiness_matrix(
+                        workflow,
+                        selected_harnesses=["droid"],
+                        timeout_seconds=30,
+                        environment=_ready_environment(),
+                        build=build,
+                        probe=lambda *args: self.fail(f"unexpected probe: {args}"),
+                        clock=lambda: NOW,
+                    )
+                    result = matrix.public_json()["results"][0]
+
+                self.assertFalse(build.source_clean)
+                self.assertEqual(result["attempt_count"], 0)
+                self.assertEqual(result["status"], ReadinessStatus.ERROR.value)
+                self.assertEqual(
+                    result["verification"],
+                    ReadinessVerification.NOT_VERIFIED.value,
+                )
+                self.assertEqual(
+                    result["error_code"],
+                    ReadinessErrorCode.READINESS_SOURCE_DIRTY.value,
+                )
+
+    def test_rejects_a_filter_outside_the_enabled_harnesses(self) -> None:
+        workflow = load_workflow(REPO_ROOT / "workflows/grok-research.toml")
+
+        with self.assertRaisesRegex(ValueError, "readiness_harness_not_enabled: codex"):
+            collect_readiness_matrix(
+                workflow,
+                selected_harnesses=["codex"],
+                timeout_seconds=30,
+                environment=_ready_environment(),
+                build=BuildIdentity("d" * 40, "0.1.6"),
+                probe=lambda *args: _probe("ready", None),
+                clock=lambda: NOW,
             )
-            health = HarnessHealthRegistry(
-                config,
-                Store(config.state_db),
-                probe=lambda workflow, harness, timeout: probes.pop(0),
-                executable_finder=lambda command: f"/bin/{command}",
-                clock=lambda: clock[0],
-            )
-
-            self.assertEqual(health.eligible((Harness.GROK,)), (Harness.GROK,))
-            clock[0] = 1901.0
-            self.assertEqual(health.eligible((Harness.GROK,)), ())
-            degraded = health.projection((Harness.GROK,))[0]
-            clock[0] = 2000.0
-            self.assertEqual(health.eligible((Harness.GROK,)), ())
-            clock[0] = 2202.0
-            self.assertEqual(health.eligible((Harness.GROK,)), (Harness.GROK,))
-
-        self.assertEqual(degraded["status"], "degraded")
-        self.assertEqual(degraded["reason_code"], "herdr_timeout")
-        self.assertEqual(probes, [])
 
 
-def _outcome(state: AgentState, error_code: str) -> DispatchOutcome:
-    return DispatchOutcome(
-        agent_name="agent",
-        state=state,
-        member_reused=False,
-        pane_id="w1:p1",
-        error_code=error_code,
-        error_summary="private terminal output",
+def _probe(
+    status: str,
+    error_code: str | None,
+    *,
+    total: int = 0,
+    observed_at: datetime | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": status,
+        "error_code": error_code,
+        "phase_timings_ms": {"total": total},
+        "error_summary": "prompt=private credential=secret terminal=full response=raw",
+    }
+    if observed_at is not None:
+        payload["observed_at"] = observed_at.isoformat().replace("+00:00", "Z")
+    return payload
+
+
+def _ready_environment() -> ReadinessEnvironment:
+    return ReadinessEnvironment(
+        managed_pane=True,
+        executable_available={harness: True for harness in Harness},
+        profile_available={harness: True for harness in Harness},
     )
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _git(workspace: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    )

@@ -17,6 +17,8 @@ Do not open a public issue with credentials, prompts, terminal output, or exploi
   default branch security gate fails.
 - Dependencies and GitHub Actions are exact-pinned or lockfile-pinned. Dependabot waits seven
   days before proposing new releases.
+- Local npm dependency audits cover both lockfiles with `npm audit --package-lock-only` at the
+  repository root and `npm audit --package-lock-only --prefix packages/herdr-manager`.
 - Runtime telemetry is local by default, redacted before persistence/export, and externally
   exported only behind fail-closed feature flags.
 

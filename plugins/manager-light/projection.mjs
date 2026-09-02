@@ -41,15 +41,19 @@ function isDirectManagerProcess(process) {
 }
 
 function isOrchestratorManagerProcess(process) {
-  const argv = Array.isArray(process?.argv)
-    ? process.argv.filter((value) => typeof value === "string")
-    : [];
+  const argv = Array.isArray(process?.argv) ? process.argv : [];
   const names = new Set(["herdr-orchestrator", "herdr-orchestrator.mjs"]);
+  const executable = executableName(argv[0]);
 
-  for (let index = 0; index < argv.length - 1; index += 1) {
-    if (names.has(executableName(argv[index])) && argv[index + 1] === "manager") {
-      return true;
-    }
+  if (names.has(executable) && argv[1] === "manager") {
+    return true;
+  }
+  if (
+    ["node", "node.exe"].includes(executable) &&
+    names.has(executableName(argv[1])) &&
+    argv[2] === "manager"
+  ) {
+    return true;
   }
 
   const processName = executableName(process?.argv0 || process?.name);

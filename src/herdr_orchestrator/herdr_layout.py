@@ -139,7 +139,7 @@ class HerdrLayout:
         )
         pane_id, tab_id, workspace_id = _created_layout(
             result,
-            fallback_workspace_id=self.workspace_id,
+            expected_workspace_id=self.workspace_id,
         )
         return ProvisionedTerminal(
             pane_id,
@@ -181,7 +181,7 @@ class HerdrLayout:
             )
             pane_id, tab_id, workspace_id = _created_layout(
                 result,
-                fallback_workspace_id=self.workspace_id,
+                expected_workspace_id=self.workspace_id,
             )
             batch = _BatchTab(tab_id, workspace_id, [pane_id])
             self._batch_tabs[batch_key] = batch
@@ -195,7 +195,7 @@ class HerdrLayout:
                 tab_id,
             )
 
-        target, direction = self._split_target(batch.pane_ids[0])
+        target, direction = self._split_target(batch)
         result = run_json(
             self.runner,
             Command(
@@ -230,19 +230,26 @@ class HerdrLayout:
             pane_id,
         )
 
-    def _split_target(self, known_pane: str) -> tuple[str, str]:
+    def _split_target(self, batch: _BatchTab) -> tuple[str, str]:
         result = run_json(
             self.runner,
             Command(
-                ["herdr", "pane", "layout", "--pane", known_pane],
+                ["herdr", "pane", "layout", "--pane", batch.pane_ids[0]],
                 self.workspace,
                 CONTROL_TIMEOUT_SECONDS,
             ),
         )
         layout = result.get("layout")
-        panes = layout.get("panes") if isinstance(layout, dict) else None
+        if (
+            not isinstance(layout, dict)
+            or layout.get("workspace_id") != batch.workspace_id
+            or layout.get("tab_id") != batch.tab_id
+        ):
+            raise TransportError("herdr_invalid_response")
+        panes = layout.get("panes")
         if not isinstance(panes, list) or not panes:
             raise TransportError("herdr_invalid_response")
+        owned_panes = set(batch.pane_ids)
         candidates: list[tuple[int, str, int, int]] = []
         for pane in panes:
             if not isinstance(pane, dict):
@@ -251,6 +258,7 @@ class HerdrLayout:
             rect = pane.get("rect")
             if (
                 not isinstance(pane_id, str)
+                or pane_id not in owned_panes
                 or not isinstance(rect, dict)
                 or not isinstance(rect.get("width"), int)
                 or not isinstance(rect.get("height"), int)
@@ -331,16 +339,14 @@ class HerdrLayout:
         worktrees = listed.get("worktrees")
         if not isinstance(worktrees, list):
             raise TransportError("herdr_invalid_response")
-        workspace_id = next(
-            (
-                row.get("open_workspace_id")
-                for row in worktrees
-                if isinstance(row, dict)
-                and row.get("path") == str(path)
-                and isinstance(row.get("open_workspace_id"), str)
-            ),
-            None,
-        )
+        workspace_id = None
+        for row in worktrees:
+            if not isinstance(row, dict) or row.get("path") != str(path):
+                continue
+            candidate = row.get("open_workspace_id")
+            if isinstance(candidate, str) and candidate.strip():
+                workspace_id = candidate.strip()
+                break
         if workspace_id is None:
             return None
         panes = run_json(
@@ -354,7 +360,13 @@ class HerdrLayout:
         if not isinstance(panes, list):
             raise TransportError("herdr_invalid_response")
         pane = next(
-            (row for row in panes if isinstance(row, dict) and row.get("cwd") == str(path)),
+            (
+                row
+                for row in panes
+                if isinstance(row, dict)
+                and row.get("workspace_id") == workspace_id
+                and row.get("cwd") == str(path)
+            ),
             None,
         )
         if not isinstance(pane, dict):
@@ -407,7 +419,7 @@ class HerdrLayout:
 def _created_layout(
     result: Mapping[str, Any],
     *,
-    fallback_workspace_id: str | None = None,
+    expected_workspace_id: str | None = None,
 ) -> tuple[str, str, str]:
     pane = result.get("root_pane")
     tab = result.get("tab")
@@ -417,9 +429,11 @@ def _created_layout(
     workspace_id = (
         _non_empty_string(workspace, "workspace_id")
         if isinstance(workspace, dict)
-        else fallback_workspace_id
+        else expected_workspace_id
     )
-    if not workspace_id:
+    if not workspace_id or (
+        expected_workspace_id is not None and workspace_id != expected_workspace_id
+    ):
         raise TransportError("herdr_invalid_response")
     return (
         _non_empty_string(pane, "pane_id"),

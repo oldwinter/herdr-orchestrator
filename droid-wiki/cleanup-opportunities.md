@@ -27,7 +27,7 @@ flowchart TD
 
 **事实依据**
 
-- `justfile` 的 `security` recipe 生成 `.orchestrator/quality/bandit.json` 与 `.orchestrator/quality/pip-audit.json`，secret scan 通过进程退出状态报告。
+- `justfile` 的 `security` recipe 生成 run-scoped Bandit 与 pip-audit artifacts，secret scan 通过进程退出状态报告。
 - `.github/workflows/ci.yml` 根据 `just security` 的 outcome 阻断 gate，并在 `main` 失败时维护一个 insight issue。
 - `security-findings.json` 是一次独立的 14 文件、零 finding 快照；`.factory/security-config.json` 另行保存 STRIDE pattern 与 severity policy。
 - 当前树中没有 `scripts/check_security_report.py`，也没有现存代码证明这三类机器结果会合并或验证 freshness。

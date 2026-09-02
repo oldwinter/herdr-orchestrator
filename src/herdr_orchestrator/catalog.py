@@ -34,6 +34,8 @@ def load_harness_profiles(directory: Path) -> tuple[HarnessProfile, ...]:
     for path in sorted(directory.glob("*.toml")):
         try:
             raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError as exc:
+            raise CatalogError(f"profile_invalid_encoding: {path}") from exc
         except tomllib.TOMLDecodeError as exc:
             raise CatalogError(f"profile_invalid_toml: {path}: {exc}") from exc
         profile = _load_profile(path, raw)
@@ -97,7 +99,10 @@ def render_compact_catalog(profiles: Iterable[HarnessProfile]) -> str:
 
 
 def load_profile_context(profile: HarnessProfile) -> str:
-    context = profile.context_file.read_text(encoding="utf-8").strip()
+    try:
+        context = profile.context_file.read_text(encoding="utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise CatalogError(f"profile_context_invalid_encoding: {profile.harness.value}") from exc
     if not context:
         raise CatalogError(f"profile_context_empty: {profile.harness.value}")
     if len(context) > PROFILE_CONTEXT_MAX_CHARS:

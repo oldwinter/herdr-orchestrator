@@ -1,524 +1,597 @@
-"""Durable, privacy-safe harness readiness classification and eligibility."""
-
 from __future__ import annotations
 
-import secrets
-import shutil
-import time
-from collections.abc import Callable, Iterable, Mapping
-from contextlib import suppress
+import hashlib
+import re
+import subprocess
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from math import ceil
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
-from herdr_orchestrator.herdr import HerdrTransport, doctor_agent_name
-from herdr_orchestrator.model import (
-    AgentState,
-    DispatchContext,
-    DispatchOutcome,
-    Harness,
-    HarnessHealthStatus,
-    PlacementTarget,
-    ReceiptKind,
-    TaskReceipt,
-    WorkflowConfig,
-)
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.model import Harness, WorkflowConfig
 
-ReadinessProbe = Callable[[WorkflowConfig, Harness, int], Mapping[str, object]]
-ExecutableFinder = Callable[[str], str | None]
+_COMMIT = re.compile(r"(?:[a-f0-9]{40}|[a-f0-9]{64})\Z")
+_PACKAGE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,127}\Z")
 
 
-class ReadinessObservability(Protocol):
-    def event(
-        self,
-        name: str,
-        *,
-        correlation_id: str,
-        fields: Mapping[str, object] | None = None,
-    ) -> None: ...
-
-    def metric(
-        self,
-        name: str,
-        value: float,
-        *,
-        correlation_id: str,
-        fields: Mapping[str, object] | None = None,
-    ) -> None: ...
+class ReadinessVerification(StrEnum):
+    VERIFIED = "VERIFIED"
+    NOT_VERIFIED = "NOT VERIFIED"
 
 
-HARD_FAILURES = {
-    "agent_auth_failed",
-    "agent_auth_required",
-    "agent_model_invalid",
-    "harness_unavailable",
-    "herdr_unavailable",
-    "not_in_herdr",
-    "profile_unavailable",
+class ReadinessStatus(StrEnum):
+    READY = "ready"
+    AUTH_REQUIRED = "auth_required"
+    MODEL_INVALID = "model_invalid"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+    UNAVAILABLE = "unavailable"
+    EXPIRED = "expired"
+
+
+class ReadinessErrorCode(StrEnum):
+    HARNESS_UNAVAILABLE = "harness_unavailable"
+    PROFILE_UNAVAILABLE = "profile_unavailable"
+    NOT_IN_HERDR = "not_in_herdr"
+    AGENT_AUTH_FAILED = "agent_auth_failed"
+    AGENT_AUTH_REQUIRED = "agent_auth_required"
+    AGENT_MODEL_INVALID = "agent_model_invalid"
+    AGENT_BLOCKED = "agent_blocked"
+    AGENT_IDENTITY_MISMATCH = "agent_identity_mismatch"
+    AGENT_NOT_READY = "agent_not_ready"
+    AGENT_NOT_SETTLED = "agent_not_settled"
+    AGENT_PANE_MISMATCH = "agent_pane_mismatch"
+    AGENT_START_FAILED = "agent_start_failed"
+    AGENT_WORKSPACE_MISMATCH = "agent_workspace_mismatch"
+    HERDR_TIMEOUT = "herdr_timeout"
+    TIMEOUT = "timeout"
+    PROMPT_ACCEPTANCE_TIMEOUT = "prompt_acceptance_timeout"
+    AGENT_PROVIDER_FAILED = "agent_provider_failed"
+    HERDR_UNAVAILABLE = "herdr_unavailable"
+    AGENT_TURN_NOT_OBSERVED = "agent_turn_not_observed"
+    HERDR_INVALID_RESPONSE = "herdr_invalid_response"
+    HERDR_PANE_ID_MISSING = "herdr_pane_id_missing"
+    HERDR_WORKSPACE_ID_MISSING = "herdr_workspace_id_missing"
+    PANE_SHELL_NOT_READY = "pane_shell_not_ready"
+    TASK_RECEIPT_AMBIGUOUS = "task_receipt_ambiguous"
+    TASK_RECEIPT_INVALID = "task_receipt_invalid"
+    TASK_RECEIPT_KIND_INVALID = "task_receipt_kind_invalid"
+    TASK_RECEIPT_MISSING = "task_receipt_missing"
+    TASK_RECEIPT_PATH_INVALID = "task_receipt_path_invalid"
+    TASK_RECEIPT_STALE = "task_receipt_stale"
+    TASK_RECEIPT_UNREADABLE = "task_receipt_unreadable"
+    READINESS_PROBE_FAILED = "readiness_probe_failed"
+    READINESS_RESULT_INVALID = "readiness_result_invalid"
+    READINESS_EVIDENCE_EXPIRED = "readiness_evidence_expired"
+    READINESS_CI_FORBIDDEN = "readiness_ci_forbidden"
+    READINESS_SOURCE_DIRTY = "readiness_source_dirty"
+    READINESS_SOURCE_CHANGED = "readiness_source_changed"
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadinessErrorPolicy:
+    status: ReadinessStatus
+    retryable: bool = False
+
+
+_ERROR_POLICY: dict[ReadinessErrorCode, _ReadinessErrorPolicy] = {
+    ReadinessErrorCode.HARNESS_UNAVAILABLE: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.PROFILE_UNAVAILABLE: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.NOT_IN_HERDR: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.HERDR_UNAVAILABLE: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.AGENT_AUTH_FAILED: _ReadinessErrorPolicy(ReadinessStatus.AUTH_REQUIRED),
+    ReadinessErrorCode.AGENT_AUTH_REQUIRED: _ReadinessErrorPolicy(ReadinessStatus.AUTH_REQUIRED),
+    ReadinessErrorCode.AGENT_MODEL_INVALID: _ReadinessErrorPolicy(ReadinessStatus.MODEL_INVALID),
+    ReadinessErrorCode.AGENT_BLOCKED: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_IDENTITY_MISMATCH: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_NOT_READY: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_NOT_SETTLED: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_PANE_MISMATCH: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_START_FAILED: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.AGENT_WORKSPACE_MISMATCH: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.HERDR_TIMEOUT: _ReadinessErrorPolicy(ReadinessStatus.TIMEOUT, True),
+    ReadinessErrorCode.TIMEOUT: _ReadinessErrorPolicy(ReadinessStatus.TIMEOUT, True),
+    ReadinessErrorCode.PROMPT_ACCEPTANCE_TIMEOUT: _ReadinessErrorPolicy(
+        ReadinessStatus.TIMEOUT, True
+    ),
+    ReadinessErrorCode.AGENT_PROVIDER_FAILED: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.AGENT_TURN_NOT_OBSERVED: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.HERDR_INVALID_RESPONSE: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.HERDR_PANE_ID_MISSING: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.HERDR_WORKSPACE_ID_MISSING: _ReadinessErrorPolicy(
+        ReadinessStatus.UNAVAILABLE
+    ),
+    ReadinessErrorCode.PANE_SHELL_NOT_READY: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_AMBIGUOUS: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_INVALID: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_KIND_INVALID: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_MISSING: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.TASK_RECEIPT_PATH_INVALID: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_STALE: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.TASK_RECEIPT_UNREADABLE: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.READINESS_PROBE_FAILED: _ReadinessErrorPolicy(ReadinessStatus.ERROR, True),
+    ReadinessErrorCode.READINESS_RESULT_INVALID: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.READINESS_EVIDENCE_EXPIRED: _ReadinessErrorPolicy(ReadinessStatus.EXPIRED),
+    ReadinessErrorCode.READINESS_CI_FORBIDDEN: _ReadinessErrorPolicy(ReadinessStatus.UNAVAILABLE),
+    ReadinessErrorCode.READINESS_SOURCE_DIRTY: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
+    ReadinessErrorCode.READINESS_SOURCE_CHANGED: _ReadinessErrorPolicy(ReadinessStatus.ERROR),
 }
-TASK_LEVEL_ERRORS = {
-    "agent_blocked",
-    "task_receipt_ambiguous",
-    "task_receipt_invalid",
-    "task_receipt_missing",
-    "task_receipt_stale",
-}
 
 
-def probe_harness_readiness(
+@dataclass(frozen=True, slots=True)
+class BuildIdentity:
+    commit: str
+    package_version: str
+    source_clean: bool = True
+
+    def __post_init__(self) -> None:
+        if _COMMIT.fullmatch(self.commit) is None:
+            raise ValueError("readiness_commit_invalid")
+        if _PACKAGE_VERSION.fullmatch(self.package_version) is None:
+            raise ValueError("readiness_package_version_invalid")
+        if not isinstance(self.source_clean, bool):
+            raise ValueError("readiness_source_state_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ReadinessEnvironment:
+    managed_pane: bool
+    executable_available: Mapping[Harness, bool]
+    profile_available: Mapping[Harness, bool]
+    ci: bool = False
+
+
+def inspect_readiness_environment(
+    workflow: WorkflowConfig,
+    *,
+    environ: Mapping[str, str],
+    which: Callable[[str], str | None],
+) -> ReadinessEnvironment:
+    managed_pane = bool(
+        environ.get("HERDR_ENV") == "1"
+        and environ.get("HERDR_PANE_ID")
+        and environ.get("HERDR_WORKSPACE_ID")
+        and which("herdr") is not None
+    )
+    executable_available = {harness: which(harness.value) is not None for harness in Harness}
+    profile_available = {
+        profile.harness: profile.context_file.is_file() for profile in workflow.profiles
+    }
+    ci = _environment_flag(environ.get("CI")) or _environment_flag(environ.get("GITHUB_ACTIONS"))
+    return ReadinessEnvironment(managed_pane, executable_available, profile_available, ci)
+
+
+def resolve_build_identity(
+    workspace: Path,
+    package_version: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> BuildIdentity:
+    try:
+        commit_process = runner(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("readiness_commit_unavailable") from exc
+    if commit_process.returncode != 0:
+        raise ValueError("readiness_commit_unavailable")
+    try:
+        status_process = runner(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        source_clean = False
+    else:
+        try:
+            confirm_process = runner(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            source_clean = False
+        else:
+            source_clean = bool(
+                status_process.returncode == 0
+                and not status_process.stdout.strip()
+                and confirm_process.returncode == 0
+                and confirm_process.stdout.strip() == commit_process.stdout.strip()
+            )
+    return BuildIdentity(commit_process.stdout.strip(), package_version, source_clean)
+
+
+@dataclass(frozen=True, slots=True)
+class ReadinessPhaseTimings:
+    provision_ready: int | None = None
+    receipt_baseline: int | None = None
+    turn_settlement: int | None = None
+    receipt_verification: int | None = None
+    total: int | None = None
+
+    @classmethod
+    def parse(cls, raw: object) -> ReadinessPhaseTimings | None:
+        if not isinstance(raw, Mapping):
+            return None
+        expected = {
+            "provision_ready",
+            "receipt_baseline",
+            "turn_settlement",
+            "receipt_verification",
+            "total",
+        }
+        if any(not isinstance(key, str) or key not in expected for key in raw):
+            return None
+        values: dict[str, int] = {}
+        for key, value in raw.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            values[str(key)] = value
+        return cls(**values)
+
+    def public_json(self) -> dict[str, int]:
+        values = {
+            "provision_ready": self.provision_ready,
+            "receipt_baseline": self.receipt_baseline,
+            "turn_settlement": self.turn_settlement,
+            "receipt_verification": self.receipt_verification,
+            "total": self.total,
+        }
+        return {key: value for key, value in values.items() if value is not None}
+
+
+class ReadinessProbe(Protocol):
+    def __call__(
+        self,
+        workflow: WorkflowConfig,
+        harness: Harness,
+        timeout_seconds: int,
+    ) -> Mapping[str, object]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ReadinessEntry:
+    harness: Harness
+    status: ReadinessStatus
+    error_code: ReadinessErrorCode | None
+    phase_timings: ReadinessPhaseTimings
+    observed_at: datetime
+    attempt_count: int
+
+    def __post_init__(self) -> None:
+        expected_status = (
+            ReadinessStatus.READY
+            if self.error_code is None
+            else _ERROR_POLICY[self.error_code].status
+        )
+        if (
+            self.status is not expected_status
+            or not 0 <= self.attempt_count <= 2
+            or self.observed_at.tzinfo is None
+        ):
+            raise ValueError("readiness_entry_invalid")
+
+    @property
+    def verification(self) -> ReadinessVerification:
+        if self.status is ReadinessStatus.READY and self.error_code is None:
+            return ReadinessVerification.VERIFIED
+        return ReadinessVerification.NOT_VERIFIED
+
+    def public_json(self) -> dict[str, object]:
+        return {
+            "harness": self.harness.value,
+            "status": self.status.value,
+            "verification": self.verification.value,
+            "error_code": self.error_code.value if self.error_code is not None else None,
+            "phase_timings_ms": self.phase_timings.public_json(),
+            "observed_at": _timestamp(self.observed_at),
+            "attempt_count": self.attempt_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReadinessMatrix:
+    build: BuildIdentity
+    workflow: str
+    workspace_id: str
+    observed_at: datetime
+    results: tuple[ReadinessEntry, ...]
+
+    @property
+    def verification(self) -> ReadinessVerification:
+        if self.results and all(
+            result.verification is ReadinessVerification.VERIFIED for result in self.results
+        ):
+            return ReadinessVerification.VERIFIED
+        return ReadinessVerification.NOT_VERIFIED
+
+    def public_json(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "commit": self.build.commit,
+            "package_version": self.build.package_version,
+            "source_clean": self.build.source_clean,
+            "workflow": self.workflow,
+            "workspace_id": self.workspace_id,
+            "observed_at": _timestamp(self.observed_at),
+            "verification": self.verification.value,
+            "results": [result.public_json() for result in self.results],
+        }
+
+    def invalidate_source_change(self, observed_at: datetime) -> ReadinessMatrix:
+        return ReadinessMatrix(
+            BuildIdentity(self.build.commit, self.build.package_version, source_clean=False),
+            self.workflow,
+            self.workspace_id,
+            _utc(observed_at),
+            tuple(
+                _error_entry(
+                    result.harness,
+                    ReadinessErrorCode.READINESS_SOURCE_CHANGED,
+                    result.phase_timings,
+                    observed_at,
+                    result.attempt_count,
+                )
+                for result in self.results
+            ),
+        )
+
+
+def collect_readiness_matrix(
+    workflow: WorkflowConfig,
+    *,
+    selected_harnesses: Sequence[str] | None,
+    timeout_seconds: int,
+    environment: ReadinessEnvironment,
+    build: BuildIdentity,
+    probe: ReadinessProbe,
+    clock: Callable[[], datetime],
+) -> ReadinessMatrix:
+    if not 5 <= timeout_seconds <= 300:
+        raise ValueError("readiness_probe_timeout_out_of_range")
+    started_at = _utc(clock())
+    harnesses = _selected_harnesses(workflow, selected_harnesses)
+    entries: list[ReadinessEntry] = []
+    for harness in harnesses:
+        preflight_error = _preflight_error(environment, build, harness)
+        if preflight_error is not None:
+            entries.append(
+                _error_entry(
+                    harness,
+                    preflight_error,
+                    ReadinessPhaseTimings(),
+                    started_at,
+                    0,
+                )
+            )
+            continue
+        entries.append(
+            _probe_with_retry(
+                workflow,
+                harness,
+                timeout_seconds,
+                probe=probe,
+                started_at=started_at,
+                clock=clock,
+            )
+        )
+    return ReadinessMatrix(
+        build,
+        workflow.name,
+        hashlib.sha256(str(workflow.workspace.resolve()).encode()).hexdigest()[:16],
+        _utc(clock()),
+        tuple(entries),
+    )
+
+
+def _selected_harnesses(
+    workflow: WorkflowConfig,
+    selected: Sequence[str] | None,
+) -> tuple[Harness, ...]:
+    enabled = list(dict.fromkeys(worker.harness for worker in workflow.workers))
+    planner = workflow.planner.harness
+    if planner is not None and planner not in enabled:
+        enabled.append(planner)
+    if not selected:
+        return tuple(enabled)
+    requested = tuple(dict.fromkeys(Harness(value) for value in selected))
+    unavailable = [harness.value for harness in requested if harness not in enabled]
+    if unavailable:
+        raise ValueError(f"readiness_harness_not_enabled: {','.join(unavailable)}")
+    return requested
+
+
+def _preflight_error(
+    environment: ReadinessEnvironment,
+    build: BuildIdentity,
+    harness: Harness,
+) -> ReadinessErrorCode | None:
+    if environment.ci:
+        return ReadinessErrorCode.READINESS_CI_FORBIDDEN
+    if not build.source_clean:
+        return ReadinessErrorCode.READINESS_SOURCE_DIRTY
+    if not environment.managed_pane:
+        return ReadinessErrorCode.NOT_IN_HERDR
+    if not environment.executable_available.get(harness, False):
+        return ReadinessErrorCode.HARNESS_UNAVAILABLE
+    if not environment.profile_available.get(harness, False):
+        return ReadinessErrorCode.PROFILE_UNAVAILABLE
+    return None
+
+
+def _environment_flag(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in {"1", "true", "yes"}
+
+
+def _probe_with_retry(
     workflow: WorkflowConfig,
     harness: Harness,
     timeout_seconds: int,
     *,
-    transport: HerdrTransport | None = None,
-) -> Mapping[str, object]:
-    active_transport = transport or HerdrTransport(workflow.name, workflow.workspace)
-    name = doctor_agent_name(workflow.name, harness)
-    prefix = f"HERDR-DOCTOR-OK harness={harness.value}"
-    started = time.monotonic()
-    try:
-        outcome = active_transport.dispatch(
-            harness,
-            (
-                "Read-only readiness probe. Do not modify files or external state. "
-                f"Reply with exactly this line: {prefix}"
-            ),
-            timeout_seconds=timeout_seconds,
-            agent_name=name,
-            context=DispatchContext(
-                placement=PlacementTarget.TAB,
-                title=f"doctor-{harness.value}",
-                task_key=f"doctor-{harness.value}",
-                receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, prefix),
-            ),
-        )
-    finally:
-        active_transport.close_created_agent(name)
-    status_by_error = {
-        "agent_auth_failed": "auth_required",
-        "agent_auth_required": "auth_required",
-        "agent_model_invalid": "model_invalid",
-        "herdr_timeout": "timeout",
-        "timeout": "timeout",
-        "prompt_acceptance_timeout": "timeout",
-        "agent_provider_failed": "error",
-        "herdr_unavailable": "unavailable",
-        "not_in_herdr": "unavailable",
-    }
-    if outcome.state in {AgentState.IDLE, AgentState.DONE} and outcome.task_verified is True:
-        status = "ready"
-    else:
-        status = status_by_error.get(outcome.error_code or "", "error")
-    return {
-        "status": status,
-        "error_code": outcome.error_code,
-        "error_summary": outcome.error_summary,
-        "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
-        "phase_timings_ms": outcome.phase_timings_ms or {},
-    }
-
-
-def _number(value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("harness_health_number_invalid")
-    return float(value)
-
-
-def _integer(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError("harness_health_integer_invalid")
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class HarnessHealth:
-    harness: Harness
-    status: HarnessHealthStatus
-    reason_code: str | None
-    source: str
-    observed_at: float
-    expires_at: float
-    cooldown_until: float
-    consecutive_failures: int
-    probe_lease_until: float | None = None
-
-    def eligible_at(self, now: float) -> bool:
-        return self.status is HarnessHealthStatus.READY and self.expires_at > now
-
-    def refreshable_at(self, now: float) -> bool:
-        return self.expires_at <= now and self.cooldown_until <= now
-
-
-class HarnessHealthRegistry:
-    """Provide one readiness interface to selection, doctor, and dispatch."""
-
-    def __init__(
-        self,
-        config: WorkflowConfig,
-        store: Store,
-        *,
-        probe: ReadinessProbe | None = None,
-        executable_finder: ExecutableFinder = shutil.which,
-        clock: Callable[[], float] = time.time,
-        monotonic: Callable[[], float] = time.monotonic,
-        observability: ReadinessObservability | None = None,
-    ) -> None:
-        self.config = config
-        self.store = store
-        self.probe = probe
-        self.executable_finder = executable_finder
-        self.clock = clock
-        self.monotonic = monotonic
-        self.observability = observability
-        self.workspace = str(config.workspace.resolve())
-
-    def eligible(
-        self,
-        harnesses: Iterable[Harness],
-        *,
-        refresh: bool = True,
-        deadline: float | None = None,
-    ) -> tuple[Harness, ...]:
-        candidates = tuple(dict.fromkeys(harnesses))
-        if not candidates:
-            return ()
-        self.store.initialize()
-        now = self.clock()
-        records = self._records(candidates)
-        if refresh:
-            for harness in candidates:
-                record = records.get(harness)
-                if record is not None and record.eligible_at(now):
-                    continue
-                if record is not None and not record.refreshable_at(now):
-                    continue
-                timeout_seconds = self._probe_timeout(deadline)
-                if timeout_seconds is None:
-                    break
-                self._refresh(harness, now, timeout_seconds)
-            records = self._records(candidates)
-        return tuple(
-            harness
-            for harness in candidates
-            if (record := records.get(harness)) is not None and record.eligible_at(now)
-        )
-
-    def require(
-        self,
-        harness: Harness,
-        *,
-        deadline: float | None = None,
-    ) -> Harness:
-        if harness in self.eligible((harness,), deadline=deadline):
-            return harness
-        reason = self.reason(harness) or "readiness_unknown"
-        raise ValueError(f"harness_unavailable:{harness.value}:{reason}")
-
-    def reason(self, harness: Harness) -> str | None:
-        record = self._records((harness,)).get(harness)
-        return record.reason_code if record is not None else "readiness_unknown"
-
-    def record_probe(
-        self,
-        harness: Harness,
-        result: Mapping[str, object],
-        *,
-        source: str = "doctor",
-        probe_token: str | None = None,
-    ) -> None:
-        status_value = str(result.get("status", "error"))
-        error_code_value = result.get("error_code")
-        error_code = str(error_code_value) if error_code_value else None
-        if status_value == "ready":
-            status = HarnessHealthStatus.READY
-            reason_code = None
-        elif error_code in HARD_FAILURES or status_value in {
-            "auth_required",
-            "model_invalid",
-            "unavailable",
-        }:
-            status = HarnessHealthStatus.UNAVAILABLE
-            reason_code = error_code or f"readiness_{status_value}"
-        else:
-            status = HarnessHealthStatus.DEGRADED
-            reason_code = error_code or "readiness_probe_failed"
-        self._record(
-            harness,
-            status,
-            reason_code,
-            source,
-            probe_token=probe_token,
-        )
-
-    def record_dispatch(
-        self,
-        harness: Harness,
-        outcome: DispatchOutcome,
-        *,
-        workspace: Path | None = None,
-    ) -> None:
-        if outcome.state is AgentState.BLOCKED and (
-            outcome.error_code is None or outcome.error_code in TASK_LEVEL_ERRORS
-        ):
-            return
-        if outcome.state in {AgentState.IDLE, AgentState.DONE} and (
-            outcome.agent_settled is not False
-            and (outcome.error_code is None or outcome.error_code in TASK_LEVEL_ERRORS)
-        ):
-            self._record(
-                harness,
-                HarnessHealthStatus.READY,
-                None,
-                "dispatch",
-                workspace=workspace,
-            )
-        elif outcome.error_code in HARD_FAILURES:
-            self._record(
-                harness,
-                HarnessHealthStatus.UNAVAILABLE,
-                outcome.error_code,
-                "dispatch",
-                workspace=workspace,
-            )
-        else:
-            self._record(
-                harness,
-                HarnessHealthStatus.DEGRADED,
-                outcome.error_code or "dispatch_runtime_failed",
-                "dispatch",
-                workspace=workspace,
-            )
-
-    def projection(
-        self,
-        harnesses: Iterable[Harness],
-        *,
-        workspace: Path | None = None,
-    ) -> list[dict[str, object]]:
-        candidates = tuple(dict.fromkeys(harnesses))
-        self.store.initialize()
-        now = self.clock()
-        records = self._records(candidates, workspace=workspace)
-        result: list[dict[str, object]] = []
-        for harness in candidates:
-            record = records.get(harness)
-            expired = (
-                record is not None
-                and record.status is HarnessHealthStatus.READY
-                and not record.eligible_at(now)
-            )
-            result.append(
-                {
-                    "harness": harness.value,
-                    "status": (
-                        HarnessHealthStatus.UNKNOWN.value
-                        if record is None or expired
-                        else record.status.value
-                    ),
-                    "eligible": record.eligible_at(now) if record is not None else False,
-                    "reason_code": (
-                        "readiness_expired"
-                        if expired
-                        else (record.reason_code if record is not None else "readiness_unknown")
-                    ),
-                    "source": record.source if record is not None else "none",
-                    "age_seconds": (
-                        max(0, int(now - record.observed_at))
-                        if record is not None and record.observed_at > 0
-                        else None
-                    ),
-                    "expires_at": record.expires_at if record is not None else None,
-                    "cooldown_until": record.cooldown_until if record is not None else None,
-                    "consecutive_failures": (
-                        record.consecutive_failures if record is not None else 0
-                    ),
-                }
-            )
-        return result
-
-    def _probe_timeout(self, deadline: float | None) -> int | None:
-        configured = self.config.coordinator.readiness_probe_timeout_seconds
-        if deadline is None:
-            return configured
-        remaining = deadline - self.monotonic()
-        if remaining <= 0:
-            return None
-        return max(1, min(configured, ceil(remaining)))
-
-    def _refresh(self, harness: Harness, now: float, timeout_seconds: int) -> None:
-        if self.executable_finder(harness.value) is None:
-            self._record(
-                harness,
-                HarnessHealthStatus.UNAVAILABLE,
-                "harness_unavailable",
-                "preflight",
-            )
-            return
-        probe_token = secrets.token_hex(16)
-        if not self.store.claim_harness_probe(
-            self.config.name,
-            self.workspace,
-            harness,
-            now=now,
-            lease_seconds=timeout_seconds + 10,
-            probe_token=probe_token,
-        ):
-            return
-        try:
-            result = self._run_probe(harness, timeout_seconds)
-            self.record_probe(
-                harness,
-                result,
-                source="preflight",
-                probe_token=probe_token,
-            )
-        except Exception:
-            self._record(
-                harness,
-                HarnessHealthStatus.DEGRADED,
-                "readiness_probe_failed",
-                "preflight",
-                probe_token=probe_token,
-            )
-        finally:
-            self.store.release_harness_probe(
-                self.config.name,
-                self.workspace,
-                harness,
-                probe_token=probe_token,
-            )
-
-    def _run_probe(
-        self,
-        harness: Harness,
-        timeout_seconds: int,
-    ) -> Mapping[str, object]:
-        if self.probe is not None:
-            return self.probe(
-                self.config,
-                harness,
-                timeout_seconds,
-            )
-        return probe_harness_readiness(
-            self.config,
+    probe: ReadinessProbe,
+    started_at: datetime,
+    clock: Callable[[], datetime],
+) -> ReadinessEntry:
+    for attempt in (1, 2):
+        result = _probe_once(
+            workflow,
             harness,
             timeout_seconds,
+            probe=probe,
+            attempt=attempt,
+            started_at=started_at,
+            clock=clock,
         )
+        if (
+            attempt == 2
+            or result.error_code is None
+            or not _ERROR_POLICY[result.error_code].retryable
+        ):
+            return result
+    raise AssertionError("readiness_retry_exhausted")
 
-    def _record(
-        self,
-        harness: Harness,
-        status: HarnessHealthStatus,
-        reason_code: str | None,
-        source: str,
-        *,
-        workspace: Path | None = None,
-        probe_token: str | None = None,
-    ) -> None:
-        self.store.initialize()
-        now = self.clock()
-        workspace_key = self._workspace_key(workspace)
-        existing = self._records((harness,), workspace=workspace).get(harness)
-        failures = (
-            0
-            if status is HarnessHealthStatus.READY
-            else (existing.consecutive_failures if existing is not None else 0) + 1
-        )
-        cooldown_until = (
-            now
-            if status is HarnessHealthStatus.READY
-            else now + self.config.coordinator.readiness_cooldown_seconds
-        )
-        recorded = self.store.record_harness_health(
-            self.config.name,
-            workspace_key,
+
+def _probe_once(
+    workflow: WorkflowConfig,
+    harness: Harness,
+    timeout_seconds: int,
+    *,
+    probe: ReadinessProbe,
+    attempt: int,
+    started_at: datetime,
+    clock: Callable[[], datetime],
+) -> ReadinessEntry:
+    try:
+        raw = probe(workflow, harness, timeout_seconds)
+    except Exception:
+        return _error_entry(
             harness,
-            status=status,
-            reason_code=reason_code,
-            source=source,
-            observed_at=now,
-            expires_at=(
-                now + self.config.coordinator.readiness_ttl_seconds
-                if status is HarnessHealthStatus.READY
-                else now
-            ),
-            cooldown_until=cooldown_until,
-            consecutive_failures=failures,
-            probe_token=probe_token,
+            ReadinessErrorCode.READINESS_PROBE_FAILED,
+            ReadinessPhaseTimings(),
+            _utc(clock()),
+            attempt,
         )
-        if not recorded:
-            return
-        if self.observability is not None:
-            correlation_id = f"harness-health-{harness.value}"
-            fields: dict[str, object] = {
-                "consecutive_failures": failures,
-                "harness": harness.value,
-                "reason_code": reason_code,
-                "source": source,
-                "status": status.value,
-            }
-            with suppress(Exception):
-                self.observability.event(
-                    "harness_health_observed",
-                    correlation_id=correlation_id,
-                    fields=fields,
-                )
-                self.observability.metric(
-                    "harness_readiness_eligible",
-                    float(status is HarnessHealthStatus.READY),
-                    correlation_id=correlation_id,
-                    fields=fields,
-                )
-                if existing is None or (
-                    existing.status is not status or existing.reason_code != reason_code
-                ):
-                    self.observability.event(
-                        "harness_health_transition",
-                        correlation_id=correlation_id,
-                        fields={
-                            **fields,
-                            "previous_reason_code": (
-                                existing.reason_code if existing is not None else None
-                            ),
-                            "previous_status": (
-                                existing.status.value
-                                if existing is not None
-                                else HarnessHealthStatus.UNKNOWN.value
-                            ),
-                        },
-                    )
+    observed_at = _utc(clock())
+    return _parse_probe_result(
+        harness,
+        raw,
+        attempt=attempt,
+        started_at=started_at,
+        observed_at=observed_at,
+    )
 
-    def _workspace_key(self, workspace: Path | None) -> str:
-        return self.workspace if workspace is None else str(workspace.resolve())
 
-    def _records(
-        self,
-        harnesses: Iterable[Harness],
-        *,
-        workspace: Path | None = None,
-    ) -> dict[Harness, HarnessHealth]:
-        rows = self.store.harness_health(
-            self.config.name,
-            self._workspace_key(workspace),
-            harnesses,
+def _parse_probe_result(
+    harness: Harness,
+    raw: object,
+    *,
+    attempt: int,
+    started_at: datetime,
+    observed_at: datetime,
+) -> ReadinessEntry:
+    if not isinstance(raw, Mapping):
+        return _invalid_entry(harness, attempt, observed_at)
+    try:
+        status = ReadinessStatus(str(raw.get("status")))
+    except ValueError:
+        return _invalid_entry(harness, attempt, observed_at)
+    raw_error = raw.get("error_code")
+    if raw_error is None:
+        error_code = None
+    else:
+        try:
+            error_code = ReadinessErrorCode(str(raw_error))
+        except ValueError:
+            return _invalid_entry(harness, attempt, observed_at)
+    expected_status = (
+        ReadinessStatus.READY if error_code is None else _ERROR_POLICY[error_code].status
+    )
+    if status is not expected_status:
+        return _invalid_entry(harness, attempt, observed_at)
+    timings = ReadinessPhaseTimings.parse(raw.get("phase_timings_ms", {}))
+    if timings is None or timings.total is None:
+        return _invalid_entry(harness, attempt, observed_at)
+    raw_timestamp = raw.get("observed_at")
+    if raw_timestamp is not None:
+        parsed = _parse_timestamp(raw_timestamp)
+        if parsed is None:
+            return _invalid_entry(harness, attempt, observed_at)
+        evidence_time = parsed
+    else:
+        evidence_time = observed_at
+    if evidence_time < started_at or evidence_time > observed_at:
+        return _error_entry(
+            harness,
+            ReadinessErrorCode.READINESS_EVIDENCE_EXPIRED,
+            timings,
+            evidence_time,
+            attempt,
         )
-        return {
-            harness: HarnessHealth(
-                harness=harness,
-                status=HarnessHealthStatus(str(row["status"])),
-                reason_code=(str(row["reason_code"]) if row["reason_code"] is not None else None),
-                source=str(row["source"]),
-                observed_at=_number(row["observed_at"]),
-                expires_at=_number(row["expires_at"]),
-                cooldown_until=_number(row["cooldown_until"]),
-                consecutive_failures=_integer(row["consecutive_failures"]),
-                probe_lease_until=(
-                    _number(row["probe_lease_until"])
-                    if row["probe_lease_until"] is not None
-                    else None
-                ),
-            )
-            for harness, row in rows.items()
-        }
+    return ReadinessEntry(harness, status, error_code, timings, evidence_time, attempt)
+
+
+def _invalid_entry(
+    harness: Harness,
+    attempt: int,
+    observed_at: datetime,
+) -> ReadinessEntry:
+    return _error_entry(
+        harness,
+        ReadinessErrorCode.READINESS_RESULT_INVALID,
+        ReadinessPhaseTimings(),
+        observed_at,
+        attempt,
+    )
+
+
+def _error_entry(
+    harness: Harness,
+    error_code: ReadinessErrorCode,
+    phase_timings: ReadinessPhaseTimings,
+    observed_at: datetime,
+    attempt_count: int,
+) -> ReadinessEntry:
+    return ReadinessEntry(
+        harness,
+        _ERROR_POLICY[error_code].status,
+        error_code,
+        phase_timings,
+        _utc(observed_at),
+        attempt_count,
+    )
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return _utc(parsed)
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        raise ValueError("readiness_clock_timezone_missing")
+    return value.astimezone(UTC)
+
+
+def _timestamp(value: datetime) -> str:
+    return _utc(value).isoformat().replace("+00:00", "Z")

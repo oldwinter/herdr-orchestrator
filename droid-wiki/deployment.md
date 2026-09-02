@@ -120,7 +120,7 @@ runner。checkout 不持久化凭据，主要工具和 GitHub Actions 均固定�
 
 测试顺序为：
 
-1. 安装 Python 3.12、Node.js 24、uv 0.12.5 和 rust-just 1.57.0；
+1. 安装 Python 3.14.7、Node.js 26.8.1、uv 0.12.7 和 rust-just 1.57.0；
 2. 用 `uv sync --locked` 安装锁定工具链；
 3. 编译 `src/`、`tests/` 和 `scripts/`；
 4. 分别执行 `just lint`、`just test-coverage`、`just test-stability`、
@@ -167,7 +167,7 @@ npm trust github herdr-orchestrator \
 `contents: write`（创建 GitHub Release）和 `id-token: write`（OIDC）权限。它会：
 
 1. 以 `persist-credentials: false` checkout 对应的 `main` 提交；
-2. 配置 Node.js 24 和 `https://registry.npmjs.org`；
+2. 配置 Node.js 26.8.1 和 `https://registry.npmjs.org`；
 3. 安装支持 OIDC 的 npm 12.0.2；
 4. 执行 `npm ci --ignore-scripts`；
 5. 执行 `npm publish --access public`。

@@ -17,7 +17,7 @@ PYTHONPATH=src uv run pytest tests/test_store.py -q
 PYTHONPATH=src uv run pytest \
   tests/test_store.py::StoreTests::test_expired_lease_is_reclaimed -q
 
-# 全部测试（生成 .orchestrator/quality/tests.json）
+# 全部测试（生成 run-scoped JSON report，通过 manifest 定位）
 just test
 
 # 分支覆盖率与 80% 门槛
@@ -101,8 +101,8 @@ flowchart TD
 
 - `just test-coverage` 对 `herdr_orchestrator` 启用 branch coverage，低于 80% 失败。
 - `just test-stability` 运行 `tests/` 三次；任一退出失败或相同 nodeid 结果不一致即失败。
-- `just profile-tests` 用标准库 `cProfile` 运行 `tests/test_protocol.py`，输出
-  `.orchestrator/quality/tests.pstats`。
+- `just profile-tests` 用标准库 `cProfile` 运行 `tests/test_protocol.py`，输出通过 run manifest
+  定位的 profile artifact。
 - 其余静态、安全与构建阶段见[工具与质量门禁](tooling.md)。
 
 `.github/workflows/ci.yml` 使用同一锁文件和命令。各质量阶段即使先标为

@@ -124,6 +124,21 @@ Runtime fatal 检查只读取 bounded detection output，并将匹配内容折�
 
 Doctor 任一 check 失败时退出码为 1；参数、配置或预期异常由 CLI 顶层返回 2。Smoke 任一 harness 失败也返回 1。
 
+## Readiness-aware routing
+
+`src/herdr_orchestrator/harness_health.py::HarnessHealth` 是 doctor、普通 dispatch、自动
+controller、router、planner 和 standardized delivery 共用的分类与 eligibility seam。它按
+`workflow + canonical workspace + harness` 在 SQLite 中保存 `unknown`、`ready`、`degraded` 或
+`unavailable`，以及 stable reason/source、observation/expiry/cooldown、retryable count 和 probe
+lease。过期 `ready` evidence 不能继续选中；unknown/过期记录最多触发一次由 CAS lease 去重的
+bounded refresh。`blocked` task question 与 task-specific receipt failure 不会污染 harness health。
+
+自动候选继续遵循 `droid → grok → codex → claude → hermes → pi`，但只在 fresh `ready` pool 中选择。
+显式 controller/worker 选择会对请求的 harness 做 bounded preflight，失败时返回包含该 harness
+和 reason 的稳定错误，不会静默切换。已有 job 的 harness 永不改写；unavailable job 保持 pending
+且不占 attempt/lease，恢复后的 fresh ready evidence 让同一 job 再次 claim。`run --until-idle`
+在存在不可服务 pending work 时返回 `degraded_capacity`，而不是成功 idle。
+
 ## 关键抽象与源文件
 
 | 抽象 | 完整路径 | 责任 |
@@ -134,6 +149,7 @@ Doctor 任一 check 失败时退出码为 1；参数、配置或预期异常由 
 | `doctor` / `probe_harness_readiness` | `src/herdr_orchestrator/cli.py` | 静态依赖检查、真实 probe 和 status 分类 |
 | `smoke` | `src/herdr_orchestrator/cli.py` | 六 harness 只读真实 turn |
 | `DispatchOutcome` | `src/herdr_orchestrator/model.py` | `agent_settled`、`task_verified`、timings 和错误传播 |
+| `HarnessHealth` | `src/herdr_orchestrator/harness_health.py` | health persistence、central classification、expiry/cooldown、probe lease 与 routing eligibility |
 
 ## 集成点与修改入口
 

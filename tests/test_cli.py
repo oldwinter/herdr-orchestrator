@@ -8,12 +8,20 @@ import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import herdr_orchestrator.cli as cli_module
-from herdr_orchestrator.cli import build_parser, doctor, probe_harness_readiness, smoke
+from herdr_orchestrator.cli import (
+    build_parser,
+    doctor,
+    probe_harness_readiness,
+    readiness_matrix,
+    smoke,
+)
+from herdr_orchestrator.completion import CompletionPolicy
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.delivery import DeliveryEscalation
 from herdr_orchestrator.model import (
@@ -21,110 +29,14 @@ from herdr_orchestrator.model import (
     DispatchContext,
     DispatchOutcome,
     Harness,
-    NewJob,
     ReceiptKind,
 )
-from herdr_orchestrator.readiness import HarnessHealthRegistry
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.readiness import BuildIdentity, ReadinessEnvironment
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliTests(unittest.TestCase):
-    def test_status_projects_enabled_health_and_pending_availability_reason(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
-            droid_worker = next(
-                worker for worker in base.workers if worker.harness is Harness.DROID
-            )
-            config = replace(
-                base,
-                state_db=Path(temporary) / "state.db",
-                workers=(droid_worker,),
-                planner=replace(
-                    base.planner,
-                    harness=Harness.GROK,
-                    worker_harnesses=(Harness.DROID,),
-                ),
-            )
-            store = Store(config.state_db)
-            store.initialize()
-            store.enqueue(
-                NewJob(
-                    workflow=config.name,
-                    title="Deferred",
-                    harness=Harness.DROID,
-                    prompt="Wait for readiness.",
-                    dedupe_key="status-deferred",
-                    max_attempts=2,
-                )
-            )
-            HarnessHealthRegistry(config, store).record_probe(
-                Harness.DROID,
-                {
-                    "status": "timeout",
-                    "error_code": "herdr_timeout",
-                    "error_summary": "private terminal output",
-                },
-            )
-
-            output = io.StringIO()
-            with redirect_stdout(output):
-                code = cli_module._command_status(config, Namespace())
-            report = json.loads(output.getvalue())
-
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            [row["harness"] for row in report["harness_health"]],
-            ["droid", "grok"],
-        )
-        self.assertEqual(report["jobs"][0]["availability_reason"], "herdr_timeout")
-        self.assertNotIn("private terminal output", output.getvalue())
-
-    def test_doctor_records_targeted_readiness_for_later_selection(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
-            config = replace(base, state_db=Path(temporary) / "state.db")
-            store = Store(config.state_db)
-            health = HarnessHealthRegistry(
-                config,
-                store,
-                executable_finder=lambda command: f"/bin/{command}",
-                clock=lambda: 100.0,
-            )
-
-            with redirect_stdout(io.StringIO()):
-                code = doctor(
-                    config,
-                    environ={
-                        "HERDR_ENV": "1",
-                        "HERDR_PANE_ID": "w1:p1",
-                        "HERDR_WORKSPACE_ID": "w1",
-                    },
-                    which=lambda name: f"/bin/{name}",
-                    version_runner=lambda *args, **kwargs: subprocess.CompletedProcess(
-                        ["herdr", "--version"],
-                        0,
-                        "herdr 0.8.2\n",
-                        "",
-                    ),
-                    readiness_probe=lambda workflow, harness, timeout: {
-                        "status": "ready",
-                        "error_code": None,
-                        "error_summary": None,
-                    },
-                    selected_harnesses=["grok"],
-                    health_registry=health,
-                )
-
-            projection = health.projection((Harness.GROK, Harness.CODEX))
-
-        self.assertEqual(code, 0)
-        self.assertEqual(projection[0]["status"], "ready")
-        self.assertTrue(projection[0]["eligible"])
-        self.assertEqual(projection[0]["source"], "doctor")
-        self.assertEqual(projection[1]["status"], "unknown")
-
     def test_readiness_probe_classifies_invalid_model_and_closes_created_agent(self) -> None:
         config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
 
@@ -277,6 +189,153 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.harness, ["droid", "codex"])
 
+    def test_readiness_matrix_accepts_repeatable_harness_filter(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "readiness-matrix",
+                "--workflow",
+                "workflow.toml",
+                "--harness",
+                "droid",
+                "--harness",
+                "codex",
+            ]
+        )
+
+        self.assertEqual(args.harness, ["droid", "codex"])
+
+    def test_readiness_matrix_prints_structured_current_build_evidence(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        output = io.StringIO()
+        environment = ReadinessEnvironment(
+            True,
+            {harness: True for harness in Harness},
+            {harness: True for harness in Harness},
+        )
+
+        with redirect_stdout(output):
+            code = readiness_matrix(
+                config,
+                selected_harnesses=["droid"],
+                probe_timeout_seconds=15,
+                environment=environment,
+                build=BuildIdentity("a" * 40, "0.1.6"),
+                readiness_probe=lambda *args: {
+                    "status": "ready",
+                    "error_code": None,
+                    "phase_timings_ms": {"total": 7},
+                },
+                clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
+            )
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["verification"], "VERIFIED")
+        self.assertEqual(report["results"][0]["harness"], "droid")
+        self.assertEqual(report["results"][0]["attempt_count"], 1)
+        self.assertEqual(report["commit"], "a" * 40)
+
+    def test_readiness_matrix_returns_not_verified_for_dirty_source(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        output = io.StringIO()
+        environment = ReadinessEnvironment(
+            True,
+            {harness: True for harness in Harness},
+            {harness: True for harness in Harness},
+        )
+
+        with redirect_stdout(output):
+            code = readiness_matrix(
+                config,
+                selected_harnesses=["droid"],
+                probe_timeout_seconds=15,
+                environment=environment,
+                build=BuildIdentity("a" * 40, "0.1.6", source_clean=False),
+                readiness_probe=lambda *args: self.fail(f"unexpected probe: {args}"),
+                clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
+            )
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verification"], "NOT VERIFIED")
+        self.assertFalse(report["source_clean"])
+        self.assertEqual(report["results"][0]["attempt_count"], 0)
+        self.assertEqual(report["results"][0]["error_code"], "readiness_source_dirty")
+
+    def test_readiness_matrix_invalidates_source_changes_during_probe(self) -> None:
+        original = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        environment = ReadinessEnvironment(
+            True,
+            {harness: True for harness in Harness},
+            {harness: True for harness in Harness},
+        )
+        for change_kind in ("tracked-mutation", "new-commit"):
+            with self.subTest(change_kind=change_kind), tempfile.TemporaryDirectory() as temporary:
+                workspace = Path(temporary)
+                tracked = workspace / "tracked.txt"
+                _git(workspace, "init", "-q")
+                tracked.write_text("original\n", encoding="utf-8")
+                _git(workspace, "add", "tracked.txt")
+                _git(
+                    workspace,
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "initial",
+                )
+                original_commit = _git_output(workspace, "rev-parse", "HEAD")
+                config = replace(original, workspace=workspace)
+
+                def probe(
+                    *args: object,
+                    current_kind: str = change_kind,
+                    current_workspace: Path = workspace,
+                    current_tracked: Path = tracked,
+                ) -> dict[str, object]:
+                    del args
+                    current_tracked.write_text(f"{current_kind}\n", encoding="utf-8")
+                    if current_kind == "new-commit":
+                        _git(current_workspace, "add", "tracked.txt")
+                        _git(
+                            current_workspace,
+                            "-c",
+                            "user.name=Test",
+                            "-c",
+                            "user.email=test@example.invalid",
+                            "commit",
+                            "-qm",
+                            "changed",
+                        )
+                    return {
+                        "status": "ready",
+                        "error_code": None,
+                        "phase_timings_ms": {"total": 7},
+                    }
+
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = readiness_matrix(
+                        config,
+                        selected_harnesses=["droid"],
+                        probe_timeout_seconds=15,
+                        environment=environment,
+                        readiness_probe=probe,
+                        clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
+                    )
+
+                report = json.loads(output.getvalue())
+                result = report["results"][0]
+                self.assertEqual(code, 1)
+                self.assertEqual(report["commit"], original_commit)
+                self.assertFalse(report["source_clean"])
+                self.assertEqual(report["verification"], "NOT VERIFIED")
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["error_code"], "readiness_source_changed")
+                self.assertEqual(result["attempt_count"], 1)
+
     def test_enqueue_defaults_to_automatic_selection(self) -> None:
         args = build_parser().parse_args(
             [
@@ -317,6 +376,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.receipt_prefix, "MOCK-OK harness=pi")
         self.assertIsNone(args.receipt_file)
 
+    def test_enqueue_accepts_structured_completion_policy(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "enqueue",
+                "--workflow",
+                "workflow.toml",
+                "--title",
+                "Inspect",
+                "--prompt-file",
+                "task.md",
+                "--dedupe-key",
+                "inspect-v2",
+                "--completion-policy",
+                "structured-v2",
+            ]
+        )
+
+        self.assertEqual(args.completion_policy, CompletionPolicy.STRUCTURED_V2.value)
+
     def test_run_accepts_separate_controller_and_worker_overrides(self) -> None:
         args = build_parser().parse_args(
             [
@@ -351,6 +429,19 @@ class CliTests(unittest.TestCase):
         self.assertTrue(args.until_idle)
         self.assertFalse(args.once)
         self.assertEqual(args.drain_timeout_seconds, 120)
+
+    def test_run_until_idle_defaults_to_day_long_drain(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "run",
+                "--workflow",
+                "workflow.toml",
+                "--until-idle",
+            ]
+        )
+
+        self.assertTrue(args.until_idle)
+        self.assertEqual(args.drain_timeout_seconds, 86400)
 
     def test_retry_accepts_job_and_attempt_budget(self) -> None:
         args = build_parser().parse_args(
@@ -470,6 +561,21 @@ class CliTests(unittest.TestCase):
         self.assertIs(context.receipt.kind, ReceiptKind.OUTPUT_PREFIX)
         self.assertIn(context.receipt.value, prompt)
 
+    def test_smoke_rejects_harness_without_enabled_worker(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        config = replace(
+            config,
+            workers=tuple(worker for worker in config.workers if worker.harness is Harness.CODEX),
+        )
+
+        with (
+            patch("herdr_orchestrator.cli.HerdrTransport") as transport,
+            self.assertRaisesRegex(ValueError, "smoke_harness_not_enabled: pi"),
+        ):
+            smoke(config, selected_harnesses=["pi"])
+
+        transport.assert_not_called()
+
     def test_deliver_is_explicit_and_accepts_bounded_overrides(self) -> None:
         args = build_parser().parse_args(
             [
@@ -526,7 +632,6 @@ class CliCommandDispatchTests(unittest.TestCase):
             self.assertEqual(cli_module._command_retry(self.config, args), 0)
             self.assertEqual(cli_module._command_status(self.config, args), 0)
         self.assertIn('"added": 2', output.getvalue())
-        self.assertIn('"harness_health"', output.getvalue())
         store.initialize.assert_called()
 
     def test_enqueue_and_run_modes_forward_typed_arguments(self) -> None:
@@ -680,6 +785,26 @@ class CliCommandDispatchTests(unittest.TestCase):
                 cli_module.main(["catalog", "--workflow", "workflow.toml"]),
                 3,
             )
+
+
+def _git(workspace: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _git_output(workspace: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 if __name__ == "__main__":

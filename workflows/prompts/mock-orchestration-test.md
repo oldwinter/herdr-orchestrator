@@ -1,4 +1,5 @@
-这是编排系统的一次 mock 连通性测试。只做只读操作，不要修改任何文件、不要执行外部动作。
+这是编排系统的一次 mock 连通性测试。只读取指定文件，不要执行外部动作。除步骤 3
+明确的 receipt 文件外，不要写入或修改任何文件。
 
 任务：
 1. 读取 workflows/multi-harness.toml，确认 `[coordinator]` 段的 poll_seconds、max_parallel、lease_seconds、max_attempts 值。

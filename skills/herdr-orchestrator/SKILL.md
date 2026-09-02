@@ -140,7 +140,10 @@ npx --yes herdr-orchestrator enqueue --project . \
 ```
 
 Automatic routing synchronously runs one controller agent turn before enqueue returns. Treat
-normal model latency as expected, then require JSON with `created`, `harness`, and `job_id`.
+normal model latency as expected. The control plane first requires fresh `ready` health evidence;
+unknown or expired evidence receives one bounded refresh, while an explicit unhealthy harness fails
+with its stable harness-specific reason instead of falling back. Then require JSON with `created`,
+`harness`, and `job_id`.
 Reusing the same `--dedupe-key` must return the existing job with `created = false`.
 
 ## 3. Drain and inspect
@@ -150,7 +153,7 @@ Use one bounded drain invocation for normal queued work:
 ```bash
 npx --yes herdr-orchestrator run --project . \
   --until-idle \
-  --drain-timeout-seconds 3600
+  --drain-timeout-seconds 86400
 ```
 
 The result separates `claimed`, cumulative `batch`, and global `queue`. When workers are
