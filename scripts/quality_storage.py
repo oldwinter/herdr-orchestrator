@@ -199,10 +199,10 @@ def publish_results(
     paths = [default_path]
     if requested_path is not None and requested_path != default_path:
         paths.append(requested_path)
-    for path in paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
     locks: list[tuple[Path, int]] = []
     try:
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
         for path in paths:
             lock = path.with_name(f".{path.name}.quality-lock")
             descriptor = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
