@@ -133,6 +133,52 @@ class StoreHealthCorrectnessTests(unittest.TestCase):
             (Harness.CODEX, Harness.DROID, Harness.GROK),
         )
 
+    def test_migrate_legacy_workspace_binds_only_unscoped_jobs(self) -> None:
+        self.store.enqueue(
+            NewJob(
+                workflow="workflow",
+                workspace="/workspace-a",
+                title="scoped",
+                harness=Harness.CODEX,
+                prompt="scoped",
+                dedupe_key="scoped",
+                max_attempts=1,
+            )
+        )
+        self.store.enqueue(
+            NewJob(
+                workflow="workflow",
+                title="legacy",
+                harness=Harness.GROK,
+                prompt="legacy",
+                dedupe_key="legacy",
+                max_attempts=1,
+            )
+        )
+        self.store.enqueue(
+            NewJob(
+                workflow="other",
+                title="foreign",
+                harness=Harness.DROID,
+                prompt="foreign",
+                dedupe_key="foreign",
+                max_attempts=1,
+            )
+        )
+
+        migrated = self.store.migrate_legacy_workspace("workflow", "/workspace-a")
+
+        self.assertEqual(migrated, 1)
+        jobs = {str(job["title"]): job["workspace"] for job in self.store.jobs("workflow")}
+        self.assertEqual(jobs["scoped"], "/workspace-a")
+        self.assertEqual(jobs["legacy"], "/workspace-a")
+        self.assertIsNone(self.store.jobs("other")[0]["workspace"])
+        self.assertEqual(
+            self.store.pending_harnesses("workflow", workspace="/workspace-a"),
+            (Harness.CODEX, Harness.GROK),
+        )
+        self.assertEqual(self.store.migrate_legacy_workspace("workflow", "/workspace-a"), 0)
+
     def test_claim_rechecks_fresh_health_without_incrementing_attempts(self) -> None:
         with patch("herdr_orchestrator.store.time.time", return_value=100.0):
             job_id, _ = self.store.enqueue(
@@ -225,7 +271,37 @@ class StoreHealthCorrectnessTests(unittest.TestCase):
 
         self.assertEqual(len(claimed), 1)
         self.assertEqual(claimed[0].job_id, 1)
-        self.assertEqual(self.store.status_counts("workflow", workspace="/workspace-b")["pending"], 1)
+        self.assertEqual(
+            self.store.status_counts("workflow", workspace="/workspace-b")["pending"],
+            1,
+        )
+
+    def test_claim_rechecks_static_validator_inside_transaction(self) -> None:
+        job_id, _ = self.store.enqueue(
+            NewJob(
+                workflow="workflow",
+                workspace="/workspace",
+                title="static race",
+                harness=Harness.CODEX,
+                prompt="task",
+                dedupe_key="static-race",
+                max_attempts=1,
+            )
+        )
+        self.assertEqual(
+            self.store.claim(
+                "workflow",
+                limit=1,
+                lease_seconds=30,
+                allowed_harnesses=(Harness.CODEX,),
+                workspace="/workspace",
+                require_fresh_health=False,
+                static_validator=lambda _harness: False,
+            ),
+            [],
+        )
+        self.assertEqual(self.store.jobs("workflow")[0]["id"], job_id)
+        self.assertEqual(self.store.jobs("workflow")[0]["attempts"], 0)
 
     def test_v7_health_schema_migration_is_restart_safe(self) -> None:
         path = Path(self.temporary.name) / "v7.db"

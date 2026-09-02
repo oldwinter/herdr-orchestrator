@@ -100,7 +100,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             "readiness_cooldown_seconds",
             aliases=("cooldown_seconds", "health_cooldown_seconds", "degraded_cooldown_seconds"),
             default=300,
-            minimum=0,
+            minimum=1,
             maximum=86400,
         ),
         readiness_probe_timeout_seconds=_health_integer(

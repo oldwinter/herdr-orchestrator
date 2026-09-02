@@ -4,7 +4,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +21,36 @@ from herdr_orchestrator.model import (
     NewJob,
     PlacementTarget,
     TaskReceipt,
+)
+from herdr_orchestrator.store_health import (
+    health_row_accepts_write as _health_row_accepts_write,
+)
+from herdr_orchestrator.store_health import (
+    health_update_statement as _health_update_statement,
+)
+from herdr_orchestrator.store_health import (
+    normalize_health_write_fence as _normalize_health_write_fence,
+)
+from herdr_orchestrator.store_metadata import (
+    metadata_float as _metadata_float,
+)
+from herdr_orchestrator.store_metadata import (
+    reserve_planner_run as _reserve_planner_run,
+)
+from herdr_orchestrator.store_metadata import (
+    set_metadata_float as _set_metadata_float,
+)
+from herdr_orchestrator.store_workspace import (
+    created_agent_panes as _created_agent_panes,
+)
+from herdr_orchestrator.store_workspace import (
+    unplaced_jobs as _unplaced_jobs,
+)
+from herdr_orchestrator.store_workspace import (
+    workspace_clause as _workspace_clause,
+)
+from herdr_orchestrator.store_workspace import (
+    workspace_matches as _workspace_matches,
 )
 
 SCHEMA_VERSION = 8
@@ -563,6 +593,7 @@ class Store:
         workspace: str | None = None,
         require_fresh_health: bool = False,
         include_legacy: bool = False,
+        static_validator: Callable[[str], bool] | None = None,
     ) -> list[ClaimedJob]:
         if limit <= 0:
             return []
@@ -601,6 +632,7 @@ class Store:
                     busy_counts=busy_counts,
                     busy_names=busy_names,
                     health_workspace=workspace if require_fresh_health else None,
+                    static_validator=static_validator,
                 )
                 if job is None:
                     continue
@@ -623,24 +655,12 @@ class Store:
             WHERE jobs.workflow = ? AND jobs.state = ? AND jobs.lease_until > ?
         """
         parameters: tuple[object, ...] = (workflow, JobState.RUNNING.value, now)
-        if workspace is not None:
-            if include_legacy:
-                query += """
-                    AND (
-                        jobs.workspace = ?
-                        OR (
-                            jobs.workspace IS NULL
-                            AND NOT EXISTS (
-                                SELECT 1 FROM jobs AS scoped_jobs
-                                WHERE scoped_jobs.workflow = jobs.workflow
-                                  AND scoped_jobs.workspace IS NOT NULL
-                            )
-                        )
-                    )
-                """
-            else:
-                query += " AND jobs.workspace = ?"
-            parameters += (workspace,)
+        scope, scope_parameters = _workspace_clause(
+            workspace,
+            include_legacy=include_legacy,
+        )
+        query += scope
+        parameters += scope_parameters
         rows = connection.execute(query, parameters).fetchall()
         counts: Counter[str] = Counter()
         names: dict[str, set[str]] = {}
@@ -677,24 +697,12 @@ class Store:
             JobState.RUNNING.value,
             now,
         )
-        if workspace is not None:
-            if include_legacy:
-                query += """
-                    AND (
-                        jobs.workspace = ?
-                        OR (
-                            jobs.workspace IS NULL
-                            AND NOT EXISTS (
-                                SELECT 1 FROM jobs AS scoped_jobs
-                                WHERE scoped_jobs.workflow = jobs.workflow
-                                  AND scoped_jobs.workspace IS NOT NULL
-                            )
-                        )
-                    )
-                """
-            else:
-                query += " AND jobs.workspace = ?"
-            parameters += (workspace,)
+        scope, scope_parameters = _workspace_clause(
+            workspace,
+            include_legacy=include_legacy,
+        )
+        query += scope
+        parameters += scope_parameters
         query += " ORDER BY created_at, id"
         return connection.execute(query, parameters).fetchall()
 
@@ -711,11 +719,18 @@ class Store:
         busy_counts: Counter[str],
         busy_names: dict[str, set[str]],
         health_workspace: str | None,
+        static_validator: Callable[[str], bool] | None,
     ) -> ClaimedJob | None:
         harness_value = str(row["harness"])
         placement_value = str(row["placement"])
         if allowed_values is not None and harness_value not in allowed_values:
             return None
+        if static_validator is not None:
+            try:
+                if not static_validator(harness_value):
+                    return None
+            except Exception:
+                return None
         if health_workspace is not None and not Store._fresh_health(
             connection,
             workflow=str(row["workflow"]),
@@ -842,27 +857,14 @@ class Store:
         allowed_values = (
             None if allowed_harnesses is None else {harness.value for harness in allowed_harnesses}
         )
-        query = "SELECT state, harness, workspace FROM jobs WHERE workflow = ?"
+        query = "SELECT state, harness, workspace FROM jobs AS jobs WHERE jobs.workflow = ?"
         parameters: tuple[object, ...] = (workflow,)
-        if workspace is not None:
-            workspace_key = str(workspace)
-            if include_legacy:
-                query += """
-                    AND (
-                        workspace = ?
-                        OR (
-                            workspace IS NULL
-                            AND NOT EXISTS (
-                                SELECT 1 FROM jobs AS scoped_jobs
-                                WHERE scoped_jobs.workflow = jobs.workflow
-                                  AND scoped_jobs.workspace IS NOT NULL
-                            )
-                        )
-                    )
-                """
-            else:
-                query += " AND workspace = ?"
-            parameters += (workspace_key,)
+        scope, scope_parameters = _workspace_clause(
+            workspace,
+            include_legacy=include_legacy,
+        )
+        query += scope
+        parameters += scope_parameters
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         for row in rows:
@@ -927,22 +929,13 @@ class Store:
         updates only that exact generation.  Unfenced writes are accepted only
         when their observation timestamp is newer than the persisted row.
         """
-        if revision is not None:
-            if expected_revision is not None and expected_revision != revision:
-                raise StoreError("health_revision_conflict")
-            expected_revision = revision
-        if owner is not None:
-            if expected_owner is not None and expected_owner != owner:
-                raise StoreError("health_owner_conflict")
-            expected_owner = owner
-        if expected_revision is not None and expected_owner is None and probe_owner is not None:
-            expected_owner = probe_owner
-            probe_owner = None
-        if expected_revision is not None:
-            if isinstance(expected_revision, bool) or expected_revision < 0:
-                raise StoreError("health_revision_invalid")
-            if not expected_owner:
-                raise StoreError("health_owner_required")
+        expected_revision, expected_owner, probe_owner = _normalize_health_write_fence(
+            expected_revision=expected_revision,
+            expected_owner=expected_owner,
+            probe_owner=probe_owner,
+            revision=revision,
+            owner=owner,
+        )
         workspace_key = str(workspace)
         with self._transaction() as connection:
             existing = connection.execute(
@@ -982,58 +975,31 @@ class Store:
                 return True
 
             current_revision = int(existing["revision"])
-            if expected_revision is None:
-                if observed_at < float(existing["observed_at"]):
-                    return False
-                if observed_at == float(existing["observed_at"]) and current_revision != 0:
-                    return False
-            elif (
-                observed_at < float(existing["observed_at"])
-                or current_revision != expected_revision
-                or existing["probe_owner"] != expected_owner
+            if not _health_row_accepts_write(
+                existing,
+                observed_at=observed_at,
+                expected_revision=expected_revision,
+                expected_owner=expected_owner,
             ):
                 return False
-
-            lease_until_sql = (
-                "NULL"
-                if clear_probe_lease
-                else "harness_health.probe_lease_until" if probe_lease_until is None else "?"
-            )
-            owner_sql = (
-                "NULL"
-                if clear_probe_lease
-                else "harness_health.probe_owner" if probe_owner is None else "?"
-            )
-            values: list[object] = [
-                status,
-                reason,
-                source,
-                observed_at,
-                expires_at,
-                cooldown_until,
-                retryable_failures,
-            ]
-            if probe_lease_until is not None and not clear_probe_lease:
-                values.append(probe_lease_until)
-            if probe_owner is not None and not clear_probe_lease:
-                values.append(probe_owner)
-            values.extend([workflow, workspace_key, harness.value, current_revision])
-            owner_predicate = ""
-            if expected_owner is not None:
-                owner_predicate = " AND probe_owner = ?"
-                values.append(expected_owner)
             cursor = connection.execute(
-                f"""
-                UPDATE harness_health
-                SET status = ?, reason = ?, source = ?, observed_at = ?,
-                    revision = revision + 1, expires_at = ?, cooldown_until = ?,
-                    retryable_failures = ?,
-                    probe_lease_until = {lease_until_sql},
-                    probe_owner = {owner_sql}
-                WHERE workflow = ? AND workspace = ? AND harness = ?
-                  AND revision = ?{owner_predicate}
-                """,
-                values,
+                *_health_update_statement(
+                    workflow=workflow,
+                    workspace=workspace_key,
+                    harness=harness,
+                    status=status,
+                    reason=reason,
+                    source=source,
+                    observed_at=observed_at,
+                    expires_at=expires_at,
+                    cooldown_until=cooldown_until,
+                    retryable_failures=retryable_failures,
+                    probe_lease_until=probe_lease_until,
+                    probe_owner=probe_owner,
+                    current_revision=current_revision,
+                    expected_owner=expected_owner,
+                    clear_probe_lease=clear_probe_lease,
+                )
             )
         return cursor.rowcount == 1
 
@@ -1073,7 +1039,7 @@ class Store:
         return (
             self.acquire_harness_probe_lease(
                 workflow=workflow,
-                workspace=workspace,
+                workspace=str(workspace),
                 harness=harness,
                 owner=owner,
                 now=now,
@@ -1191,30 +1157,31 @@ class Store:
             WHERE jobs.workflow = ? AND jobs.state = ?
         """
         parameters: tuple[object, ...] = (workflow, JobState.PENDING.value)
-        if workspace is not None:
-            # NULL workspace is never attributed by default.  Coordinator
-            # may opt into the constrained fallback for a legacy-only queue.
-            if include_legacy:
-                query += """
-                    AND (
-                        jobs.workspace = ?
-                        OR (
-                            jobs.workspace IS NULL
-                            AND NOT EXISTS (
-                                SELECT 1 FROM jobs AS scoped_jobs
-                                WHERE scoped_jobs.workflow = jobs.workflow
-                                  AND scoped_jobs.workspace IS NOT NULL
-                            )
-                        )
-                    )
-                """
-            else:
-                query += " AND jobs.workspace = ?"
-            parameters += (workspace,)
+        scope, scope_parameters = _workspace_clause(
+            workspace,
+            include_legacy=include_legacy,
+        )
+        query += scope
+        parameters += scope_parameters
         query += " ORDER BY harness"
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(Harness(str(row["harness"])) for row in rows)
+
+    def migrate_legacy_workspace(self, workflow: str, workspace: str | Path) -> int:
+        """Bind unscoped legacy jobs to an operator-selected workspace."""
+        workspace_key = str(workspace)
+        now = time.time()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET workspace = ?, updated_at = ?
+                WHERE workflow = ? AND workspace IS NULL
+                """,
+                (workspace_key, now, workflow),
+            )
+        return cursor.rowcount
 
     def claim_blocked_for_resume(
         self,
@@ -1222,9 +1189,19 @@ class Store:
         job_id: int,
         *,
         lease_seconds: int,
+        workspace: str | Path | None = None,
+        include_legacy: bool = False,
     ) -> tuple[ClaimedJob, str]:
         now = time.time()
         with self._transaction() as connection:
+            if workspace is not None and not self._job_in_workspace(
+                connection,
+                workflow,
+                job_id,
+                str(workspace),
+                include_legacy=include_legacy,
+            ):
+                raise StoreError("job_not_found")
             return AttemptLedger.claim_resume(
                 connection,
                 workflow,
@@ -1256,6 +1233,8 @@ class Store:
         job_id: int,
         *,
         extra_attempts: int = 1,
+        workspace: str | Path | None = None,
+        include_legacy: bool = False,
     ) -> dict[str, object]:
         if not 1 <= extra_attempts <= 10:
             raise StoreError("extra_attempts_out_of_range")
@@ -1263,12 +1242,19 @@ class Store:
         with self._transaction() as connection:
             row = connection.execute(
                 """
-                SELECT id, state, attempts, max_attempts
+                SELECT id, workspace, state, attempts, max_attempts
                 FROM jobs WHERE workflow = ? AND id = ?
                 """,
                 (workflow, job_id),
             ).fetchone()
             if row is None:
+                raise StoreError("job_not_found")
+            if workspace is not None and not _workspace_matches(
+                row["workspace"],
+                str(workspace),
+                include_legacy=include_legacy,
+                has_scoped_jobs=self._has_scoped_jobs(connection, workflow),
+            ):
                 raise StoreError("job_not_found")
             if row["state"] != JobState.FAILED.value:
                 raise StoreError("job_not_retryable")
@@ -1299,6 +1285,35 @@ class Store:
             "max_attempts": max_attempts,
         }
 
+    @staticmethod
+    def _has_scoped_jobs(connection: sqlite3.Connection, workflow: str) -> bool:
+        row = connection.execute(
+            "SELECT 1 FROM jobs WHERE workflow = ? AND workspace IS NOT NULL LIMIT 1",
+            (workflow,),
+        ).fetchone()
+        return row is not None
+
+    @classmethod
+    def _job_in_workspace(
+        cls,
+        connection: sqlite3.Connection,
+        workflow: str,
+        job_id: int,
+        workspace: str,
+        *,
+        include_legacy: bool,
+    ) -> bool:
+        row = connection.execute(
+            "SELECT workspace FROM jobs WHERE workflow = ? AND id = ?",
+            (workflow, job_id),
+        ).fetchone()
+        return row is not None and _workspace_matches(
+            row["workspace"],
+            workspace,
+            include_legacy=include_legacy,
+            has_scoped_jobs=cls._has_scoped_jobs(connection, workflow),
+        )
+
     def jobs(
         self,
         workflow: str,
@@ -1317,30 +1332,17 @@ class Store:
                        jobs.completion_status, jobs.completion_evidence_summary,
                        jobs.completion_error_code, jobs.current_attempt_id,
                        job_attempts.phase AS attempt_phase
-                FROM jobs
+                FROM jobs AS jobs
                 LEFT JOIN job_attempts ON job_attempts.id = jobs.current_attempt_id
                 WHERE jobs.workflow = ?
         """
         parameters: tuple[object, ...] = (workflow,)
-        if workspace is not None:
-            workspace_key = str(workspace)
-            if include_legacy:
-                query += """
-                    AND (
-                        jobs.workspace = ?
-                        OR (
-                            jobs.workspace IS NULL
-                            AND NOT EXISTS (
-                                SELECT 1 FROM jobs AS scoped_jobs
-                                WHERE scoped_jobs.workflow = jobs.workflow
-                                  AND scoped_jobs.workspace IS NOT NULL
-                            )
-                        )
-                    )
-                """
-            else:
-                query += " AND jobs.workspace = ?"
-            parameters += (workspace_key,)
+        scope, scope_parameters = _workspace_clause(
+            workspace,
+            include_legacy=include_legacy,
+        )
+        query += scope
+        parameters += scope_parameters
         query += " ORDER BY jobs.id"
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
@@ -1350,28 +1352,19 @@ class Store:
             job["task_verified"] = _nullable_bool(job["task_verified"])
         return jobs
 
-    def created_agent_panes(self, workflow: str) -> dict[str, str]:
-        """Return the latest pane recorded when this workflow created an agent."""
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT receipts.agent_name, receipts.pane_id
-                FROM receipts
-                JOIN jobs ON jobs.id = receipts.job_id
-                WHERE jobs.workflow = ?
-                  AND receipts.member_reused = 0
-                  AND receipts.is_stale = 0
-                  AND receipts.pane_id IS NOT NULL
-                  AND receipts.placement IN (?, ?)
-                ORDER BY receipts.observed_at, receipts.id
-                """,
-                (
-                    workflow,
-                    PlacementTarget.TAB.value,
-                    PlacementTarget.PANE.value,
-                ),
-            ).fetchall()
-        return {str(row["agent_name"]): str(row["pane_id"]) for row in rows}
+    def created_agent_panes(
+        self,
+        workflow: str,
+        *,
+        workspace: str | Path | None = None,
+        include_legacy: bool = False,
+    ) -> dict[str, str]:
+        return _created_agent_panes(
+            self,
+            workflow,
+            workspace=workspace,
+            include_legacy=include_legacy,
+        )
 
     def unplaced_jobs(
         self,
@@ -1381,42 +1374,13 @@ class Store:
         workspace: str | Path | None = None,
         include_legacy: bool = False,
     ) -> list[dict[str, object]]:
-        allowed_values = (
-            None if allowed_harnesses is None else {harness.value for harness in allowed_harnesses}
+        return _unplaced_jobs(
+            self,
+            workflow,
+            allowed_harnesses=allowed_harnesses,
+            workspace=workspace,
+            include_legacy=include_legacy,
         )
-        query = """
-                SELECT id, title, harness, prompt, dedupe_key
-                FROM jobs
-                WHERE workflow = ? AND state = ? AND placement IS NULL
-        """
-        parameters: tuple[object, ...] = (workflow, JobState.PENDING.value)
-        if workspace is not None:
-            workspace_key = str(workspace)
-            if include_legacy:
-                query += """
-                    AND (
-                        workspace = ?
-                        OR (
-                            workspace IS NULL
-                            AND NOT EXISTS (
-                                SELECT 1 FROM jobs AS scoped_jobs
-                                WHERE scoped_jobs.workflow = jobs.workflow
-                                  AND scoped_jobs.workspace IS NOT NULL
-                            )
-                        )
-                    )
-                """
-            else:
-                query += " AND workspace = ?"
-            parameters += (workspace_key,)
-        query += " ORDER BY created_at, id"
-        with self._connect() as connection:
-            rows = connection.execute(query, parameters).fetchall()
-        return [
-            dict(row)
-            for row in rows
-            if allowed_values is None or str(row["harness"]) in allowed_values
-        ]
 
     def set_placement(
         self,
@@ -1442,29 +1406,10 @@ class Store:
                 raise StoreError("job_placement_not_assignable")
 
     def metadata_float(self, key: str) -> float | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT value FROM metadata WHERE key = ?",
-                (key,),
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            return float(row["value"])
-        except ValueError as exc:
-            raise StoreError(f"metadata_invalid_float: {key}") from exc
+        return _metadata_float(self, key)
 
     def set_metadata_float(self, key: str, value: float) -> None:
-        now = time.time()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO metadata(key, value, updated_at) VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE
-                SET value = excluded.value, updated_at = excluded.updated_at
-                """,
-                (key, str(value), now),
-            )
+        _set_metadata_float(self, key, value)
 
     def reserve_planner_run(
         self,
@@ -1472,30 +1417,15 @@ class Store:
         interval_seconds: int,
         *,
         now: float | None = None,
+        workspace: str | Path | None = None,
     ) -> bool:
-        observed_at = time.time() if now is None else now
-        key = f"planner_last_attempt:{workflow}"
-        with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT value FROM metadata WHERE key = ?",
-                (key,),
-            ).fetchone()
-            if row is not None:
-                try:
-                    last_attempt = float(row["value"])
-                except (TypeError, ValueError) as exc:
-                    raise StoreError(f"metadata_invalid_float: {key}") from exc
-                if observed_at - last_attempt < interval_seconds:
-                    return False
-            connection.execute(
-                """
-                INSERT INTO metadata(key, value, updated_at) VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE
-                SET value = excluded.value, updated_at = excluded.updated_at
-                """,
-                (key, str(observed_at), observed_at),
-            )
-        return True
+        return _reserve_planner_run(
+            self,
+            workflow,
+            interval_seconds,
+            now=now,
+            workspace=workspace,
+        )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

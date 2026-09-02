@@ -55,31 +55,71 @@ def select_controller_harness(
 ) -> Harness:
     requested = None if force_auto else (override or config.planner.harness)
     if requested is not None:
-        if health is not None:
-            if health_snapshot is None:
-                health.require(
-                    requested,
-                    role="controller",
-                    probe=readiness_probe,
-                    timeout_seconds=health_timeout_seconds,
-                    deadline=health_deadline,
-                    static_reason=health.static_reason(requested),
-                )
-            else:
-                try:
-                    record = health_snapshot.record_for(requested)
-                except KeyError as exc:
-                    raise ValueError("controller_health_snapshot_missing") from exc
-                if not record.eligible_at(health_snapshot.evaluated_at):
-                    health.record_selection(health_snapshot, role="controller")
-                    raise HarnessHealthError("controller", requested, record)
-                health.record_selection(
-                    health_snapshot,
-                    role="controller",
-                    selected=requested,
-                )
+        _require_requested_controller(
+            requested,
+            health=health,
+            readiness_probe=readiness_probe,
+            health_timeout_seconds=health_timeout_seconds,
+            health_deadline=health_deadline,
+            health_snapshot=health_snapshot,
+        )
         return requested
+    return _select_auto_controller(
+        worker_harnesses,
+        executable_finder=executable_finder,
+        health=health,
+        readiness_probe=readiness_probe,
+        health_timeout_seconds=health_timeout_seconds,
+        health_deadline=health_deadline,
+        health_snapshot=health_snapshot,
+    )
 
+
+def _require_requested_controller(
+    requested: Harness,
+    *,
+    health: HarnessHealth | None,
+    readiness_probe: HealthProbe | None,
+    health_timeout_seconds: int | None,
+    health_deadline: float | None,
+    health_snapshot: EligibilitySnapshot | None,
+) -> None:
+    if health is None:
+        return
+    if health_snapshot is None:
+        health.require(
+            requested,
+            role="controller",
+            probe=readiness_probe,
+            timeout_seconds=health_timeout_seconds,
+            deadline=health_deadline,
+            static_reason=health.static_reason(requested),
+        )
+        return
+    try:
+        record = health_snapshot.record_for(requested)
+    except KeyError as exc:
+        raise ValueError("controller_health_snapshot_missing") from exc
+    if not record.eligible_at(health_snapshot.evaluated_at):
+        health.record_selection(health_snapshot, role="controller")
+        raise HarnessHealthError("controller", requested, record)
+    health.record_selection(
+        health_snapshot,
+        role="controller",
+        selected=requested,
+    )
+
+
+def _select_auto_controller(
+    worker_harnesses: Iterable[Harness],
+    *,
+    executable_finder: ExecutableFinder,
+    health: HarnessHealth | None,
+    readiness_probe: HealthProbe | None,
+    health_timeout_seconds: int | None,
+    health_deadline: float | None,
+    health_snapshot: EligibilitySnapshot | None,
+) -> Harness:
     candidates = tuple(dict.fromkeys(worker_harnesses))
     eligible = set(candidates)
     snapshot: EligibilitySnapshot | None = None

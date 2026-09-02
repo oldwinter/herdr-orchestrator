@@ -272,6 +272,7 @@ class Coordinator:
             workspace=str(self.config.workspace.resolve()),
             require_fresh_health=self.health is not None,
             include_legacy=True,
+            static_validator=self._static_harness_available if self.health is not None else None,
         )
         results = {state.value: 0 for state in JobState}
         if not jobs:
@@ -375,9 +376,11 @@ class Coordinator:
             ),
         }
         if self.health is not None:
-            snapshot = health_snapshot or self._health_snapshot(refresh=False)
+            snapshot = self._health_snapshot(refresh=False)
             report["harness_health"] = snapshot.public_json()
             report["deferred_jobs"] = self._deferred_jobs(snapshot)
+            if health_snapshot is not None:
+                report["routing_snapshot"] = health_snapshot.public_json()
         return report
 
     def run_until_idle(self, *, timeout_seconds: int) -> dict[str, object]:
@@ -518,6 +521,8 @@ class Coordinator:
             self.config.name,
             job_id,
             lease_seconds=self.config.coordinator.lease_seconds,
+            workspace=str(self.config.workspace.resolve()),
+            include_legacy=True,
         )
         if not job.recovery:
             self._observe_transition(job, AttemptPhase.CLAIMED)
@@ -587,7 +592,11 @@ class Coordinator:
             "error_code": outcome.error_code,
             "agent_settled": outcome.agent_settled,
             "task_verified": outcome.task_verified,
-            "queue": self.store.status_counts(self.config.name),
+            "queue": self.store.status_counts(
+                self.config.name,
+                workspace=str(self.config.workspace.resolve()),
+                include_legacy=True,
+            ),
         }
 
     def _drain_report(
@@ -617,9 +626,11 @@ class Coordinator:
             "queue": queue,
         }
         if self.health is not None:
-            snapshot = health_snapshot or self._health_snapshot(refresh=False)
+            snapshot = self._health_snapshot(refresh=False)
             report["harness_health"] = snapshot.public_json()
             report["deferred_jobs"] = self._deferred_jobs(snapshot)
+            if health_snapshot is not None:
+                report["routing_snapshot"] = health_snapshot.public_json()
         return report
 
     def gc_succeeded_agents(self, *, dry_run: bool = True) -> dict[str, object]:
@@ -640,9 +651,18 @@ class Coordinator:
         }:
             raise ValueError("gc_states_invalid")
         self.initialize()
-        rows = self.store.jobs(self.config.name)
+        workspace = str(self.config.workspace.resolve())
+        rows = self.store.jobs(
+            self.config.name,
+            workspace=workspace,
+            include_legacy=True,
+        )
         target_values = {state.value for state in target_states}
-        created_panes = self.store.created_agent_panes(self.config.name)
+        created_panes = self.store.created_agent_panes(
+            self.config.name,
+            workspace=workspace,
+            include_legacy=True,
+        )
         owned_names = {
             name
             for worker in self.config.workers
@@ -829,6 +849,15 @@ class Coordinator:
                 agent_settled=getattr(error, "agent_settled", None),
             ),
         )
+
+    def _static_harness_available(self, value: str) -> bool:
+        if self.health is None:
+            return True
+        try:
+            harness = Harness(value)
+        except ValueError:
+            return False
+        return self.health.static_reason(harness) is None
 
     def _deferred_jobs(self, snapshot: EligibilitySnapshot) -> list[dict[str, object]]:
         records = {record.harness: record for record in snapshot.records}
@@ -1192,7 +1221,7 @@ class Coordinator:
             health_snapshot=health_snapshot,
         )
         if not allowed_harnesses:
-            snapshot = self._health_snapshot(refresh=False)
+            snapshot = health_snapshot or self._health_snapshot(refresh=False)
             reasons = ",".join(
                 f"{harness.value}={snapshot.record_for(harness).reason}"
                 for harness in self.worker_harnesses
@@ -1303,6 +1332,7 @@ class Coordinator:
         if not self.store.reserve_planner_run(
             self.config.name,
             planner.interval_seconds,
+            workspace=str(self.config.workspace.resolve()),
         ):
             return
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)

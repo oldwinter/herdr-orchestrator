@@ -93,6 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.add_argument("--job-id", type=int, required=True)
     retry_parser.add_argument("--extra-attempts", type=int, choices=range(1, 11), default=1)
 
+    migrate_parser = subparsers.add_parser(
+        "migrate-legacy-workspace",
+        help="Bind legacy unscoped jobs to this workflow's canonical workspace.",
+    )
+    migrate_parser.add_argument("--workflow", required=True)
+
     resume_parser = subparsers.add_parser("resume")
     resume_parser.add_argument("--workflow", required=True)
     resume_parser.add_argument("--job-id", type=int, required=True)
@@ -226,8 +232,32 @@ def _command_retry(config: WorkflowConfig, args: argparse.Namespace) -> int:
         config.name,
         args.job_id,
         extra_attempts=args.extra_attempts,
+        workspace=str(config.workspace.resolve()),
+        include_legacy=True,
     )
     print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _command_migrate_legacy_workspace(
+    config: WorkflowConfig,
+    args: argparse.Namespace,
+) -> int:
+    del args
+    store = Store(config.state_db)
+    store.initialize()
+    workspace = str(config.workspace.resolve())
+    migrated = store.migrate_legacy_workspace(config.name, workspace)
+    print(
+        json.dumps(
+            {
+                "migrated": migrated,
+                "workflow": config.name,
+                "workspace": workspace,
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -380,7 +410,8 @@ def _command_status(config: WorkflowConfig, args: argparse.Namespace) -> int:
         refresh=False,
         static_reasons=health.static_reasons(harnesses),
     )
-    jobs = store.jobs(config.name)
+    workspace = str(config.workspace.resolve())
+    jobs = store.jobs(config.name, workspace=workspace, include_legacy=True)
     health_by_harness = {record.harness.value: record for record in health_snapshot.records}
     for job in jobs:
         record = health_by_harness.get(str(job["harness"]))
@@ -393,7 +424,11 @@ def _command_status(config: WorkflowConfig, args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "counts": store.status_counts(config.name),
+                "counts": store.status_counts(
+                    config.name,
+                    workspace=workspace,
+                    include_legacy=True,
+                ),
                 "jobs": jobs,
                 "harness_health": health_snapshot.public_json(),
                 "workflow": config.name,
@@ -460,6 +495,7 @@ COMMAND_HANDLERS: Mapping[str, CommandHandler] = {
     "doctor": _command_doctor,
     "enqueue": _command_enqueue,
     "gc": _command_gc,
+    "migrate-legacy-workspace": _command_migrate_legacy_workspace,
     "profile": _command_profile,
     "readiness-matrix": _command_readiness_matrix,
     "resume": _command_resume,
@@ -526,6 +562,7 @@ def doctor(
     probe_timeout_seconds: int = 30,
     selected_harnesses: list[str] | None = None,
     store: Store | None = None,
+    isolate_probes: bool | None = None,
 ) -> int:
     current_environ = os.environ if environ is None else environ
     probe = readiness_probe or probe_harness_readiness
@@ -541,6 +578,7 @@ def doctor(
         ),
         environment=current_environ,
         executable_finder=which,
+        isolate_probes=(readiness_probe is None if isolate_probes is None else isolate_probes),
     )
     checks = _doctor_system_checks(workflow, current_environ, which, version_runner)
     herdr_path = which("herdr")
@@ -786,12 +824,6 @@ def _doctor_harness_checks(
             probe,
             probe_timeout_seconds,
         )
-    if not isinstance(active_readiness, Mapping):
-        active_readiness = {
-            "status": "error",
-            "error_code": "readiness_result_invalid",
-            "error_summary": None,
-        }
     measured_ms = max(0, int((time.monotonic() - probe_started) * 1000))
     reported_ms = active_readiness.get("duration_ms")
     duration_ms = (
@@ -855,14 +887,7 @@ def _harness_readiness(
             "error_summary": None,
         }
     try:
-        result = probe(workflow, harness, probe_timeout_seconds)
-        if isinstance(result, Mapping):
-            return result
-        return {
-            "status": "error",
-            "error_code": "readiness_result_invalid",
-            "error_summary": None,
-        }
+        return probe(workflow, harness, probe_timeout_seconds)
     except Exception as exc:
         return {
             "status": "error",

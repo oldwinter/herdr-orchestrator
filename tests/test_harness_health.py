@@ -60,6 +60,7 @@ class HarnessHealthTests(unittest.TestCase):
                 config,
                 clock=lambda: now[0],
                 probe=probe,
+                allow_live_probe=True,
                 ttl_seconds=10,
                 cooldown_seconds=5,
             )
@@ -119,6 +120,7 @@ class HarnessHealthTests(unittest.TestCase):
                 config,
                 clock=lambda: now[0],
                 probe=probe,
+                allow_live_probe=True,
                 ttl_seconds=5,
             )
             health.record_probe(Harness.DROID, {"status": "ready"})
@@ -181,9 +183,7 @@ class HarnessHealthTests(unittest.TestCase):
             )
             self.assertIsNone(health.record_dispatch(Harness.DROID, task_block))
             self.assertEqual(
-                health.snapshot((Harness.DROID,), refresh=False)
-                .record_for(Harness.DROID)
-                .status,
+                health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID).status,
                 HarnessHealthStatus.READY,
             )
 
@@ -208,6 +208,7 @@ class HarnessHealthTests(unittest.TestCase):
                 Store(config.state_db),
                 config,
                 probe=probe,
+                allow_live_probe=True,
                 probe_timeout_seconds=5,
             )
             deadline = time.monotonic() + 5.1
@@ -227,6 +228,43 @@ class HarnessHealthTests(unittest.TestCase):
             self.assertEqual(persisted.status, HarnessHealthStatus.DEGRADED)
             self.assertEqual(persisted.reason, "timeout")
             release.set()
+
+    def test_live_probe_deadline_terminates_isolated_probe_process(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+
+            def probe(_workflow, _harness, _timeout):
+                time.sleep(30)
+                return {"status": "ready"}
+
+            health = HarnessHealth(
+                Store(config.state_db),
+                config,
+                probe=probe,
+                allow_live_probe=True,
+                environment={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w:p",
+                    "HERDR_WORKSPACE_ID": "w",
+                },
+                executable_finder=lambda command: f"/bin/{command}",
+                isolate_probes=True,
+                probe_timeout_seconds=5,
+            )
+            began = time.monotonic()
+            snapshot = health.snapshot(
+                (Harness.DROID,),
+                refresh=True,
+                timeout_seconds=5,
+                deadline=time.monotonic() + 5.1,
+            )
+
+            self.assertLess(time.monotonic() - began, 6.0)
+            self.assertEqual(snapshot.eligible_harnesses, ())
+            self.assertEqual(
+                health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID).reason,
+                "timeout",
+            )
 
     def test_injected_ci_disables_and_persists_probe_classification(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -318,8 +356,12 @@ class HarnessHealthTests(unittest.TestCase):
                 release.wait(timeout=2)
                 return {"status": "ready"}
 
-            first = HarnessHealth(Store(config.state_db), config, probe=probe)
-            second = HarnessHealth(Store(config.state_db), config, probe=probe)
+            first = HarnessHealth(
+                Store(config.state_db), config, probe=probe, allow_live_probe=True
+            )
+            second = HarnessHealth(
+                Store(config.state_db), config, probe=probe, allow_live_probe=True
+            )
             with ThreadPoolExecutor(max_workers=2) as executor:
                 future = executor.submit(first.snapshot, (Harness.GROK,), refresh=True)
                 self.assertTrue(entered.wait(timeout=2))
@@ -351,7 +393,7 @@ class HarnessHealthTests(unittest.TestCase):
             def probe(_config, _harness, _timeout):
                 return {"status": "unavailable", "error_code": "agent_auth_required"}
 
-            health = HarnessHealth(store, config, probe=probe)
+            health = HarnessHealth(store, config, probe=probe, allow_live_probe=True)
             result = Coordinator(
                 config,
                 store=store,
@@ -413,6 +455,48 @@ class HarnessHealthTests(unittest.TestCase):
                 health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID).status,
                 HarnessHealthStatus.READY,
             )
+
+    def test_run_report_reads_post_dispatch_health_without_changing_routing_wave(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(
+                NewJob(
+                    workflow=config.name,
+                    workspace=str(config.workspace.resolve()),
+                    title="post-dispatch-health",
+                    harness=Harness.DROID,
+                    prompt="task",
+                    dedupe_key="post-dispatch-health",
+                    max_attempts=1,
+                )
+            )
+            health = HarnessHealth(store, config)
+            health.record_probe(Harness.DROID, {"status": "ready"})
+
+            class Dispatcher:
+                def dispatch(self, *_args, **_kwargs):
+                    return DispatchOutcome(
+                        "droid-worker",
+                        AgentState.UNKNOWN,
+                        False,
+                        None,
+                        error_code="agent_auth_required",
+                    )
+
+            report = Coordinator(
+                config,
+                store=store,
+                dispatcher=Dispatcher(),
+                health=health,
+            ).run_once()
+
+            current = report["harness_health"]["records"][0]
+            routed = report["routing_snapshot"]["records"][0]
+            self.assertEqual(current["status"], HarnessHealthStatus.UNAVAILABLE.value)
+            self.assertEqual(routed["status"], HarnessHealthStatus.READY.value)
 
     def test_static_preflight_is_effective_only_and_does_not_poison_ready_evidence(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -604,7 +688,7 @@ class HarnessHealthTests(unittest.TestCase):
                         agent_settled=True,
                     )
 
-            health = HarnessHealth(store, config, probe=probe)
+            health = HarnessHealth(store, config, probe=probe, allow_live_probe=True)
             started = time.monotonic()
             result = Coordinator(
                 config,

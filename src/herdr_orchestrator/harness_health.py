@@ -5,12 +5,16 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import pickle
 import re
+import select
 import shutil
+import signal
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
@@ -80,6 +84,11 @@ _TASK_FAILURES = frozenset(
         "completion_evidence_invalid",
         "completion_evidence_oversized",
         "completion_policy_mismatch",
+        "completion_policy_invalid",
+        "completion_recovery_unverified",
+        "task_receipt_recovery_unverified",
+        "completion_result_invalid",
+        "completion_identity_invalid",
     }
 )
 _HARD_FAILURES = frozenset(
@@ -113,6 +122,7 @@ _RETRYABLE_FAILURES = frozenset(
         "resume_unhandled_error",
     }
 )
+PROBE_COMMIT_GRACE_SECONDS = 0.25
 
 
 class HealthProbe(Protocol):
@@ -271,6 +281,7 @@ class HarnessHealth:
         allow_live_probe: bool | None = None,
         environment: Mapping[str, str] | None = None,
         executable_finder: Callable[[str], str | None] = shutil.which,
+        isolate_probes: bool | None = None,
     ) -> None:
         self.store = store
         self.workflow = workflow
@@ -287,7 +298,7 @@ class HarnessHealth:
         )
         if (
             self.ttl_seconds < 1
-            or self.cooldown_seconds < 0
+            or self.cooldown_seconds < 1
             or not 5 <= self.probe_timeout_seconds <= 300
         ):
             raise ValueError("harness_health_policy_invalid")
@@ -296,10 +307,15 @@ class HarnessHealth:
         self.observability = observability
         self.environment = environment
         self.executable_finder = executable_finder
+        self.isolate_probes = environment is not None if isolate_probes is None else isolate_probes
         self._refresh_lock = threading.Lock()
+        # The ambient CI guard remains the default; tests or controlled callers
+        # can explicitly opt into injected probes with ``allow_live_probe``.
         probe_environment = os.environ if environment is None else environment
         self.live_probe_allowed = (
-            not any(_environment_flag(probe_environment.get(key)) for key in ("CI", "GITHUB_ACTIONS"))
+            not any(
+                _environment_flag(probe_environment.get(key)) for key in ("CI", "GITHUB_ACTIONS")
+            )
             if allow_live_probe is None
             else allow_live_probe
         )
@@ -320,18 +336,16 @@ class HarnessHealth:
             raise ValueError("harness_health_probe_timeout_invalid")
         _validate_deadline(deadline)
         values = _unique_harnesses(harnesses)
-        refresh_values = values if refresh_harnesses is None else _unique_harnesses(refresh_harnesses)
+        refresh_values = (
+            values if refresh_harnesses is None else _unique_harnesses(refresh_harnesses)
+        )
         refresh_set = set(refresh_values)
         now = self._now()
         self.store.initialize()
         effective_static_reasons = self.static_reasons(values)
         if static_reasons:
             effective_static_reasons.update(
-                {
-                    harness: reason
-                    for harness, reason in static_reasons.items()
-                    if harness in values
-                }
+                {harness: reason for harness, reason in static_reasons.items() if harness in values}
             )
         records = self._apply_static_reasons(
             self._records(values, now),
@@ -407,16 +421,15 @@ class HarnessHealth:
         }
 
     def static_reason(self, harness: Harness) -> str | None:
-        if self.environment is None:
+        environment = self.environment
+        if environment is None:
             return None
+
         def value(key: str) -> str:
-            raw = self.environment.get(key, "")
+            raw = environment.get(key, "")
             return raw if isinstance(raw, str) else ""
 
-        if any(
-            _environment_flag(value(key))
-            for key in ("CI", "GITHUB_ACTIONS")
-        ):
+        if any(_environment_flag(value(key)) for key in ("CI", "GITHUB_ACTIONS")):
             return "readiness_ci_forbidden"
         if value("HERDR_ENV") != "1":
             return "not_in_herdr"
@@ -709,7 +722,7 @@ class HarnessHealth:
                 target=self._refresh,
                 args=(harness, probe, timeout_seconds),
                 kwargs={"deadline": deadline},
-                daemon=True,
+                daemon=False,
                 name=f"harness-health-{harness.value}",
             )
             thread.start()
@@ -741,6 +754,7 @@ class HarnessHealth:
                 deadline_exhausted = True
             else:
                 configured_timeout = min(configured_timeout, int(remaining))
+        probe_deadline = deadline or (time.monotonic() + configured_timeout)
         owner = f"health-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:12]}"
         lease_seconds = max(30.0, float(timeout_seconds or self.probe_timeout_seconds) + 5.0)
         with self._refresh_lock:
@@ -756,6 +770,7 @@ class HarnessHealth:
         if lease is None:
             return {"status": "error", "error_code": "readiness_probe_in_progress"}
         try:
+            result: Mapping[str, object]
             if deadline_exhausted:
                 result = {
                     "status": "timeout",
@@ -767,14 +782,14 @@ class HarnessHealth:
                         probe,
                         harness,
                         configured_timeout,
-                        deadline=deadline,
+                        deadline=probe_deadline,
                     )
                 except Exception:
                     result = {
                         "status": HarnessHealthStatus.DEGRADED.value,
                         "error_code": "readiness_probe_failed",
                     }
-            if deadline is not None and deadline - time.monotonic() <= 0:
+            if probe_deadline - time.monotonic() <= 0:
                 result = {
                     "status": "timeout",
                     "error_code": "timeout",
@@ -797,14 +812,15 @@ class HarnessHealth:
                 and persisted.observed_at == observed_at
             ):
                 return result
-            return persisted.public_json()
+            return persisted.public_json(self._now())
         finally:
-            self.store.release_harness_probe(
-                workflow=self.workflow_name,
-                workspace=self.workspace,
-                harness=harness,
-                owner=owner,
-            )
+            with suppress(Exception):
+                self.store.release_harness_probe(
+                    workflow=self.workflow_name,
+                    workspace=self.workspace,
+                    harness=harness,
+                    owner=owner,
+                )
 
     def _invoke_probe(
         self,
@@ -816,6 +832,27 @@ class HarnessHealth:
     ) -> Mapping[str, object]:
         if deadline is None:
             return _normalize_probe_result(probe(self.workflow, harness, timeout_seconds))
+        if self.isolate_probes and hasattr(os, "fork"):
+            return self._invoke_probe_subprocess(
+                probe,
+                harness,
+                timeout_seconds,
+                deadline,
+            )
+        return self._invoke_probe_thread(
+            probe,
+            harness,
+            timeout_seconds,
+            deadline,
+        )
+
+    def _invoke_probe_thread(
+        self,
+        probe: HealthProbe,
+        harness: Harness,
+        timeout_seconds: int,
+        deadline: float,
+    ) -> Mapping[str, object]:
         result: dict[str, object] = {}
         error: list[Exception] = []
         finished = threading.Event()
@@ -832,12 +869,66 @@ class HarnessHealth:
 
         thread = threading.Thread(target=invoke, daemon=True, name="harness-health-probe")
         thread.start()
-        remaining = max(0.0, deadline - time.monotonic())
+        remaining = max(0.0, deadline - PROBE_COMMIT_GRACE_SECONDS - time.monotonic())
         if not finished.wait(timeout=remaining):
             return {"status": "timeout", "error_code": "timeout"}
         if error:
             raise error[0]
         return result
+
+    def _invoke_probe_subprocess(
+        self,
+        probe: HealthProbe,
+        harness: Harness,
+        timeout_seconds: int,
+        deadline: float,
+    ) -> Mapping[str, object]:
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            try:
+                payload = pickle.dumps(
+                    ("ok", _normalize_probe_result(probe(self.workflow, harness, timeout_seconds))),
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            except BaseException:
+                payload = pickle.dumps(("error", "readiness_probe_failed"))
+            try:
+                os.write(write_fd, payload)
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+
+        os.close(write_fd)
+        data = bytearray()
+        try:
+            while True:
+                remaining = deadline - PROBE_COMMIT_GRACE_SECONDS - time.monotonic()
+                if remaining <= 0:
+                    _terminate_probe_process(child)
+                    return {"status": "timeout", "error_code": "timeout"}
+                ready, _, _ = select.select([read_fd], [], [], remaining)
+                if not ready:
+                    _terminate_probe_process(child)
+                    return {"status": "timeout", "error_code": "timeout"}
+                chunk = os.read(read_fd, 65536)
+                if not chunk:
+                    break
+                data.extend(chunk)
+        finally:
+            os.close(read_fd)
+        _, status = os.waitpid(child, 0)
+        if not data:
+            return {"status": "error", "error_code": "readiness_probe_failed"}
+        try:
+            result_kind, payload = pickle.loads(bytes(data))
+        except (pickle.PickleError, EOFError, ValueError, TypeError):
+            return {"status": "error", "error_code": "readiness_result_invalid"}
+        del status
+        if result_kind != "ok":
+            return {"status": "error", "error_code": "readiness_probe_failed"}
+        return _normalize_probe_result(payload)
 
     def _write(
         self,
@@ -920,6 +1011,13 @@ def _normalize_probe_result(result: Mapping[str, object] | object) -> Mapping[st
     }
 
 
+def _terminate_probe_process(pid: int) -> None:
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    with suppress(ChildProcessError):
+        os.waitpid(pid, 0)
+
+
 def _workspace_id(workspace: str) -> str:
     return hashlib.sha256(workspace.encode()).hexdigest()[:16]
 
@@ -969,18 +1067,14 @@ def _record_from_row(row: Mapping[str, object]) -> HarnessHealthRecord:
     )
 
 
-def _classify_probe(result: Mapping[str, object] | object) -> tuple[HarnessHealthStatus, str]:
+def _probe_mapping(result: Mapping[str, object] | object) -> Mapping[str, object] | None:
     public_json = getattr(result, "public_json", None)
     if not isinstance(result, Mapping) and callable(public_json):
         result = public_json()
-    if not isinstance(result, Mapping):
-        return HarnessHealthStatus.DEGRADED, "readiness_result_invalid"
-    raw_status = result.get("status")
-    status = str(raw_status.value if isinstance(raw_status, StrEnum) else raw_status or "")
-    raw_reason = result.get("error_code")
-    reason = _bounded_reason(raw_reason)
-    if raw_reason not in (None, "") and not reason:
-        return HarnessHealthStatus.DEGRADED, "readiness_reason_invalid"
+    return result if isinstance(result, Mapping) else None
+
+
+def _classify_probe_status(status: str, reason: str) -> tuple[HarnessHealthStatus, str]:
     if status == "expired" or reason == "readiness_evidence_expired":
         return HarnessHealthStatus.UNKNOWN, READINESS_EXPIRED
     if status == HarnessHealthStatus.READY.value and not reason:
@@ -992,6 +1086,19 @@ def _classify_probe(result: Mapping[str, object] | object) -> tuple[HarnessHealt
     if status in {"timeout", "error", "degraded"}:
         return HarnessHealthStatus.DEGRADED, reason or f"readiness_{status or 'error'}"
     return HarnessHealthStatus.DEGRADED, reason or "readiness_result_invalid"
+
+
+def _classify_probe(result: Mapping[str, object] | object) -> tuple[HarnessHealthStatus, str]:
+    payload = _probe_mapping(result)
+    if payload is None:
+        return HarnessHealthStatus.DEGRADED, "readiness_result_invalid"
+    raw_status = payload.get("status")
+    status = str(raw_status.value if isinstance(raw_status, StrEnum) else raw_status or "")
+    raw_reason = payload.get("error_code")
+    reason = _bounded_reason(raw_reason)
+    if raw_reason not in (None, "") and not reason:
+        return HarnessHealthStatus.DEGRADED, "readiness_reason_invalid"
+    return _classify_probe_status(status, reason)
 
 
 def _bounded_reason(value: object) -> str:
