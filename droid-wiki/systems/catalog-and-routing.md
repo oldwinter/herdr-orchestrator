@@ -17,6 +17,7 @@ src/herdr_orchestrator/
 ├── config.py              # Workflow/profile/worker 关联校验
 ├── planner.py             # Planner 与 router 的提示和 JSON 校验
 ├── selection.py           # Worker pool 与 controller 选择
+├── harness_health.py      # TTL/cooldown、分类、eligibility 与 probe lease
 ├── runner.py              # Queue 中的自动路由、planner 和 dispatch
 ├── delivery.py            # 标准化交付中的自动路由
 └── model.py               # Harness、HarnessProfile、PlannerTask 等模型
@@ -42,6 +43,7 @@ workflows/
 | `execution_prompt()` | `src/herdr_orchestrator/catalog.py` | 在 dispatch 时把已选 profile 的完整 context 与 task packet 拼接。 |
 | `effective_worker_harnesses()` | `src/herdr_orchestrator/selection.py` | 从 CLI override、planner worker 列表或 workflow workers 计算有效候选池。 |
 | `select_controller_harness()` | `src/herdr_orchestrator/selection.py` | 解析显式 controller 或按固定优先序选择本机可执行 controller。 |
+| `HarnessHealth` / `EligibilitySnapshot` | `src/herdr_orchestrator/harness_health.py` | 以 workflow/workspace/harness 为 scope 持久化 health，统一 freshness、分类、probe 去重与 eligible worker snapshot。 |
 | `worker_selection_prompt()` / `load_worker_selection()` | `src/herdr_orchestrator/planner.py` | 定义并校验单任务路由的 `{"harness":"..."}` 协议。 |
 | `planner_prompt()` / `load_planner_tasks()` | `src/herdr_orchestrator/planner.py` | 定义并校验批量任务规划协议。 |
 
@@ -58,7 +60,9 @@ sequenceDiagram
 
     W->>C: workers + profiles_dir
     C-->>Q: 已校验的 profiles
-    Q->>C: 仅筛选有效 worker profiles
+    Q->>H: health snapshot + bounded refresh
+    H-->>Q: fresh ready worker pool
+    Q->>C: 仅筛选 eligible worker profiles
     C-->>O: 紧凑 catalog
     O-->>V: {"harness":"codex"}
     V->>V: exact shape + enum + allowed pool
@@ -93,15 +97,16 @@ sequenceDiagram
 
 ### 3. Controller 只产生受限输出
 
-自动 controller 的优先序由 `AUTO_CONTROLLER_ORDER` 在 `src/herdr_orchestrator/selection.py` 固定为 `droid → grok → codex → claude → hermes → pi`。自动模式只在有效 worker pool 中寻找本机可执行 CLI；显式 CLI override 或 workflow 中的 controller 则直接优先于自动探测。`force_auto` 会忽略已配置 controller。
+自动 controller 的优先序由 `AUTO_CONTROLLER_ORDER` 在 `src/herdr_orchestrator/selection.py` 固定为 `droid → grok → codex → claude → hermes → pi`。启用 `HarnessHealth` 时，自动模式只在 fresh `ready` worker pool 中选择；unknown/expired 记录至多由 SQLite probe lease 去重后 refresh 一次。显式 CLI override 或 workflow 中的 controller 必须通过同一 bounded preflight，永远不会静默 fallback。没有候选时返回每个 harness 的稳定 reason。
 
 Queue 的自动路由位于 `Coordinator._select_worker_harness()`，见 `src/herdr_orchestrator/runner.py`。它：
 
-1. 用 workflow 名和 `dedupe_key` 生成稳定摘要，并在 planner runtime 目录下创建临时 `route-*.json`；
-2. 向 controller 发送任务标题、prompt、紧凑 catalog、允许的 harness 列表和唯一输出路径；
-3. 只接受 `IDLE` 或 `DONE` 且无 transport error 的 turn；
-4. 通过 `load_worker_selection()` 要求输出对象只有 `harness` 一个字段，并再次校验 allowed pool；
-5. 删除临时 route 文件；若 controller agent 是本次新建的，还会关闭该临时 agent。
+1. 请求 `HarnessHealth` eligibility snapshot，并以 fresh ready harness 构造 compact catalog；
+2. 用 workflow 名和 `dedupe_key` 生成稳定摘要，并在 planner runtime 目录下创建临时 `route-*.json`；
+3. 向 controller 发送任务标题、prompt、紧凑 catalog、允许的 harness 列表和唯一输出路径；
+4. 只接受 `IDLE` 或 `DONE` 且无 transport error 的 turn；
+5. 通过 `load_worker_selection()` 要求输出对象只有 `harness` 一个字段，并再次校验同一 eligible pool；
+6. 删除临时 route 文件；若 controller agent 是本次新建的，还会关闭该临时 agent。
 
 标准化交付的 `StandardizedDelivery._select_worker()` 在 `src/herdr_orchestrator/delivery.py` 中复用相同 prompt 和 validator，但把路由 artifact 保存在该次 delivery 的 `routes/` 下，以便恢复时复用选择。
 
@@ -148,7 +153,8 @@ Queue 的自动路由位于 `Coordinator._select_worker_harness()`，见 `src/he
 | --- | --- |
 | `src/herdr_orchestrator/catalog.py` | Profile schema、紧凑 catalog、完整 context 和执行 prompt。 |
 | `src/herdr_orchestrator/planner.py` | Planner/router 提示模板与严格 JSON 输出校验。 |
-| `src/herdr_orchestrator/selection.py` | Worker pool 与 controller 选择。 |
+| `src/herdr_orchestrator/selection.py` | Worker pool 与 controller 选择，以及 health snapshot 的 policy seam。 |
+| `src/herdr_orchestrator/harness_health.py` | Health persistence、TTL/cooldown、central failure classification、probe lease 与 eligibility。 |
 | `src/herdr_orchestrator/config.py` | Workflow、worker、planner 和 profile 的装载及关联校验。 |
 | `src/herdr_orchestrator/runner.py` | Queue 自动路由、周期 planner 和 dispatch 前 profile 注入。 |
 | `src/herdr_orchestrator/delivery.py` | 标准化交付中的持久路由 artifact 与 profile 注入。 |
@@ -162,4 +168,5 @@ Queue 的自动路由位于 `Coordinator._select_worker_harness()`，见 `src/he
 | `tests/test_catalog.py` | 两级 profile、按需读取和路径逃逸测试。 |
 | `tests/test_planner.py` | Router/planner schema、allowed pool 和禁止额外命令测试。 |
 | `tests/test_selection.py` | 自动 controller 顺序与 override 测试。 |
+| `tests/test_harness_health.py` | health persistence、expiry/cooldown、probe dedupe、dispatch classification 与 pending recovery。 |
 | `tests/test_config.py` | Workflow 与 profile/worker 关联测试。 |

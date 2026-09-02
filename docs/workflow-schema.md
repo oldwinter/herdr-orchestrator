@@ -40,8 +40,15 @@ harness 仍可能使用自身工具。prompt policy 不能改变这一点。work
 | `lease_seconds` | integer，30–86400 | running lease |
 | `max_attempts` | integer，1–10 | 总 claim 次数 |
 | `agent_timeout_seconds` | integer，10–86400 | 单次完整派发 deadline，包含 topology provisioning、agent 启动、prompt、settlement 与 receipt 验证。到期后 coordinator 停止等待并记 `herdr_timeout`，不会杀死已在跑的 Herdr agent；lease 过期后同一任务可能被重新 claim |
+| `readiness_ttl_seconds` | integer，1–604800 | readiness 成功证据有效期，默认 `3600` |
+| `readiness_cooldown_seconds` | integer，1–86400 | degraded/unavailable 后再次 refresh 前的 cooldown，默认 `300` |
+| `readiness_probe_timeout_seconds` | integer，5–300 | bounded readiness refresh timeout，默认 `30` |
 
 `lease_seconds` 必须至少比 `agent_timeout_seconds` 长 90 秒，为 agent 启动、Herdr 控制请求和收据提交留出窗口，防止同一任务在旧 turn 尚未结束时被重复 claim。
+
+健康字段也可以放在可选的 `[harness_health]` table 中，使用 `ttl_seconds`、`cooldown_seconds`
+和 `probe_timeout_seconds` 短名称；`[readiness]` 是兼容别名。所有配置都保持相同范围，省略
+时使用上面的默认值。现有 workflow 不需要新增字段。
 
 ## `[placement]`
 
@@ -125,7 +132,10 @@ Profile 只接受声明表中的字段。`context_file` 内容只在该 harness 
 
 planner 的 `output_file` 必须位于 workflow workspace 内，且解析后的路径组成中必须包含 `.orchestrator`。
 
-`harness = "auto"` 时，coordinator 按 `droid → grok → codex → claude → hermes → pi` 的固定优先级，从候选 worker 中选择本机 executable 存在的 harness。显式主控可以不在 worker 候选池中，但必须有 catalog profile 和可用 CLI。
+`harness = "auto"` 时，coordinator 按 `droid → grok → codex → claude → hermes → pi` 的固定优先级，
+只从有 fresh `ready` health evidence 的候选 worker 中选择。unknown/过期候选只做一次 bounded
+refresh；没有可用候选时 fail closed 并报告每个 harness 的 reason。显式主控可以不在 worker 候选池中，
+但必须通过同一 bounded preflight，不会静默切换到另一个 harness。
 
 `run` 与 `enqueue` 可用 `--controller-harness` 和可重复的 `--worker-harness` 临时覆盖这些默认值。`enqueue --harness auto` 或省略 `--harness` 时，主控读取候选池 compact catalog 并输出严格的单 harness JSON；显式 `--harness` 则跳过这次路由 turn。
 

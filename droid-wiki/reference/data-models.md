@@ -49,7 +49,7 @@ Active contributors: oldwinter, chendongdong
 | Dataclass | 生命周期与关键字段 |
 | --- | --- |
 | `TaskReceipt` | `kind + value`；声明内容级成功条件 |
-| `NewJob` | 入库 packet：workflow、title、harness、prompt、dedupe、attempt budget、placement、receipt |
+| `NewJob` | 入库 packet：workflow、canonical workspace、title、harness、prompt、dedupe、attempt budget、placement、receipt |
 | `ClaimedJob` | claim 后的 job 快照：job id、attempt、agent slot、确定 placement、correlation id |
 | `DispatchContext` | 交给 transport 的 topology、task/batch key、worktree root 与 receipt |
 | `DispatchOutcome` | transport observation：agent state、pane/workspace、error、settlement、verification 与 timings |
@@ -73,8 +73,9 @@ Active contributors: oldwinter, chendongdong
 
 ## SQLite durable queue
 
-当前 schema version 是 **4**。`Store.initialize()` 创建 `schema_meta`、`jobs`、
-`receipts`、`metadata` 和 runnable index，并能按顺序迁移 v1 → v2 → v3 → v4。
+当前 schema version 是 **8**。`Store.initialize()` 创建 `schema_meta`、`jobs`、
+`receipts`、`metadata`、`harness_health` 和 runnable index，并能按顺序迁移 v1 → v2 → v3 → v4
+→ v5 → v6 → v7 → v8。
 SQLite 使用 foreign keys、WAL journal 和写事务 `BEGIN IMMEDIATE`。
 
 ### `jobs`
@@ -83,7 +84,7 @@ SQLite 使用 foreign keys、WAL journal 和写事务 `BEGIN IMMEDIATE`。
 
 | 列组 | 列与 SQLite 声明 |
 | --- | --- |
-| 标识 | `id INTEGER PRIMARY KEY AUTOINCREMENT`; `workflow TEXT NOT NULL`; `UNIQUE(workflow, dedupe_key)` |
+| 标识 | `id INTEGER PRIMARY KEY AUTOINCREMENT`; `workflow TEXT NOT NULL`; `workspace TEXT NULL`; `UNIQUE(workflow, dedupe_key)` |
 | 输入 | `title TEXT NOT NULL`, `harness TEXT NOT NULL`, `prompt TEXT NOT NULL`, `dedupe_key TEXT NOT NULL` |
 | 调度 | `placement TEXT NULL`, `state TEXT NOT NULL`, `attempts INTEGER NOT NULL DEFAULT 0`, `max_attempts INTEGER NOT NULL`, `available_at REAL NOT NULL`, `lease_until REAL NULL` |
 | Agent/runtime | `agent_name TEXT NULL`, `execution_path TEXT NULL`, `herdr_workspace_id TEXT NULL`, `correlation_id TEXT NULL` |
@@ -94,6 +95,10 @@ SQLite 使用 foreign keys、WAL journal 和写事务 `BEGIN IMMEDIATE`。
 索引 `jobs_runnable` 覆盖 `(workflow, state, available_at, lease_until)`。`placement=NULL`
 表示 topology 尚未决策；claim 只选择 placement 已确定、attempt 未耗尽且可运行或 lease
 已过期的记录。
+
+新 coordinator enqueue 的 job 写入 canonical workspace；迁移保留旧 job 的 `workspace=NULL`。
+按 workspace 查询 pending harness 时，NULL 记录按当前 workflow scope 兼容处理，避免历史任务被
+静默丢弃；新的多 workspace job 不会互相混入。
 
 ### `receipts`
 
@@ -115,6 +120,9 @@ schema 没有把它声明成不可变审计日志；外部代码不应绕过 `St
 
 - `schema_meta(version INTEGER NOT NULL)`：数据库 schema version。
 - `metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)`：当前用于 coordinator 的少量运行 metadata，例如 planner cadence；它不是通用配置存储。
+- `harness_health(workflow, workspace, harness)`：readiness health projection。它保存 `status`、
+  `reason`、`source`、`observed_at`、`expires_at`、`cooldown_until`、`retryable_failures` 和
+  `revision`、compare-and-set probe lease；不保存 prompt 或 terminal output。当前 schema version 为 `8`。
 
 ### 状态迁移
 

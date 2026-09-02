@@ -389,7 +389,7 @@ PYTHONPATH=src python3 -m herdr_orchestrator enqueue \
   --dedupe-key review-auto-v2
 ```
 
-未指定主控时，coordinator 按 `droid → grok → codex → claude → hermes → pi` 的固定优先级，从候选 worker 中选择本机已安装的 CLI；这一步只检查 executable，不代表认证健康。未指定 worker 时，选中的主控只收到候选池 compact catalog，并写出严格的 `{"harness":"..."}` JSON，coordinator 校验后才入队。显式指定 worker 时不会额外启动 router turn。
+未指定主控时，coordinator 按 `droid → grok → codex → claude → hermes → pi` 的固定优先级，只从具有 fresh `ready` health evidence 的候选 worker 中选择。unknown/过期 evidence 会接受一次 bounded refresh；认证、invalid model、provider 或 integration failure 会被排除，并报告每个 harness 的稳定 reason。未指定 worker 时，选中的主控只收到 eligible 候选池 compact catalog，并写出严格的 `{"harness":"..."}` JSON，coordinator 校验后才入队。显式指定 harness 不会静默 fallback。
 
 ## Opt-in 标准化交付
 

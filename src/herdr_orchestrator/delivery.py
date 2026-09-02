@@ -17,6 +17,10 @@ from herdr_orchestrator.catalog import (
     render_compact_catalog,
 )
 from herdr_orchestrator.delivery_completed_legacy import CompletedLegacyRecoveryMixin
+from herdr_orchestrator.delivery_identity import (
+    delivery_run_id,
+    recoverable_delivery_identity,
+)
 from herdr_orchestrator.delivery_journal import (
     DeliveryEffect,
     DeliveryEffectObservation,
@@ -72,6 +76,12 @@ from herdr_orchestrator.delivery_recovery import (
 )
 from herdr_orchestrator.delivery_repair import DeliveryRepairMixin
 from herdr_orchestrator.git_workspace import GitWorkspace, GitWorkspaceError, Worktree
+from herdr_orchestrator.harness_health import (
+    EligibilitySnapshot,
+    HarnessHealth,
+    HarnessHealthError,
+    HealthProbe,
+)
 from herdr_orchestrator.herdr import HerdrTransport
 from herdr_orchestrator.model import (
     AgentState,
@@ -89,7 +99,9 @@ from herdr_orchestrator.planner import (
 )
 from herdr_orchestrator.protocol import Command, TransportError, run_json
 from herdr_orchestrator.selection import (
+    AUTO_CONTROLLER_ORDER,
     effective_worker_harnesses,
+    eligible_worker_harnesses,
     select_controller_harness,
 )
 from herdr_orchestrator.tracker import (
@@ -263,6 +275,8 @@ class StandardizedDelivery(
         controller_auto: bool = False,
         worker_harnesses: Iterable[Harness] | None = None,
         lease_seconds: float | None = None,
+        health: HarnessHealth | None = None,
+        readiness_probe: HealthProbe | None = None,
     ) -> None:
         self.config = config
         self.dispatcher = dispatcher or HerdrDeliveryDispatcher(config)
@@ -270,12 +284,31 @@ class StandardizedDelivery(
         self.controller_override = controller_harness
         self.controller_auto = controller_auto
         self.worker_harnesses = effective_worker_harnesses(config, worker_harnesses)
-        self.controller = select_controller_harness(
-            config,
-            worker_harnesses=self.worker_harnesses,
-            override=controller_harness,
-            force_auto=controller_auto,
-        )
+        self.health = health
+        self.readiness_probe = readiness_probe
+        health_harnesses = list(self.worker_harnesses)
+        for harness in (controller_harness, config.planner.harness):
+            if harness is not None and harness not in health_harnesses:
+                health_harnesses.append(harness)
+        self._health_harnesses = tuple(health_harnesses)
+        self._health_snapshot: EligibilitySnapshot | None = None
+        if health is None:
+            try:
+                self.controller = select_controller_harness(
+                    config,
+                    worker_harnesses=self.worker_harnesses,
+                    override=controller_harness,
+                    force_auto=controller_auto,
+                )
+            except HarnessHealthError as exc:
+                raise DeliveryError(str(exc)) from exc
+        else:
+            requested = controller_harness or (
+                config.planner.harness if not controller_auto else None
+            )
+            self.controller = requested or next(
+                harness for harness in AUTO_CONTROLLER_ORDER if harness in self.worker_harnesses
+            )
         self._goal = ""
         self._run_id = ""
         self._run_root = Path()
@@ -302,28 +335,28 @@ class StandardizedDelivery(
                 "delivery_secret_material_rejected: remove secret material before retry"
             )
         self._goal = goal
-        delivery_config = self.config.standardized_delivery
-        run_id = hashlib.sha256(
-            (
-                f"{self.config.name}\0{self.config.workspace.resolve()}\0{goal}\0"
-                f"{delivery_config.tracker_backend.value}\0"
-                f"{delivery_config.tracker_root}\0"
-                f"{delivery_config.github_repository}\0"
-                f"{delivery_config.wayfinder.value}\0"
-                f"{delivery_config.max_parallel}\0"
-                f"{delivery_config.review_repair_rounds}\0"
-                f"{self.controller.value}\0"
-                f"{','.join(harness.value for harness in self.worker_harnesses)}"
-            ).encode()
-        ).hexdigest()[:12]
+        run_id = delivery_run_id(
+            self.config,
+            goal,
+            controller_request=self._controller_request_identity(),
+            worker_harnesses=self.worker_harnesses,
+        )
+        run_id, run_root = recoverable_delivery_identity(
+            self.config,
+            goal,
+            run_id,
+            self.controller,
+            self.worker_harnesses,
+        )
         self._run_id = run_id
         self._run_root = _safe_delivery_path(
-            self.config.standardized_delivery.artifact_root / run_id,
+            run_root,
             root=self.config.standardized_delivery.artifact_root,
         )
         self._run_root.mkdir(parents=True, exist_ok=True)
         _safe_delivery_path(self._run_root, root=self.config.standardized_delivery.artifact_root)
         self._previous_state = {}
+        self._health_snapshot = None
         lease_seconds = self._lease_seconds or max(
             MINIMUM_DELIVERY_LEASE_SECONDS,
             self.config.coordinator.agent_timeout_seconds + DELIVERY_LEASE_GRACE_SECONDS,
@@ -341,6 +374,35 @@ class StandardizedDelivery(
             finally:
                 self._journal = None
 
+    def _resolve_health_selection(self) -> None:
+        if self.health is None:
+            return
+        previous = self._previous_state.get("controller")
+        if previous is not None and not isinstance(previous, str):
+            raise DeliveryError("delivery_health_selection_invalid")
+        try:
+            self._health_snapshot = self.health.snapshot(
+                self._health_harnesses,
+                refresh=True,
+                probe=self.readiness_probe,
+            )
+            override = self.controller_override
+            force_auto = self.controller_auto
+            if isinstance(previous, str):
+                override = Harness(previous)
+                force_auto = False
+            self.controller = select_controller_harness(
+                self.config,
+                worker_harnesses=self.worker_harnesses,
+                override=override,
+                force_auto=force_auto,
+                health=self.health,
+                readiness_probe=self.readiness_probe,
+                health_snapshot=self._health_snapshot,
+            )
+        except (HarnessHealthError, ValueError) as exc:
+            raise DeliveryError(str(exc)) from exc
+
     def _run_claimed(self, run_id: str) -> DeliveryResult:
         if (state_path := self._run_root / "state.json").is_file():
             _safe_delivery_path(state_path, root=self._run_root)
@@ -353,9 +415,20 @@ class StandardizedDelivery(
                 self._write_state("failed", stage="stopped", error="DeliveryStateInvalid")
                 raise DeliveryError("delivery_state_invalid")
             self._previous_state = state
-        self._recover_proxy_responses()
         try:
             completed_result = _load_completed_result(self._run_root / "result.json", run_id)
+            if completed_result is None:
+                self._resolve_health_selection()
+                self._recover_proxy_responses()
+            else:
+                previous = self._previous_state.get("controller")
+                if previous is not None:
+                    if not isinstance(previous, str):
+                        raise DeliveryError("delivery_health_selection_invalid")
+                    try:
+                        self.controller = Harness(previous)
+                    except ValueError as exc:
+                        raise DeliveryError("delivery_health_selection_invalid") from exc
         except Exception as exc:
             self._write_state("failed", stage="stopped", error=type(exc).__name__)
             raise
@@ -387,7 +460,7 @@ class StandardizedDelivery(
             )
             return completed_result
         failed_stage = "wayfinder"
-        self._write_state("running", stage="wayfinder")
+        self._write_state("running", stage="wayfinder", controller=self.controller.value)
         try:
             self._delivery_base_commit(
                 GitWorkspace(self.config.workspace, self._run_root, "delivery")
@@ -740,7 +813,20 @@ class StandardizedDelivery(
         return report
 
     def _select_worker(self, title: str, prompt: str, dedupe_key: str) -> Harness:
-        profiles = self._worker_profiles()
+        allowed_harnesses = self._eligible_worker_harnesses()
+        if not allowed_harnesses:
+            if self.health is None:
+                raise DeliveryError("worker_harness_unavailable")
+            snapshot = self._health_snapshot or self.health.snapshot(
+                self._health_harnesses,
+                refresh=False,
+            )
+            reasons = ",".join(
+                f"{harness.value}={snapshot.record_for(harness).reason}"
+                for harness in self.worker_harnesses
+            )
+            raise DeliveryError(f"worker_harness_unavailable:{reasons}")
+        profiles = self._worker_profiles(allowed_harnesses)
         digest = hashlib.sha256(f"{self.config.name}\0delivery\0{dedupe_key}".encode()).hexdigest()[
             :12
         ]
@@ -755,7 +841,7 @@ class StandardizedDelivery(
                     f"Title: {title}\n\nPrompt:\n{prompt}",
                     output,
                     render_compact_catalog(profiles),
-                    self.worker_harnesses,
+                    allowed_harnesses,
                 ),
                 output,
                 role=f"route-{digest[:5]}",
@@ -763,7 +849,7 @@ class StandardizedDelivery(
         try:
             selected = load_worker_selection(
                 output,
-                allowed_harnesses=self.worker_harnesses,
+                allowed_harnesses=allowed_harnesses,
             )
         except PlannerOutputError as exc:
             raise DeliveryError(str(exc)) from exc
@@ -929,7 +1015,22 @@ class StandardizedDelivery(
     ) -> DispatchOutcome:
         if self._legacy_reconstruction_read_only:
             raise DeliveryError("delivery_recovery_conflict:agent.dispatch")
+        role = (
+            "controller"
+            if workspace.resolve() == self.config.workspace.resolve() and harness is self.controller
+            else "worker"
+        )
         for attempt in range(ARTIFACT_PROMPT_ATTEMPTS):
+            if self.health is not None:
+                try:
+                    self.health.require(
+                        harness,
+                        role=role,
+                        probe=self.readiness_probe,
+                        static_reason=self.health.static_reason(harness),
+                    )
+                except HarnessHealthError as exc:
+                    raise DeliveryError(str(exc)) from exc
             if use_principal_proxy:
                 outcome = self._dispatch_with_proxy(
                     workspace,
@@ -939,17 +1040,23 @@ class StandardizedDelivery(
                     agent_name_override=agent_name_override,
                 )
             else:
-                outcome = self.dispatcher.dispatch(
-                    workspace,
-                    harness,
-                    prompt,
-                    timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-                    agent_name=(
-                        agent_name_override or self._delivery_agent_name(workspace, harness, role)
-                    ),
-                )
+                try:
+                    outcome = self.dispatcher.dispatch(
+                        workspace,
+                        harness,
+                        prompt,
+                        timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                        agent_name=(
+                            agent_name_override
+                            or self._delivery_agent_name(workspace, harness, role)
+                        ),
+                    )
+                except Exception as exc:
+                    self._record_dispatch_exception(harness, exc)
+                    raise
                 if outcome.state is AgentState.BLOCKED:
                     raise DeliveryEscalation("principal_proxy_controller_blocked")
+            self._record_health(harness, outcome)
             _require_success(outcome, role)
             if output_file.is_file():
                 return outcome
@@ -998,13 +1105,17 @@ class StandardizedDelivery(
             harness,
             role,
         )
-        outcome = self.dispatcher.dispatch(
-            workspace,
-            harness,
-            prompt,
-            timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-            agent_name=agent_name,
-        )
+        try:
+            outcome = self.dispatcher.dispatch(
+                workspace,
+                harness,
+                prompt,
+                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                agent_name=agent_name,
+            )
+        except Exception as exc:
+            self._record_dispatch_exception(harness, exc)
+            raise
         for proxy_round in range(MAX_PROXY_ROUNDS):
             if outcome.state is not AgentState.BLOCKED:
                 return outcome
@@ -1071,6 +1182,22 @@ class StandardizedDelivery(
         proxy_round: int,
         decision_file: Path,
     ) -> DispatchOutcome:
+        if self.health is not None:
+            role = (
+                "controller"
+                if workspace.resolve() == self.config.workspace.resolve()
+                and harness is self.controller
+                else "worker"
+            )
+            try:
+                self.health.require(
+                    harness,
+                    role=role,
+                    probe=self.readiness_probe,
+                    static_reason=self.health.static_reason(harness),
+                )
+            except HarnessHealthError as exc:
+                raise DeliveryError(str(exc)) from exc
         if self._journal is None:
             return self.dispatcher.respond(
                 workspace,
@@ -1248,10 +1375,52 @@ class StandardizedDelivery(
             agent_name_override=name,
         )
 
-    def _worker_profiles(self) -> tuple[HarnessProfile, ...]:
-        return tuple(
-            profile_for_harness(self.config.profiles, harness) for harness in self.worker_harnesses
+    def _eligible_worker_harnesses(self) -> tuple[Harness, ...]:
+        if self.health is not None and self._health_snapshot is None:
+            self._health_snapshot = self.health.snapshot(
+                self._health_harnesses,
+                refresh=True,
+                probe=self.readiness_probe,
+            )
+        return eligible_worker_harnesses(
+            self.config,
+            self.worker_harnesses,
+            health=self.health,
+            health_snapshot=self._health_snapshot,
         )
+
+    def _record_health(self, harness: Harness, outcome: DispatchOutcome) -> None:
+        if self.health is not None:
+            self.health.record_dispatch(harness, outcome)
+
+    def _record_dispatch_exception(self, harness: Harness, error: Exception) -> None:
+        code = getattr(error, "code", None)
+        if not isinstance(code, str) or not code:
+            code = "dispatcher_unhandled_error"
+        self._record_health(
+            harness,
+            DispatchOutcome(
+                agent_name="delivery",
+                state=AgentState.UNKNOWN,
+                member_reused=False,
+                pane_id=None,
+                error_code=code,
+            ),
+        )
+
+    def _controller_request_identity(self) -> str:
+        if self.controller_override is not None:
+            return self.controller_override.value
+        if not self.controller_auto and self.config.planner.harness is not None:
+            return self.config.planner.harness.value
+        return "auto"
+
+    def _worker_profiles(
+        self,
+        harnesses: Iterable[Harness] | None = None,
+    ) -> tuple[HarnessProfile, ...]:
+        selected = self.worker_harnesses if harnesses is None else tuple(harnesses)
+        return tuple(profile_for_harness(self.config.profiles, harness) for harness in selected)
 
     def _record(self, event: str, details: dict[str, object]) -> None:
         row = {
@@ -1269,9 +1438,19 @@ class StandardizedDelivery(
             )
 
     def _write_state(self, status: str, *, stage: str, **details: str) -> None:
+        state_path = self._run_root / "state.json"
+        state: dict[str, object] = {}
+        if state_path.is_file():
+            try:
+                previous = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                previous = None
+            if isinstance(previous, dict):
+                state.update(previous)
         _write_json(
-            self._run_root / "state.json",
+            state_path,
             {
+                **state,
                 "status": status,
                 "stage": stage,
                 **details,

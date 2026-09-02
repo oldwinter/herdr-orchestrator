@@ -1265,8 +1265,15 @@ def stable_agent_name(workflow_name: str, workspace: Path, harness: Harness) -> 
     return f"ho-{harness.value}-{digest}"
 
 
-def doctor_agent_name(workflow_name: str, harness: Harness) -> str:
-    digest = hashlib.sha256(f"{workflow_name}\0doctor\0{harness.value}".encode()).hexdigest()[:6]
+def doctor_agent_name(
+    workflow_name: str,
+    harness: Harness,
+    workspace: Path | None = None,
+) -> str:
+    workspace_key = "" if workspace is None else str(workspace.resolve())
+    digest = hashlib.sha256(
+        f"{workflow_name}\0{workspace_key}\0doctor\0{harness.value}".encode()
+    ).hexdigest()[:6]
     return f"doctor-{harness.value}-{digest}"
 
 
@@ -1304,8 +1311,15 @@ def worktree_agent_name(
     return f"ho-{harness.value}-wt-{job_id}-{digest}"[:32].rstrip("-")
 
 
-def smoke_agent_name(workflow_name: str, harness: Harness) -> str:
-    digest = hashlib.sha256(f"{workflow_name}\0smoke\0{harness.value}".encode()).hexdigest()[:6]
+def smoke_agent_name(
+    workflow_name: str,
+    harness: Harness,
+    workspace: Path | None = None,
+) -> str:
+    workspace_key = "" if workspace is None else str(workspace.resolve())
+    digest = hashlib.sha256(
+        f"{workflow_name}\0{workspace_key}\0smoke\0{harness.value}".encode()
+    ).hexdigest()[:6]
     return f"smoke-{harness.value}-{digest}"
 
 

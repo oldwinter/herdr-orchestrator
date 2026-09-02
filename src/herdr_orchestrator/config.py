@@ -16,6 +16,7 @@ from herdr_orchestrator.catalog import (
 from herdr_orchestrator.model import (
     CoordinatorConfig,
     Harness,
+    HarnessHealthConfig,
     PlacementConfig,
     PlacementMode,
     PlacementTarget,
@@ -69,6 +70,8 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     )
 
     coordinator_raw = _table(raw, "coordinator")
+    health_raw = _optional_table(raw, "harness_health")
+    legacy_health_raw = _optional_table(raw, "readiness")
     coordinator = CoordinatorConfig(
         poll_seconds=_integer(coordinator_raw, "poll_seconds", minimum=1, maximum=3600),
         max_parallel=_integer(coordinator_raw, "max_parallel", minimum=1, maximum=16),
@@ -79,6 +82,36 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             "agent_timeout_seconds",
             minimum=10,
             maximum=86400,
+        ),
+        readiness_ttl_seconds=_health_integer(
+            coordinator_raw,
+            legacy_health_raw,
+            health_raw,
+            "readiness_ttl_seconds",
+            aliases=("ttl_seconds", "evidence_ttl_seconds", "health_ttl_seconds"),
+            default=3600,
+            minimum=1,
+            maximum=604800,
+        ),
+        readiness_cooldown_seconds=_health_integer(
+            coordinator_raw,
+            legacy_health_raw,
+            health_raw,
+            "readiness_cooldown_seconds",
+            aliases=("cooldown_seconds", "health_cooldown_seconds", "degraded_cooldown_seconds"),
+            default=300,
+            minimum=1,
+            maximum=86400,
+        ),
+        readiness_probe_timeout_seconds=_health_integer(
+            coordinator_raw,
+            legacy_health_raw,
+            health_raw,
+            "readiness_probe_timeout_seconds",
+            aliases=("probe_timeout_seconds", "health_probe_timeout_seconds"),
+            default=30,
+            minimum=5,
+            maximum=300,
         ),
     )
     if coordinator.lease_seconds < coordinator.agent_timeout_seconds + 90:
@@ -163,6 +196,11 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         profiles=profiles,
         workers=tuple(workers),
         seed_jobs=tuple(seed_jobs),
+        harness_health=HarnessHealthConfig(
+            ttl_seconds=coordinator.readiness_ttl_seconds,
+            cooldown_seconds=coordinator.readiness_cooldown_seconds,
+            probe_timeout_seconds=coordinator.readiness_probe_timeout_seconds,
+        ),
     )
 
 
@@ -362,6 +400,32 @@ def _optional_integer(
     if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
         raise ConfigError(f"{key}_must_be_integer_{minimum}_{maximum}")
     return value
+
+
+def _health_integer(
+    coordinator: Mapping[str, Any],
+    legacy: Mapping[str, Any],
+    current: Mapping[str, Any],
+    key: str,
+    *,
+    aliases: tuple[str, ...],
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Accept health policy in its dedicated table and older coordinator spellings."""
+    keys = (key, *aliases)
+    for source in (current, legacy, coordinator):
+        for candidate in keys:
+            if candidate in source:
+                return _optional_integer(
+                    source,
+                    candidate,
+                    default=default,
+                    minimum=minimum,
+                    maximum=maximum,
+                )
+    return default
 
 
 def _integer(
