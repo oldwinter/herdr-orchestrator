@@ -139,6 +139,7 @@ h2 {
   border: 1px solid var(--line);
   border-radius: 999px;
   background: rgba(18, 21, 24, 0.86);
+  transition: border-color 180ms ease, background-color 180ms ease;
 }
 
 .connection-dot {
@@ -148,6 +149,7 @@ h2 {
   border-radius: 50%;
   background: var(--amber);
   box-shadow: 0 0 0 5px rgba(255, 191, 105, 0.09);
+  transition: background-color 180ms ease, box-shadow 180ms ease;
 }
 
 .connection.is-live .connection-dot {
@@ -155,9 +157,19 @@ h2 {
   box-shadow: 0 0 0 5px rgba(110, 231, 168, 0.09);
 }
 
+.connection.is-live {
+  border-color: rgba(110, 231, 168, 0.28);
+  background: rgba(110, 231, 168, 0.04);
+}
+
 .connection.is-offline .connection-dot {
   background: var(--red);
   box-shadow: 0 0 0 5px rgba(255, 117, 109, 0.09);
+}
+
+.connection.is-offline {
+  border-color: rgba(255, 117, 109, 0.34);
+  background: rgba(255, 117, 109, 0.06);
 }
 
 .connection strong,
@@ -175,6 +187,30 @@ h2 {
   font: 500 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+.source-warning-region {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition-property: grid-template-rows, opacity;
+  transition-duration: 240ms, 150ms;
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1), ease;
+}
+
+.source-warning-region.is-hidden {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.source-warning-clip {
+  min-height: 0;
+  height: auto;
+  overflow: hidden;
+  transition-property: height;
+  transition-duration: 240ms;
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 .source-warning {
   margin-bottom: var(--space-4);
   padding: var(--space-3) var(--space-4);
@@ -184,6 +220,12 @@ h2 {
   background: rgba(255, 191, 105, 0.08);
   font-size: 13px;
   overflow-wrap: anywhere;
+  transform: translateY(0);
+  transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.source-warning-region.is-hidden .source-warning {
+  transform: translateY(-4px);
 }
 
 .is-hidden {
@@ -229,6 +271,7 @@ h2 {
   margin: var(--space-2) 0;
   font: 650 32px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   letter-spacing: -0.06em;
+  transform-origin: left center;
 }
 
 .metric-primary strong {
@@ -297,12 +340,78 @@ h2 {
   white-space: nowrap;
 }
 
+.kanban-navigation {
+  display: none;
+  position: relative;
+  --kanban-indicator-position: 0%;
+  border-bottom: 1px solid var(--line-soft);
+  background: #0e1113;
+}
+
+.kanban-navigation[hidden] {
+  display: none;
+}
+
+.kanban-navigation::after {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 25%;
+  height: 2px;
+  content: "";
+  background: var(--signal);
+  transform: translateX(var(--kanban-indicator-position));
+}
+
+.kanban-navigation button {
+  min-width: 0;
+  padding: 0 var(--space-1);
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font: 600 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  cursor: pointer;
+}
+
+.kanban-navigation button[aria-current="true"] {
+  color: var(--text);
+  background: rgba(215, 255, 100, 0.045);
+}
+
+.kanban-navigation button:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--signal);
+  outline-offset: -2px;
+}
+
 .kanban {
   display: grid;
   grid-template-columns: repeat(4, minmax(180px, 1fr));
   height: min(62vh, 680px);
   min-height: 510px;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-color: #46534e transparent;
+  scrollbar-width: thin;
+}
+
+.kanban[data-density="sparse"] {
+  height: min(48vh, 520px);
+  min-height: 360px;
+}
+
+.kanban[data-density="empty"] {
+  height: 360px;
+  min-height: 360px;
+}
+
+.kanban:focus-visible,
+.attention-list:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--signal);
+  outline-offset: -2px;
 }
 
 .kanban-column {
@@ -311,6 +420,10 @@ h2 {
   border-right: 1px solid var(--line-soft);
   background: rgba(11, 13, 15, 0.22);
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #46534e transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
 }
 
 .kanban-column:last-child {
@@ -327,6 +440,14 @@ h2 {
   font: 600 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.column-heading h2 {
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
 }
 
 .column-count {
@@ -367,6 +488,13 @@ h2 {
   line-height: 1.35;
   letter-spacing: -0.01em;
   overflow-wrap: anywhere;
+}
+
+.kanban-column:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--signal);
+  outline-offset: -2px;
 }
 
 .job-meta {
@@ -414,6 +542,13 @@ h2 {
   white-space: nowrap;
 }
 
+@media (max-width: 340px) {
+  .job-detail dd[title] {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
 .drift-line {
   margin-top: var(--space-2);
   color: var(--amber);
@@ -435,7 +570,11 @@ h2 {
   max-height: 440px;
   overflow-y: auto;
   overflow-x: hidden;
+  overscroll-behavior: contain;
   padding: var(--space-3);
+  scrollbar-color: #46534e transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
 }
 
 .attention-item {
@@ -501,6 +640,19 @@ h2 {
   background: var(--surface-muted);
   font: 650 17px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   cursor: pointer;
+  transition-property: border-color, background-color, color, opacity;
+  transition-duration: 160ms;
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.icon-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
 }
 
 .icon-button:hover,
@@ -508,6 +660,15 @@ h2 {
   border-color: #59636c;
   color: var(--text);
   background: var(--surface-raised);
+}
+
+.icon-button:disabled,
+.icon-button:disabled:hover {
+  border-color: var(--line);
+  color: var(--muted);
+  background: var(--surface-muted);
+  opacity: 0.44;
+  cursor: not-allowed;
 }
 
 .icon-button:focus-visible,
@@ -559,6 +720,8 @@ h2 {
   height: 520px;
   min-height: 420px;
   overflow: hidden;
+  contain: layout paint;
+  touch-action: pan-y pinch-zoom;
   background:
     linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
@@ -572,6 +735,34 @@ h2 {
   width: 100%;
   height: 100%;
   touch-action: none;
+  cursor: grab;
+  user-select: none;
+  transition: opacity 180ms ease;
+}
+
+.topology-canvas[data-touch-owner="page"] {
+  pointer-events: none;
+  touch-action: pan-y pinch-zoom;
+  cursor: default;
+}
+
+.topology-canvas[data-touch-owner="graph"] {
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.topology-touch-toggle[hidden] {
+  display: none;
+}
+
+.topology-touch-toggle[aria-pressed="true"] {
+  border-color: rgba(215, 255, 100, 0.48);
+  color: var(--signal);
+  background: var(--signal-soft);
+}
+
+.topology-canvas:active {
+  cursor: grabbing;
 }
 
 .topology-canvas canvas {
@@ -604,12 +795,36 @@ h2 {
   border-radius: 8px;
   background: rgba(18, 21, 24, 0.94);
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  opacity: 1;
+  clip-path: inset(0 0 0 0);
   pointer-events: none;
+  transform: translateY(0) scale(1);
+  transform-origin: left bottom;
+  transition-property: opacity, transform, clip-path, display;
+  transition-duration: 260ms, 260ms, 260ms, 260ms;
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  transition-behavior: normal, normal, normal, allow-discrete;
 }
 
-.topology-empty.is-hidden,
+.topology-empty.is-hidden {
+  display: none;
+}
+
 .topology-inspector.is-hidden {
   display: none;
+  opacity: 0;
+  clip-path: inset(100% 0 0 0);
+  transform: translateY(4px) scale(0.99);
+  transition-duration: 160ms, 160ms, 160ms, 160ms;
+  transition-timing-function: cubic-bezier(0.4, 0, 1, 1);
+}
+
+@starting-style {
+  .topology-inspector:not(.is-hidden) {
+    opacity: 0;
+    clip-path: inset(100% 0 0 0);
+    transform: translateY(6px) scale(0.98);
+  }
 }
 
 .topology-inspector strong,
@@ -805,6 +1020,11 @@ h2 {
     font-size: 10px;
   }
 
+  .icon-button {
+    width: 44px;
+    height: 44px;
+  }
+
   .topology-legend {
     gap: var(--space-3);
   }
@@ -814,11 +1034,36 @@ h2 {
     min-height: 360px;
   }
 
+  .kanban-navigation:not([hidden]) {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .kanban-navigation button {
+    min-height: 44px;
+  }
+
   .kanban {
     grid-template-columns: repeat(4, 82vw);
     height: 460px;
     min-height: 460px;
+    scroll-padding-inline: var(--space-3);
     scroll-snap-type: x proximity;
+  }
+
+  .kanban[data-density="sparse"] {
+    height: 340px;
+    min-height: 340px;
+  }
+
+  .kanban[data-density="empty"] {
+    height: 280px;
+    min-height: 280px;
+  }
+
+  .kanban[data-current-column-state="empty"] {
+    height: 176px;
+    min-height: 176px;
   }
 
   .kanban-column {
@@ -826,13 +1071,170 @@ h2 {
   }
 }
 
+@media (max-width: 760px) and (prefers-reduced-motion: no-preference) {
+  .kanban[data-height-motion="ready"] {
+    transition:
+      height 240ms cubic-bezier(0.16, 1, 0.3, 1),
+      min-height 240ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+
+@media (pointer: coarse) {
+  .icon-button {
+    width: 44px;
+    height: 44px;
+  }
+}
+
 @media (prefers-reduced-motion: no-preference) {
-  .connection.is-live .connection-dot {
-    animation: live-pulse 2.4s ease-out infinite;
+  .icon-button {
+    transition-property: border-color, background-color, color, opacity, transform;
+    transition-duration: 160ms, 160ms, 160ms, 160ms, 120ms;
+  }
+
+  .kanban-navigation::after {
+    transition: transform 220ms ease;
+  }
+
+  .icon-button:active {
+    transform: scale(0.94);
+  }
+
+  .connection.is-live.is-transitioning .connection-dot {
+    animation: live-pulse 640ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .connection.is-transitioning {
+    animation: connection-transition 360ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .metric strong.is-changing {
+    animation: metric-change 420ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .quiet-badge.is-changing {
+    animation: badge-change 320ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .job-card.is-entering {
+    animation: card-enter 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .job-card.is-state-change {
+    animation: card-state-change 320ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .attention-item.is-new,
+  .attention-item.is-updated {
+    animation: attention-change 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .timeline-event.is-new,
+  .timeline-event.is-updated {
+    animation: timeline-enter 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .topology-canvas.is-reflowing {
+    opacity: 0.72;
+  }
+
+  .main-grid > .is-order-changing {
+    animation: order-shift 300ms cubic-bezier(0.16, 1, 0.3, 1) both;
   }
 
   @keyframes live-pulse {
     0% { box-shadow: 0 0 0 0 rgba(110, 231, 168, 0.22); }
     70%, 100% { box-shadow: 0 0 0 8px rgba(110, 231, 168, 0); }
+  }
+
+  @keyframes connection-transition {
+    0% { transform: translateY(2px); opacity: 0.7; }
+    100% { transform: translateY(0); opacity: 1; }
+  }
+
+  @keyframes metric-change {
+    0% { transform: scale(1); }
+    45% { transform: scale(1.08); color: var(--signal); }
+    100% { transform: scale(1); }
+  }
+
+  @keyframes badge-change {
+    0% { transform: scale(1); }
+    45% { transform: scale(1.06); color: var(--text); }
+    100% { transform: scale(1); }
+  }
+
+  @keyframes card-enter {
+    0% { opacity: 0; transform: translateY(10px); filter: blur(2px); }
+    100% { opacity: 1; transform: translateY(0); filter: blur(0); }
+  }
+
+  @keyframes card-state-change {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(215, 255, 100, 0); }
+    45% { box-shadow: 0 0 0 4px rgba(215, 255, 100, 0.14); }
+  }
+
+  @keyframes attention-change {
+    0% { opacity: 0.35; transform: translateX(-6px); }
+    100% { opacity: 1; transform: translateX(0); }
+  }
+
+  @keyframes timeline-enter {
+    0% { opacity: 0.3; transform: translateY(8px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes order-shift {
+    0% { opacity: 0.58; transform: translateY(6px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kanban-navigation::after {
+    transition: none;
+  }
+
+  .connection,
+  .connection-dot,
+  .metric strong,
+  .job-card,
+  .topology-canvas {
+    transition: color 180ms ease, border-color 180ms ease, background-color 180ms ease;
+  }
+
+  .topology-inspector,
+  .topology-inspector.is-hidden {
+    clip-path: none;
+    transform: none;
+    transition-property: color, border-color, background-color, opacity, display;
+    transition-duration: 180ms, 180ms, 180ms, 120ms, 120ms;
+    transition-timing-function: ease;
+    transition-behavior: normal, normal, normal, normal, allow-discrete;
+  }
+
+  @starting-style {
+    .topology-inspector:not(.is-hidden) {
+      opacity: 0;
+      clip-path: none;
+      transform: none;
+    }
+  }
+
+  .source-warning-region,
+  .source-warning-region.is-hidden,
+  .source-warning {
+    transform: none;
+    transition: none;
+  }
+
+  .source-warning-clip {
+    transition: none;
+  }
+
+  .kanban {
+    transition: none;
+    scroll-behavior: auto;
   }
 }

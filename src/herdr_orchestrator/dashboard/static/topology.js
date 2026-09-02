@@ -195,6 +195,231 @@ function topologyGraph(projects) {
   };
 }
 
+function topologyNavigationOrder(graph) {
+  if (!graph || !Array.isArray(graph.elements)) return [];
+  return graph.elements
+    .map((element) => element?.data?.id)
+    .filter((id) => typeof id === "string" && id.length > 0);
+}
+
+function topologySelectionDirection(event) {
+  if (!event?.ctrlKey || event.altKey || event.metaKey) return null;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") return 1;
+  if (event.key === "ArrowLeft" || event.key === "ArrowUp") return -1;
+  return null;
+}
+
+function topologyFocusViewport({
+  viewport,
+  subject,
+  visibleRect,
+  minZoom,
+  maxZoom,
+  minimumRenderedLabelPx = 9,
+  preferredZoom = 0.72,
+}) {
+  const readableTarget = Math.min(
+    maxZoom,
+    Math.max(
+      minZoom,
+      viewport.zoom,
+      preferredZoom,
+      minimumRenderedLabelPx / subject.modelLabelPx,
+    ),
+  );
+  const renderedCenter = {
+    x: (visibleRect.x1 + visibleRect.x2) / 2,
+    y: (visibleRect.y1 + visibleRect.y2) / 2,
+  };
+  let zoom = readableTarget;
+  let modelCenter = subject.modelCenter;
+  if (subject.kind === "container") {
+    const modelWidth = subject.modelBounds.x2 - subject.modelBounds.x1;
+    const modelHeight = subject.modelBounds.y2 - subject.modelBounds.y1;
+    const fitCeiling = Math.min(
+      (visibleRect.x2 - visibleRect.x1) / modelWidth,
+      (visibleRect.y2 - visibleRect.y1) / modelHeight,
+    );
+    zoom = Math.min(
+      maxZoom,
+      Math.max(minZoom, Math.min(readableTarget, fitCeiling)),
+    );
+    modelCenter = {
+      x: (subject.modelBounds.x1 + subject.modelBounds.x2) / 2,
+      y: (subject.modelBounds.y1 + subject.modelBounds.y2) / 2,
+    };
+  } else if (subject.kind === "leaf" && subject.context) {
+    const { leafBounds, contextBounds } = subject.context;
+    const validBounds = (bounds) => (
+      bounds !== null
+      && typeof bounds === "object"
+      && !Array.isArray(bounds)
+      && [bounds.x1, bounds.y1, bounds.x2, bounds.y2].every(Number.isFinite)
+      && bounds.x2 > bounds.x1
+      && bounds.y2 > bounds.y1
+    );
+    if (
+      validBounds(leafBounds)
+      && validBounds(contextBounds)
+      && contextBounds.x1 <= leafBounds.x1
+      && contextBounds.y1 <= leafBounds.y1
+      && contextBounds.x2 >= leafBounds.x2
+      && contextBounds.y2 >= leafBounds.y2
+    ) {
+      const contextWidth = contextBounds.x2 - contextBounds.x1;
+      const contextHeight = contextBounds.y2 - contextBounds.y1;
+      const fitCeiling = Math.min(
+        (visibleRect.x2 - visibleRect.x1) / contextWidth,
+        (visibleRect.y2 - visibleRect.y1) / contextHeight,
+      );
+      const contextCenter = {
+        x: (contextBounds.x1 + contextBounds.x2) / 2,
+        y: (contextBounds.y1 + contextBounds.y2) / 2,
+      };
+      if (fitCeiling >= readableTarget) {
+        modelCenter = contextCenter;
+      } else {
+        const contextPan = {
+          x: renderedCenter.x - contextCenter.x * zoom,
+          y: renderedCenter.y - contextCenter.y * zoom,
+        };
+        const minPanX = visibleRect.x1 - leafBounds.x1 * zoom;
+        const maxPanX = visibleRect.x2 - leafBounds.x2 * zoom;
+        const minPanY = visibleRect.y1 - leafBounds.y1 * zoom;
+        const maxPanY = visibleRect.y2 - leafBounds.y2 * zoom;
+        const panLimits = [minPanX, maxPanX, minPanY, maxPanY];
+        if (
+          panLimits.every(Number.isFinite)
+          && minPanX <= maxPanX
+          && minPanY <= maxPanY
+        ) {
+          return {
+            zoom,
+            pan: {
+              x: Math.min(maxPanX, Math.max(minPanX, contextPan.x)),
+              y: Math.min(maxPanY, Math.max(minPanY, contextPan.y)),
+            },
+          };
+        }
+      }
+    }
+  }
+  return {
+    zoom,
+    pan: {
+      x: renderedCenter.x - modelCenter.x * zoom,
+      y: renderedCenter.y - modelCenter.y * zoom,
+    },
+  };
+}
+
+function topologyZoomViewport({
+  nodes = [],
+  selectedNodeId = null,
+  viewportCenter,
+  fallbackViewport,
+} = {}) {
+  const fallbackValues = [
+    fallbackViewport?.zoom,
+    fallbackViewport?.pan?.x,
+    fallbackViewport?.pan?.y,
+  ];
+  if (!fallbackValues.every(Number.isFinite) || fallbackViewport.zoom <= 0) return null;
+  if (![viewportCenter?.x, viewportCenter?.y].every(Number.isFinite)) {
+    return fallbackViewport;
+  }
+  const validNodes = Array.isArray(nodes)
+    ? nodes.filter((node) => (
+      node !== null
+      && typeof node === "object"
+      && !Array.isArray(node)
+      && typeof node.id === "string"
+      && node.id.length > 0
+      && [
+        node.modelPosition?.x,
+        node.modelPosition?.y,
+        node.renderedPosition?.x,
+        node.renderedPosition?.y,
+      ].every(Number.isFinite)
+    ))
+    : [];
+  if (!validNodes.length) return fallbackViewport;
+  const selected = typeof selectedNodeId === "string"
+    ? validNodes.find((node) => node.id === selectedNodeId)
+    : null;
+  const panes = validNodes.filter((node) => node.kind === "pane");
+  const nearestCandidates = panes.length ? panes : validNodes;
+  const anchor = selected || nearestCandidates.reduce((nearest, node) => {
+    if (!nearest) return node;
+    const distance = Math.hypot(
+      node.renderedPosition.x - viewportCenter.x,
+      node.renderedPosition.y - viewportCenter.y,
+    );
+    const nearestDistance = Math.hypot(
+      nearest.renderedPosition.x - viewportCenter.x,
+      nearest.renderedPosition.y - viewportCenter.y,
+    );
+    return distance < nearestDistance ? node : nearest;
+  }, null);
+  return {
+    zoom: fallbackViewport.zoom,
+    pan: {
+      x: viewportCenter.x - anchor.modelPosition.x * fallbackViewport.zoom,
+      y: viewportCenter.y - anchor.modelPosition.y * fallbackViewport.zoom,
+    },
+  };
+}
+
+function topologyRebaseViewportCapture(capture, nextSize) {
+  return {
+    size: nextSize,
+    viewport: {
+      zoom: capture.viewport.zoom,
+      pan: {
+        x: capture.viewport.pan.x + (nextSize.width - capture.size.width) / 2,
+        y: capture.viewport.pan.y + (nextSize.height - capture.size.height) / 2,
+      },
+    },
+  };
+}
+
+function topologyViewportMotionDuration({
+  currentViewport,
+  targetViewport,
+  viewportSize,
+} = {}) {
+  const minimumDuration = 180;
+  const maximumDuration = 240;
+  const fullDistance = 0.8;
+  const values = [
+    currentViewport?.zoom,
+    currentViewport?.pan?.x,
+    currentViewport?.pan?.y,
+    targetViewport?.zoom,
+    targetViewport?.pan?.x,
+    targetViewport?.pan?.y,
+    viewportSize?.width,
+    viewportSize?.height,
+  ];
+  if (
+    !values.every(Number.isFinite)
+    || currentViewport.zoom <= 0
+    || targetViewport.zoom <= 0
+    || viewportSize.width <= 0
+    || viewportSize.height <= 0
+  ) return minimumDuration;
+
+  const diagonal = Math.hypot(viewportSize.width, viewportSize.height);
+  const zoomTravel = Math.abs(Math.log(targetViewport.zoom / currentViewport.zoom));
+  const panTravel = Math.hypot(
+    targetViewport.pan.x - currentViewport.pan.x,
+    targetViewport.pan.y - currentViewport.pan.y,
+  ) / diagonal;
+  const distance = Math.hypot(zoomTravel, panTravel);
+  const progress = Math.min(distance / fullDistance, 1);
+  return minimumDuration + (maximumDuration - minimumDuration) * progress;
+}
+
 function topologyPresetPositions(projects) {
   const positions = Object.create(null);
   const paneWidth = 218;

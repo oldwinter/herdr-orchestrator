@@ -8,6 +8,10 @@
     <link rel="stylesheet" href="/assets/dashboard.css">
     <script src="/assets/cytoscape.min.js" defer></script>
     <script src="/assets/topology.js" defer></script>
+    <script src="/assets/topology-style.js" defer></script>
+    <script src="/assets/dashboard-utils.js" defer></script>
+    <script src="/assets/source-warning.js" defer></script>
+    <script src="/assets/timeline-continuity.js" defer></script>
     <script src="/assets/dashboard.js" defer></script>
   </head>
   <body>
@@ -22,17 +26,21 @@
             <h1 id="workflow-name">Herdr Orchestrator</h1>
           </div>
         </div>
-        <div class="connection" aria-live="polite">
+        <div class="connection">
           <span id="connection-dot" class="connection-dot" aria-hidden="true"></span>
           <div>
-            <strong id="connection-label">Connecting</strong>
-            <span id="last-updated">Waiting for first snapshot</span>
+            <strong id="connection-label" aria-live="polite" aria-atomic="true">Connecting</strong>
+            <span id="last-updated" aria-live="off">Waiting for first snapshot</span>
           </div>
         </div>
       </header>
 
       <main>
-        <section id="source-warning" class="source-warning is-hidden" role="status" aria-live="polite"></section>
+        <div id="source-warning-region" class="source-warning-region is-hidden" aria-hidden="true">
+          <div id="source-warning-clip" class="source-warning-clip">
+            <section id="source-warning" class="source-warning" role="status" aria-live="polite" aria-atomic="true"></section>
+          </div>
+        </div>
 
         <section class="metrics" aria-label="Workflow summary">
           <article class="metric metric-primary">
@@ -56,7 +64,7 @@
             <span class="metric-note">working or blocked in Herdr</span>
           </article>
           <article class="metric">
-            <span class="metric-label">Worktrees</span>
+            <span class="metric-label">Git worktrees</span>
             <strong id="metric-worktrees">—</strong>
             <span class="metric-note">native isolated checkouts</span>
           </article>
@@ -66,6 +74,7 @@
             <span class="metric-note">durable receipts settled</span>
           </article>
         </section>
+        <p id="status-announcement" class="sr-only" aria-live="polite" aria-atomic="true"></p>
 
         <section class="panel topology-panel">
           <div class="panel-heading topology-heading">
@@ -76,9 +85,37 @@
             <div class="topology-heading-actions">
               <span id="topology-count" class="quiet-badge" data-compact="0 nodes">0 nodes</span>
               <div class="topology-controls" role="group" aria-label="Topology viewport controls">
-                <button id="topology-zoom-out" class="icon-button" type="button" aria-label="Zoom out" title="Zoom out">−</button>
-                <button id="topology-fit" class="icon-button" type="button" aria-label="Fit topology" title="Fit topology">⌂</button>
-                <button id="topology-zoom-in" class="icon-button" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+                <button
+                  id="topology-touch-owner"
+                  class="icon-button topology-touch-toggle"
+                  type="button"
+                  hidden
+                  aria-controls="topology"
+                  aria-label="Enable touch navigation"
+                  aria-pressed="false"
+                  title="Enable touch navigation"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M12 2v20"></path>
+                    <path d="m15 19-3 3-3-3"></path>
+                    <path d="m19 9 3 3-3 3"></path>
+                    <path d="M2 12h20"></path>
+                    <path d="m5 9-3 3 3 3"></path>
+                    <path d="m9 5 3-3 3 3"></path>
+                  </svg>
+                </button>
+                <button id="topology-zoom-out" class="icon-button" type="button" aria-label="Zoom out" title="Zoom out" disabled>
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12h14"></path></svg>
+                  <span class="sr-only">Zoom out</span>
+                </button>
+                <button id="topology-fit" class="icon-button" type="button" aria-label="Fit topology" title="Fit topology" disabled>
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 7V5a2 2 0 0 1 2-2h2"></path><path d="M17 3h2a2 2 0 0 1 2 2v2"></path><path d="M21 17v2a2 2 0 0 1-2 2h-2"></path><path d="M7 21H5a2 2 0 0 1-2-2v-2"></path></svg>
+                  <span class="sr-only">Fit topology</span>
+                </button>
+                <button id="topology-zoom-in" class="icon-button" type="button" aria-label="Zoom in" title="Zoom in" disabled>
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 5v14M5 12h14"></path></svg>
+                  <span class="sr-only">Zoom in</span>
+                </button>
               </div>
             </div>
           </div>
@@ -96,16 +133,21 @@
               role="application"
               aria-label="Interactive Herdr topology (read-only)"
               aria-describedby="topology-a11y"
-              aria-keyshortcuts="+ - 0 Home ArrowRight ArrowLeft ArrowDown ArrowUp Enter Space Escape"
+              aria-details="topology-selection-help"
+              aria-keyshortcuts="+ - 0 Home ArrowUp ArrowDown ArrowLeft ArrowRight Control+ArrowUp Control+ArrowDown Control+ArrowLeft Control+ArrowRight Escape"
               aria-busy="true"
-            ></div>
+            >
+              <span id="topology-active-descendant" class="sr-only"></span>
+            </div>
             <div id="topology-empty" class="topology-empty" role="status" aria-live="polite">Waiting for Herdr…</div>
-            <div id="topology-inspector" class="topology-inspector is-hidden" aria-live="polite"></div>
+            <div id="topology-inspector" class="topology-inspector is-hidden" aria-hidden="true" aria-live="polite" aria-atomic="true"></div>
           </div>
           <div id="topology-a11y" class="sr-only" aria-live="polite"></div>
+          <p id="topology-selection-help" class="sr-only">Control plus arrow keys select topology nodes. Escape clears the selected node.</p>
+          <p id="topology-selection-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
         </section>
 
-        <section class="main-grid">
+        <section id="main-grid" class="main-grid">
           <article class="panel board-panel">
             <div class="panel-heading">
               <div>
@@ -114,7 +156,8 @@
               </div>
               <span id="job-total" class="quiet-badge">0 jobs</span>
             </div>
-            <div id="kanban" class="kanban" role="region" tabindex="0" aria-label="Work in flight board" aria-busy="true">
+            <nav id="kanban-navigation" class="kanban-navigation" aria-label="Kanban columns" hidden></nav>
+            <div id="kanban" class="kanban" role="region" tabindex="0" aria-label="Work in flight board" aria-keyshortcuts="ArrowLeft ArrowRight" aria-busy="true">
               <div class="empty-state">Loading queue state…</div>
             </div>
           </article>

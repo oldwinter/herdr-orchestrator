@@ -395,6 +395,10 @@ def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
                 "dashboard.css",
                 "cytoscape.min.js",
                 "topology.js",
+                "topology-style.js",
+                "dashboard-utils.js",
+                "source-warning.js",
+                "timeline-continuity.js",
                 "dashboard.js",
             }:
                 self.send_error(HTTPStatus.NOT_FOUND)
