@@ -2,15 +2,16 @@
 
 ## One-command setup
 
-Install Python 3.12+, Node.js 20+, `uv` 0.12.5, and `just`, then run:
+Install Python 3.12+, Node.js 20+, `uv` 0.12.7, and `just`, then run:
 
 ```bash
 uv sync --locked
 just check
 ```
 
-The devcontainer performs `uv sync --locked` automatically and includes Python 3.12 and
-Node.js 24. Runtime smoke tests still require Herdr and authenticated harness CLIs on the host.
+CI runs Python 3.14.7 and Node.js 26.8.1. The devcontainer performs `uv sync --locked`
+automatically and keeps Python 3.12 as the compatibility floor while using Node.js 26.
+Runtime smoke tests still require Herdr and authenticated harness CLIs on the host.
 Copy `.env.example` only when testing optional exporters. Never commit `.env` files.
 
 ## Fast feedback
