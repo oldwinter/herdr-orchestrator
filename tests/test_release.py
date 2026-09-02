@@ -287,7 +287,10 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("--provenance", workflow)
         self.assertNotIn("NODE_AUTH_TOKEN", workflow)
-        self.assertIn("actions/checkout@11d5960a326750d5838078e36cf38b85af677262", workflow)
+        self.assertEqual(
+            workflow.count("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"),
+            3,
+        )
         self.assertEqual(
             workflow.count("actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"),
             3,
