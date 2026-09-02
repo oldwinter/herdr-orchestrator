@@ -5,13 +5,11 @@ import { spawnSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
-  mkdirSync,
+  readdirSync,
   readFileSync,
-  rmdirSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -23,12 +21,42 @@ import {
   METADATA_SOURCE,
   tokenPatchFor,
 } from "../plugins/manager-light/projection.mjs";
+import {
+  INSTALLER_HARNESSES,
+  installerFileState,
+  inspectInstallerJournal,
+  observeInstallerTarget,
+  reconcileInstallerJournal,
+  runInstallerTransaction,
+} from "./installer-journal.mjs";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const HARNESSES = ["droid", "grok", "codex", "pi", "claude", "hermes"];
+const HARNESSES = INSTALLER_HARNESSES;
 const MANAGER_HARNESSES = ["grok", "codex", "claude"];
+const DOCTOR_PROBE_TIMEOUT_OPTION = "--probe-timeout-seconds";
+const DOCTOR_PROBE_TIMEOUT_SECONDS = 30;
+const DOCTOR_PROBE_TIMEOUT_MAX_SECONDS = 300;
+const DOCTOR_PROCESS_OVERHEAD_MS = 90_000;
+const DOCTOR_PROCESS_TIMEOUT_ENV = "HERDR_ORCHESTRATOR_DOCTOR_TIMEOUT_MS";
+const WORKFLOW_OPTION_PREFIXES = [
+  "--w",
+  "--wo",
+  "--wor",
+  "--work",
+  "--workf",
+  "--workfl",
+  "--workflo",
+  "--workflow",
+];
 const GIT_EXCLUDE_BEGIN = "# BEGIN herdr-orchestrator managed paths";
+const GIT_EXCLUDE_BEGIN_WITH_SEPARATOR =
+  "# BEGIN herdr-orchestrator managed paths separator-owned";
 const GIT_EXCLUDE_END = "# END herdr-orchestrator managed paths";
+const GIT_EXCLUDE_BEGIN_BYTES = Buffer.from(GIT_EXCLUDE_BEGIN);
+const GIT_EXCLUDE_BEGIN_WITH_SEPARATOR_BYTES = Buffer.from(
+  GIT_EXCLUDE_BEGIN_WITH_SEPARATOR,
+);
+const GIT_EXCLUDE_END_BYTES = Buffer.from(GIT_EXCLUDE_END);
 const WORKER_NAMES = {
   droid: "operations",
   grok: "grok-build",
@@ -77,6 +105,12 @@ function parseArguments(argv) {
       options.rest.push(value);
     }
   }
+  if (
+    ["install", "update", "upgrade", "uninstall"].includes(command)
+    && options.rest.length > 0
+  ) {
+    throw new Error(`option_unsupported: ${options.rest[0]}`);
+  }
   return options;
 }
 
@@ -84,14 +118,22 @@ function sha256(content) {
   return createHash("sha256").update(content).digest("hex");
 }
 
-function stageFile(desiredFiles, relativePath, content) {
-  desiredFiles.set(relativePath, Buffer.from(content));
+function installerStateEqual(left, right) {
+  return left.kind === right.kind && (
+    left.kind === "absent"
+    || (
+      left.digest === right.digest
+      && left.mode === right.mode
+    )
+  );
 }
 
-function writeManagedFile(project, relativePath, content) {
-  const target = join(project, relativePath);
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, content);
+function installerTargetLabel(target) {
+  return target.scope === "project" ? target.path : `git-exclude:${target.path}`;
+}
+
+function stageFile(desiredFiles, relativePath, content) {
+  desiredFiles.set(relativePath, Buffer.from(content));
 }
 
 function loadManifest(project) {
@@ -99,14 +141,39 @@ function loadManifest(project) {
   if (!existsSync(path)) {
     return null;
   }
-  const manifest = JSON.parse(readFileSync(path, "utf8"));
+  let manifest;
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(path));
+    manifest = JSON.parse(text);
+  } catch {
+    throw new Error("manifest_invalid");
+  }
   if (
-    manifest.schema_version !== 1
+    manifest === null
+    || typeof manifest !== "object"
+    || Array.isArray(manifest)
+    || manifest.schema_version !== 1
     || manifest.package !== "herdr-orchestrator"
     || typeof manifest.version !== "string"
     || typeof manifest.files !== "object"
     || manifest.files === null
     || Array.isArray(manifest.files)
+    || (
+      manifest.file_modes !== undefined
+      && (
+        typeof manifest.file_modes !== "object"
+        || manifest.file_modes === null
+        || Array.isArray(manifest.file_modes)
+      )
+    )
+    || (
+      manifest.unmanaged_files !== undefined
+      && (
+        typeof manifest.unmanaged_files !== "object"
+        || manifest.unmanaged_files === null
+        || Array.isArray(manifest.unmanaged_files)
+      )
+    )
     || !Array.isArray(manifest.harnesses)
     || manifest.harnesses.length === 0
     || new Set(manifest.harnesses).size !== manifest.harnesses.length
@@ -118,10 +185,34 @@ function loadManifest(project) {
   ) {
     throw new Error("manifest_invalid");
   }
-  for (const [relativePath, hash] of Object.entries(manifest.files)) {
+  if (
+    manifest.file_modes !== undefined
+    && JSON.stringify(Object.keys(manifest.file_modes).sort())
+      !== JSON.stringify(Object.keys(manifest.files).sort())
+  ) {
+    throw new Error("manifest_invalid");
+  }
+  const unmanagedFiles = manifest.unmanaged_files ?? {};
+  for (const [relativePath, hash] of Object.entries({
+    ...manifest.files,
+    ...unmanagedFiles,
+  })) {
     if (!isManagedPath(relativePath) || !/^[a-f0-9]{64}$/.test(hash)) {
       throw new Error(`manifest_entry_invalid: ${relativePath}`);
     }
+  }
+  for (const [relativePath, mode] of Object.entries(manifest.file_modes ?? {})) {
+    if (
+      manifest.files[relativePath] === undefined
+      || !Number.isInteger(mode)
+      || mode < 0
+      || mode > 0o7777
+    ) {
+      throw new Error(`manifest_entry_invalid: ${relativePath}`);
+    }
+  }
+  if (Object.keys(unmanagedFiles).some((path) => manifest.files[path] !== undefined)) {
+    throw new Error("manifest_invalid");
   }
   return manifest;
 }
@@ -142,13 +233,64 @@ function isManagedPath(relativePath) {
   );
 }
 
+function regularFileMode(path) {
+  const status = lstatSync(path);
+  if (status.isSymbolicLink() || !status.isFile()) {
+    throw new Error(`managed_path_not_regular: ${path}`);
+  }
+  return status.mode & 0o7777;
+}
+
+function defaultFileMode() {
+  return 0o666 & ~process.umask();
+}
+
+function fileModesForManifest(manifest) {
+  return manifest?.file_modes ?? {};
+}
+
+function manifestModesAreUnknown(manifest) {
+  return manifest !== null && manifest.file_modes === undefined;
+}
+
+function directoryHasFiles(path) {
+  let entries;
+  try {
+    const status = lstatSync(path);
+    if (status.isSymbolicLink() || !status.isDirectory()) {
+      return true;
+    }
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+  return entries.some((entry) => {
+    const entryPath = join(path, entry.name);
+    return entry.isDirectory() && !entry.isSymbolicLink()
+      ? directoryHasFiles(entryPath)
+      : true;
+  });
+}
+
 function assertNoSymlink(project, relativePath) {
   let current = project;
-  for (const part of relativePath.split("/")) {
+  const parts = relativePath.split("/");
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
     current = join(current, part);
     try {
-      if (lstatSync(current).isSymbolicLink()) {
+      const status = lstatSync(current);
+      if (status.isSymbolicLink()) {
         throw new Error(`managed_path_symlink: ${relativePath}`);
+      }
+      if (index < parts.length - 1 && !status.isDirectory()) {
+        throw new Error(`managed_path_ancestor_not_directory: ${relativePath}`);
+      }
+      if (index === parts.length - 1 && !status.isFile()) {
+        throw new Error(`managed_path_not_regular: ${relativePath}`);
       }
     } catch (error) {
       if (error.code !== "ENOENT") {
@@ -171,7 +313,7 @@ function gitExcludePath(project) {
   const result = spawnSync(
     "git",
     ["-C", project, "rev-parse", "--git-path", "info/exclude"],
-    { encoding: "utf8", timeout: 5_000 },
+    { encoding: "utf8", env: gitEnvironment(), timeout: 5_000 },
   );
   if (result.status !== 0) {
     return null;
@@ -180,20 +322,44 @@ function gitExcludePath(project) {
   return rendered.length > 0 ? resolve(project, rendered) : null;
 }
 
+function gitEnvironment() {
+  const environment = { ...process.env };
+  for (const name of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+  ]) {
+    delete environment[name];
+  }
+  return environment;
+}
+
 function removeManagedExcludeBlock(content) {
-  const start = content.indexOf(GIT_EXCLUDE_BEGIN);
+  const start = content.indexOf(GIT_EXCLUDE_BEGIN_BYTES);
   if (start < 0) {
     return content;
   }
-  const endMarker = content.indexOf(GIT_EXCLUDE_END, start);
+  const endMarker = content.indexOf(GIT_EXCLUDE_END_BYTES, start);
   if (endMarker < 0) {
     throw new Error("git_exclude_marker_invalid");
   }
-  let end = endMarker + GIT_EXCLUDE_END.length;
-  if (content[end] === "\n") {
+  const ownsSeparator = content.subarray(
+    start,
+    start + GIT_EXCLUDE_BEGIN_WITH_SEPARATOR_BYTES.length,
+  ).equals(GIT_EXCLUDE_BEGIN_WITH_SEPARATOR_BYTES);
+  if (ownsSeparator && (start === 0 || content[start - 1] !== 0x0a)) {
+    throw new Error("git_exclude_marker_invalid");
+  }
+  let end = endMarker + GIT_EXCLUDE_END_BYTES.length;
+  if (content[end] === 0x0a) {
     end += 1;
   }
-  return `${content.slice(0, start)}${content.slice(end)}`;
+  const removalStart = ownsSeparator ? start - 1 : start;
+  return Buffer.concat([
+    content.subarray(0, removalStart),
+    content.subarray(end),
+  ]);
 }
 
 function assertGitExcludeSafe(project, path) {
@@ -248,81 +414,20 @@ function assertGitExcludeSafe(project, path) {
   }
 }
 
-function renderGitExcludeBlock(includeSkill) {
+function renderGitExcludeBlock(includeSkill, ownsSeparator = false) {
   const paths = ["/.herdr-orchestrator/", "/.orchestrator/"];
   if (includeSkill) {
     paths.push("/.agents/skills/herdr-orchestrator/");
   }
-  return `${GIT_EXCLUDE_BEGIN}\n${paths.join("\n")}\n${GIT_EXCLUDE_END}\n`;
-}
-
-function installLocalGitExcludes(project, path, includeSkill) {
-  if (path === null) {
-    return "unavailable";
-  }
-  assertGitExcludeSafe(project, path);
-  const current = existsSync(path) ? readFileSync(path, "utf8") : "";
-  const withoutManaged = removeManagedExcludeBlock(current);
-  const separator = withoutManaged.length > 0 && !withoutManaged.endsWith("\n") ? "\n" : "";
-  const desired = `${withoutManaged}${separator}${renderGitExcludeBlock(includeSkill)}`;
-  if (desired !== current) {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, desired);
-  }
-  return "managed";
-}
-
-function removeLocalGitExcludesIfUnused(project, includeSkill) {
-  const managedRoots = [".herdr-orchestrator", ".orchestrator"];
-  if (includeSkill) {
-    managedRoots.push(".agents/skills/herdr-orchestrator");
-  }
-  if (managedRoots.some((relativePath) => existsSync(join(project, relativePath)))) {
-    return "retained";
-  }
-  const path = gitExcludePath(project);
-  if (path === null || !existsSync(path)) {
-    return "unavailable";
-  }
-  assertGitExcludeSafe(project, path);
-  const current = readFileSync(path, "utf8");
-  const desired = removeManagedExcludeBlock(current);
-  if (desired !== current) {
-    writeFileSync(path, desired);
-  }
-  return "removed";
-}
-
-function install(options) {
-  const project = resolve(options.project);
-  if (!existsSync(project)) {
-    throw new Error(`project_not_found: ${project}`);
-  }
-  if (!lstatSync(project).isDirectory()) {
-    throw new Error(`project_not_directory: ${project}`);
-  }
-  assertNoSymlink(project, ".herdr-orchestrator/manifest.json");
-  const localExcludePath = gitExcludePath(project);
-  if (localExcludePath !== null) {
-    assertGitExcludeSafe(project, localExcludePath);
-  }
-  const previous = loadManifest(project);
-  const skillRouterExists = existsSync(join(project, ".agents/skills"));
-  const installSkill = options.installSkill ?? (
-    previous === null ? !skillRouterExists : previousSkillPreference(previous)
+  const begin = ownsSeparator
+    ? GIT_EXCLUDE_BEGIN_WITH_SEPARATOR
+    : GIT_EXCLUDE_BEGIN;
+  return Buffer.from(
+    `${begin}\n${paths.join("\n")}\n${GIT_EXCLUDE_END}\n`,
   );
-  const harnesses = options.harnesses.length > 0
-    ? [...new Set(options.harnesses)]
-    : previous?.harnesses ?? HARNESSES.filter((harness) => commandExists(harness));
-  if (harnesses.length === 0) {
-    throw new Error("no_harness_detected: pass --harness <name>");
-  }
-  for (const harness of harnesses) {
-    if (!HARNESSES.includes(harness)) {
-      throw new Error(`unsupported_harness: ${harness}`);
-    }
-  }
+}
 
+function buildDesiredFiles(harnesses, installSkill) {
   const desiredFiles = new Map();
   const workflow = renderWorkflow(harnesses);
   stageFile(
@@ -362,8 +467,265 @@ function install(options) {
     }
   }
   stageFile(desiredFiles, ".orchestrator/.gitignore", "*\n!.gitignore\n");
+  return desiredFiles;
+}
+
+function desiredLocalGitExclude(project, path, includeSkill) {
+  if (path === null) {
+    return {
+      content: null,
+      status: "unavailable",
+    };
+  }
+  assertGitExcludeSafe(project, path);
+  const current = existsSync(path) ? readFileSync(path) : Buffer.alloc(0);
+  const withoutManaged = removeManagedExcludeBlock(current);
+  const ownsSeparator = (
+    withoutManaged.length > 0
+    && withoutManaged[withoutManaged.length - 1] !== 0x0a
+  );
+  const separator = ownsSeparator ? Buffer.from("\n") : Buffer.alloc(0);
+  return {
+    content: Buffer.concat([
+      withoutManaged,
+      separator,
+      renderGitExcludeBlock(includeSkill, ownsSeparator),
+    ]),
+    status: "managed",
+  };
+}
+
+function inspectLocalGitExclude(project, path, includeSkill) {
+  if (path === null) {
+    return {
+      available: false,
+      ok: true,
+      status: "unavailable",
+    };
+  }
+  assertGitExcludeSafe(project, path);
+  if (!existsSync(path)) {
+    return {
+      available: true,
+      ok: false,
+      status: "missing",
+    };
+  }
+  try {
+    const current = readFileSync(path);
+    const desired = desiredLocalGitExclude(project, path, includeSkill).content;
+    const ok = current.equals(desired);
+    return {
+      available: true,
+      ok,
+      status: ok ? "managed" : "modified",
+    };
+  } catch (error) {
+    if (error.message === "git_exclude_marker_invalid") {
+      return {
+        available: true,
+        ok: false,
+        status: "invalid",
+      };
+    }
+    throw error;
+  }
+}
+
+function managedRootsHaveRemainingEntries(project, roots, ignoredPaths) {
+  function containsEntry(relativeDirectory) {
+    const directory = join(project, relativeDirectory);
+    let entries;
+    try {
+      const status = lstatSync(directory);
+      if (status.isSymbolicLink() || !status.isDirectory()) {
+        return true;
+      }
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+    for (const entry of entries) {
+      const relativePath = `${relativeDirectory}/${entry.name}`;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        if (containsEntry(relativePath)) {
+          return true;
+        }
+      } else if (!ignoredPaths.has(relativePath)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  return roots.some((root) => containsEntry(root));
+}
+
+function listManagedRootEntries(project) {
+  const paths = [];
+  function visit(relativeDirectory) {
+    const directory = join(project, relativeDirectory);
+    let entries;
+    try {
+      const status = lstatSync(directory);
+      if (status.isSymbolicLink() || !status.isDirectory()) {
+        paths.push(relativeDirectory);
+        return;
+      }
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
+    for (const entry of entries) {
+      const relativePath = `${relativeDirectory}/${entry.name}`;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        visit(relativePath);
+      } else {
+        paths.push(relativePath);
+      }
+    }
+  }
+  for (const root of [
+    ".herdr-orchestrator",
+    ".orchestrator",
+    ".agents/skills/herdr-orchestrator",
+  ]) {
+    visit(root);
+  }
+  return paths.sort();
+}
+
+function unownedLocalExcludeStatus(path) {
+  if (path === null || !existsSync(path)) {
+    return "unavailable";
+  }
+  const content = readFileSync(path);
+  return (
+    content.includes(GIT_EXCLUDE_BEGIN_BYTES)
+    || content.includes(GIT_EXCLUDE_END_BYTES)
+  ) ? "retained" : "removed";
+}
+
+function desiredUninstallGitExclude(
+  project,
+  path,
+  managedSkill,
+  removedPaths,
+) {
+  if (path === null || !existsSync(path)) {
+    return {
+      content: null,
+      status: "unavailable",
+    };
+  }
+  assertGitExcludeSafe(project, path);
+  const roots = [".herdr-orchestrator", ".orchestrator"];
+  if (managedSkill) {
+    roots.push(".agents/skills/herdr-orchestrator");
+  }
+  const ignoredPaths = new Set([
+    ...removedPaths,
+    ".herdr-orchestrator/manifest.json",
+    ".herdr-orchestrator/install-journal.json",
+  ]);
+  const current = readFileSync(path);
+  if (managedRootsHaveRemainingEntries(project, roots, ignoredPaths)) {
+    return {
+      content: current,
+      status: "retained",
+    };
+  }
+  return {
+    content: removeManagedExcludeBlock(current),
+    status: "removed",
+  };
+}
+
+function projectFileTarget(relativePath) {
+  return {
+    path: relativePath,
+    scope: "project",
+  };
+}
+
+function gitExcludeTarget(path) {
+  return {
+    path,
+    scope: "git-exclude",
+  };
+}
+
+function install(options) {
+  const project = resolve(options.project);
+  if (!existsSync(project)) {
+    throw new Error(`project_not_found: ${project}`);
+  }
+  if (!lstatSync(project).isDirectory()) {
+    throw new Error(`project_not_directory: ${project}`);
+  }
+  assertNoSymlink(project, ".herdr-orchestrator/manifest.json");
+  const localExcludePath = gitExcludePath(project);
+  if (localExcludePath !== null) {
+    assertGitExcludeSafe(project, localExcludePath);
+  }
+  const journalContext = {
+    assertGitExcludeSafe,
+    gitExcludePath: localExcludePath,
+    project,
+  };
+  const recovery = reconcileInstallerJournal(journalContext);
+  if (recovery.command === "uninstall" && recovery.command_result?.ok === false) {
+    process.stdout.write(`${JSON.stringify({
+      ...recovery.command_result,
+      project,
+      recovered_command: "uninstall",
+    })}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const plannedOriginals = new Map();
+  const plannedTargetState = (target) => {
+    const key = `${target.scope}:${target.path}`;
+    if (!plannedOriginals.has(key)) {
+      plannedOriginals.set(
+        key,
+        observeInstallerTarget(project, target, journalContext),
+      );
+    }
+    return plannedOriginals.get(key);
+  };
+  const manifestTarget = projectFileTarget(
+    ".herdr-orchestrator/manifest.json",
+  );
+  const plannedManifestOriginal = plannedTargetState(manifestTarget);
+  const previous = loadManifest(project);
+  const skillRouterExists = directoryHasFiles(join(project, ".agents/skills"));
+  const installSkill = options.installSkill ?? (
+    previous === null ? !skillRouterExists : previousSkillPreference(previous)
+  );
+  const harnesses = options.harnesses.length > 0
+    ? [...new Set(options.harnesses)]
+    : previous?.harnesses ?? HARNESSES.filter((harness) => commandExists(harness));
+  if (harnesses.length === 0) {
+    throw new Error("no_harness_detected: pass --harness <name>");
+  }
+  for (const harness of harnesses) {
+    if (!HARNESSES.includes(harness)) {
+      throw new Error(`unsupported_harness: ${harness}`);
+    }
+  }
+
+  const desiredFiles = buildDesiredFiles(harnesses, installSkill);
 
   const previousFiles = previous?.files ?? {};
+  const previousFileModes = fileModesForManifest(previous);
+  const legacyModesUnknown = manifestModesAreUnknown(previous);
   const conflicts = [];
   const preserved = [];
   const removals = [];
@@ -377,27 +739,51 @@ function install(options) {
     unmanaged.push(skillPath);
   }
   const manifestFiles = {};
+  const manifestFileModes = {};
+  const unmanagedFiles = {};
   for (const [relativePath, content] of desiredFiles) {
     assertNoSymlink(project, relativePath);
-    const target = join(project, relativePath);
+    const target = projectFileTarget(relativePath);
+    const current = plannedTargetState(target);
     const desiredHash = sha256(content);
-    if (!existsSync(target)) {
+    if (current.kind === "absent") {
       manifestFiles[relativePath] = desiredHash;
+      manifestFileModes[relativePath] = defaultFileMode();
       continue;
     }
-    const currentHash = sha256(readFileSync(target));
+    const currentMode = current.mode;
+    const currentHash = current.digest;
     const previousHash = previousFiles[relativePath];
+    const previousMode = previousFileModes[relativePath];
+    if (legacyModesUnknown && previousHash !== undefined) {
+      // An old manifest cannot prove the mode of an existing file. Keep the
+      // bytes untouched and retain the legacy manifest until an explicit,
+      // mode-aware ownership record exists.
+      preserved.push(relativePath);
+      manifestFiles[relativePath] = previousHash;
+      continue;
+    }
+    const matchesPrevious = (
+      previousHash !== undefined
+      && currentHash === previousHash
+      && (previousMode === undefined || currentMode === previousMode)
+    );
     if (previousHash === undefined) {
       if (currentHash !== desiredHash) {
         conflicts.push(relativePath);
       } else {
         unmanaged.push(relativePath);
+        unmanagedFiles[relativePath] = desiredHash;
       }
-    } else if (previousHash !== undefined && currentHash !== previousHash) {
+    } else if (!matchesPrevious) {
       preserved.push(relativePath);
       manifestFiles[relativePath] = previousHash;
+      if (previousMode !== undefined) {
+        manifestFileModes[relativePath] = previousMode;
+      }
     } else {
       manifestFiles[relativePath] = desiredHash;
+      manifestFileModes[relativePath] = currentMode;
     }
   }
   for (const [relativePath, previousHash] of Object.entries(previousFiles)) {
@@ -405,26 +791,47 @@ function install(options) {
       continue;
     }
     assertNoSymlink(project, relativePath);
-    const target = join(project, relativePath);
-    if (!existsSync(target)) {
+    const target = projectFileTarget(relativePath);
+    const current = plannedTargetState(target);
+    if (current.kind === "absent") {
       continue;
     }
-    if (sha256(readFileSync(target)) === previousHash) {
+    if (legacyModesUnknown) {
+      preserved.push(relativePath);
+      manifestFiles[relativePath] = previousHash;
+      continue;
+    }
+    const currentMode = current.mode;
+    if (
+      current.digest === previousHash
+      && (
+        previousFileModes[relativePath] === undefined
+        || currentMode === previousFileModes[relativePath]
+      )
+    ) {
       removals.push(relativePath);
     } else {
       preserved.push(relativePath);
       manifestFiles[relativePath] = previousHash;
+      if (previousFileModes[relativePath] !== undefined) {
+        manifestFileModes[relativePath] = previousFileModes[relativePath];
+      }
     }
   }
   if (conflicts.length > 0) {
     throw new Error(`unmanaged_file_conflict: ${conflicts.sort().join(",")}`);
   }
-  for (const relativePath of removals) {
-    unlinkSync(join(project, relativePath));
-  }
-  for (const [relativePath, content] of desiredFiles) {
-    if (!preserved.includes(relativePath) && !unmanaged.includes(relativePath)) {
-      writeManagedFile(project, relativePath, content);
+
+  if (!legacyModesUnknown) {
+    for (const relativePath of Object.keys(manifestFiles)) {
+      if (manifestFileModes[relativePath] !== undefined) {
+        continue;
+      }
+      const target = projectFileTarget(relativePath);
+      const current = plannedTargetState(target);
+      manifestFileModes[relativePath] = current.kind === "regular"
+        ? current.mode
+        : defaultFileMode();
     }
   }
 
@@ -435,16 +842,92 @@ function install(options) {
     harnesses,
     install_skill: installSkill,
     files: manifestFiles,
+    ...(legacyModesUnknown ? {} : { file_modes: manifestFileModes }),
+    unmanaged_files: unmanagedFiles,
   };
-  mkdirSync(join(project, ".herdr-orchestrator"), { recursive: true });
-  writeFileSync(
-    join(project, ".herdr-orchestrator/manifest.json"),
-    `${JSON.stringify(manifest, null, 2)}\n`,
-  );
+  const manifestContent = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
   const managesSkill = Object.keys(manifestFiles).some((relativePath) =>
     relativePath.startsWith(".agents/skills/herdr-orchestrator/")
   );
-  const localExclude = installLocalGitExcludes(project, localExcludePath, managesSkill);
+  const localExcludeTarget = localExcludePath === null
+    ? null
+    : gitExcludeTarget(localExcludePath);
+  const plannedLocalExcludeOriginal = localExcludeTarget === null
+    ? null
+    : plannedTargetState(localExcludeTarget);
+  const localExclude = desiredLocalGitExclude(
+    project,
+    localExcludePath,
+    managesSkill,
+  );
+  const preservedSet = new Set(preserved);
+  const unmanagedSet = new Set(unmanaged);
+  const participants = [];
+  const priorOnlyPaths = Object.keys(previousFiles)
+    .filter((path) => !desiredFiles.has(path))
+    .sort();
+  const priorOnlySet = new Set(priorOnlyPaths);
+  const managedPaths = [
+    ...priorOnlyPaths,
+    ...[...desiredFiles.keys()].filter((path) => !priorOnlySet.has(path)).sort(),
+  ];
+  for (const relativePath of managedPaths) {
+    const target = projectFileTarget(relativePath);
+    const original = plannedTargetState(target);
+    let desired = installerFileState(null);
+    let desiredContent = null;
+    if (desiredFiles.has(relativePath)) {
+      const content = desiredFiles.get(relativePath);
+      if (preservedSet.has(relativePath) || unmanagedSet.has(relativePath)) {
+        desired = original;
+      } else {
+        desired = installerFileState(content, original);
+        desiredContent = content;
+      }
+    } else if (preservedSet.has(relativePath)) {
+      desired = original;
+    }
+    participants.push({
+      desired,
+      desiredContent,
+      original,
+      target,
+    });
+  }
+  if (localExcludePath !== null) {
+    const target = localExcludeTarget;
+    const original = plannedLocalExcludeOriginal;
+    participants.push({
+      desired: installerFileState(localExclude.content, original),
+      desiredContent: localExclude.content,
+      original,
+      target,
+    });
+  }
+  participants.push({
+    desired: installerFileState(manifestContent, plannedManifestOriginal),
+    desiredContent: manifestContent,
+    original: plannedManifestOriginal,
+    target: manifestTarget,
+  });
+  for (const participant of participants) {
+    const actual = observeInstallerTarget(
+      project,
+      participant.target,
+      journalContext,
+    );
+    if (!installerStateEqual(actual, participant.original)) {
+      throw new Error(`installer_state_changed: ${installerTargetLabel(participant.target)}`);
+    }
+  }
+  runInstallerTransaction({
+    ...journalContext,
+    command: options.command === "install" ? "install" : "upgrade",
+    harnesses,
+    installSkill,
+    packageVersion: packageVersion(),
+    participants,
+  });
   let skill = "skipped";
   if (installSkill) {
     skill = unmanaged.includes(skillPath) ? "existing_unmanaged" : "managed";
@@ -453,7 +936,7 @@ function install(options) {
   }
   process.stdout.write(`${JSON.stringify({
     harnesses,
-    local_exclude: localExclude,
+    local_exclude: localExclude.status,
     manager: ".herdr-orchestrator/manager",
     manifest: ".herdr-orchestrator/manifest.json",
     ok: preserved.length === 0,
@@ -482,6 +965,52 @@ function commandExists(command) {
     timeout: 5_000,
   });
   return result.status === 0;
+}
+
+function doctorProcessTimeoutMs(rest) {
+  let probeTimeoutSeconds = DOCTOR_PROBE_TIMEOUT_SECONDS;
+  for (let index = 0; index < rest.length; index += 1) {
+    const value = rest[index];
+    if (
+      value.length > 2
+      && DOCTOR_PROBE_TIMEOUT_OPTION.startsWith(value)
+      && index + 1 < rest.length
+    ) {
+      probeTimeoutSeconds = Number(rest[index + 1]);
+      index += 1;
+      continue;
+    }
+    const [option, inlineValue] = value.split("=", 2);
+    if (
+      option.length > 2
+      && DOCTOR_PROBE_TIMEOUT_OPTION.startsWith(option)
+      && inlineValue !== undefined
+    ) {
+      probeTimeoutSeconds = Number(inlineValue);
+    }
+  }
+  if (!Number.isInteger(probeTimeoutSeconds) || probeTimeoutSeconds <= 0) {
+    probeTimeoutSeconds = DOCTOR_PROBE_TIMEOUT_SECONDS;
+  }
+  probeTimeoutSeconds = Math.min(probeTimeoutSeconds, DOCTOR_PROBE_TIMEOUT_MAX_SECONDS);
+  const maximum = (
+    HARNESSES.length * probeTimeoutSeconds * 1_000
+    + DOCTOR_PROCESS_OVERHEAD_MS
+  );
+  const requested = Number(process.env[DOCTOR_PROCESS_TIMEOUT_ENV]);
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.min(Math.floor(requested), maximum);
+  }
+  return maximum;
+}
+
+function rejectWorkflowOverride(rest) {
+  for (const value of rest) {
+    const option = value.split("=", 1)[0];
+    if (WORKFLOW_OPTION_PREFIXES.includes(option)) {
+      throw new Error("workflow_option_reserved");
+    }
+  }
 }
 
 function reportManagerLight(classification) {
@@ -600,44 +1129,189 @@ function managerLight(options) {
   }
 }
 
+function inspectJournalGitExclude(journal) {
+  const entry = Object.entries(journal.desired_inventory ?? {}).find(
+    ([, item]) => item.target.scope === "git-exclude",
+  );
+  if (entry === undefined) {
+    return {
+      available: false,
+      ok: true,
+      status: "unavailable",
+    };
+  }
+  const [key] = entry;
+  const status = journal.states[key] ?? "conflict";
+  return {
+    available: true,
+    ok: status === "desired",
+    status,
+  };
+}
+
 function inspectInstallation(project) {
   const manifestPath = join(project, ".herdr-orchestrator/manifest.json");
   assertNoSymlink(project, ".herdr-orchestrator/manifest.json");
-  if (!existsSync(manifestPath)) {
+  const localExcludePath = gitExcludePath(project);
+  if (localExcludePath !== null) {
+    assertGitExcludeSafe(project, localExcludePath);
+  }
+  const journal = inspectInstallerJournal({
+    assertGitExcludeSafe,
+    gitExcludePath: localExcludePath,
+    project,
+  });
+  const manifest = existsSync(manifestPath) ? loadManifest(project) : null;
+  const selection = (
+    journal.active
+    && Array.isArray(journal.harnesses)
+    && typeof journal.install_skill === "boolean"
+  ) ? {
+      harnesses: journal.harnesses,
+      installSkill: journal.install_skill,
+    } : manifest === null ? null : {
+      harnesses: manifest.harnesses,
+      installSkill: previousSkillPreference(manifest),
+    };
+  if (selection === null) {
     return {
+      git_exclude: {
+        available: localExcludePath !== null,
+        ok: false,
+        status: "not_checked",
+      },
+      journal,
       manifest: false,
+      manifest_extra: [],
+      manifest_mismatched: [],
+      manifest_missing: [],
       missing: [".herdr-orchestrator/manifest.json"],
+      mode_unverified: [],
       modified: [],
       ok: false,
+      package_missing: [],
+      package_modified: [],
     };
   }
-  const manifest = loadManifest(project);
   const missing = [];
   const modified = [];
-  for (const [relativePath, expectedHash] of Object.entries(manifest.files ?? {})) {
+  const modeUnverified = [];
+  const manifestModesUnknown = manifestModesAreUnknown(manifest);
+  const manifestFileModes = fileModesForManifest(manifest);
+  for (const [relativePath, expectedHash] of Object.entries(manifest?.files ?? {})) {
     assertNoSymlink(project, relativePath);
     const target = join(project, relativePath);
     if (!existsSync(target)) {
       missing.push(relativePath);
-    } else if (sha256(readFileSync(target)) !== expectedHash) {
-      modified.push(relativePath);
+    } else {
+      const contentModified = sha256(readFileSync(target)) !== expectedHash;
+      const modeModified = (
+        manifestModesUnknown
+        || (
+          manifestFileModes[relativePath] !== undefined
+          && regularFileMode(target) !== manifestFileModes[relativePath]
+        )
+      );
+      if (manifestModesUnknown) {
+        modeUnverified.push(relativePath);
+      }
+      if (contentModified || modeModified) {
+        modified.push(relativePath);
+      }
     }
   }
+  const desiredFiles = buildDesiredFiles(
+    selection.harnesses,
+    selection.installSkill,
+  );
+  const unmanagedFiles = manifest?.unmanaged_files ?? {};
+  const declaredFiles = {
+    ...(manifest?.files ?? {}),
+    ...unmanagedFiles,
+  };
+  const packageMissing = [];
+  const packageModified = [];
+  const manifestMissing = [];
+  const manifestMismatched = [];
+  for (const [relativePath, content] of desiredFiles) {
+    const expectedHash = sha256(content);
+    const target = join(project, relativePath);
+    assertNoSymlink(project, relativePath);
+    if (!existsSync(target)) {
+      packageMissing.push(relativePath);
+    } else {
+      const contentModified = sha256(readFileSync(target)) !== expectedHash;
+      const modeModified = (
+        manifest?.files?.[relativePath] !== undefined
+        && (
+          manifestModesUnknown
+          || (
+            manifestFileModes[relativePath] !== undefined
+            && regularFileMode(target) !== manifestFileModes[relativePath]
+          )
+        )
+      );
+      if (contentModified || modeModified) {
+        packageModified.push(relativePath);
+      }
+    }
+    if (declaredFiles[relativePath] === undefined) {
+      manifestMissing.push(relativePath);
+    } else if (declaredFiles[relativePath] !== expectedHash) {
+      manifestMismatched.push(relativePath);
+    }
+  }
+  const manifestExtra = Object.keys(declaredFiles).filter(
+    (relativePath) => !desiredFiles.has(relativePath),
+  );
+  const managesSkill = Object.keys(manifest?.files ?? {}).some(
+    (relativePath) =>
+      relativePath.startsWith(".agents/skills/herdr-orchestrator/"),
+  );
+  const gitExclude = journal.active
+    ? inspectJournalGitExclude(journal)
+    : inspectLocalGitExclude(project, localExcludePath, managesSkill);
   const runtimeVersion = packageVersion();
-  const versionSkew = manifest.version !== runtimeVersion;
+  const versionSkew = manifest !== null && manifest.version !== runtimeVersion;
   return {
-    manifest: true,
-    missing: missing.sort(),
+    git_exclude: gitExclude,
+    journal,
+    manifest: manifest !== null,
+    manifest_extra: manifestExtra.sort(),
+    manifest_mismatched: manifestMismatched.sort(),
+    manifest_missing: manifestMissing.sort(),
+    missing: manifest === null
+      ? [".herdr-orchestrator/manifest.json"]
+      : missing.sort(),
+    mode_unverified: modeUnverified.sort(),
     modified: modified.sort(),
-    ok: missing.length === 0 && modified.length === 0 && !versionSkew,
-    installed_version: manifest.version,
+    ok: (
+      missing.length === 0
+      && modified.length === 0
+      && packageMissing.length === 0
+      && packageModified.length === 0
+      && manifestMissing.length === 0
+      && manifestExtra.length === 0
+      && manifestMismatched.length === 0
+      && gitExclude.ok
+      && !versionSkew
+      && !journal.active
+      && manifest !== null
+    ),
+    package_missing: packageMissing.sort(),
+    package_modified: packageModified.sort(),
+    unmanaged: Object.keys(unmanagedFiles).sort(),
+    ...(manifest === null ? {} : {
+      installed_version: manifest.version,
+      version: manifest.version,
+    }),
     runtime_version: runtimeVersion,
-    version: manifest.version,
     version_skew: versionSkew,
   };
 }
 
 function doctor(options) {
+  rejectWorkflowOverride(options.rest);
   const project = resolve(options.project);
   const installation = inspectInstallation(project);
   const workflow = join(project, ".herdr-orchestrator/workflows/multi-harness.toml");
@@ -660,6 +1334,7 @@ function doctor(options) {
       {
         cwd: project,
         encoding: "utf8",
+        timeout: doctorProcessTimeoutMs(options.rest),
         env: {
           ...process.env,
           PYTHONPATH: join(PACKAGE_ROOT, "src"),
@@ -667,10 +1342,32 @@ function doctor(options) {
       },
     );
     if (result.error) {
-      runtime = { error: result.error.message, ok: false };
+      runtime = {
+        error: result.error.code === "ETIMEDOUT"
+          ? "runtime_doctor_timeout"
+          : result.error.message,
+        ok: false,
+      };
     } else {
       try {
-        runtime = JSON.parse(result.stdout);
+        const parsed = JSON.parse(result.stdout);
+        if (
+          parsed === null
+          || typeof parsed !== "object"
+          || Array.isArray(parsed)
+          || typeof parsed.ok !== "boolean"
+        ) {
+          throw new Error("runtime_doctor_invalid_output");
+        }
+        runtime = parsed;
+        if (result.status !== 0) {
+          const status = result.status === null ? "signal" : result.status;
+          runtime = {
+            ...runtime,
+            error: runtime.error ?? `runtime_doctor_exit: ${status}`,
+            ok: false,
+          };
+        }
       } catch {
         runtime = {
           error: result.stderr.trim() || "runtime_doctor_invalid_output",
@@ -686,60 +1383,158 @@ function doctor(options) {
   }
 }
 
+function writeUninstallResult(project, result) {
+  process.stdout.write(`${JSON.stringify({
+    ...result,
+    project,
+  })}\n`);
+  if (!result.ok) {
+    process.exitCode = 1;
+  }
+}
+
 function uninstall(options) {
   const project = resolve(options.project);
   const manifestPath = join(project, ".herdr-orchestrator/manifest.json");
   assertNoSymlink(project, ".herdr-orchestrator/manifest.json");
-  if (!existsSync(manifestPath)) {
-    throw new Error(`installation_not_found: ${project}`);
+  const localExcludePath = gitExcludePath(project);
+  if (localExcludePath !== null) {
+    assertGitExcludeSafe(project, localExcludePath);
   }
+  const journalContext = {
+    assertGitExcludeSafe,
+    gitExcludePath: localExcludePath,
+    project,
+  };
+  const plannedOriginals = new Map();
+  const plannedTargetState = (target) => {
+    const key = `${target.scope}:${target.path}`;
+    if (!plannedOriginals.has(key)) {
+      plannedOriginals.set(
+        key,
+        observeInstallerTarget(project, target, journalContext),
+      );
+    }
+    return plannedOriginals.get(key);
+  };
+  const manifestTarget = projectFileTarget(
+    ".herdr-orchestrator/manifest.json",
+  );
+  const recovery = reconcileInstallerJournal(journalContext);
+  if (!existsSync(manifestPath)) {
+    if (recovery.active && recovery.command === "uninstall") {
+      writeUninstallResult(project, recovery.command_result);
+      return;
+    }
+    const preserved = listManagedRootEntries(project);
+    writeUninstallResult(project, {
+      local_exclude: unownedLocalExcludeStatus(localExcludePath),
+      ok: preserved.length === 0,
+      preserved,
+    });
+    return;
+  }
+  const plannedManifestOriginal = plannedTargetState(manifestTarget);
+  const localExcludeTarget = localExcludePath === null
+    ? null
+    : gitExcludeTarget(localExcludePath);
+  const plannedLocalExcludeOriginal = localExcludeTarget === null
+    ? null
+    : plannedTargetState(localExcludeTarget);
   const manifest = loadManifest(project);
   const managedSkill = Object.keys(manifest.files).some((relativePath) =>
     relativePath.startsWith(".agents/skills/herdr-orchestrator/")
   );
   const preserved = [];
-  for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
+  const removals = [];
+  const originalStates = new Map();
+  const manifestModesUnknown = manifestModesAreUnknown(manifest);
+  const manifestFileModes = fileModesForManifest(manifest);
+  for (const [relativePath, expectedHash] of Object.entries(manifest.files).sort()) {
     assertNoSymlink(project, relativePath);
-    const target = join(project, relativePath);
-    if (!existsSync(target)) {
+    const target = projectFileTarget(relativePath);
+    const original = plannedTargetState(target);
+    originalStates.set(relativePath, original);
+    if (original.kind === "absent") {
       continue;
     }
-    if (sha256(readFileSync(target)) === expectedHash) {
-      unlinkSync(target);
+    if (manifestModesUnknown) {
+      preserved.push(relativePath);
+      continue;
+    }
+    if (
+      original.digest === expectedHash
+      && (
+        manifestFileModes[relativePath] === undefined
+        || original.mode === manifestFileModes[relativePath]
+      )
+    ) {
+      removals.push(relativePath);
     } else {
       preserved.push(relativePath);
     }
   }
-  unlinkSync(manifestPath);
-  for (const relativePath of [
-    ".herdr-orchestrator/profiles/harnesses",
-    ".herdr-orchestrator/profiles",
-    ".herdr-orchestrator/manager",
-    ".herdr-orchestrator/workflows/prompts",
-    ".herdr-orchestrator/workflows",
-    ".herdr-orchestrator",
-    ".agents/skills/herdr-orchestrator",
-    ".orchestrator",
-  ]) {
-    try {
-      rmdirSync(join(project, relativePath));
-    } catch (error) {
-      if (!["ENOENT", "ENOTEMPTY"].includes(error.code)) {
-        throw error;
-      }
+  const localExclude = desiredUninstallGitExclude(
+    project,
+    localExcludePath,
+    managedSkill,
+    removals,
+  );
+  const removalSet = new Set(removals);
+  const participants = [];
+  for (const relativePath of Object.keys(manifest.files).sort()) {
+    const original = originalStates.get(relativePath);
+    participants.push({
+      desired: removalSet.has(relativePath) ? installerFileState(null) : original,
+      desiredContent: null,
+      original,
+      target: projectFileTarget(relativePath),
+    });
+  }
+  if (localExcludePath !== null) {
+    const target = localExcludeTarget;
+    const original = plannedLocalExcludeOriginal;
+    participants.push({
+      desired: installerFileState(localExclude.content, original),
+      desiredContent: localExclude.content,
+      original,
+      target,
+    });
+  }
+  participants.push({
+    desired: installerFileState(null),
+    desiredContent: null,
+    original: plannedManifestOriginal,
+    target: manifestTarget,
+  });
+  for (const participant of participants) {
+    const actual = observeInstallerTarget(
+      project,
+      participant.target,
+      journalContext,
+    );
+    if (!installerStateEqual(actual, participant.original)) {
+      throw new Error(`installer_state_changed: ${installerTargetLabel(participant.target)}`);
     }
   }
-  const localExclude = removeLocalGitExcludesIfUnused(project, managedSkill);
-  const ok = preserved.length === 0;
-  process.stdout.write(`${JSON.stringify({
-    local_exclude: localExclude,
-    ok,
+  runInstallerTransaction({
+    ...journalContext,
+    command: "uninstall",
+    commandResult: {
+      local_exclude: localExclude.status,
+      ok: preserved.length === 0,
+      preserved: preserved.sort(),
+    },
+    harnesses: manifest.harnesses,
+    installSkill: previousSkillPreference(manifest),
+    packageVersion: packageVersion(),
+    participants,
+  });
+  writeUninstallResult(project, {
+    local_exclude: localExclude.status,
+    ok: preserved.length === 0,
     preserved: preserved.sort(),
-    project,
-  })}\n`);
-  if (!ok) {
-    process.exitCode = 1;
-  }
+  });
 }
 
 function renderWorkflow(harnesses) {
@@ -786,6 +1581,7 @@ ${workers}`;
 }
 
 function runRuntime(options) {
+  rejectWorkflowOverride(options.rest);
   const workflow = join(
     resolve(options.project),
     ".herdr-orchestrator/workflows/multi-harness.toml",

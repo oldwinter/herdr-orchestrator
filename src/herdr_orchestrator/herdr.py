@@ -6,20 +6,31 @@ import re
 import subprocess
 import threading
 import time
-from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from herdr_orchestrator import attempt_runtime
+from herdr_orchestrator.completion import (
+    CompletionPolicy,
+    FileReceiptSnapshot,
+    completion_policy_for,
+    failed_completion,
+    file_receipt_snapshot,
+    receipt_file_path,
+    snapshot_file_receipt,
+    snapshot_output_receipt,
+    verify_completion,
+    verify_legacy_receipt,
+)
 from herdr_orchestrator.herdr_layout import HerdrLayout, ProvisionedTerminal
 from herdr_orchestrator.model import (
     AgentState,
+    AttemptRuntime,
     DispatchContext,
     DispatchOutcome,
     Harness,
     PlacementTarget,
-    ReceiptKind,
     TaskReceipt,
 )
 from herdr_orchestrator.protocol import (
@@ -35,14 +46,12 @@ CONTROL_TIMEOUT_SECONDS = 10
 START_TIMEOUT_MS = 120_000
 START_RECOVERY_TIMEOUT_MS = 120_000
 SHELL_READY_TIMEOUT_SECONDS = 10
-AGENT_POST_START_SETTLE_SECONDS = 3
 AGENT_INTERACTIVE_READY_TIMEOUT_SECONDS = 10
 PROMPT_COMMAND_GRACE_SECONDS = 1
 PROMPT_ENTER_RETRIES = 2
 SETTLED_CONFIRMATION_POLLS = 6
 SETTLED_STATES = {AgentState.IDLE, AgentState.DONE}
 PROMPT_TIMEOUT_ERRORS = {"herdr_timeout", "timeout"}
-OUTPUT_RECEIPT_UI_MARKERS = {"\u26ec", "⧬", "⏺", "•", "●", "◆", "◇", "✦"}
 CLAUDE_WORKSPACE_TRUST_MARKERS = (
     "Accessing workspace:",
     "Quick safety check:",
@@ -90,13 +99,6 @@ MAXIMUM_AUTOMATION_ARGUMENTS: dict[Harness, tuple[str, ...]] = {
     Harness.CLAUDE: ("--dangerously-skip-permissions",),
     Harness.HERMES: ("--yolo", "--accept-hooks"),
 }
-
-
-@dataclass(frozen=True, slots=True)
-class _FileReceiptSnapshot:
-    exists: bool
-    size: int | None
-    sha256: str | None
 
 
 class HerdrTransport:
@@ -178,10 +180,15 @@ class HerdrTransport:
             harness.value,
             agent_name or harness.value,
         )
+        completion_policy = completion_policy_for(
+            dispatch_context.receipt,
+            dispatch_context.completion_identity,
+        )
         name = agent_name or stable_agent_name(self.workflow_name, self.workspace, harness)
         pane_id: str | None = None
         workspace_id: str | None = None
         state: AgentState | None = None
+        reused = False
         dispatch_started = time.monotonic()
         phase_timings_ms: dict[str, int] = {}
         try:
@@ -201,45 +208,79 @@ class HerdrTransport:
                 )
             finally:
                 self._provision_lock.release()
-            phase_timings_ms["provision_ready"] = _elapsed_ms(provision_started)
-            receipt_baseline_started = time.monotonic()
-            receipt_output_before = self._snapshot_output_receipt(
+            phase_timings_ms["provision_ready"] = attempt_runtime.elapsed_ms(provision_started)
+            execution_path = str(self._layout.execution_workspace(dispatch_context))
+            reporter = attempt_runtime.AttemptReporter(
+                dispatch_context,
                 name,
-                dispatch_context.receipt,
+                pane_id,
+                workspace_id,
+                execution_path,
+                reused,
             )
-            receipt_file_before = self._snapshot_file_receipt(
+            receipt_baseline_started = time.monotonic()
+            receipt_output_before = snapshot_output_receipt(
+                dispatch_context.receipt,
+                dispatch_context.completion_identity,
+                lambda: self._read_receipt_output(name),
+            )
+            receipt_file_before = snapshot_file_receipt(
                 dispatch_context.receipt,
                 self._layout.execution_workspace(dispatch_context),
             )
-            phase_timings_ms["receipt_baseline"] = _elapsed_ms(receipt_baseline_started)
+            phase_timings_ms["receipt_baseline"] = attempt_runtime.elapsed_ms(
+                receipt_baseline_started
+            )
             turn_started = time.monotonic()
             try:
-                state = self._prompt(name, harness, prompt, timeout_seconds)
+                settled = self._prompt(
+                    name,
+                    harness,
+                    prompt,
+                    timeout_seconds,
+                    reporter=reporter,
+                )
+                state = _agent_state(settled)
             finally:
-                phase_timings_ms["turn_settlement"] = _elapsed_ms(turn_started)
+                phase_timings_ms["turn_settlement"] = attempt_runtime.elapsed_ms(turn_started)
+            reporter.settled(state, sequence=_state_change_sequence(settled))
+            self._raise_for_runtime_error(name, harness, state)
+            if state is AgentState.BLOCKED:
+                raise TransportError("agent_blocked")
             receipt_verification_started = time.monotonic()
-            task_verified: bool | None
             try:
-                if dispatch_context.receipt is not None and state not in SETTLED_STATES:
-                    task_verified = False
+                if (
+                    completion_policy is not CompletionPolicy.LEGACY_UNVERIFIED
+                    and state not in SETTLED_STATES
+                ):
+                    completion = failed_completion(completion_policy, "agent_not_settled")
                 else:
-                    task_verified = self._verify_task_receipt(
-                        name,
+                    completion = verify_completion(
                         dispatch_context.receipt,
+                        dispatch_context.completion_identity,
                         self._layout.execution_workspace(dispatch_context),
                         prompt=prompt,
                         output_before=receipt_output_before,
                         file_before=receipt_file_before,
+                        read_output=lambda: self._read_receipt_output(name),
                     )
             finally:
-                phase_timings_ms["receipt_verification"] = _elapsed_ms(receipt_verification_started)
+                phase_timings_ms["receipt_verification"] = attempt_runtime.elapsed_ms(
+                    receipt_verification_started
+                )
+            reporter.receipt_observed(
+                state,
+                completion.task_verified,
+                completion=completion,
+            )
         except TransportError as exc:
-            phase_timings_ms["total"] = _elapsed_ms(dispatch_started)
+            completion = failed_completion(completion_policy, exc.code)
+            phase_timings_ms["total"] = attempt_runtime.elapsed_ms(dispatch_started)
             terminal = self._created_terminals.get(name)
             return DispatchOutcome(
                 agent_name=name,
                 state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
-                member_reused=terminal is None,
+                member_reused=reused,
                 pane_id=terminal.pane_id if terminal is not None else pane_id,
                 error_code=exc.code,
                 placement=dispatch_context.placement,
@@ -251,12 +292,13 @@ class HerdrTransport:
                 herdr_workspace_id=(
                     terminal.workspace_id if terminal is not None else workspace_id
                 ),
-                task_verified=(False if dispatch_context.receipt is not None else None),
+                task_verified=completion.task_verified,
                 error_summary=exc.summary,
                 agent_settled=(exc.agent_settled or state in SETTLED_STATES),
                 phase_timings_ms=phase_timings_ms,
+                completion=completion,
             )
-        phase_timings_ms["total"] = _elapsed_ms(dispatch_started)
+        phase_timings_ms["total"] = attempt_runtime.elapsed_ms(dispatch_started)
         return DispatchOutcome(
             name,
             state,
@@ -265,10 +307,40 @@ class HerdrTransport:
             placement=dispatch_context.placement,
             execution_path=str(self._layout.execution_workspace(dispatch_context)),
             herdr_workspace_id=workspace_id,
-            task_verified=task_verified,
+            error_code=completion.error_code,
+            task_verified=completion.task_verified,
             agent_settled=state in SETTLED_STATES,
             phase_timings_ms=phase_timings_ms,
+            completion=completion,
         )
+
+    def recover(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        agent_name: str,
+        context: DispatchContext,
+        runtime: AttemptRuntime,
+    ) -> DispatchOutcome:
+        del prompt
+        previous = getattr(self._dispatch_deadline, "value", None)
+        self._dispatch_deadline.value = time.monotonic() + timeout_seconds
+        try:
+            return attempt_runtime.recover_turn(
+                self,
+                harness,
+                timeout_seconds=timeout_seconds,
+                agent_name=agent_name,
+                context=context,
+                runtime=runtime,
+            )
+        finally:
+            if previous is None:
+                del self._dispatch_deadline.value
+            else:
+                self._dispatch_deadline.value = previous
 
     def read_agent(self, name: str, *, lines: int = 120) -> str:
         return run_text(
@@ -299,8 +371,38 @@ class HerdrTransport:
         expected_pane_id: str | None = None,
         context: DispatchContext | None = None,
     ) -> DispatchOutcome:
+        previous = getattr(self._dispatch_deadline, "value", None)
+        self._dispatch_deadline.value = time.monotonic() + timeout_seconds
+        try:
+            return self._respond_with_active_deadline(
+                name,
+                harness,
+                response,
+                timeout_seconds=timeout_seconds,
+                expected_pane_id=expected_pane_id,
+                context=context,
+            )
+        finally:
+            if previous is None:
+                del self._dispatch_deadline.value
+            else:
+                self._dispatch_deadline.value = previous
+
+    def _respond_with_active_deadline(
+        self,
+        name: str,
+        harness: Harness,
+        response: str,
+        *,
+        timeout_seconds: int,
+        expected_pane_id: str | None,
+        context: DispatchContext | None,
+    ) -> DispatchOutcome:
         pane_id = expected_pane_id
         workspace_id: str | None = None
+        receipt = context.receipt if context is not None else None
+        completion_identity = context.completion_identity if context is not None else None
+        completion_policy = completion_policy_for(receipt, completion_identity)
         try:
             self.check_environment()
             current, pane_id, workspace_id, execution_workspace = self._blocked_response_context(
@@ -309,45 +411,61 @@ class HerdrTransport:
                 expected_pane_id=expected_pane_id,
                 context=context,
             )
-            receipt = context.receipt if context is not None else None
-            output_before = self._snapshot_output_receipt(name, receipt)
-            file_before = self._snapshot_file_receipt(receipt, execution_workspace)
+            output_before = snapshot_output_receipt(
+                receipt,
+                completion_identity,
+                lambda: self._read_receipt_output(name),
+            )
+            file_before = snapshot_file_receipt(receipt, execution_workspace)
             baseline_sequence = _state_change_sequence(current)
-            run_json(
-                self.runner,
-                Command(
-                    ["herdr", "pane", "send-text", pane_id, response],
-                    self.workspace,
-                    CONTROL_TIMEOUT_SECONDS,
-                ),
-            )
-            run_json(
-                self.runner,
-                Command(
-                    ["herdr", "agent", "send-keys", name, "enter"],
-                    self.workspace,
-                    CONTROL_TIMEOUT_SECONDS,
-                ),
-            )
-            state = self._wait_after_blocked_response(
+            reporter = attempt_runtime.AttemptReporter(
+                context,
                 name,
-                harness,
+                pane_id,
+                workspace_id,
+                str(execution_workspace),
+                True,
+            )
+            reporter.runtime_acquired(current, baseline_sequence)
+            state, settlement_sequence = attempt_runtime.submit_blocked_response(
+                self,
+                name,
+                pane_id,
+                response,
                 baseline_sequence,
                 timeout_seconds,
+                on_acceptance=lambda agent: reporter.prompt_accepted(
+                    agent,
+                    baseline_sequence=baseline_sequence,
+                    accepted_sequence=_state_change_sequence(agent),
+                ),
             )
-            task_verified: bool | None
-            if receipt is not None and state not in SETTLED_STATES:
-                task_verified = False
+            reporter.settled(state, sequence=settlement_sequence)
+            self._raise_for_runtime_error(name, harness, state)
+            if state is AgentState.BLOCKED:
+                raise TransportError("agent_blocked")
+            if (
+                completion_policy is not CompletionPolicy.LEGACY_UNVERIFIED
+                and state not in SETTLED_STATES
+            ):
+                completion = failed_completion(completion_policy, "agent_not_settled")
             else:
-                task_verified = self._verify_task_receipt(
-                    name,
+                completion = verify_completion(
                     receipt,
+                    completion_identity,
                     execution_workspace,
                     prompt=response,
                     output_before=output_before,
                     file_before=file_before,
+                    read_output=lambda: self._read_receipt_output(name),
                 )
+            reporter.receipt_observed(
+                state,
+                completion.task_verified,
+                completion=completion,
+            )
         except TransportError as exc:
+            completion = failed_completion(completion_policy, exc.code)
             return DispatchOutcome(
                 agent_name=name,
                 state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
@@ -359,9 +477,10 @@ class HerdrTransport:
                     str(self._layout.execution_workspace(context)) if context is not None else None
                 ),
                 herdr_workspace_id=workspace_id,
-                task_verified=(False if context is not None and context.receipt else None),
+                task_verified=completion.task_verified,
                 error_summary=exc.summary,
                 agent_settled=exc.agent_settled,
+                completion=completion,
             )
         return DispatchOutcome(
             name,
@@ -371,8 +490,10 @@ class HerdrTransport:
             placement=context.placement if context is not None else None,
             execution_path=str(execution_workspace),
             herdr_workspace_id=workspace_id,
-            task_verified=task_verified,
+            error_code=completion.error_code,
+            task_verified=completion.task_verified,
             agent_settled=state in SETTLED_STATES,
+            completion=completion,
         )
 
     def _blocked_response_context(
@@ -416,39 +537,6 @@ class HerdrTransport:
                 execution_workspace=execution_workspace,
             )
         return current, pane_id, workspace_id, execution_workspace
-
-    def _wait_after_blocked_response(
-        self,
-        name: str,
-        harness: Harness,
-        baseline_sequence: int,
-        timeout_seconds: int,
-    ) -> AgentState:
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            current = _agent_payload(
-                run_json(
-                    self.runner,
-                    Command(
-                        ["herdr", "agent", "get", name],
-                        self.workspace,
-                        CONTROL_TIMEOUT_SECONDS,
-                    ),
-                )
-            )
-            state = _agent_state(current)
-            sequence = _state_change_sequence(current)
-            if sequence > baseline_sequence and state in {
-                AgentState.IDLE,
-                AgentState.DONE,
-                AgentState.BLOCKED,
-            }:
-                state = self._confirm_stable_settlement(name, state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
-            if time.monotonic() >= deadline:
-                raise TransportError("herdr_timeout")
-            self.sleeper(0.5)
 
     def close_created_agent(self, name: str) -> None:
         terminal = self._created_terminals.pop(name, None)
@@ -576,7 +664,18 @@ class HerdrTransport:
                 raise
         else:
             agent = _agent_payload(result)
-            _validate_reusable_agent(agent, name, harness, execution_workspace)
+            expected_workspace_id = (
+                self._layout.workspace_id
+                if context.placement is not PlacementTarget.WORKTREE
+                else None
+            )
+            _validate_reusable_agent(
+                agent,
+                name,
+                harness,
+                execution_workspace,
+                expected_workspace_id=expected_workspace_id,
+            )
             if refresh_visible_label:
                 self._layout.refresh_visible_label(agent, context)
             pane_id = _non_empty_string(agent, "pane_id")
@@ -622,7 +721,7 @@ class HerdrTransport:
                     ),
                 )
             self._sleep_until(
-                AGENT_POST_START_SETTLE_SECONDS,
+                3,
                 getattr(self._dispatch_deadline, "value", float("inf")),
             )
             started_agent = self._wait_for_interactive_agent(name, harness, pane_id)
@@ -839,7 +938,9 @@ class HerdrTransport:
         harness: Harness,
         prompt: str,
         timeout_seconds: float,
-    ) -> AgentState:
+        *,
+        reporter: attempt_runtime.AttemptReporter,
+    ) -> Mapping[str, Any]:
         before = _agent_payload(
             run_json(
                 self.runner,
@@ -851,6 +952,21 @@ class HerdrTransport:
             )
         )
         baseline_sequence = _state_change_sequence(before)
+        reporter.runtime_acquired(before, baseline_sequence)
+        acceptance_reported = False
+
+        def report_acceptance(agent: Mapping[str, Any]) -> None:
+            nonlocal acceptance_reported
+            sequence = _state_change_sequence(agent)
+            if acceptance_reported or sequence <= baseline_sequence:
+                return
+            acceptance_reported = True
+            reporter.prompt_accepted(
+                agent,
+                baseline_sequence=baseline_sequence,
+                accepted_sequence=sequence,
+            )
+
         deadline = getattr(
             self._dispatch_deadline,
             "value",
@@ -907,7 +1023,7 @@ class HerdrTransport:
                     raise
                 raise TransportError(
                     "prompt_acceptance_timeout",
-                    summary=_prompt_acceptance_summary(
+                    summary=attempt_runtime.prompt_acceptance_summary(
                         acceptance_started,
                         baseline_sequence,
                         None,
@@ -918,7 +1034,7 @@ class HerdrTransport:
             if exc.code in PROMPT_TIMEOUT_ERRORS and sequence <= baseline_sequence:
                 raise TransportError(
                     "prompt_acceptance_timeout",
-                    summary=_prompt_acceptance_summary(
+                    summary=attempt_runtime.prompt_acceptance_summary(
                         acceptance_started,
                         sequence,
                         state,
@@ -930,14 +1046,13 @@ class HerdrTransport:
                 sequence = _state_change_sequence(stalled)
             if sequence <= baseline_sequence:
                 raise TransportError("agent_turn_not_observed") from exc
+            report_acceptance(stalled)
             if state in {
                 AgentState.IDLE,
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                state = self._confirm_stable_settlement(name, state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
+                return self._confirm_stable_settlement(name, stalled, deadline)
             if state is not AgentState.WORKING:
                 raise TransportError("agent_not_settled") from exc
         else:
@@ -945,14 +1060,13 @@ class HerdrTransport:
             sequence = _state_change_sequence(prompted)
             if sequence <= baseline_sequence:
                 raise TransportError("agent_turn_not_observed")
+            report_acceptance(prompted)
             if state in {
                 AgentState.IDLE,
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                state = self._confirm_stable_settlement(name, state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
+                return self._confirm_stable_settlement(name, prompted, deadline)
             if state is not AgentState.WORKING:
                 raise TransportError("agent_not_settled")
 
@@ -976,9 +1090,7 @@ class HerdrTransport:
                 AgentState.DONE,
                 AgentState.BLOCKED,
             }:
-                state = self._confirm_stable_settlement(name, state, deadline)
-                self._raise_for_runtime_error(name, harness, state)
-                return state
+                return self._confirm_stable_settlement(name, current, deadline)
             self._sleep_until(0.5, deadline)
 
     def _resubmit_enter_until_turn(
@@ -1014,11 +1126,12 @@ class HerdrTransport:
     def _confirm_stable_settlement(
         self,
         name: str,
-        state: AgentState,
+        current: Mapping[str, Any],
         deadline: float,
-    ) -> AgentState:
+    ) -> Mapping[str, Any]:
+        state = _agent_state(current)
         if state is AgentState.BLOCKED:
-            return state
+            return current
 
         confirmations = 0
         while confirmations < self.settled_confirmation_polls:
@@ -1037,12 +1150,12 @@ class HerdrTransport:
             )
             state = _agent_state(current)
             if state is AgentState.BLOCKED:
-                return state
+                return current
             if state in SETTLED_STATES:
                 confirmations += 1
             else:
                 confirmations = 0
-        return state
+        return current
 
     def _raise_for_runtime_error(
         self,
@@ -1105,84 +1218,19 @@ class HerdrTransport:
         *,
         prompt: str,
         output_before: str | None,
-        file_before: _FileReceiptSnapshot | None,
+        file_before: FileReceiptSnapshot | None,
     ) -> bool | None:
-        if receipt is None:
-            return None
-        if receipt.kind is ReceiptKind.OUTPUT_PREFIX:
-            if any(_line_starts_with_receipt(line, receipt.value) for line in prompt.splitlines()):
-                raise TransportError("task_receipt_ambiguous")
-            output = self._read_receipt_output(name)
-            if not any(
-                _line_starts_with_receipt(line, receipt.value)
-                for line in _lines_after_snapshot(output_before or "", output)
-            ):
-                raise TransportError("task_receipt_missing")
-            return True
-        if receipt.kind is ReceiptKind.FILE:
-            candidate = self._receipt_file_path(receipt, execution_workspace)
-            current = self._file_receipt_snapshot(candidate)
-            if not current.exists:
-                raise TransportError("task_receipt_missing")
-            if current.size == 0:
-                raise TransportError("task_receipt_invalid")
-            if file_before == current:
-                raise TransportError("task_receipt_stale")
-            return True
-        raise TransportError("task_receipt_kind_invalid")
-
-    def _snapshot_output_receipt(
-        self,
-        name: str,
-        receipt: TaskReceipt | None,
-    ) -> str | None:
-        if receipt is None or receipt.kind is not ReceiptKind.OUTPUT_PREFIX:
-            return None
-        return self._read_receipt_output(name)
-
-    def _snapshot_file_receipt(
-        self,
-        receipt: TaskReceipt | None,
-        execution_workspace: Path,
-    ) -> _FileReceiptSnapshot | None:
-        if receipt is None or receipt.kind is not ReceiptKind.FILE:
-            return None
-        candidate = self._receipt_file_path(receipt, execution_workspace)
-        return self._file_receipt_snapshot(candidate)
-
-    @staticmethod
-    def _receipt_file_path(
-        receipt: TaskReceipt,
-        execution_workspace: Path,
-    ) -> Path:
-        relative = Path(receipt.value)
-        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
-            raise TransportError("task_receipt_path_invalid")
-        root = execution_workspace.resolve()
-        unresolved = root / relative
-        current = root
-        for part in relative.parts:
-            current /= part
-            if current.is_symlink():
-                raise TransportError("task_receipt_path_invalid")
-        candidate = unresolved.resolve()
-        if not candidate.is_relative_to(root):
-            raise TransportError("task_receipt_path_invalid")
-        return candidate
-
-    @staticmethod
-    def _file_receipt_snapshot(candidate: Path) -> _FileReceiptSnapshot:
-        if not candidate.is_file():
-            return _FileReceiptSnapshot(False, None, None)
-        try:
-            content = candidate.read_bytes()
-        except OSError as exc:
-            raise TransportError("task_receipt_unreadable") from exc
-        return _FileReceiptSnapshot(
-            True,
-            len(content),
-            hashlib.sha256(content).hexdigest(),
+        return verify_legacy_receipt(
+            receipt,
+            execution_workspace,
+            prompt=prompt,
+            output_before=output_before,
+            file_before=file_before,
+            read_output=lambda: self._read_receipt_output(name),
         )
+
+    _receipt_file_path = staticmethod(receipt_file_path)
+    _file_receipt_snapshot = staticmethod(file_receipt_snapshot)
 
     def _read_receipt_output(self, name: str) -> str:
         return run_text(
@@ -1211,58 +1259,21 @@ def _matched_error_summary(output: str, pattern: re.Pattern[str]) -> str:
     return re.sub(r"\s+", " ", match.group(0)).strip()[:300]
 
 
-def _elapsed_ms(started: float) -> int:
-    return max(0, int((time.monotonic() - started) * 1000))
-
-
-def _line_starts_with_receipt(line: str, receipt: str) -> bool:
-    normalized = line.strip()
-    if normalized.startswith(receipt):
-        return True
-    if normalized and normalized[0] in OUTPUT_RECEIPT_UI_MARKERS:
-        return normalized[1:].lstrip().startswith(receipt)
-    return False
-
-
-def _prompt_acceptance_summary(
-    started: float,
-    state_change_sequence: int,
-    state: AgentState | None,
-) -> str:
-    elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
-    state_value = state.value if state is not None else "unobserved"
-    return (
-        f"phase=prompt_acceptance elapsed_ms={elapsed_ms} "
-        f"state={state_value} state_change_seq={state_change_sequence}"
-    )
-
-
-def _lines_after_snapshot(before: str, after: str) -> list[str]:
-    before_lines = before.splitlines()
-    after_lines = after.splitlines()
-    if not before_lines:
-        return after_lines
-    for overlap in range(min(len(before_lines), len(after_lines)), 0, -1):
-        if before_lines[-overlap:] == after_lines[:overlap]:
-            return after_lines[overlap:]
-    remaining = Counter(before_lines)
-    fresh: list[str] = []
-    for line in after_lines:
-        if remaining[line] > 0:
-            remaining[line] -= 1
-        else:
-            fresh.append(line)
-    return fresh
-
-
 def stable_agent_name(workflow_name: str, workspace: Path, harness: Harness) -> str:
     seed = f"{workflow_name}\0{workspace.resolve()}\0{harness.value}"
     digest = hashlib.sha256(seed.encode()).hexdigest()[:8]
     return f"ho-{harness.value}-{digest}"
 
 
-def doctor_agent_name(workflow_name: str, harness: Harness) -> str:
-    digest = hashlib.sha256(f"{workflow_name}\0doctor\0{harness.value}".encode()).hexdigest()[:6]
+def doctor_agent_name(
+    workflow_name: str,
+    harness: Harness,
+    workspace: Path | None = None,
+) -> str:
+    workspace_key = "" if workspace is None else str(workspace.resolve())
+    digest = hashlib.sha256(
+        f"{workflow_name}\0{workspace_key}\0doctor\0{harness.value}".encode()
+    ).hexdigest()[:6]
     return f"doctor-{harness.value}-{digest}"
 
 
@@ -1300,8 +1311,15 @@ def worktree_agent_name(
     return f"ho-{harness.value}-wt-{job_id}-{digest}"[:32].rstrip("-")
 
 
-def smoke_agent_name(workflow_name: str, harness: Harness) -> str:
-    digest = hashlib.sha256(f"{workflow_name}\0smoke\0{harness.value}".encode()).hexdigest()[:6]
+def smoke_agent_name(
+    workflow_name: str,
+    harness: Harness,
+    workspace: Path | None = None,
+) -> str:
+    workspace_key = "" if workspace is None else str(workspace.resolve())
+    digest = hashlib.sha256(
+        f"{workflow_name}\0{workspace_key}\0smoke\0{harness.value}".encode()
+    ).hexdigest()[:6]
     return f"smoke-{harness.value}-{digest}"
 
 
@@ -1348,12 +1366,24 @@ def _validate_reusable_agent(
     name: str,
     harness: Harness,
     workspace: Path,
+    *,
+    expected_workspace_id: str | None = None,
 ) -> None:
     live_name = agent.get("name")
     if live_name is not None and live_name != name:
         raise TransportError("agent_identity_mismatch")
     if agent.get("agent") != harness.value:
         raise TransportError("agent_identity_mismatch")
+    reported_workspace_id = agent.get("workspace_id")
+    if (
+        expected_workspace_id
+        and reported_workspace_id is not None
+        and (
+            not isinstance(reported_workspace_id, str)
+            or reported_workspace_id.strip() != expected_workspace_id
+        )
+    ):
+        raise TransportError("agent_workspace_mismatch")
     for key in ("cwd", "foreground_cwd"):
         value = agent.get(key)
         if not isinstance(value, str) or Path(value).resolve() != workspace:

@@ -8,23 +8,27 @@
 // without a browser or Cytoscape. Keep this file free of browser/DOM globals.
 
 function stateClass(value) {
-  return String(value || "unknown")
+  return (topologyText(value) || "unknown")
     .toLowerCase()
     .replaceAll("_", "-")
     .replace(/[^a-z0-9-]/g, "-");
 }
 
 function normalizedProjects(topology, workflow) {
-  if (Array.isArray(topology.projects) && topology.projects.length) {
-    return topology.projects;
+  const snapshot = topologyRecord(topology) ? topology : {};
+  const projects = topologyRecords(snapshot.projects);
+  if (projects.length) {
+    return projects.length === snapshot.projects.length ? snapshot.projects : projects;
   }
-  const workspaces = Array.isArray(topology.workspaces) ? topology.workspaces : [];
+  const workspaces = topologyRecords(snapshot.workspaces);
   if (!workspaces.length) return [];
+  const workflowLabel = topologyText(workflow);
+  const projectLabel = workflowLabel || "Project";
   return [{
-    project_id: `workflow:${workflow || "project"}`,
-    label: workflow || "Project",
+    project_id: `workflow:${projectLabel}`,
+    label: projectLabel,
     worktrees: workspaces.map((workspace) => {
-      const worktree = workspace.worktree || {};
+      const worktree = topologyRecord(workspace.worktree) ? workspace.worktree : {};
       return {
         worktree_id: workspace.workspace_id,
         workspace_id: workspace.workspace_id,
@@ -42,14 +46,20 @@ function topologyGraph(projects) {
   const elements = [];
   const layoutProjects = [];
   const counts = { projects: 0, worktrees: 0, tabs: 0, panes: 0 };
+  const usedIds = new Set();
 
-  projects.forEach((project, projectIndex) => {
-    const projectId = topologyId(
+  normalizedProjectRecords(projects).forEach((project, projectIndex) => {
+    const projectLabel = topologyText(
+      topologyIdentity(project.label, project.project_id),
+      "Project",
+    );
+    const projectId = uniqueTopologyId(
+      usedIds,
       "project",
-      project.project_id || project.label,
+      topologyIdentity(project.project_id, project.label),
       projectIndex,
     );
-    const worktrees = Array.isArray(project.worktrees) ? project.worktrees : [];
+    const worktrees = project.worktrees;
     const layoutProject = { id: projectId, worktrees: [] };
     layoutProjects.push(layoutProject);
     counts.projects += 1;
@@ -59,25 +69,31 @@ function topologyGraph(projects) {
         id: projectId,
         kind: "project",
         kindLabel: "Project",
-        label: project.label || project.project_id || "Project",
-        displayLabel: `PROJECT  ${project.label || project.project_id || "Project"}`,
-        identity: project.project_id || "",
+        label: projectLabel,
+        displayLabel: `PROJECT  ${projectLabel}`,
+        identity: topologyText(project.project_id),
         detail: `${worktrees.length} worktree${worktrees.length === 1 ? "" : "s"}`,
       },
       classes: "kind-project",
     });
 
     worktrees.forEach((worktree, worktreeIndex) => {
-      const worktreeId = topologyId(
+      const worktreeId = uniqueTopologyId(
+        usedIds,
         `${projectId}|worktree`,
-        worktree.worktree_id || worktree.workspace_id || worktree.label,
+        topologyIdentity(worktree.worktree_id, worktree.workspace_id, worktree.label),
         worktreeIndex,
       );
-      const tabs = Array.isArray(worktree.tabs) ? worktree.tabs : [];
+      const tabs = worktree.tabs;
       const layoutWorktree = { id: worktreeId, tabs: [] };
       layoutProject.worktrees.push(layoutWorktree);
-      const worktreeLabel = worktree.label || worktree.branch || worktree.workspace_id || "Workspace";
-      const branchLabel = worktree.branch ? `\n${worktree.branch}` : "";
+      const worktreeLabel = topologyText(
+        topologyIdentity(worktree.label, worktree.branch, worktree.workspace_id),
+        "Workspace",
+      );
+      const branch = topologyText(worktree.branch);
+      const path = topologyText(worktree.path);
+      const branchLabel = branch ? `\n${branch}` : "";
       counts.worktrees += 1;
       elements.push({
         group: "nodes",
@@ -88,25 +104,26 @@ function topologyGraph(projects) {
           kindLabel: "Worktree",
           label: worktreeLabel,
           displayLabel: `WORKTREE  ${worktreeLabel}${branchLabel}`,
-          identity: worktree.workspace_id || worktree.worktree_id || "",
-          detail: [worktree.branch, worktree.path].filter(Boolean).join(" · ") || "main workspace",
-          branch: worktree.branch || "",
-          path: worktree.path || "",
+          identity: topologyText(topologyIdentity(worktree.workspace_id, worktree.worktree_id)),
+          detail: [branch, path].filter(Boolean).join(" · ") || "main workspace",
+          branch,
+          path,
           linked: worktree.is_linked_worktree === true,
         },
         classes: `kind-worktree${worktree.is_linked_worktree === true ? " is-linked" : ""}`,
       });
 
       tabs.forEach((tab, tabIndex) => {
-        const tabId = topologyId(
+        const tabId = uniqueTopologyId(
+          usedIds,
           `${worktreeId}|tab`,
-          tab.tab_id || tab.label,
+          topologyIdentity(tab.tab_id, tab.label),
           tabIndex,
         );
-        const panes = Array.isArray(tab.panes) ? tab.panes : [];
+        const panes = tab.panes;
         const layoutTab = { id: tabId, panes: [] };
         layoutWorktree.tabs.push(layoutTab);
-        const tabLabel = tab.label || tab.tab_id || "Tab";
+        const tabLabel = topologyText(topologyIdentity(tab.label, tab.tab_id), "Tab");
         counts.tabs += 1;
         elements.push({
           group: "nodes",
@@ -117,20 +134,28 @@ function topologyGraph(projects) {
             kindLabel: "Tab",
             label: tabLabel,
             displayLabel: `TAB  ${tabLabel}`,
-            identity: tab.tab_id || "",
+            identity: topologyText(tab.tab_id),
             detail: `${panes.length} pane${panes.length === 1 ? "" : "s"}`,
           },
           classes: `kind-tab${tab.focused === true ? " is-focused" : ""}`,
         });
 
         panes.forEach((pane, paneIndex) => {
-          const agent = pane.agent || null;
-          const status = agent?.agent_status || pane.agent_status || "unknown";
+          const agent = topologyRecord(pane.agent) ? pane.agent : null;
+          const status = topologyText(
+            topologyIdentity(agent?.agent_status, pane.agent_status),
+            "unknown",
+          );
           const agentLabel = agent
-            ? agent.name || agent.agent || "agent"
-            : pane.agent || "shell";
-          const paneLabel = pane.pane_id || `Pane ${paneIndex + 1}`;
-          const paneId = topologyId(`${tabId}|pane`, pane.pane_id, paneIndex);
+            ? topologyText(topologyIdentity(agent.name, agent.agent), "agent")
+            : topologyText(pane.agent, "shell");
+          const paneLabel = topologyText(pane.pane_id, `Pane ${paneIndex + 1}`);
+          const paneId = uniqueTopologyId(
+            usedIds,
+            `${tabId}|pane`,
+            pane.pane_id,
+            paneIndex,
+          );
           layoutTab.panes.push(paneId);
           counts.panes += 1;
           elements.push({
@@ -142,11 +167,11 @@ function topologyGraph(projects) {
               kindLabel: "Pane",
               label: paneLabel,
               displayLabel: `${paneLabel}\n${agentLabel} · ${status}`,
-              identity: pane.pane_id || "",
+              identity: topologyText(pane.pane_id),
               detail: `${agentLabel} · ${status}`,
               agent: agentLabel,
               status,
-              cwd: pane.cwd || "",
+              cwd: topologyText(pane.cwd),
             },
             classes: [
               "kind-pane",
@@ -171,7 +196,7 @@ function topologyGraph(projects) {
 }
 
 function topologyPresetPositions(projects) {
-  const positions = {};
+  const positions = Object.create(null);
   const paneWidth = 218;
   const paneHeight = 78;
   const paneGapX = 36;
@@ -181,15 +206,22 @@ function topologyPresetPositions(projects) {
   const projectGapY = 230;
   let projectTop = 0;
 
-  projects.forEach((project) => {
+  topologyRecords(projects).forEach((project) => {
     let worktreeLeft = 0;
     let projectHeight = paneHeight;
+    const worktrees = topologyRecords(project.worktrees);
 
-    project.worktrees.forEach((worktree) => {
-      const tabSizes = worktree.tabs.map((tab) => {
-        if (!tab.panes.length) return { columns: 1, rows: 1, width: 190, height: 58 };
-        const columns = Math.min(2, tab.panes.length);
-        const rows = Math.ceil(tab.panes.length / columns);
+    worktrees.forEach((worktree) => {
+      const tabs = topologyRecords(worktree.tabs).map((tab) => ({
+        tab,
+        panes: Array.isArray(tab.panes)
+          ? tab.panes.filter((paneId) => typeof paneId === "string" && paneId)
+          : [],
+      }));
+      const tabSizes = tabs.map(({ panes }) => {
+        if (!panes.length) return { columns: 1, rows: 1, width: 190, height: 58 };
+        const columns = Math.min(2, panes.length);
+        const rows = Math.ceil(panes.length / columns);
         return {
           columns,
           rows,
@@ -202,23 +234,27 @@ function topologyPresetPositions(projects) {
         : 250;
       let tabTop = projectTop;
 
-      if (!worktree.tabs.length) {
-        positions[worktree.id] = {
-          x: worktreeLeft + worktreeWidth / 2,
-          y: tabTop + 41,
-        };
+      if (!tabs.length) {
+        if (typeof worktree.id === "string" && worktree.id) {
+          positions[worktree.id] = {
+            x: worktreeLeft + worktreeWidth / 2,
+            y: tabTop + 41,
+          };
+        }
         tabTop += 82;
       } else {
-        worktree.tabs.forEach((tab, tabIndex) => {
+        tabs.forEach(({ tab, panes }, tabIndex) => {
           const size = tabSizes[tabIndex];
-          if (!tab.panes.length) {
-            positions[tab.id] = {
-              x: worktreeLeft + worktreeWidth / 2,
-              y: tabTop + size.height / 2,
-            };
+          if (!panes.length) {
+            if (typeof tab.id === "string" && tab.id) {
+              positions[tab.id] = {
+                x: worktreeLeft + worktreeWidth / 2,
+                y: tabTop + size.height / 2,
+              };
+            }
           } else {
             const contentLeft = worktreeLeft + (worktreeWidth - size.width) / 2;
-            tab.panes.forEach((paneId, paneIndex) => {
+            panes.forEach((paneId, paneIndex) => {
               const column = paneIndex % size.columns;
               const row = Math.floor(paneIndex / size.columns);
               positions[paneId] = {
@@ -227,7 +263,7 @@ function topologyPresetPositions(projects) {
               };
             });
           }
-          tabTop += size.height + (tabIndex === worktree.tabs.length - 1 ? 0 : tabGapY);
+          tabTop += size.height + (tabIndex === tabs.length - 1 ? 0 : tabGapY);
         });
       }
 
@@ -236,8 +272,10 @@ function topologyPresetPositions(projects) {
       worktreeLeft += worktreeWidth + worktreeGapX;
     });
 
-    if (!project.worktrees.length) {
-      positions[project.id] = { x: 140, y: projectTop + 45 };
+    if (!worktrees.length) {
+      if (typeof project.id === "string" && project.id) {
+        positions[project.id] = { x: 140, y: projectTop + 45 };
+      }
       projectHeight = 90;
     }
     projectTop += projectHeight + projectGapY;
@@ -246,6 +284,77 @@ function topologyPresetPositions(projects) {
 }
 
 function topologyId(prefix, value, fallback) {
-  const identity = String(value || fallback).trim() || String(fallback);
-  return `${prefix}:${encodeURIComponent(identity)}`;
+  const fallbackIdentity = topologyText(fallback, "undefined");
+  const identity = topologyText(value).trim() || fallbackIdentity.trim();
+  const encoded = encodeURIComponent(identity).replace(/[!'()*]/g, (character) => (
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+  ));
+  return `${prefix}:${encoded}`;
+}
+
+function uniqueTopologyId(usedIds, prefix, value, fallback) {
+  const baseId = topologyId(prefix, value, fallback);
+  let id = baseId;
+  let duplicate = 2;
+  while (usedIds.has(id)) {
+    id = `${baseId}|duplicate:${duplicate}`;
+    duplicate += 1;
+  }
+  usedIds.add(id);
+  return id;
+}
+
+function topologyRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function topologyRecords(value) {
+  return Array.isArray(value) ? value.filter(topologyRecord) : [];
+}
+
+function topologyIdentity(...values) {
+  return values.find((value) => topologyText(value).trim());
+}
+
+function normalizedProjectRecords(projects) {
+  return topologyRecords(projects).map((project) => ({
+    ...project,
+    worktrees: topologyRecords(project.worktrees).map((worktree) => ({
+      ...worktree,
+      tabs: topologyRecords(worktree.tabs).map((tab) => ({
+        ...tab,
+        panes: topologyRecords(tab.panes),
+      })),
+    })),
+  }));
+}
+
+function wellFormedText(value) {
+  const input = typeof value === "string" ? value : "";
+  let output = "";
+  for (let index = 0; index < input.length; index += 1) {
+    const codeUnit = input.charCodeAt(index);
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      const next = input.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        output += input[index] + input[index + 1];
+        index += 1;
+      } else {
+        output += "\uFFFD";
+      }
+    } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+      output += "\uFFFD";
+    } else {
+      output += input[index];
+    }
+  }
+  return output;
+}
+
+function topologyText(value, fallback = "") {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === "object" || typeof value === "function" || typeof value === "symbol") {
+    return fallback;
+  }
+  return wellFormedText(String(value));
 }

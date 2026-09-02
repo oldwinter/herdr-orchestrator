@@ -11,14 +11,14 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     outputs:
-      security: ${{ steps.security.outcome }}
+      security: ${{ steps.bundle.outputs.security }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,60 +40,93 @@ jobs:
           uv sync --locked
       - name: Compile
         run: PYTHONPATH=src uv run python -m compileall -q src tests scripts
-      - name: Static quality gates
-        id: lint
+      - name: Installer crash matrix
+        id: installer-matrix
         continue-on-error: true
-        run: just lint
-      - name: Branch-aware coverage
-        id: coverage
+        run: just test-installer-crash-matrix
+      - name: Collect quality bundle
+        id: quality
         continue-on-error: true
-        run: just test-coverage
-      - name: Flaky-test detection
-        id: stability
-        continue-on-error: true
-        run: just test-stability
-      - name: Security review
-        id: security
-        continue-on-error: true
-        run: just security
-      - name: Package build metrics
-        id: build
-        continue-on-error: true
-        run: just build-metrics
-      - name: Profiling evidence
-        id: profiling
-        continue-on-error: true
-        run: just profile-tests
-      - name: Generate quality review
+        run: |
+          python3 scripts/quality_bundle.py run \
+            --all \
+            --commit "$GITHUB_SHA" \
+            --invocation "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --result "$RUNNER_TEMP/quality-result.json"
+      - name: Resolve quality bundle
+        id: bundle
         if: always()
-        run: just quality-summary
+        continue-on-error: true
+        env:
+          RESULT_PATH: ${{ runner.temp }}/quality-result.json
+          SUMMARY_PATH: ${{ github.workspace }}/.orchestrator/quality/summaries/${{ github.run_id }}-${{ github.run_attempt }}.md
+        run: |
+          printf 'result=%s\nsummary=%s\nsecurity=failure\nbundle=\n' \
+            "$RESULT_PATH" "$SUMMARY_PATH" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result_path = Path(os.environ["RESULT_PATH"])
+          result = json.loads(result_path.read_text(encoding="utf-8"))
+          manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+          security = next(
+              producer for producer in manifest["producers"] if producer["name"] == "security"
+          )
+          security_outcome = (
+              "success"
+              if security["outcome"] == "passed" and security["verification"] == "verified"
+              else "failure"
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              print(f"bundle={result['bundle']}", file=output)
+              print(f"security={security_outcome}", file=output)
+          PY
+      - name: Generate quality review
+        id: summary
+        if: always()
+        continue-on-error: true
+        env:
+          RESULT_PATH: ${{ steps.bundle.outputs.result }}
+          SUMMARY_PATH: ${{ steps.bundle.outputs.summary }}
+        run: |
+          mkdir -p "$(dirname "$SUMMARY_PATH")"
+          python3 scripts/quality_summary.py \
+            --root "$GITHUB_WORKSPACE/.orchestrator/quality" \
+            --result "$RESULT_PATH" \
+            --require-clean \
+            --output "$SUMMARY_PATH"
       - name: Upload quality evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: quality-${{ github.run_id }}
-          path: .orchestrator/quality/
+          name: quality-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.bundle.outputs.bundle }}
+            ${{ steps.bundle.outputs.summary }}
           include-hidden-files: true
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
-      - name: Enforce all outcomes
+      - name: Enforce quality manifest
         if: always()
         env:
-          BUILD: ${{ steps.build.outcome }}
-          COVERAGE: ${{ steps.coverage.outcome }}
-          LINT: ${{ steps.lint.outcome }}
-          PROFILING: ${{ steps.profiling.outcome }}
-          SECURITY: ${{ steps.security.outcome }}
-          STABILITY: ${{ steps.stability.outcome }}
+          INSTALLER_MATRIX: ${{ steps.installer-matrix.outcome }}
+          RESULT_PATH: ${{ steps.bundle.outputs.result }}
+          SUMMARY_STATUS: ${{ steps.summary.outcome }}
         run: |
-          printf 'lint=%s coverage=%s stability=%s security=%s build=%s profiling=%s\n' \
-            "$LINT" "$COVERAGE" "$STABILITY" "$SECURITY" "$BUILD" "$PROFILING"
-          test "$LINT" = success
-          test "$COVERAGE" = success
-          test "$STABILITY" = success
-          test "$SECURITY" = success
-          test "$BUILD" = success
-          test "$PROFILING" = success
+          set +e
+          python3 scripts/quality_bundle.py enforce \
+            --root "$GITHUB_WORKSPACE/.orchestrator/quality" \
+            --result "$RESULT_PATH" \
+            --require-full \
+            --require-clean
+          quality_status=$?
+          set -e
+          printf 'quality=%s summary=%s installer_matrix=%s\n' "$quality_status" "$SUMMARY_STATUS" "$INSTALLER_MATRIX"
+          test "$SUMMARY_STATUS" = success
+          test "$INSTALLER_MATRIX" = success
+          exit "$quality_status"
 
   pr-review:
     if: always() && github.event_name == 'pull_request'
@@ -108,7 +141,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: quality-${{ github.run_id }}
+          name: quality-${{ github.run_id }}-${{ github.run_attempt }}
           path: quality
       - name: Post automated review
         env:
@@ -118,10 +151,11 @@ jobs:
           {
             printf '## Automated quality review\n\n'
             printf 'Overall gate: **%s**\n\n' "$RESULT"
-            if test -f quality/summary.md; then
-              tail -n +2 quality/summary.md
+            summary="$(find quality/summaries -maxdepth 1 -type f -name '*.md' -print -quit 2>/dev/null || true)"
+            if test -n "$summary"; then
+              tail -n +2 "$summary"
             else
-              printf 'Quality artifacts were unavailable. Inspect the `test` job logs.\n'
+              printf 'Quality evidence was incomplete. Inspect the test job logs.\n'
             fi
           } > /tmp/quality-review.md
           gh pr comment "${{ github.event.pull_request.number }}" \
@@ -166,7 +200,10 @@ jobs:
     runs-on: [self-hosted, Linux, X64, herdr-orchestrator]
     timeout-minutes: 5
     outputs:
+      manager_name: ${{ steps.manager.outputs.name }}
       manager_publish: ${{ steps.manager.outputs.publish }}
+      manager_version: ${{ steps.manager.outputs.version }}
+      orchestrator_name: ${{ steps.orchestrator.outputs.name }}
       orchestrator_publish: ${{ steps.orchestrator.outputs.publish }}
       orchestrator_version: ${{ steps.orchestrator.outputs.version }}
     steps:
@@ -196,7 +233,7 @@ jobs:
     timeout-minutes: 5
     environment: npm
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -210,20 +247,76 @@ jobs:
         run: npm install --global npm@12.0.2
       - name: Install package metadata
         run: npm ci --ignore-scripts
-      - name: Publish orchestrator package
-        if: needs.release-plan.outputs.orchestrator_publish == 'true'
-        run: npm publish --access public
-      - name: Publish manager package
-        if: needs.release-plan.outputs.manager_publish == 'true'
-        run: npm publish --access public ./packages/herdr-manager
-      - name: Generate GitHub release notes
-        if: needs.release-plan.outputs.orchestrator_publish == 'true'
+      - name: Publish package versions
+        env:
+          MANAGER_NAME: ${{ needs.release-plan.outputs.manager_name }}
+          MANAGER_PUBLISH: ${{ needs.release-plan.outputs.manager_publish }}
+          MANAGER_VERSION: ${{ needs.release-plan.outputs.manager_version }}
+          ORCHESTRATOR_NAME: ${{ needs.release-plan.outputs.orchestrator_name }}
+          ORCHESTRATOR_PUBLISH: ${{ needs.release-plan.outputs.orchestrator_publish }}
+          ORCHESTRATOR_VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
+        run: |
+          if test "$ORCHESTRATOR_PUBLISH" = true; then
+            if ! npm publish --access public; then
+              printf '%s\n' 'orchestrator publish failed; registry verification will decide whether retry is needed'
+            fi
+          fi
+          if test "$MANAGER_PUBLISH" = true; then
+            if ! npm publish --access public ./packages/herdr-manager; then
+              printf '%s\n' 'manager publish failed; registry verification will decide whether retry is needed'
+            fi
+          fi
+      - name: Verify package versions
+        if: always() && !cancelled()
+        env:
+          MANAGER_NAME: ${{ needs.release-plan.outputs.manager_name }}
+          MANAGER_VERSION: ${{ needs.release-plan.outputs.manager_version }}
+          ORCHESTRATOR_NAME: ${{ needs.release-plan.outputs.orchestrator_name }}
+          ORCHESTRATOR_VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
+        run: |
+          set -eu
+          verify_version() {
+            name="$1"
+            version="$2"
+            actual="$(npm view "$name@$version" version 2>/dev/null || true)"
+            if test "$actual" != "$version"; then
+              printf 'registry version missing: %s@%s\n' "$name" "$version" >&2
+              return 1
+            fi
+          }
+          verify_version "$ORCHESTRATOR_NAME" "$ORCHESTRATOR_VERSION"
+          verify_version "$MANAGER_NAME" "$MANAGER_VERSION"
+
+  github-release:
+    if: >-
+      always() &&
+      !cancelled() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.release-plan.result == 'success' &&
+      (
+        needs.publish.result == 'success' ||
+        needs.publish.result == 'skipped'
+      )
+    needs: [release-plan, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure GitHub release exists
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
-        run: >-
-          gh release create "v$VERSION"
-          --repo "$GITHUB_REPOSITORY"
-          --target "$GITHUB_SHA"
-          --title "v$VERSION"
-          --generate-notes
+        run: |
+          set -eu
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf 'GitHub release v%s already exists\n' "$VERSION"
+          else
+            gh release create "v$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "v$VERSION" \
+              --generate-notes \
+              || gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null
+          fi

@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+from herdr_orchestrator.completion import (
+    CompletionIdentity,
+    CompletionPolicy,
+    CompletionResult,
+)
+from herdr_orchestrator.completion import (
+    ReceiptKind as ReceiptKind,
+)
+from herdr_orchestrator.completion import (
+    TaskReceipt as TaskReceipt,
+)
 
 
 class Harness(StrEnum):
@@ -30,6 +43,43 @@ class AgentState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class AttemptPhase(StrEnum):
+    CLAIMED = "claimed"
+    RUNTIME_ACQUIRED = "runtime_acquired"
+    PROMPT_ACCEPTED = "prompt_accepted"
+    SETTLED = "settled"
+    RECEIPT_OBSERVED = "receipt_observed"
+    OUTCOME_COMMITTED = "outcome_committed"
+    ABANDONED = "abandoned"
+    ATTENTION = "attention"
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRuntime:
+    agent_name: str
+    pane_id: str | None
+    herdr_workspace_id: str | None
+    execution_path: str | None
+    agent_session_id: str | None
+    prompt_baseline_sequence: int | None
+    prompt_accepted_sequence: int | None
+    state_change_sequence: int | None
+    phase: AttemptPhase = AttemptPhase.CLAIMED
+    agent_state: AgentState | None = None
+    agent_settled: bool | None = None
+    task_verified: bool | None = None
+    completion: CompletionResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptTransition:
+    job_id: int
+    attempt_id: int
+    attempt: int
+    operation_sequence: int
+    phase: AttemptPhase
+
+
 class PlacementMode(StrEnum):
     HYBRID = "hybrid"
     TAB = "tab"
@@ -41,11 +91,6 @@ class PlacementTarget(StrEnum):
     TAB = "tab"
     PANE = "pane"
     WORKTREE = "worktree"
-
-
-class ReceiptKind(StrEnum):
-    OUTPUT_PREFIX = "output-prefix"
-    FILE = "file"
 
 
 class TrackerBackend(StrEnum):
@@ -66,6 +111,18 @@ class CoordinatorConfig:
     lease_seconds: int
     max_attempts: int
     agent_timeout_seconds: int
+    readiness_ttl_seconds: int = 3600
+    readiness_cooldown_seconds: int = 300
+    readiness_probe_timeout_seconds: int = 30
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessHealthConfig:
+    """Bounded persistence policy for readiness evidence."""
+
+    ttl_seconds: int = 3600
+    cooldown_seconds: int = 300
+    probe_timeout_seconds: int = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +199,7 @@ class WorkflowConfig:
     profiles: tuple[HarnessProfile, ...]
     workers: tuple[WorkerConfig, ...]
     seed_jobs: tuple[SeedJobConfig, ...]
+    harness_health: HarnessHealthConfig = HarnessHealthConfig()
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,12 +212,8 @@ class NewJob:
     max_attempts: int
     placement: PlacementTarget | None = PlacementTarget.TAB
     receipt: TaskReceipt | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TaskReceipt:
-    kind: ReceiptKind
-    value: str
+    completion_policy: CompletionPolicy | None = None
+    workspace: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +230,16 @@ class ClaimedJob:
     placement: PlacementTarget
     receipt: TaskReceipt | None = None
     correlation_id: str = ""
+    attempt_id: int = 0
+    fencing_token: str = ""
+    lease_owner: str = ""
+    lease_until: float = 0.0
+    operation_token: str = ""
+    operation_sequence: int = 0
+    phase: AttemptPhase = AttemptPhase.CLAIMED
+    recovery: bool = False
+    runtime: AttemptRuntime | None = None
+    completion_policy: CompletionPolicy = CompletionPolicy.LEGACY_UNVERIFIED
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +257,27 @@ class DispatchOutcome:
     agent_settled: bool | None = None
     phase_timings_ms: dict[str, int] | None = None
     correlation_id: str = ""
+    completion: CompletionResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptProgress:
+    phase: AttemptPhase
+    agent_name: str
+    pane_id: str | None = None
+    herdr_workspace_id: str | None = None
+    execution_path: str | None = None
+    agent_session_id: str | None = None
+    prompt_baseline_sequence: int | None = None
+    prompt_accepted_sequence: int | None = None
+    state_change_sequence: int | None = None
+    agent_state: AgentState | None = None
+    member_reused: bool | None = None
+    agent_settled: bool | None = None
+    task_verified: bool | None = None
+    error_code: str | None = None
+    error_summary: str | None = None
+    completion: CompletionResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +289,8 @@ class DispatchContext:
     worktree_root: Path | None = None
     receipt: TaskReceipt | None = None
     correlation_id: str = ""
+    attempt_progress: Callable[[AttemptProgress], None] | None = None
+    completion_identity: CompletionIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)

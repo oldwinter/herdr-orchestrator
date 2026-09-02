@@ -20,7 +20,7 @@ just catalog
 just profile codex
 just seed
 just run-once
-just run-until-idle --drain-timeout-seconds 3600
+just run-until-idle --drain-timeout-seconds 86400
 just status
 ```
 
@@ -64,7 +64,7 @@ PYTHONPATH=src uv run python -m herdr_orchestrator enqueue \
 ## 运行、恢复与清理
 
 ```bash
-just run-until-idle --drain-timeout-seconds 3600
+just run-until-idle --drain-timeout-seconds 86400
 just status
 
 # failed job 追加一次 attempt budget

@@ -1,6 +1,6 @@
 {
   "name": "herdr-orchestrator",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Install and run durable multi-harness orchestration over Herdr",
   "keywords": [
     "agents",
@@ -40,7 +40,7 @@
   },
   "scripts": {
     "release:plan": "node scripts/npm-release-plan.mjs --package-json package.json",
-    "test": "python3 -m unittest tests.test_distribution tests.test_manager_light -v"
+    "test": "PYTHONPATH=src python3 -m unittest tests.test_distribution tests.test_manager_light -v"
   },
   "repository": {
     "type": "git",

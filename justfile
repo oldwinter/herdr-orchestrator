@@ -17,46 +17,42 @@ install-manager:
 doctor *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}} "$@"
 
+[positional-arguments]
+readiness-matrix *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator readiness-matrix --workflow {{workflow}} "$@"
+
 test:
-    @mkdir -p .orchestrator/quality
-    @PYTHONPATH=src uv run pytest tests --durations=0 --json-report --json-report-file=.orchestrator/quality/tests.json
+    @python3 scripts/quality_bundle.py run --producer test
 
 test-coverage:
-    @mkdir -p .orchestrator/quality
-    @PYTHONPATH=src uv run pytest tests --durations=0 --cov=herdr_orchestrator --cov-branch --cov-report=term-missing --cov-report=json:.orchestrator/quality/coverage.json --cov-fail-under=80 --json-report --json-report-file=.orchestrator/quality/tests.json
+    @python3 scripts/quality_bundle.py run --producer coverage
+
+test-installer-crash-matrix:
+    @PYTHONPATH=src uv run pytest tests/test_installer_journal.py -q -m installer_crash_matrix
+
+# The bundled coverage command excludes this marker; the crash matrix runs once below.
+# Keep the marker visible here so the stable command contract stays explicit: -m "not installer_crash_matrix".
 
 test-stability:
-    @PYTHONPATH=src uv run python scripts/test_stability.py --runs 3 --output .orchestrator/quality/stability.json
+    @python3 scripts/quality_bundle.py run --producer stability
 
 lint:
-    @uv run ruff check src tests scripts
-    @uv run black --check src tests scripts
-    @uv run mypy
-    @uv run pylint src/herdr_orchestrator --disable=all --enable=invalid-name,duplicate-code
-    @uv run vulture src tests scripts --min-confidence 90
-    @uv run xenon --max-absolute C --max-modules B --max-average A src
-    @uv run lint-imports
-    @uv run deptry src
-    @uv run python scripts/check_repository.py
-    @uv run python scripts/check_feature_flags.py
-    @uv run python scripts/check_docs.py
-    @uv run python scripts/generate_reference.py --check
+    @python3 scripts/quality_bundle.py run --producer lint
 
 security:
-    @mkdir -p .orchestrator/quality
-    @uv run detect-secrets-hook --baseline .secrets.baseline $(git ls-files --cached --others --exclude-standard)
-    @uv run bandit -q -r src -ll -f json -o .orchestrator/quality/bandit.json
-    @uv run pip-audit --local --format json --output .orchestrator/quality/pip-audit.json
+    @python3 scripts/quality_bundle.py run --producer security
 
 build-metrics:
-    @uv run python scripts/build_metrics.py --output .orchestrator/quality/build.json
+    @python3 scripts/quality_bundle.py run --producer build
 
 profile-tests:
-    @mkdir -p .orchestrator/quality
-    @PYTHONPATH=src uv run python -m cProfile -o .orchestrator/quality/tests.pstats -m pytest tests/test_protocol.py -q
+    @python3 scripts/quality_bundle.py run --producer profiling
 
-quality-summary:
-    @uv run python scripts/quality_summary.py --output .orchestrator/quality/summary.md
+quality-summary result="" output="":
+    @root="${QUALITY_EVIDENCE_ROOT:-.orchestrator/quality}"; result={{quote(result)}}; if test -z "$result"; then result="$(python3 scripts/quality_bundle.py latest-result --root "$root")"; fi; output={{quote(output)}}; if test -z "$output"; then output="${result%.json}.md"; fi; python3 scripts/quality_summary.py --result "$result" --root "$root" --output "$output"
+
+quality-enforce result:
+    @root="${QUALITY_EVIDENCE_ROOT:-.orchestrator/quality}"; python3 scripts/quality_bundle.py enforce --root "$root" --result {{quote(result)}} --require-full
 
 docs-generate:
     @uv run python scripts/generate_reference.py
@@ -68,13 +64,7 @@ docs-check:
 check:
     @uv sync --locked
     @PYTHONPATH=src {{python}} -m compileall -q src tests scripts
-    @just lint
-    @just test-coverage
-    @just test-stability
-    @just security
-    @just build-metrics
-    @just profile-tests
-    @just quality-summary
+    @just test-installer-crash-matrix || installer_status=$?; installer_status=${installer_status:-0}; root="${QUALITY_EVIDENCE_ROOT:-.orchestrator/quality}"; mkdir -p "$root/results"; result="$(mktemp "$root/results/check.XXXXXX.json")"; summary="${result%.json}.md"; set +e; python3 scripts/quality_bundle.py run --all --root "$root" --result "$result"; collect_status=$?; python3 scripts/quality_summary.py --result "$result" --root "$root" --output "$summary"; summary_status=$?; python3 scripts/quality_bundle.py enforce --result "$result" --root "$root" --require-full; enforce_status=$?; set -e; printf 'bundle=%s summary=%s collect=%s render=%s enforce=%s installer=%s\n' "$result" "$summary" "$collect_status" "$summary_status" "$enforce_status" "$installer_status"; if test "$installer_status" -ne 0; then exit "$installer_status"; fi; if test "$enforce_status" -ne 0; then exit "$enforce_status"; fi; if test "$summary_status" -ne 0; then exit "$summary_status"; fi; exit "$collect_status"
 
 seed:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator seed --workflow {{workflow}}

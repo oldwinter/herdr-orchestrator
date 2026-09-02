@@ -85,6 +85,7 @@ Task receipt 二选一：
     "succeeded": 2
   },
   "jobs": [],
+  "harness_health": {"eligible": [], "records": []},
   "workflow": "example"
 }
 ```
@@ -106,6 +107,7 @@ Task receipt 二选一：
 | `receipt_value` | string 或 null |
 | `agent_settled`, `task_verified` | boolean 或 null |
 | `correlation_id` | string 或 null |
+| `availability_reason` | pending 且 harness 当前不可选时的 stable reason；否则省略 |
 
 `status` 不输出 job prompt。
 
@@ -153,7 +155,7 @@ Task receipt 二选一：
 | `scope` | 固定为 `worker_pool` |
 | `idle` | worker 候选池是否达到 idle |
 | `worker_pool_idle`, `queue_idle` | 候选池与全 workflow queue 的独立判断 |
-| `reason` | `queue_idle|worker_pool_idle|blocked|drain_timeout` |
+| `reason` | `queue_idle|worker_pool_idle|blocked|degraded_capacity|drain_timeout` |
 | `waves`, `claimed` | wave 数与累计 claim 数 |
 | `queue` | 返回时全 workflow state 计数 |
 
@@ -276,7 +278,7 @@ GC 排除 worktree、未被本 workflow 拥有的 agent、仍被 active job 使�
 }
 ```
 
-实际 `checks[]` 的公共字段为 `check`、`ok`、`value`；readiness check 使用 `status`、`error_code`、`error_summary`、`duration_ms`、`phase_timings_ms`。探测状态可包括 `ready`、`auth_required`、`model_invalid`、`timeout`、`unavailable`、`error`。全部 check 通过时退出 `0`，否则退出 `1`。`--probe-timeout-seconds` 必须为 5–300；可重复 `--harness` 只探测已启用 harness。
+实际 `checks[]` 的公共字段为 `check`、`ok`、`value`；readiness check 使用 `status`、`error_code`、`error_summary`、`duration_ms`、`phase_timings_ms`。探测状态可包括 `ready`、`auth_required`、`model_invalid`、`timeout`、`unavailable`、`error`。输出还包含 additive `harness_health` projection，列出 status、eligibility、reason、source、age、expiry/cooldown 和 retryable count，不含 prompt 或 terminal output。全部 check 通过时退出 `0`，否则退出 `1`。`--probe-timeout-seconds` 必须为 5–300；可重复 `--harness` 只探测已启用 harness。
 
 #### `smoke`
 

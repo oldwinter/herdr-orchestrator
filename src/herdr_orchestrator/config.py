@@ -16,6 +16,7 @@ from herdr_orchestrator.catalog import (
 from herdr_orchestrator.model import (
     CoordinatorConfig,
     Harness,
+    HarnessHealthConfig,
     PlacementConfig,
     PlacementMode,
     PlacementTarget,
@@ -38,11 +39,18 @@ class ConfigError(ValueError):
 
 
 def load_workflow(path: str | Path) -> WorkflowConfig:
-    workflow_path = Path(path).expanduser().resolve()
+    try:
+        workflow_path = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ConfigError("workflow_path_invalid") from exc
     if not workflow_path.is_file():
         raise ConfigError(f"workflow_not_found: {workflow_path}")
     try:
-        raw = tomllib.loads(workflow_path.read_text(encoding="utf-8"))
+        text = workflow_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"workflow_invalid_encoding: {exc}") from exc
+    try:
+        raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"workflow_invalid_toml: {exc}") from exc
 
@@ -62,6 +70,8 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     )
 
     coordinator_raw = _table(raw, "coordinator")
+    health_raw = _optional_table(raw, "harness_health")
+    legacy_health_raw = _optional_table(raw, "readiness")
     coordinator = CoordinatorConfig(
         poll_seconds=_integer(coordinator_raw, "poll_seconds", minimum=1, maximum=3600),
         max_parallel=_integer(coordinator_raw, "max_parallel", minimum=1, maximum=16),
@@ -71,7 +81,37 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             coordinator_raw,
             "agent_timeout_seconds",
             minimum=10,
-            maximum=3600,
+            maximum=86400,
+        ),
+        readiness_ttl_seconds=_health_integer(
+            coordinator_raw,
+            legacy_health_raw,
+            health_raw,
+            "readiness_ttl_seconds",
+            aliases=("ttl_seconds", "evidence_ttl_seconds", "health_ttl_seconds"),
+            default=3600,
+            minimum=1,
+            maximum=604800,
+        ),
+        readiness_cooldown_seconds=_health_integer(
+            coordinator_raw,
+            legacy_health_raw,
+            health_raw,
+            "readiness_cooldown_seconds",
+            aliases=("cooldown_seconds", "health_cooldown_seconds", "degraded_cooldown_seconds"),
+            default=300,
+            minimum=1,
+            maximum=86400,
+        ),
+        readiness_probe_timeout_seconds=_health_integer(
+            coordinator_raw,
+            legacy_health_raw,
+            health_raw,
+            "readiness_probe_timeout_seconds",
+            aliases=("probe_timeout_seconds", "health_probe_timeout_seconds"),
+            default=30,
+            minimum=5,
+            maximum=300,
         ),
     )
     if coordinator.lease_seconds < coordinator.agent_timeout_seconds + 90:
@@ -112,6 +152,9 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
     planner_worker_harnesses = _optional_harness_list(planner_raw, "worker_harnesses")
     if any(harness not in harnesses for harness in planner_worker_harnesses):
         raise ConfigError("planner_worker_harness_has_no_worker")
+    planner_prompt = _existing_file(base, planner_raw, "prompt_file")
+    if not planner_prompt.is_relative_to(workspace):
+        raise ConfigError("planner_prompt_must_be_in_workspace")
     planner = PlannerConfig(
         enabled=_boolean(planner_raw, "enabled"),
         harness=_optional_harness(planner_raw, "harness"),
@@ -122,7 +165,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             minimum=60,
             maximum=86400,
         ),
-        prompt_file=_existing_file(base, planner_raw, "prompt_file"),
+        prompt_file=planner_prompt,
         output_file=planner_output,
         max_tasks=_integer(planner_raw, "max_tasks", minimum=1, maximum=100),
     )
@@ -132,6 +175,8 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         profiles_for_workers(profiles, workers)
         if planner.harness is not None:
             profile_for_harness(profiles, planner.harness)
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"profile_invalid_encoding: {exc}") from exc
     except CatalogError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -151,6 +196,11 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         profiles=profiles,
         workers=tuple(workers),
         seed_jobs=tuple(seed_jobs),
+        harness_health=HarnessHealthConfig(
+            ttl_seconds=coordinator.readiness_ttl_seconds,
+            cooldown_seconds=coordinator.readiness_cooldown_seconds,
+            probe_timeout_seconds=coordinator.readiness_probe_timeout_seconds,
+        ),
     )
 
 
@@ -274,8 +324,11 @@ def _load_seed_jobs(
 
 
 def _resolve_path(base: Path, value: str) -> Path:
-    candidate = Path(value).expanduser()
-    return (base / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    try:
+        candidate = Path(value).expanduser()
+        return (base / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError("path_invalid") from exc
 
 
 def _table(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -349,6 +402,32 @@ def _optional_integer(
     return value
 
 
+def _health_integer(
+    coordinator: Mapping[str, Any],
+    legacy: Mapping[str, Any],
+    current: Mapping[str, Any],
+    key: str,
+    *,
+    aliases: tuple[str, ...],
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Accept health policy in its dedicated table and older coordinator spellings."""
+    keys = (key, *aliases)
+    for source in (current, legacy, coordinator):
+        for candidate in keys:
+            if candidate in source:
+                return _optional_integer(
+                    source,
+                    candidate,
+                    default=default,
+                    minimum=minimum,
+                    maximum=maximum,
+                )
+    return default
+
+
 def _integer(
     data: Mapping[str, Any],
     key: str,
@@ -420,6 +499,7 @@ def _optional_placement(
     value = data.get(key, "auto")
     if not isinstance(value, str):
         raise ConfigError(f"{key}_must_be_placement_or_auto")
+    value = value.strip()
     if value == "auto":
         return None
     try:
@@ -451,10 +531,7 @@ def _optional_path(
     value = data.get(key, default)
     if not isinstance(value, str) or not value.strip() or len(value) > 4096:
         raise ConfigError(f"{key}_must_be_non_empty_string")
-    candidate = Path(value).expanduser()
-    if candidate.is_absolute():
-        return candidate.resolve()
-    return (workspace / candidate).resolve()
+    return _resolve_path(workspace, value.strip())
 
 
 def _enum_value[EnumValue: StrEnum](
@@ -466,6 +543,7 @@ def _enum_value[EnumValue: StrEnum](
     value = data.get(key, default.value)
     if not isinstance(value, str):
         raise ConfigError(f"{key}_must_be_string")
+    value = value.strip()
     try:
         return enum_type(value)
     except ValueError as exc:

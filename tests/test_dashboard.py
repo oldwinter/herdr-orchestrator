@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
+from copy import deepcopy
 from dataclasses import replace
 from http.client import HTTPConnection
 from pathlib import Path
@@ -20,7 +23,15 @@ from herdr_orchestrator.dashboard.observer import (
 )
 from herdr_orchestrator.dashboard.projector import RuntimeProjector
 from herdr_orchestrator.dashboard.server import DashboardServer, SnapshotFeed
-from herdr_orchestrator.model import Harness, NewJob, PlacementTarget
+from herdr_orchestrator.model import (
+    AgentState,
+    DispatchOutcome,
+    Harness,
+    NewJob,
+    PlacementTarget,
+    ReceiptKind,
+    TaskReceipt,
+)
 from herdr_orchestrator.store import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +62,63 @@ class FakeProjector:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_server_does_not_create_missing_state_db(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            path = Path(temporary) / "missing" / "state.db"
+            config = replace(base, state_db=path)
+
+            with self.assertRaisesRegex(ValueError, "dashboard_state_db_not_found"):
+                DashboardServer(config, port=0, projector=FakeProjector({}))
+
+            self.assertFalse(path.exists())
+            self.assertFalse(path.parent.exists())
+
+    def test_server_does_not_migrate_incompatible_state_db(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            path = Path(temporary) / "legacy.db"
+            Store(path).initialize()
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("UPDATE schema_meta SET version = 3")
+
+            config = replace(base, state_db=path)
+            server = None
+            try:
+                with self.assertRaisesRegex(ValueError, "dashboard_state_db_incompatible"):
+                    server = DashboardServer(config, port=0, projector=FakeProjector({}))
+            finally:
+                if server is not None:
+                    server.httpd.server_close()
+
+            with closing(sqlite3.connect(path)) as connection, connection:
+                version = connection.execute("SELECT version FROM schema_meta").fetchone()[0]
+            self.assertEqual(version, 3)
+
+    def test_server_opens_existing_state_db_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            path = Path(temporary) / "readonly.db"
+            Store(path).initialize()
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("PRAGMA journal_mode = DELETE")
+            before = path.stat().st_mtime_ns
+            path.chmod(0o444)
+            Path(temporary).chmod(0o555)
+            config = replace(base, state_db=path)
+            server = None
+            try:
+                server = DashboardServer(config, port=0, projector=FakeProjector({}))
+            finally:
+                if server is not None:
+                    server.httpd.server_close()
+                Path(temporary).chmod(0o700)
+                path.chmod(0o644)
+
+            self.assertEqual(path.stat().st_mtime_ns, before)
+            self.assertFalse(path.with_name(f"{path.name}-wal").exists())
+            self.assertFalse(path.with_name(f"{path.name}-journal").exists())
+
     def test_sqlite_observer_never_reads_prompt_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "state.db"
@@ -73,6 +141,90 @@ class DashboardTests(unittest.TestCase):
 
         self.assertNotIn("prompt", observation.jobs[0])
         self.assertNotIn("TOP SECRET PROMPT", serialized)
+
+    def test_sqlite_observer_handles_uri_reserved_path_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state?query.db"
+            store = Store(path)
+            store.initialize()
+            store.enqueue(
+                NewJob(
+                    workflow="example",
+                    title="Safe title",
+                    harness=Harness.CODEX,
+                    prompt="Read only.",
+                    dedupe_key="reserved-path-v1",
+                    max_attempts=1,
+                )
+            )
+
+            observation = SqliteObserver(path, "example").observe()
+
+        self.assertEqual([row["title"] for row in observation.jobs], ["Safe title"])
+
+    def test_sqlite_observer_excludes_receipt_values_and_transcripts(self) -> None:
+        prompt = "TOP SECRET PROMPT"
+        receipt_value = "TOP SECRET RECEIPT PREFIX"
+        terminal_output = "TOP SECRET TERMINAL OUTPUT"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            store = Store(path)
+            store.initialize()
+            store.enqueue(
+                NewJob(
+                    workflow="example",
+                    title="Safe title",
+                    harness=Harness.CODEX,
+                    prompt=prompt,
+                    dedupe_key="secret-v1",
+                    max_attempts=2,
+                    placement=PlacementTarget.TAB,
+                    receipt=TaskReceipt(ReceiptKind.OUTPUT_PREFIX, receipt_value),
+                )
+            )
+            claimed = store.claim("example", limit=1, lease_seconds=60)[0]
+            store.record_outcome(
+                claimed,
+                DispatchOutcome(
+                    "worker",
+                    AgentState.DONE,
+                    False,
+                    "w1:p1",
+                    placement=PlacementTarget.TAB,
+                    execution_path="/repo",
+                    herdr_workspace_id="w1",
+                ),
+            )
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    "UPDATE jobs SET error_summary = NULL WHERE id = ?",
+                    (claimed.job_id,),
+                )
+                connection.execute(
+                    "UPDATE receipts SET error_summary = ? WHERE job_id = ?",
+                    (terminal_output, claimed.job_id),
+                )
+
+            observation = SqliteObserver(path, "example").observe()
+            snapshot = RuntimeProjector(
+                "example",
+                FakeQueueObserver(observation),
+                FakeHerdrObserver(HerdrObservation("ok", None, (), (), (), (), ())),
+                clock=lambda: 1.0,
+            ).snapshot()
+            serialized = json.dumps(
+                {
+                    "jobs": observation.jobs,
+                    "receipts": observation.receipts,
+                    "snapshot": snapshot,
+                }
+            )
+
+        self.assertNotIn(prompt, serialized)
+        self.assertNotIn(receipt_value, serialized)
+        self.assertNotIn(terminal_output, serialized)
+        self.assertNotIn("receipt_value", observation.jobs[0])
+        self.assertNotIn("error_summary", observation.receipts[0])
 
     def test_projector_correlates_jobs_and_reports_runtime_drift(self) -> None:
         now = 2_000.0
@@ -155,6 +307,21 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(snapshot["summary"]["running"], 1)
         self.assertEqual(snapshot["summary"]["active_agents"], 1)
+        self.assertLessEqual(
+            {
+                "schema_version",
+                "workflow",
+                "generated_at",
+                "source_health",
+                "summary",
+                "jobs",
+                "attention",
+                "topology",
+                "timeline",
+            },
+            set(snapshot),
+        )
+        self.assertLessEqual({"workspaces", "projects"}, set(snapshot["topology"]))
         self.assertIn("running_agent_missing", snapshot["jobs"][0]["drift"])
         self.assertIn(
             "terminal_job_agent_working",
@@ -175,7 +342,70 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(worktree["is_linked_worktree"])
         self.assertEqual(worktree["tabs"][0]["panes"][0]["pane_id"], "w1:p2")
         self.assertEqual(snapshot["timeline"][0]["type"], "receipt")
-        self.assertGreaterEqual(snapshot["summary"]["needs_attention"], 3)
+        attention_codes = {item["code"] for item in snapshot["attention"]}
+        self.assertLessEqual(
+            {
+                "running_agent_missing",
+                "terminal_job_agent_working",
+                "lease_expired",
+                "job_stale",
+            },
+            attention_codes,
+        )
+
+    def test_topology_does_not_cross_join_foreign_entities(self) -> None:
+        herdr = HerdrObservation(
+            "ok",
+            None,
+            (
+                {"workspace_id": "local", "label": "local"},
+                {"workspace_id": "foreign", "label": "foreign"},
+            ),
+            (
+                {"workspace_id": "local", "tab_id": "shared:t1", "label": "local"},
+                {"workspace_id": "foreign", "tab_id": "shared:t1", "label": "foreign"},
+            ),
+            (
+                {"workspace_id": "local", "tab_id": "shared:t1", "pane_id": "shared:p1"},
+                {"workspace_id": "foreign", "tab_id": "shared:t1", "pane_id": "shared:p1"},
+            ),
+            (
+                {
+                    "name": "local-agent",
+                    "workspace_id": "local",
+                    "tab_id": "shared:t1",
+                    "pane_id": "shared:p1",
+                    "agent_status": "idle",
+                },
+                {
+                    "name": "foreign-agent",
+                    "workspace_id": "foreign",
+                    "tab_id": "shared:t1",
+                    "pane_id": "shared:p1",
+                    "agent_status": "working",
+                },
+            ),
+            (),
+        )
+        original_herdr = deepcopy(herdr)
+
+        snapshot = RuntimeProjector(
+            "example",
+            FakeQueueObserver(QueueObservation((), ())),
+            FakeHerdrObserver(herdr),
+            clock=lambda: 2_000.0,
+        ).snapshot()
+
+        workspaces = {
+            workspace["workspace_id"]: workspace for workspace in snapshot["topology"]["workspaces"]
+        }
+        local_panes = workspaces["local"]["tabs"][0]["panes"]
+        foreign_panes = workspaces["foreign"]["tabs"][0]["panes"]
+        self.assertEqual(len(local_panes), 1)
+        self.assertEqual(len(foreign_panes), 1)
+        self.assertEqual(local_panes[0]["agent"]["name"], "local-agent")
+        self.assertEqual(foreign_panes[0]["agent"]["name"], "foreign-agent")
+        self.assertEqual(herdr, original_herdr)
 
     def test_herdr_observer_scopes_and_whitelists_runtime_fields(self) -> None:
         workspace = Path("/repo")
@@ -198,6 +428,22 @@ class DashboardTests(unittest.TestCase):
                             "pane_id": "w1:p1",
                             "cwd": "/repo",
                             "terminal_title": "must not leak",
+                        },
+                        {
+                            "name": "outside",
+                            "agent": "codex",
+                            "agent_status": "working",
+                            "workspace_id": "w1",
+                            "cwd": "/outside",
+                            "terminal_title": "outside output must not leak",
+                        },
+                        {
+                            "name": "malformed-path",
+                            "agent": "codex",
+                            "agent_status": "working",
+                            "workspace_id": "w1",
+                            "cwd": "\x00",
+                            "terminal_title": "malformed output must not leak",
                         },
                         {
                             "name": "other",
@@ -234,6 +480,11 @@ class DashboardTests(unittest.TestCase):
                             "secret": "must not leak",
                         },
                         {
+                            "path": "/repo/.orchestrator/worktrees/empty",
+                            "branch": "empty",
+                            "open_workspace_id": "",
+                        },
+                        {
                             "path": "/other",
                             "branch": "other",
                             "open_workspace_id": "w9",
@@ -247,7 +498,12 @@ class DashboardTests(unittest.TestCase):
                             "workspace_id": argv[-1],
                             "tab_id": f"{argv[-1]}:t1",
                             "label": "Task",
-                        }
+                        },
+                        {
+                            "workspace_id": "w9",
+                            "tab_id": "w9:t9",
+                            "label": "foreign tab must not leak",
+                        },
                     ]
                 }
             elif argv[1:3] == ["pane", "list"]:
@@ -258,8 +514,23 @@ class DashboardTests(unittest.TestCase):
                             "tab_id": f"{argv[-1]}:t1",
                             "pane_id": f"{argv[-1]}:p1",
                             "cwd": "/repo",
+                            "agent": {"terminal_output": "must not leak nested"},
                             "terminal_id": "must not leak",
-                        }
+                        },
+                        {
+                            "workspace_id": "w9",
+                            "tab_id": "w9:t9",
+                            "pane_id": "w9:p9",
+                            "cwd": "/other",
+                            "terminal_id": "foreign output must not leak",
+                        },
+                        {
+                            "workspace_id": "w1",
+                            "tab_id": "w1:t1",
+                            "pane_id": "w1:p-outside",
+                            "cwd": "/outside",
+                            "terminal_id": "outside output must not leak",
+                        },
                     ]
                 }
             else:
@@ -287,8 +558,36 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(observation.health, "ok")
         self.assertEqual([row["workspace_id"] for row in observation.workspaces], ["w1"])
         self.assertEqual([row["name"] for row in observation.agents], ["worker"])
+        self.assertEqual([row["workspace_id"] for row in observation.tabs], ["w1"])
+        self.assertEqual([row["workspace_id"] for row in observation.panes], ["w1"])
+        self.assertEqual([row["pane_id"] for row in observation.panes], ["w1:p1"])
         self.assertNotIn("must not leak", serialized)
         self.assertNotIn("secret", serialized)
+
+    def test_herdr_observer_rejects_non_object_rows(self) -> None:
+        workspace = Path("/repo")
+
+        def runner(
+            argv: list[str],
+            *,
+            cwd: str,
+            timeout: int | None,
+        ) -> subprocess.CompletedProcess[str]:
+            if argv[1:3] == ["agent", "list"]:
+                result = {"agents": ["malformed terminal output"]}
+            else:
+                result = {argv[1] + "s": []}
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({"id": "test", "result": result}),
+                "",
+            )
+
+        observation = HerdrObserver(workspace, runner=runner).observe()
+
+        self.assertEqual(observation.health, "unavailable")
+        self.assertEqual(observation.error_code, "herdr_invalid_response")
 
     def test_snapshot_feed_waits_for_new_event(self) -> None:
         feed = SnapshotFeed()
@@ -306,10 +605,109 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(snapshot, {"value": 2})
         self.assertEqual((reset_id, reset_snapshot), (2, {"value": 2}))
 
+    def test_sse_future_id_recovers_before_first_snapshot(self) -> None:
+        feed = SnapshotFeed()
+        result: list[tuple[int, dict[str, object] | None]] = []
+        waiter = threading.Thread(
+            target=lambda: result.append(feed.wait_after(99, timeout=0.5)),
+        )
+        waiter.start()
+        time.sleep(0.02)
+        feed.publish({"value": 1})
+        waiter.join(timeout=1)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(result, [(1, {"value": 1})])
+
+    def test_server_shutdown_closes_open_sse_clients(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(base, state_db=Path(temporary) / "state.db")
+            Store(config.state_db).initialize()
+            projector = FakeProjector(
+                {
+                    "schema_version": 1,
+                    "workflow": "example",
+                    "generated_at": 1.0,
+                    "source_health": {"queue": "ok", "herdr": "ok"},
+                    "summary": {},
+                    "jobs": [],
+                    "attention": [],
+                    "topology": {"workspaces": []},
+                    "timeline": [],
+                }
+            )
+            server = DashboardServer(
+                config,
+                port=0,
+                poll_seconds=60,
+                projector=projector,
+            )
+            serve_thread = threading.Thread(target=server.serve_forever)
+            connection: HTTPConnection | None = None
+            reader: threading.Thread | None = None
+            result: list[tuple[str, bytes | None]] = []
+            try:
+                serve_thread.start()
+                deadline = time.monotonic() + 2
+                while server.feed.current()[1] is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("dashboard monitor did not publish a snapshot")
+                    time.sleep(0.01)
+
+                host, port = server.address
+                event_id, _ = server.feed.current()
+                connection = HTTPConnection(host, port, timeout=0.5)
+                connection.request(
+                    "GET",
+                    "/api/events",
+                    headers={"Last-Event-ID": str(event_id)},
+                )
+                response = connection.getresponse()
+
+                def read_response() -> None:
+                    try:
+                        result.append(("ok", response.read(1)))
+                    except Exception as exc:
+                        result.append((type(exc).__name__, None))
+
+                reader = threading.Thread(target=read_response, daemon=True)
+                reader.start()
+                time.sleep(0.05)
+                server.shutdown()
+                serve_thread.join(timeout=2)
+                reader.join(timeout=1)
+
+                self.assertFalse(serve_thread.is_alive())
+                self.assertFalse(reader.is_alive())
+                self.assertEqual(result, [("ok", b"")])
+            finally:
+                if connection is not None:
+                    connection.close()
+                if serve_thread.is_alive():
+                    server.shutdown()
+                    serve_thread.join(timeout=2)
+
+    def test_server_shutdown_before_serving_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(base, state_db=Path(temporary) / "state.db")
+            Store(config.state_db).initialize()
+            server = DashboardServer(config, port=0, projector=FakeProjector({}))
+
+            server.shutdown()
+            server.shutdown()
+            serve_thread = threading.Thread(target=server.serve_forever)
+            serve_thread.start()
+            serve_thread.join(timeout=1)
+
+        self.assertFalse(serve_thread.is_alive())
+
     def test_http_server_serves_snapshot_and_packaged_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             config = replace(base, state_db=Path(temporary) / "state.db")
+            Store(config.state_db).initialize()
             projector = FakeProjector(
                 {
                     "schema_version": 1,

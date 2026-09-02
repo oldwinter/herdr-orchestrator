@@ -1,6 +1,6 @@
 {
   "name": "herdr-manager",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Start a manual Herdr manager session with one npx command",
   "keywords": [
     "agents",
@@ -21,7 +21,7 @@
     "README.md"
   ],
   "dependencies": {
-    "herdr-orchestrator": "^0.1.6"
+    "herdr-orchestrator": "0.1.7"
   },
   "engines": {
     "node": ">=20"
@@ -37,5 +37,5 @@
   "bugs": {
     "url": "https://github.com/oldwinter/herdr-orchestrator/issues"
   },
-  "homepage": "https://github.com/oldwinter/herdr-orchestrator#manual-herdr-manager-session"
+  "homepage": "https://github.com/oldwinter/herdr-orchestrator/tree/main/packages/herdr-manager#readme"
 }

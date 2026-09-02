@@ -11,13 +11,13 @@ Active contributors: oldwinter, chendongdong
 | --- | --- | --- |
 | `uv sync --locked` | 安装锁定运行/开发环境 | 本地虚拟环境 |
 | `just lint` | 静态质量、架构、文档和仓库策略 | 控制台失败项 |
-| `just test` | 完整测试与 JSON report | `.orchestrator/quality/tests.json` |
-| `just test-coverage` | branch coverage，门槛 80% | `.orchestrator/quality/coverage.json` |
-| `just test-stability` | 三次重复测试并比较 nodeid outcome | `.orchestrator/quality/stability.json` |
-| `just security` | secret、源码与依赖安全扫描 | `.orchestrator/quality/bandit.json`、`.orchestrator/quality/pip-audit.json` |
-| `just build-metrics` | `npm pack --dry-run --json` | `.orchestrator/quality/build.json` |
-| `just profile-tests` | `cProfile` 基准证据 | `.orchestrator/quality/tests.pstats` |
-| `just quality-summary` | 汇总 coverage/stability/build/security | `.orchestrator/quality/summary.md` |
+| `just test` | 完整测试与 JSON report | 通过 run manifest 定位 |
+| `just test-coverage` | branch coverage，门槛 80% | 通过 run manifest 定位 |
+| `just test-stability` | 三次重复测试并比较 nodeid outcome | 通过 run manifest 定位 |
+| `just security` | secret、源码与依赖安全扫描 | 通过 run manifest 定位 |
+| `just build-metrics` | `npm pack --dry-run --json` | 通过 run manifest 定位 |
+| `just profile-tests` | `cProfile` 基准证据 | 通过 run manifest 定位 |
+| `just quality-summary` | 汇总 coverage/stability/build/security | run-scoped summary |
 | `just docs-generate` | 重建 CLI reference | `docs/generated/cli.md` |
 | `just docs-check` | 校验关键文档链接和生成物 freshness | 控制台失败项 |
 | `just check` | 运行完整合并门禁 | 上述质量证据 |
@@ -106,7 +106,7 @@ just docs-check
 - `pip-audit --local` 检查锁定环境中的已知依赖漏洞。
 
 不要通过把真实 secret 加进 baseline 来让检查通过。安全漏洞应按 `SECURITY.md` 的私下
-流程处理。扫描 JSON 位于 `.orchestrator/quality/`，可能包含本机包元数据；不要提交。
+流程处理。扫描 JSON 位于 run-scoped `.orchestrator/quality/runs/<run-id>/`，可能包含本机包元数据；不要提交。
 
 ## Git hooks
 
@@ -150,9 +150,9 @@ PR job 会更新自动质量评论。main 上只有测试通过后才进入 npm 
 | repository policy | 文件拆分、带 owner 的 debt marker |
 | docs freshness | 运行 `just docs-generate`，审阅生成 diff |
 | coverage | 缺失 branch 和负面路径，而非只补无断言调用 |
-| stability | `.orchestrator/quality/stability.json` 中 unstable nodeid |
+| stability | run manifest 中 stability artifact 的 unstable nodeid |
 | security | Bandit/pip-audit 原始 JSON；secret 不得贴入 issue |
-| package build | `.orchestrator/quality/build.json` 与 `package.json` files 清单 |
+| package build | run manifest 中 build artifact 与 `package.json` files 清单 |
 | 真实 Herdr | 按[调试与运行态排障](debugging.md)的证据层检查 |
 
 ## 导航

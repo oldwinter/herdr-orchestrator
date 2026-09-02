@@ -25,18 +25,18 @@ EXEMPT_LINE_PATHS = {
 EXEMPT_DEBT_PATHS = {"scripts/check_repository.py"}
 
 
-def tracked_files() -> tuple[Path, ...]:
+def tracked_files(root: Path = ROOT) -> tuple[Path, ...]:
     result = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-        cwd=ROOT,
+        cwd=root,
         capture_output=True,
         check=True,
     )
-    return tuple(ROOT / value.decode() for value in result.stdout.split(b"\0") if value)
+    return tuple(root / value.decode() for value in result.stdout.split(b"\0") if value)
 
 
-def line_limit(path: Path) -> int:
-    relative = path.relative_to(ROOT)
+def line_limit(path: Path, root: Path = ROOT) -> int:
+    relative = path.relative_to(root)
     if path.suffix == ".py" and relative.parts[0] == "tests":
         return MAX_TEST_LINES
     if path.suffix == ".py":
@@ -44,30 +44,40 @@ def line_limit(path: Path) -> int:
     return MAX_TEXT_LINES
 
 
-def main() -> int:
+def repository_failures(root: Path, files: tuple[Path, ...]) -> list[str]:
     failures: list[str] = []
-    for path in tracked_files():
+    for path in files:
         if not path.is_file():
             continue
-        relative = path.relative_to(ROOT).as_posix()
+        relative = path.relative_to(root).as_posix()
         size = path.stat().st_size
         if size > MAX_BYTES and relative not in EXEMPT_SIZE_PATHS:
             failures.append(f"{relative}: {size} bytes exceeds {MAX_BYTES}")
         if path.suffix not in TEXT_SUFFIXES or relative in EXEMPT_SIZE_PATHS:
             continue
         text = path.read_text(encoding="utf-8")
-        lines = text.count("\n") + int(bool(text))
-        maximum = line_limit(path)
+        lines = len(text.splitlines())
+        maximum = line_limit(path, root)
         if lines > maximum and relative not in EXEMPT_LINE_PATHS:
             failures.append(f"{relative}: {lines} lines exceeds {maximum}")
         if relative in EXEMPT_DEBT_PATHS:
             continue
         for number, line in enumerate(text.splitlines(), start=1):
-            if DEBT_MARKER.search(line) and not TRACKED_DEBT.search(line):
+            tracked_spans = tuple(match.span() for match in TRACKED_DEBT.finditer(line))
+            has_untracked_marker = any(
+                not any(start <= marker.start() < end for start, end in tracked_spans)
+                for marker in DEBT_MARKER.finditer(line)
+            )
+            if has_untracked_marker:
                 failures.append(
                     f"{relative}:{number}: debt marker needs issue and owner, "
                     "for example TODO(#123 owner=name):"
                 )
+    return failures
+
+
+def main() -> int:
+    failures = repository_failures(ROOT, tracked_files())
     if failures:
         print("\n".join(failures))
         return 1

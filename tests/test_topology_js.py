@@ -16,6 +16,7 @@ Requires a `node` binary; skipped when it is not available.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from importlib.resources import files
@@ -24,6 +25,9 @@ from typing import cast
 import pytest
 
 TOPOLOGY_JS = files("herdr_orchestrator.dashboard.static").joinpath("topology.js")
+INDEX_HTML = files("herdr_orchestrator.dashboard.static").joinpath("index.html")
+DASHBOARD_CSS = files("herdr_orchestrator.dashboard.static").joinpath("dashboard.css")
+DASHBOARD_JS = files("herdr_orchestrator.dashboard.static").joinpath("dashboard.js")
 
 _DRIVER = r"""
 const fs = require("fs");
@@ -273,6 +277,137 @@ check("stateClass mapping",
   [t.stateClass("working"), t.stateClass("in_progress"), t.stateClass(""),
     t.stateClass(null), t.stateClass("Working!")].join(" | "));
 
+// ---- malformed snapshots and identity collisions ------------------------
+check("null topology is treated as empty",
+  Array.isArray(t.normalizedProjects(null, "x"))
+  && t.normalizedProjects(null, "x").length === 0
+  && t.topologyGraph(null).elements.length === 0
+  && t.topologyGraph([null]).elements.length === 0,
+  "null topology raised or produced projects");
+
+let incompleteGraph = null;
+try {
+  incompleteGraph = t.topologyGraph(t.normalizedProjects({
+    workspaces: [
+      null,
+      {
+        workspace_id: "w1",
+        tabs: [null, { tab_id: "w1:t1", panes: [null, { pane_id: "w1:p1" }] }],
+      },
+    ],
+  }, "incomplete"));
+} catch (error) {
+  incompleteGraph = { error: String(error) };
+}
+check("incomplete records do not abort graph construction",
+  incompleteGraph && !incompleteGraph.error
+  && incompleteGraph.counts.worktrees === 1
+  && incompleteGraph.counts.tabs === 1
+  && incompleteGraph.counts.panes === 1,
+  JSON.stringify(incompleteGraph));
+
+let duplicateGraph = null;
+try {
+  duplicateGraph = t.topologyGraph([
+    {
+      project_id: "same",
+      worktrees: [
+        {
+          worktree_id: "same",
+          tabs: [
+            { tab_id: "same", panes: [{ pane_id: "same" }, { pane_id: "same" }] },
+            { tab_id: "same", panes: [] },
+          ],
+        },
+        { worktree_id: "same", tabs: [] },
+      ],
+    },
+    { project_id: "same", worktrees: [] },
+  ]);
+} catch (error) {
+  duplicateGraph = { error: String(error) };
+}
+const duplicateIds = duplicateGraph && duplicateGraph.elements
+  ? duplicateGraph.elements.map((element) => element.data.id)
+  : [];
+check("duplicate identities remain uniquely addressable",
+  duplicateGraph && !duplicateGraph.error
+  && duplicateIds.length === 8
+  && new Set(duplicateIds).size === duplicateIds.length
+  && duplicateIds[0] === "project:same",
+  JSON.stringify(duplicateGraph));
+
+let escapedIdentity = null;
+try {
+  escapedIdentity = t.topologyId(
+    "pane",
+    "unsafe!'()*" + String.fromCharCode(0xD800),
+    0,
+  );
+} catch (error) {
+  escapedIdentity = `error:${String(error)}`;
+}
+check("identity encoding is well formed and strict",
+  escapedIdentity === "pane:unsafe%21%27%28%29%2A%EF%BF%BD",
+  String(escapedIdentity));
+
+const falseyGraph = t.topologyGraph([
+  { project_id: "first", worktrees: [] },
+  {
+    project_id: 0,
+    worktrees: [{ worktree_id: 0, tabs: [{ tab_id: 0, panes: [{ pane_id: 0 }] }] }],
+  },
+]);
+const falseyIds = falseyGraph.elements.map((element) => element.data.id);
+check("falsey identities remain distinct from fallbacks",
+  t.topologyId("node", 0, 7) === "node:0"
+  && t.topologyId("node", false, 7) === "node:false"
+  && falseyIds.includes("project:0")
+  && falseyIds.some((id) => id.endsWith("|worktree:0"))
+  && falseyIds.some((id) => id.endsWith("|tab:0"))
+  && falseyIds.some((id) => id.endsWith("|pane:0")),
+  falseyIds.join(" | "));
+
+let malformedPositions = null;
+try {
+  malformedPositions = t.topologyPresetPositions(null);
+} catch (error) {
+  malformedPositions = `error:${String(error)}`;
+}
+check("malformed layout input is empty",
+  JSON.stringify(malformedPositions) === "{}",
+  JSON.stringify(malformedPositions));
+
+const prototypePositions = t.topologyPresetPositions([{ id: "__proto__", worktrees: [] }]);
+check("layout positions do not mutate object prototypes",
+  Object.prototype.hasOwnProperty.call(prototypePositions, "__proto__")
+  && Number.isFinite(prototypePositions["__proto__"].x),
+  JSON.stringify(prototypePositions));
+
+let hostileGraph = null;
+try {
+  hostileGraph = t.topologyGraph([{
+    project_id: { toString: null },
+    label: { toString: null },
+    worktrees: [{
+      worktree_id: { toString: null },
+      tabs: [{
+        tab_id: { toString: null },
+        panes: [{ pane_id: { toString: null }, agent: { name: { toString: null } } }],
+      }],
+    }],
+  }]);
+} catch (error) {
+  hostileGraph = { error: String(error) };
+}
+check("hostile scalar objects do not abort graph construction",
+  hostileGraph && !hostileGraph.error
+  && hostileGraph.counts.projects === 1
+  && hostileGraph.counts.worktrees === 1
+  && hostileGraph.counts.tabs === 1
+  && hostileGraph.counts.panes === 1,
+  JSON.stringify(hostileGraph));
+
 process.stdout.write(JSON.stringify(results));
 """
 
@@ -304,3 +439,48 @@ def test_topology_js_contracts(node_bin: str) -> None:
         f"  - {result['name']}: {result['detail']}" for result in failures
     )
     assert len(results) >= 14, f"expected a meaningful check suite, got {len(results)}"
+
+
+def test_dashboard_static_accessibility_and_overflow_contracts() -> None:
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    css = DASHBOARD_CSS.read_text(encoding="utf-8")
+    javascript = DASHBOARD_JS.read_text(encoding="utf-8")
+
+    attention = re.search(r'<div id="attention-list"[^>]*>', html)
+    assert attention is not None
+    assert 'role="region"' in attention.group(0)
+    assert 'tabindex="0"' in attention.group(0)
+    assert 'aria-busy="true"' in attention.group(0)
+    assert 'aria-describedby="topology-a11y"' in html
+    assert 'id="topology-count" class="quiet-badge" data-compact="0 nodes"' in html
+    assert "Loading alerts…" in html
+    assert "Loading lifecycle…" in html
+    assert html.count('aria-busy="true"') >= 4
+
+    assert re.search(r'<section class="kanban-column"\s+tabindex="0"', javascript)
+    assert re.search(
+        r"\.attention-item span\s*\{[^}]*overflow-wrap:\s*anywhere;",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"\.job-detail dt\s*\{[^}]*color:\s*var\(--muted\);",
+        css,
+        re.DOTALL,
+    )
+    assert ".attention-list:focus-visible" in css
+    assert re.search(
+        r"\.panel-heading > \.quiet-badge\s*\{[^}]*min-width:\s*0;",
+        css,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"@media \(max-width: 760px\).*?\.panel-heading\s*\{[^}]*flex-wrap:\s*wrap;",
+        css,
+        re.DOTALL,
+    )
+    assert "function showUnavailableState" in javascript
+    assert "aria-busy" in javascript
+    assert "ArrowRight" in javascript
+    assert "<form" not in html.lower()
+    assert not re.search(r"\b(?:post|put|patch|delete)\b", javascript, re.IGNORECASE)
