@@ -25,6 +25,7 @@ from typing import cast
 import pytest
 
 TOPOLOGY_JS = files("herdr_orchestrator.dashboard.static").joinpath("topology.js")
+TOPOLOGY_STYLE_JS = files("herdr_orchestrator.dashboard.static").joinpath("topology-style.js")
 INDEX_HTML = files("herdr_orchestrator.dashboard.static").joinpath("index.html")
 DASHBOARD_CSS = files("herdr_orchestrator.dashboard.static").joinpath("dashboard.css")
 DASHBOARD_JS = files("herdr_orchestrator.dashboard.static").joinpath("dashboard.js")
@@ -39,7 +40,12 @@ const evaluate = new Function(
   "require",
   src
     + "\n;module.exports = { stateClass, normalizedProjects, topologyGraph, "
-    + "topologyPresetPositions, topologyId };",
+    + "topologyPresetPositions, topologyNavigationOrder, topologySelectionDirection, "
+    + "topologyFocusViewport, topologyRebaseViewportCapture, topologyId, "
+    + "topologyZoomViewport: typeof topologyZoomViewport === 'function' "
+    + "? topologyZoomViewport : null, "
+    + "topologyViewportMotionDuration: typeof topologyViewportMotionDuration === "
+    + "'function' ? topologyViewportMotionDuration : null };",
 );
 evaluate(moduleLike, moduleLike.exports, require);
 const t = moduleLike.exports;
@@ -163,6 +169,33 @@ check("agent detail and shell fallback",
   && pane3 && pane3.data.agent === "shell" && pane3.data.detail === "shell · blocked"
   && pane3.data.status === "blocked",
   JSON.stringify([pane1 && pane1.data.detail, pane3 && pane3.data]));
+
+const navigationOrder = t.topologyNavigationOrder(graph);
+check("navigation order follows deterministic graph order",
+  JSON.stringify(navigationOrder) === JSON.stringify(g.map((element) => element.data.id))
+  && navigationOrder[0] === PID && navigationOrder.at(-1) === P3,
+  JSON.stringify(navigationOrder));
+check("navigation order is stable and empty-safe",
+  JSON.stringify(navigationOrder) === JSON.stringify(t.topologyNavigationOrder(graph))
+  && t.topologyNavigationOrder({ elements: [] }).length === 0
+  && t.topologyNavigationOrder({}).length === 0,
+  JSON.stringify(t.topologyNavigationOrder({ elements: [] })));
+const direction = (key, modifiers = {}) => t.topologySelectionDirection({
+  ctrlKey: true,
+  altKey: false,
+  metaKey: false,
+  key,
+  ...modifiers,
+});
+check("ctrl arrow selection direction is isolated from pan keys",
+  direction("ArrowRight") === 1
+  && direction("ArrowDown") === 1
+  && direction("ArrowLeft") === -1
+  && direction("ArrowUp") === -1
+  && direction("ArrowRight", { ctrlKey: false }) === null
+  && direction("ArrowRight", { altKey: true }) === null
+  && direction("ArrowRight", { metaKey: true }) === null,
+  "unexpected direction mapping");
 
 // ---- signatures: status-only updates must not change structure -----------
 const changedStatuses = deepClone(baseProjects);
@@ -407,6 +440,423 @@ check("hostile scalar objects do not abort graph construction",
   && hostileGraph.counts.tabs === 1
   && hostileGraph.counts.panes === 1,
   JSON.stringify(hostileGraph));
+const focusViewport = t.topologyFocusViewport({
+  viewport: { zoom: 0.2493428464, pan: { x: 172, y: 220 } },
+  subject: {
+    kind: "leaf",
+    modelCenter: { x: 400, y: 300 },
+    modelLabelPx: 14,
+  },
+  visibleRect: { x1: 18, y1: 18, x2: 344, y2: 428 },
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+check("focus viewport makes the selected leaf readable without zooming out",
+  focusViewport.zoom === 0.72
+  && focusViewport.zoom * 14 >= 9
+  && focusViewport.pan.x === -107
+  && focusViewport.pan.y === 7,
+  JSON.stringify(focusViewport));
+
+const fittingLeafBounds = { x1: 360, y1: 270, x2: 440, y2: 320 };
+const fittingContextBounds = { x1: 300, y1: 220, x2: 500, y2: 320 };
+const contextLeafFocus = t.topologyFocusViewport({
+  viewport: { zoom: 0.25, pan: { x: 0, y: 0 } },
+  subject: {
+    kind: "leaf",
+    modelCenter: { x: 400, y: 300 },
+    modelLabelPx: 14,
+    context: {
+      leafBounds: fittingLeafBounds,
+      contextBounds: fittingContextBounds,
+    },
+  },
+  visibleRect: { x1: 18, y1: 18, x2: 344, y2: 428 },
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+check("fitting leaf context centers the optional bounds at readable zoom",
+  contextLeafFocus.zoom === 0.72
+  && contextLeafFocus.pan.x === -107
+  && Math.abs(contextLeafFocus.pan.y - 28.6) < 1e-12,
+  JSON.stringify(contextLeafFocus));
+
+const frozenVisibleRect = { x1: 18, y1: 18, x2: 268, y2: 422 };
+const frozenLeafBounds = { x1: 44.5, y1: 5.5, x2: 205.5, y2: 72.5 };
+const frozenContextBounds = { x1: -212.5, y1: -81.5, x2: 205.5, y2: 72.5 };
+const frozenCompactFocus = t.topologyFocusViewport({
+  viewport: {
+    zoom: 0.21697722567287786,
+    pan: { x: 87.07412008281574, y: 200.58053830227743 },
+  },
+  subject: {
+    kind: "leaf",
+    modelCenter: { x: 125, y: 39 },
+    modelLabelPx: 14,
+    context: {
+      leafBounds: frozenLeafBounds,
+      contextBounds: frozenContextBounds,
+    },
+  },
+  visibleRect: frozenVisibleRect,
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+const frozenRenderedLeaf = {
+  x1: frozenLeafBounds.x1 * frozenCompactFocus.zoom + frozenCompactFocus.pan.x,
+  y1: frozenLeafBounds.y1 * frozenCompactFocus.zoom + frozenCompactFocus.pan.y,
+  x2: frozenLeafBounds.x2 * frozenCompactFocus.zoom + frozenCompactFocus.pan.x,
+  y2: frozenLeafBounds.y2 * frozenCompactFocus.zoom + frozenCompactFocus.pan.y,
+};
+check("impossible compact context keeps zoom and chooses the closest leaf-containing pan",
+  frozenCompactFocus.zoom === 0.72
+  && Math.abs(frozenCompactFocus.pan.x - 120.04) < 1e-12
+  && Math.abs(frozenCompactFocus.pan.y - 223.24) < 1e-12
+  && frozenRenderedLeaf.x1 >= frozenVisibleRect.x1
+  && frozenRenderedLeaf.y1 >= frozenVisibleRect.y1
+  && frozenRenderedLeaf.x2 <= frozenVisibleRect.x2
+  && frozenRenderedLeaf.y2 <= frozenVisibleRect.y2
+  && Math.abs(frozenRenderedLeaf.x2 - frozenVisibleRect.x2) < 1e-12
+  && frozenCompactFocus.pan.x < 145.52,
+  JSON.stringify({ frozenCompactFocus, frozenRenderedLeaf }));
+
+const focusWithOptionalContext = (contextFields) => t.topologyFocusViewport({
+  viewport: { zoom: 0.2493428464, pan: { x: 172, y: 220 } },
+  subject: {
+    kind: "leaf",
+    modelCenter: { x: 400, y: 300 },
+    modelLabelPx: 14,
+    ...contextFields,
+  },
+  visibleRect: { x1: 18, y1: 18, x2: 344, y2: 428 },
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+const fallbackContexts = [
+  { contextBounds: fittingContextBounds },
+  { context: { contextBounds: fittingContextBounds } },
+  { context: { leafBounds: fittingLeafBounds } },
+  { context: {
+    leafBounds: { ...fittingLeafBounds, x1: Number.NaN },
+    contextBounds: fittingContextBounds,
+  } },
+  { context: {
+    leafBounds: fittingLeafBounds,
+    contextBounds: { ...fittingContextBounds, y2: Number.POSITIVE_INFINITY },
+  } },
+  { context: {
+    leafBounds: { x1: 360, y1: 270, x2: 360, y2: 320 },
+    contextBounds: fittingContextBounds,
+  } },
+  { context: {
+    leafBounds: fittingLeafBounds,
+    contextBounds: { x1: 300, y1: 220, x2: 500, y2: 220 },
+  } },
+  { context: {
+    leafBounds: fittingLeafBounds,
+    contextBounds: { x1: 370, y1: 280, x2: 430, y2: 310 },
+  } },
+];
+const fallbackViewports = fallbackContexts.map(focusWithOptionalContext);
+check("malformed, non-containing, and half-configured context uses exact leaf fallback",
+  fallbackViewports.every((target) => (
+    target.zoom === 0.72 && target.pan.x === -107 && target.pan.y === 7
+  )),
+  JSON.stringify(fallbackViewports));
+
+const infeasibleLeafFocus = focusWithOptionalContext({
+  context: {
+    leafBounds: { x1: 0, y1: 0, x2: 500, y2: 50 },
+    contextBounds: { x1: -50, y1: -10, x2: 500, y2: 100 },
+  },
+});
+check("fixed-zoom leaf that cannot fit uses exact leaf fallback",
+  infeasibleLeafFocus.zoom === 0.72
+  && infeasibleLeafFocus.pan.x === -107
+  && infeasibleLeafFocus.pan.y === 7,
+  JSON.stringify(infeasibleLeafFocus));
+
+const projectBounds = { x1: -366, y1: -119.5, x2: 870, y2: 321 };
+const projectVisibleRect = { x1: 18, y1: 18, x2: 338, y2: 358.5 };
+const projectFocus = t.topologyFocusViewport({
+  viewport: {
+    zoom: 0.2510396975425331,
+    pan: { x: 127.85482041587902, y: 197.5319470699433 },
+  },
+  subject: {
+    kind: "container",
+    modelBounds: projectBounds,
+    modelLabelPx: 14,
+  },
+  visibleRect: projectVisibleRect,
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+const renderedProjectBounds = {
+  x1: projectBounds.x1 * projectFocus.zoom + projectFocus.pan.x,
+  y1: projectBounds.y1 * projectFocus.zoom + projectFocus.pan.y,
+  x2: projectBounds.x2 * projectFocus.zoom + projectFocus.pan.x,
+  y2: projectBounds.y2 * projectFocus.zoom + projectFocus.pan.y,
+};
+check("focus viewport contains the selected project interaction bounds",
+  Math.abs(projectFocus.zoom - 0.2588996763754045) < 1e-12
+  && renderedProjectBounds.x1 >= projectVisibleRect.x1 - 1e-9
+  && renderedProjectBounds.y1 >= projectVisibleRect.y1 - 1e-9
+  && renderedProjectBounds.x2 <= projectVisibleRect.x2 + 1e-9
+  && renderedProjectBounds.y2 <= projectVisibleRect.y2 + 1e-9,
+  JSON.stringify({ projectFocus, renderedProjectBounds }));
+
+const twelvePixelFocus = t.topologyFocusViewport({
+  viewport: { zoom: 0.25, pan: { x: 0, y: 0 } },
+  subject: {
+    kind: "leaf",
+    modelCenter: { x: 100, y: 50 },
+    modelLabelPx: 12,
+  },
+  visibleRect: { x1: 0, y1: 0, x2: 300, y2: 200 },
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+const alreadyReadableFocus = t.topologyFocusViewport({
+  viewport: { zoom: 1.1, pan: { x: 10, y: 20 } },
+  subject: {
+    kind: "leaf",
+    modelCenter: { x: 100, y: 50 },
+    modelLabelPx: 14,
+  },
+  visibleRect: { x1: 0, y1: 0, x2: 300, y2: 200 },
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+const cappedFocus = t.topologyFocusViewport({
+  viewport: { zoom: 0.25, pan: { x: 0, y: 0 } },
+  subject: {
+    kind: "leaf",
+    modelCenter: { x: 100, y: 50 },
+    modelLabelPx: 12,
+  },
+  visibleRect: { x1: 0, y1: 0, x2: 300, y2: 200 },
+  minZoom: 0.08,
+  maxZoom: 0.5,
+});
+check("focus viewport handles font thresholds and zoom bounds",
+  twelvePixelFocus.zoom === 0.75
+  && alreadyReadableFocus.zoom === 1.1
+  && cappedFocus.zoom === 0.5,
+  JSON.stringify([twelvePixelFocus, alreadyReadableFocus, cappedFocus]));
+
+const fittingWorktreeFocus = t.topologyFocusViewport({
+  viewport: { zoom: 0.25, pan: { x: 0, y: 0 } },
+  subject: {
+    kind: "container",
+    modelBounds: { x1: -40, y1: -20, x2: 340, y2: 180 },
+    modelLabelPx: 12,
+  },
+  visibleRect: { x1: 0, y1: 0, x2: 300, y2: 200 },
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+const fittingTabFocus = t.topologyFocusViewport({
+  viewport: { zoom: 0.25, pan: { x: 0, y: 0 } },
+  subject: {
+    kind: "container",
+    modelBounds: { x1: 20, y1: -30, x2: 220, y2: 220 },
+    modelLabelPx: 12,
+  },
+  visibleRect: { x1: 0, y1: 0, x2: 300, y2: 200 },
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+const impossibleFitFocus = t.topologyFocusViewport({
+  viewport: { zoom: 0.25, pan: { x: 0, y: 0 } },
+  subject: {
+    kind: "container",
+    modelBounds: { x1: -1000, y1: -500, x2: 1000, y2: 500 },
+    modelLabelPx: 12,
+  },
+  visibleRect: { x1: 10, y1: 20, x2: 110, y2: 100 },
+  minZoom: 0.08,
+  maxZoom: 2.6,
+});
+check("container focus keeps readable fitting branches and centers a legal minimum zoom",
+  fittingWorktreeFocus.zoom === 0.75
+  && fittingWorktreeFocus.pan.x === 37.5
+  && fittingWorktreeFocus.pan.y === 40
+  && fittingTabFocus.zoom === 0.75
+  && fittingTabFocus.pan.x === 60
+  && fittingTabFocus.pan.y === 28.75
+  && impossibleFitFocus.zoom === 0.08
+  && impossibleFitFocus.pan.x === 60
+  && impossibleFitFocus.pan.y === 60,
+  JSON.stringify({ fittingWorktreeFocus, fittingTabFocus, impossibleFitFocus }));
+
+const rebasedCapture = t.topologyRebaseViewportCapture({
+  size: { width: 356, height: 440 },
+  viewport: focusViewport,
+}, { width: 390, height: 500 });
+check("viewport capture rebases its pan with canvas size",
+  rebasedCapture.size.width === 390
+  && rebasedCapture.size.height === 500
+  && rebasedCapture.viewport.zoom === 0.72
+  && rebasedCapture.viewport.pan.x === -90
+  && rebasedCapture.viewport.pan.y === 37,
+  JSON.stringify(rebasedCapture));
+
+const rebasedTwice = t.topologyRebaseViewportCapture(
+  t.topologyRebaseViewportCapture({
+    size: { width: 356, height: 440 },
+    viewport: focusViewport,
+  }, { width: 370, height: 470 }),
+  { width: 390, height: 500 },
+);
+check("viewport capture rebasing is path independent",
+  JSON.stringify(rebasedTwice) === JSON.stringify(rebasedCapture),
+  `${JSON.stringify(rebasedTwice)} vs ${JSON.stringify(rebasedCapture)}`);
+
+const zoomViewport = t.topologyZoomViewport;
+check("toolbar zoom viewport helper is available",
+  typeof zoomViewport === "function", String(zoomViewport));
+if (typeof zoomViewport === "function") {
+  const zoomNodes = [{
+    id: "project",
+    kind: "project",
+    modelPosition: { x: 50, y: 40 },
+    renderedPosition: { x: 170, y: 210 },
+  }, {
+    id: "pane-near",
+    kind: "pane",
+    modelPosition: { x: 10, y: 20 },
+    renderedPosition: { x: 140, y: 205 },
+  }, {
+    id: "pane-far",
+    kind: "pane",
+    modelPosition: { x: 100, y: 20 },
+    renderedPosition: { x: 300, y: 205 },
+  }];
+  const zoomInput = (nodes, selectedNodeId, fallbackViewport = {
+    zoom: 2.6,
+    pan: { x: -500, y: -10 },
+  }) => ({
+    nodes,
+    selectedNodeId,
+    viewportCenter: { x: 178, y: 220 },
+    fallbackViewport,
+  });
+  const inputBefore = JSON.stringify(zoomNodes);
+  const selectedZoom = zoomViewport(zoomInput(zoomNodes, "pane-far"));
+  const nearestPaneZoom = zoomViewport(zoomInput(zoomNodes, null));
+  const noPaneZoom = zoomViewport(zoomInput([zoomNodes[0]], null));
+  check("toolbar zoom centers the selected node",
+    selectedZoom.zoom === 2.6
+    && selectedZoom.pan.x === -82
+    && selectedZoom.pan.y === 168,
+    JSON.stringify(selectedZoom));
+  check("toolbar zoom centers the nearest pane without a selection",
+    nearestPaneZoom.zoom === 2.6
+    && nearestPaneZoom.pan.x === 152
+    && nearestPaneZoom.pan.y === 168,
+    JSON.stringify(nearestPaneZoom));
+  check("toolbar zoom falls back to the nearest valid node when no pane exists",
+    noPaneZoom.zoom === 2.6
+    && noPaneZoom.pan.x === 48
+    && noPaneZoom.pan.y === 116,
+    JSON.stringify(noPaneZoom));
+  const fallback = { zoom: 1.2, pan: { x: 8, y: 9 } };
+  const malformedZoom = zoomViewport(zoomInput([
+    { id: "broken", kind: "pane", modelPosition: { x: NaN, y: 2 }, renderedPosition: null },
+  ], null, fallback));
+  const invalidZoom = zoomViewport(zoomInput([], null, { zoom: NaN, pan: { x: 0, y: 0 } }));
+  check("toolbar zoom rejects malformed points and invalid fallback cameras",
+    JSON.stringify(malformedZoom) === JSON.stringify(fallback)
+    && invalidZoom === null,
+    JSON.stringify({ malformedZoom, invalidZoom }));
+  check("toolbar zoom leaves normalized node input immutable",
+    JSON.stringify(zoomNodes) === inputBefore,
+    JSON.stringify(zoomNodes));
+}
+
+const motionDuration = t.topologyViewportMotionDuration;
+check("viewport motion duration helper is available",
+  typeof motionDuration === "function", String(motionDuration));
+if (typeof motionDuration === "function") {
+  const motionInput = (currentViewport, targetViewport, viewportSize) => ({
+    currentViewport,
+    targetViewport,
+    viewportSize,
+  });
+  const smallMotion = motionDuration(motionInput(
+    { zoom: 0.75, pan: { x: 134.5, y: 104.4100341796875 } },
+    { zoom: 0.75, pan: { x: 84.25, y: 162.5350341796875 } },
+    { width: 356, height: 440 },
+  ));
+  const largeMotion = motionDuration(motionInput(
+    {
+      zoom: 0.2509448223733938,
+      pan: { x: 127.81103552532124, y: 197.54043839758126 },
+    },
+    { zoom: 0.72, pan: { x: 88, y: 163.70503417968752 } },
+    { width: 356, height: 440 },
+  ));
+  check("viewport motion duration reproduces the frozen browser fixtures",
+    Math.abs(smallMotion - 190.18160036503215) < 1e-12
+    && largeMotion === 240,
+    JSON.stringify({ smallMotion, largeMotion }));
+
+  const stillMotion = motionDuration(motionInput(
+    { zoom: 1, pan: { x: 20, y: 30 } },
+    { zoom: 1, pan: { x: 20, y: 30 } },
+    { width: 300, height: 400 },
+  ));
+  const clampedMotion = motionDuration(motionInput(
+    { zoom: 1, pan: { x: 0, y: 0 } },
+    { zoom: 1, pan: { x: 80, y: 0 } },
+    { width: 60, height: 80 },
+  ));
+  check("viewport motion duration preserves the 180 to 240 millisecond bounds",
+    stillMotion === 180 && clampedMotion === 240,
+    JSON.stringify({ stillMotion, clampedMotion }));
+
+  const zoomOut = motionDuration(motionInput(
+    { zoom: 1, pan: { x: 0, y: 0 } },
+    { zoom: 0.5, pan: { x: 0, y: 0 } },
+    { width: 300, height: 400 },
+  ));
+  const zoomIn = motionDuration(motionInput(
+    { zoom: 0.5, pan: { x: 0, y: 0 } },
+    { zoom: 1, pan: { x: 0, y: 0 } },
+    { width: 300, height: 400 },
+  ));
+  check("viewport motion duration is symmetric for equal zoom ratios",
+    Math.abs(zoomOut - zoomIn) < 1e-12,
+    JSON.stringify({ zoomOut, zoomIn }));
+
+  const invalidMotions = [
+    motionDuration(),
+    motionDuration(motionInput(
+      { zoom: 0, pan: { x: 0, y: 0 } },
+      { zoom: 1, pan: { x: 0, y: 0 } },
+      { width: 300, height: 400 },
+    )),
+    motionDuration(motionInput(
+      { zoom: 1, pan: { x: 0, y: 0 } },
+      { zoom: 1, pan: { x: 0, y: 0 } },
+      { width: 0, height: 400 },
+    )),
+    motionDuration(motionInput(
+      { zoom: "1", pan: { x: 0, y: 0 } },
+      { zoom: 1, pan: { x: 0, y: 0 } },
+      { width: 300, height: 400 },
+    )),
+    motionDuration(motionInput(
+      { zoom: 1, pan: { x: Number.NaN, y: 0 } },
+      { zoom: 1, pan: { x: 0, y: 0 } },
+      { width: 300, height: 400 },
+    )),
+  ];
+  check("viewport motion duration falls back for invalid numeric domains",
+    invalidMotions.every((duration) => duration === 180),
+    JSON.stringify(invalidMotions));
+}
 
 process.stdout.write(JSON.stringify(results));
 """
@@ -439,6 +889,52 @@ def test_topology_js_contracts(node_bin: str) -> None:
         f"  - {result['name']}: {result['detail']}" for result in failures
     )
     assert len(results) >= 14, f"expected a meaningful check suite, got {len(results)}"
+
+
+def test_compact_selection_path_label_contracts() -> None:
+    topology_style = TOPOLOGY_STYLE_JS.read_text(encoding="utf-8")
+    compact_styles = topology_style[
+        topology_style.index("...(compact ? [{") : topology_style.index("}] : []),")
+    ]
+    assert "node[kind = 'worktree'].is-selection-path" in compact_styles
+    assert (
+        "node[kind = 'project']:selected, node[kind = 'worktree']:selected, "
+        "node[kind = 'tab']:selected"
+    ) in compact_styles
+    assert '"text-halign": "center"' in compact_styles
+    assert '"text-margin-x": 0' in compact_styles
+
+
+def test_selection_path_lifecycle_contracts() -> None:
+    dashboard = DASHBOARD_JS.read_text(encoding="utf-8")
+    selection = dashboard[
+        dashboard.index("function selectTopologyNode") : dashboard.index(
+            "function revealTopologyNode"
+        )
+    ]
+    remove_path = 'topologyCanvas.nodes(".is-selection-path").removeClass("is-selection-path");'
+    add_nearest_worktree = (
+        'node.parents(\'[kind = "worktree"]\').first().addClass("is-selection-path");'
+    )
+    focus = "focusTopologyNode(node, { selectionChanged, animate: motionAllowed() });"
+    assert remove_path in selection
+    assert add_nearest_worktree in selection
+    assert selection.index(remove_path) < selection.index(add_nearest_worktree)
+    assert selection.index(add_nearest_worktree) < selection.index(focus)
+
+    clear = dashboard[
+        dashboard.index("function clearTopologySelection") : dashboard.index(
+            "function handleTopologyResize"
+        )
+    ]
+    clear_path = (
+        'if (topologyCanvas) topologyCanvas.nodes(".is-selection-path")'
+        '.removeClass("is-selection-path");'
+    )
+    assert clear_path in clear
+    assert clear.index(clear_path) < clear.index(
+        'if (!hadSelection && phase.kind !== "focused" && reason === "user-clear")'
+    )
 
 
 def test_dashboard_static_accessibility_and_overflow_contracts() -> None:
@@ -482,5 +978,29 @@ def test_dashboard_static_accessibility_and_overflow_contracts() -> None:
     assert "function showUnavailableState" in javascript
     assert "aria-busy" in javascript
     assert "ArrowRight" in javascript
+    focus_adapter = javascript[
+        javascript.index("function readTopologyFocusInput") : javascript.index(
+            "function readTopologyContentState"
+        )
+    ]
+    assert "function readTopologyLeafFocusContext(node)" in focus_adapter
+    assert "readTopologyLeafFocusContext(node)" in focus_adapter
+    assert "parents('[kind = \"worktree\"]')" in focus_adapter
+    assert "includeNodes: true" in focus_adapter
+    assert "includeLabels: true" in focus_adapter
+    assert "includeNodes: false" in focus_adapter
+    assert "leafBounds:" in focus_adapter
+    assert "contextBounds" in focus_adapter
+    assert "...(context ? { context } : {})" in focus_adapter
+    topology_source = TOPOLOGY_JS.read_text(encoding="utf-8")
+    focus_calculator = topology_source[
+        topology_source.index("function topologyFocusViewport") : topology_source.index(
+            "function topologyRebaseViewportCapture"
+        )
+    ]
+    assert 'subject.kind === "leaf" && subject.context' in focus_calculator
+    assert "leafBounds" in focus_calculator
+    assert "contextBounds" in focus_calculator
+    assert "fitCeiling >= readableTarget" in focus_calculator
     assert "<form" not in html.lower()
     assert not re.search(r"\b(?:post|put|patch|delete)\b", javascript, re.IGNORECASE)
