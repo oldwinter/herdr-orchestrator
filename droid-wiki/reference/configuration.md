@@ -77,6 +77,9 @@ flowchart TD
 | `lease_seconds` | integer，30–86400 | 无 | running lease |
 | `max_attempts` | integer，1–10 | 无 | 新 job 的总 attempt budget |
 | `agent_timeout_seconds` | integer，10–86400 | 无 | 单次完整 dispatch deadline。到期后 coordinator 停止等待并记 `herdr_timeout`，不会杀死已在跑的 Herdr agent |
+| `readiness_ttl_seconds` | integer，1–604800 | `3600` | fresh ready health evidence 的有效期 |
+| `readiness_cooldown_seconds` | integer，1–86400 | `300` | degraded/unavailable 后再次 refresh 前的 cooldown |
+| `readiness_probe_timeout_seconds` | integer，5–300 | `30` | bounded readiness refresh timeout |
 
 跨字段约束：`lease_seconds >= agent_timeout_seconds + 90`。这 90 秒窗口用于 topology provisioning、Herdr 控制与 receipt 提交，避免旧 turn 尚未结束时 lease 已被重新 claim。
 
@@ -125,6 +128,10 @@ flowchart TD
 - 显式 `harness` 不必是 worker，但必须在 `profiles_dir` 中有 profile。
 - 每个 worker 也必须有对应 profile。
 - `output_file` 必须在 workspace 的 `.orchestrator` runtime 路径内；不能借此写入已跟踪 prompt 或源码。
+
+Health policy 也可以放在可选的 `[harness_health]` table 中，使用 `ttl_seconds`、
+`cooldown_seconds` 和 `probe_timeout_seconds` 短名称；`[readiness]` 是兼容别名。范围和默认值
+与 `[coordinator]` 中的字段相同，现有 workflow 无需新增配置。
 
 ## `[standardized_delivery]`
 

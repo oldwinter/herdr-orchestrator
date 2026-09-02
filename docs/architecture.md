@@ -148,8 +148,22 @@ bytes 与 recorded commit 不一致时，matrix 不能返回 `VERIFIED`。
 
 真实 matrix 依赖本机登录态，只能由 operator 在 Herdr-managed pane 运行。`CI` 或
 `GITHUB_ACTIONS` 环境返回 zero-attempt `readiness_ci_forbidden`，不会调用 live probe。Matrix 只生产
-compatibility evidence，不持久化 health、不计算 eligibility，也不影响 controller 或 worker
-selection。Readiness-aware routing 仍由 Issue #39 单独拥有。
+compatibility evidence；readiness-aware routing 由独立的 `HarnessHealth` 深模块拥有并消费 doctor
+和 dispatch evidence，避免把一次 matrix 报告误当作永久有效的 queue eligibility。
+
+### Readiness-aware routing
+
+`HarnessHealth` 按 `workflow + canonical workspace + harness` 持久化 privacy-safe health rows。
+状态只有 `unknown`、`ready`、`degraded` 和 `unavailable`；记录包含 stable reason/source、
+observation/expiry/cooldown、retryable failure count 和 probe lease，不包含 prompt、terminal output
+或 credential。过期的 ready evidence 投影为 unknown，degraded/unavailable 在 cooldown 内不可选。
+
+Coordinator、router、planner、doctor 和 standardized delivery 都请求同一个 eligibility snapshot；
+自动 controller 仍遵循固定 preference order，显式 override 不会 fallback。unknown/过期记录至多发起
+一次由 SQLite compare-and-set lease 去重的 bounded probe。claim 只接收 snapshot 中 eligible 的
+harness，因此不 eligible 的 pending job 不增加 attempt、不取得 lease；fresh ready evidence 到达后
+同一 job 可继续 claim。所有 dispatch outcome 都回写同一分类器，blocked task 和 task receipt failure
+保持 harness health 中立。无可服务 pending work 时 drain 返回 `degraded_capacity`，而不是 queue idle。
 
 ### Execution topology
 
@@ -297,11 +311,11 @@ planner 只能选择当前 workflow catalog 中的 harness。任务 dispatch 时
 
 主控 harness 与 worker harness 是两个独立选择：
 
-- 主控可由 TOML 或 CLI 明确指定；未指定时，coordinator 从候选池中按固定优先级选择已安装 CLI；
+- 主控可由 TOML 或 CLI 明确指定；未指定时，coordinator 从 fresh-ready 候选池中按固定优先级选择；
 - planner 为一批子任务选择 worker；
 - 直接 enqueue 未指定 worker 时，主控执行一次受限 router turn，只能写 `{"harness":"..."}`；
 - 显式 worker 直接入队，不启动 router turn；
-- runtime worker override 同时限制 planner catalog、自动路由候选和本轮 queue claim，池外任务保留在 durable queue。
+- runtime worker override 同时限制 planner catalog、健康 eligibility、自动路由候选和本轮 queue claim，池外任务保留在 durable queue。
 
 ### Opt-in standardized delivery
 

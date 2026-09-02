@@ -19,6 +19,12 @@ sanitized `fields`.
 Local write and exporter network failures never alter queue state. Files are local runtime state
 and are ignored by Git. Prompts and terminal output are never telemetry fields.
 
+Readiness routing emits sanitized `harness_health_changed` and `harness_selection` events. They contain
+only the harness name, four-state health classification, stable reason/source, eligibility, bounded age,
+retryable count, selected role, and the eligible/excluded summary. Health records are scoped by workflow
+and canonical workspace, while telemetry exposes only a one-way workspace digest. A probe lease prevents
+concurrent coordinators from launching duplicate refresh turns.
+
 ## Data handling
 
 All telemetry passes through central sanitization before local persistence and export. Values under

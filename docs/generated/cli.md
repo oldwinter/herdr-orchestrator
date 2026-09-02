@@ -80,6 +80,14 @@ Run commands from a source checkout with `uv run python -m herdr_orchestrator`.
 | `--failed-agents` | yes, exactly one of (mutually exclusive): `--succeeded-agents`, `--failed-agents` |
 | `--apply` | no |
 
+## `migrate-legacy-workspace`
+
+`herdr-orchestrator migrate-legacy-workspace [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--workflow` | yes |
+
 ## `profile`
 
 `herdr-orchestrator profile [arguments]`
