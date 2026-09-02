@@ -53,6 +53,12 @@ After a restart, the coordinator reconstructs the completed frontier from valida
 ticket commits already reachable from integration. It closes recovered tickets before claiming
 the next frontier.
 
+Delivery uses the same durable `HarnessHealth` policy as the ordinary queue. Health preflight runs
+after the delivery journal is claimed, and the selected worker is rechecked immediately before
+transport. Fresh `ready` evidence is required; explicit unhealthy harnesses fail with a stable
+reason and are never silently replaced. The delivery run ID excludes transient controller/worker
+eligibility, so a health transition cannot fork recovery identity.
+
 ## Prompt data and schema boundaries
 
 Prompt templates encode goals, maps, plans, tickets, findings, and worker output as untrusted

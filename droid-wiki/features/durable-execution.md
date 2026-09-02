@@ -73,7 +73,7 @@ lease 过期但尚有 attempt 预算时，任务可被下一次 claim 回收；�
 
 ## 持久化模型与边界
 
-SQLite 使用 WAL、外键检查和显式事务。`jobs` 保存当前投影，`receipts` 追加每个观察到的 attempt outcome，`metadata` 保存 planner 等周期状态；schema migration 从 v1 顺序升级到当前 v4，新增字段时必须保持迁移链与旧数据库兼容。
+SQLite 使用 WAL、外键检查和显式事务。`jobs` 保存当前投影，`receipts` 追加每个观察到的 attempt outcome，`metadata` 保存按 workflow/workspace 隔离的 planner 等周期状态；schema migration 从 v1 顺序升级到当前 v8，新增字段时必须保持迁移链与旧数据库兼容。
 
 必须明确以下边界：
 

@@ -118,6 +118,16 @@ summary 不会进入 matrix。
 `readiness_source_changed` 表示 live probe 期间 HEAD 或 porcelain source state 改变；该 run 的全部
 rows 都失效。等待 source 稳定后重新运行完整 matrix，不复用上一轮单-row evidence。
 
+### Health-aware routing
+
+`just status` 的 `harness_health` projection 是 durable routing evidence：`ready` 必须仍在
+`expires_at` 之前，`degraded`/`unavailable` 在 cooldown 内不会被自动选择。unknown 或过期记录
+会在下一次自动 selection 触发一次 bounded refresh；refresh 使用 SQLite probe lease 去重。显式
+`--controller-harness` 或 `--worker-harness` 不会切换到别的 harness，失败信息会保留请求值和
+stable reason。若 pending job 的目标 harness 暂不可选，job 不会增加 attempt 或 lease，
+`run --until-idle` 返回 `degraded_capacity`；修复运行环境后用 targeted `doctor` 写入 fresh
+evidence，原 job 会继续 claim。
+
 再读取结构化 agent 状态：
 
 ```bash
