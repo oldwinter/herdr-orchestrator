@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -1013,14 +1012,16 @@ class QualityBundleRunTests(unittest.TestCase):
                 if Path(destination).parent.name == "runs":
                     raise RuntimeError("injected finalize crash")
 
-            with patch.object(quality_bundle.os, "replace", side_effect=crash_after_finalize):
-                with self.assertRaisesRegex(RuntimeError, "injected finalize crash"):
-                    quality_bundle.run_quality(
-                        root=root,
-                        commit=commit,
-                        invocation_id="finalize-crash",
-                        specs=(spec,),
-                    )
+            with (
+                patch.object(quality_bundle.os, "replace", side_effect=crash_after_finalize),
+                self.assertRaisesRegex(RuntimeError, "injected finalize crash"),
+            ):
+                quality_bundle.run_quality(
+                    root=root,
+                    commit=commit,
+                    invocation_id="finalize-crash",
+                    specs=(spec,),
+                )
 
             adopted = quality_bundle.run_quality(
                 root=root,
@@ -1094,8 +1095,11 @@ class QualityBundleRunTests(unittest.TestCase):
         ):
             branch_payload = json.loads(json.dumps(payload))
             branch_payload["totals"].pop(field)
-            with self.subTest(missing_branch_field=field), self.assertRaisesRegex(
-                quality_bundle.QualityBundleError, "quality_artifact_invalid"
+            with (
+                self.subTest(missing_branch_field=field),
+                self.assertRaisesRegex(
+                    quality_bundle.QualityBundleError, "quality_artifact_invalid"
+                ),
             ):
                 quality_bundle._validate_artifact_payload(
                     "coverage", "coverage", branch_payload, expected_branch=True

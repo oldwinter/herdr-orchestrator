@@ -273,9 +273,12 @@ def run_quality(
             expected_specs=specs,
             source_probe=source_probe,
         )
-        passed = enforce_manifest(
-            manifest, required_producers=tuple(producer.name for producer in manifest.producers)
-        ) == 0
+        passed = (
+            enforce_manifest(
+                manifest, required_producers=tuple(producer.name for producer in manifest.producers)
+            )
+            == 0
+        )
         return CompletedBundle(final, final / "manifest.json", passed, 0 if passed else 1)
     _claim_run_directory(pending, final)
     (pending / "producers").mkdir()
@@ -753,9 +756,7 @@ def load_completed_manifest(
             validated_commands[0].exit_code if len(validated_commands) == 1 else None
         )
         expected_branch = _quality_validation.expected_branch_coverage(producer_spec.commands)
-        coverage_threshold = _quality_validation.expected_coverage_threshold(
-            producer_spec.commands
-        )
+        coverage_threshold = _quality_validation.expected_coverage_threshold(producer_spec.commands)
         build_command = _quality_validation.expected_build_command(producer_spec.commands)
         if any(
             command.started_at < producer_started or command.ended_at > producer_ended

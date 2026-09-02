@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -212,7 +212,7 @@ def publish_results(
                 os.close(descriptor)
                 raise OSError("quality_result_busy") from error
             locks.append((lock, descriptor))
-    except OSError as error:
+    except OSError:
         for _, descriptor in locks:
             os.close(descriptor)
         with suppress(OSError, shutil.Error):
