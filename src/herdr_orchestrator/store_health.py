@@ -110,5 +110,5 @@ def health_update_statement(
             probe_owner = {owner_sql}
         WHERE workflow = ? AND workspace = ? AND harness = ?
           AND revision = ?{owner_predicate}
-    """
+    """  # nosec B608: fragments are from a fixed SQL-token allowlist
     return query, values

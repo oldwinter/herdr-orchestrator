@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
-import pickle
 import re
 import select
 import shutil
@@ -888,12 +888,11 @@ class HarnessHealth:
         if child == 0:
             os.close(read_fd)
             try:
-                payload = pickle.dumps(
-                    ("ok", _normalize_probe_result(probe(self.workflow, harness, timeout_seconds))),
-                    protocol=pickle.HIGHEST_PROTOCOL,
-                )
+                payload = json.dumps(
+                    ["ok", _normalize_probe_result(probe(self.workflow, harness, timeout_seconds))]
+                ).encode()
             except BaseException:
-                payload = pickle.dumps(("error", "readiness_probe_failed"))
+                payload = json.dumps(["error", "readiness_probe_failed"]).encode()
             try:
                 os.write(write_fd, payload)
             finally:
@@ -922,8 +921,11 @@ class HarnessHealth:
         if not data:
             return {"status": "error", "error_code": "readiness_probe_failed"}
         try:
-            result_kind, payload = pickle.loads(bytes(data))
-        except (pickle.PickleError, EOFError, ValueError, TypeError):
+            decoded = json.loads(bytes(data))
+            if not isinstance(decoded, list) or len(decoded) != 2:
+                raise ValueError("readiness_result_invalid")
+            result_kind, payload = decoded
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
             return {"status": "error", "error_code": "readiness_result_invalid"}
         del status
         if result_kind != "ok":

@@ -42,7 +42,7 @@ def workspace_clause(
                 )
             )
         )
-        """,
+        """,  # nosec B608: alias is a local SQL identifier, values are bound
         (target,),
     )
 
