@@ -112,7 +112,11 @@ class CliTests(unittest.TestCase):
         droid = next(check for check in report["checks"] if check["check"] == "readiness:droid")
         self.assertEqual(code, 1)
         self.assertFalse(report["ok"])
+        self.assertEqual(report["verification"], "NOT VERIFIED")
+        self.assertEqual(report["summary"]["readiness_verification"], "NOT VERIFIED")
+        self.assertEqual(report["summary"]["evidence_kind"], "live_readiness")
         self.assertEqual(droid["status"], "auth_required")
+        self.assertEqual(droid["verification"], "NOT VERIFIED")
         self.assertFalse(droid["ok"])
 
     def test_doctor_can_filter_harnesses_and_reports_probe_timing(self) -> None:
@@ -158,8 +162,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(probed, [Harness.DROID])
         self.assertEqual([check["check"] for check in readiness], ["readiness:droid"])
         self.assertEqual(readiness[0]["duration_ms"], 7)
+        self.assertEqual(readiness[0]["verification"], "VERIFIED")
+        self.assertEqual(report["verification"], "VERIFIED")
         self.assertEqual(report["summary"]["harnesses"], ["droid"])
         self.assertEqual(report["summary"]["readiness_ms"], 7)
+        self.assertEqual(report["summary"]["readiness_verification"], "VERIFIED")
+        self.assertEqual(report["summary"]["evidence_kind"], "live_readiness")
 
     def test_dashboard_defaults_to_loopback_live_view(self) -> None:
         args = build_parser().parse_args(

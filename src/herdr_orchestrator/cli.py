@@ -596,11 +596,24 @@ def doctor(
     checks.extend(readiness_checks)
     ok = all(bool(check["ok"]) for check in checks)
     passed = sum(bool(check["ok"]) for check in checks)
+    readiness_checks = [
+        check for check in checks if str(check.get("check", "")).startswith("readiness:")
+    ]
+    verification = (
+        ReadinessVerification.VERIFIED
+        if readiness_checks
+        and all(
+            check.get("verification") == ReadinessVerification.VERIFIED.value
+            for check in readiness_checks
+        )
+        else ReadinessVerification.NOT_VERIFIED
+    )
     print(
         json.dumps(
             {
                 "checks": checks,
                 "ok": ok,
+                "verification": verification.value,
                 "harness_health": health.snapshot(harnesses, refresh=False).public_json(),
                 "summary": {
                     "checks": len(checks),
@@ -608,6 +621,8 @@ def doctor(
                     "harnesses": [harness.value for harness in harnesses],
                     "passed": passed,
                     "readiness_ms": readiness_ms,
+                    "readiness_verification": verification.value,
+                    "evidence_kind": "live_readiness",
                 },
             },
             indent=2,
@@ -847,6 +862,11 @@ def _doctor_harness_checks(
             "check": f"readiness:{harness.value}",
             "ok": status == "ready",
             "status": status,
+            "verification": (
+                ReadinessVerification.VERIFIED.value
+                if status == "ready" and active_readiness.get("error_code") is None
+                else ReadinessVerification.NOT_VERIFIED.value
+            ),
             "error_code": active_readiness.get("error_code"),
             "error_summary": active_readiness.get("error_summary"),
             "duration_ms": duration_ms,

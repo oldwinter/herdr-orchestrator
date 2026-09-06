@@ -338,6 +338,8 @@ class HarnessHealthTests(unittest.TestCase):
             )
             self.assertEqual(result, 1)
             self.assertFalse(readiness["ok"])
+            self.assertEqual(readiness["verification"], "NOT VERIFIED")
+            self.assertEqual(report["verification"], "NOT VERIFIED")
             self.assertEqual(readiness["error_code"], "readiness_result_invalid")
 
     def test_probe_lease_deduplicates_concurrent_refreshes(self) -> None:

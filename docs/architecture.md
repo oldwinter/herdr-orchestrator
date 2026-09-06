@@ -128,7 +128,12 @@ blocked 会立即返回 `idle=false`、`reason=blocked`。结果用 `worker_pool
 
 ### Readiness evidence
 
-`readiness-matrix` 与 durable queue、`doctor` summary、`smoke` 和 routing policy 相互独立。它从当前
+`readiness-matrix` 与 durable queue、`doctor` summary、`smoke` 和 routing policy 相互独立。
+`doctor` 的 readiness 行与顶层 `verification` 也使用同一 `VERIFIED` / `NOT VERIFIED` 词，并把
+`summary.evidence_kind` 标为 `live_readiness`，避免把本机 probe 结果与仓库测试矩阵混读。系统检查仍用
+`ok`；缺失、失败或不可解析的 readiness 证据一律 `NOT VERIFIED`。
+
+`readiness-matrix` 从当前
 Herdr-managed pane 对每个 enabled 或 repeat-filtered harness 调用既有真实 probe，并输出 schema v1
 matrix。每条结果包含 exact Git commit、package version、workflow、canonical workspace digest、
 harness、source-clean flag、closed status、closed error code、allowlisted phase timings、UTC observation
