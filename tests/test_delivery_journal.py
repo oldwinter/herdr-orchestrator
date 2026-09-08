@@ -14,6 +14,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from crash_matrix import CrashInjected, run_public_operation_crash_matrix
+
 import herdr_orchestrator.delivery_recovery as recovery_module
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.delivery import DeliveryError, StandardizedDelivery
@@ -2003,67 +2005,75 @@ class DeliveryJournalTests(unittest.TestCase):
             "review:accept:1",
             "result:publish",
         )
-        for operation_key in boundaries:
-            for transition in ("effect_intent", "effect_confirmed"):
-                with (
-                    self.subTest(
-                        operation_key=operation_key,
-                        transition=transition,
-                    ),
-                    tempfile.TemporaryDirectory() as temporary,
-                ):
-                    repository = Path(temporary).resolve() / "repository"
-                    _initialize_repository(repository)
-                    config = _workflow(repository)
-                    goal = repository / "goal.md"
-                    goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
-                    external: dict[str, object] = {}
-                    interrupted = [False]
-                    interrupt = _interrupt_journal(
-                        DeliveryJournal._persist_event,
-                        transition,
-                        operation_key,
-                        interrupted,
-                    )
 
-                    first = StandardizedDelivery(
-                        config,
-                        dispatcher=CompleteDispatcher(),
-                        tracker=StableTracker(external),
-                        controller_harness=Harness.DROID,
-                        worker_harnesses=(Harness.DROID,),
-                    )
-                    with (
-                        patch.object(
-                            DeliveryJournal,
-                            "_persist_event",
-                            interrupt,
-                        ),
-                        self.assertRaisesRegex(
-                            RuntimeError,
-                            "journal interruption",
-                        ),
-                    ):
-                        first.run(goal)
-                    self.assertTrue(interrupted[0])
+        def setup(root: Path):
+            repository = root / "repository"
+            _initialize_repository(repository)
+            goal = repository / "goal.md"
+            goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+            return _workflow(repository), goal, {}, CompleteDispatcher(), {}
 
-                    result = StandardizedDelivery(
-                        config,
-                        dispatcher=CompleteDispatcher(),
-                        tracker=StableTracker(external),
-                        controller_harness=Harness.DROID,
-                        worker_harnesses=(Harness.DROID,),
-                    ).run(goal)
-                    log = _git(
-                        result.artifact_root / "worktrees/integration",
-                        "log",
-                        "--format=%s",
-                    ).stdout
+        def execute(case) -> None:
+            config, goal, external, dispatcher, completed = case
+            completed["result"] = StandardizedDelivery(
+                config,
+                dispatcher=dispatcher,
+                tracker=StableTracker(external),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            ).run(goal)
 
-                    self.assertEqual(result.status, "succeeded")
-                    self.assertEqual(external["publish_mutations"], 1)
-                    self.assertEqual(external["close_mutations"], 1)
-                    self.assertEqual(log.count("Merge branch"), 1)
+        def run(case, boundary: str | None) -> None:
+            if boundary is None:
+                execute(case)
+                return
+            transition, operation_key = boundary.split("/", 1)
+            interrupted = [False]
+            interrupt = _interrupt_journal(
+                DeliveryJournal._persist_event,
+                transition,
+                operation_key,
+                interrupted,
+            )
+            with patch.object(DeliveryJournal, "_persist_event", interrupt):
+                try:
+                    execute(case)
+                except RuntimeError as exc:
+                    if not interrupted[0] or str(exc) != "journal interruption":
+                        raise
+                    raise CrashInjected(boundary) from exc
+
+        def observe(case):
+            _, _, external, dispatcher, completed = case
+            result = completed["result"]
+            integration = result.artifact_root / "worktrees/integration"
+            subjects = _git(integration, "log", "--format=%s").stdout
+            return {
+                "status": result.status,
+                "tracker": dict(external),
+                "merge_count": subjects.count("Merge branch"),
+                "ticket_commit_count": subjects.count("feat: implement journal slice"),
+                "business_artifact": (integration / "slice-01.txt").read_bytes(),
+                "turn_count": len(dispatcher.prompts),
+            }
+
+        results = run_public_operation_crash_matrix(
+            (
+                f"{transition}/{key}"
+                for key in boundaries
+                for transition in ("effect_intent", "effect_confirmed")
+            ),
+            setup=setup,
+            run=run,
+            restart=execute,
+            observe=observe,
+        )
+        self.assertEqual(len(results), 16)
+        for result in results.values():
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["tracker"]["publish_mutations"], 1)
+            self.assertEqual(result["tracker"]["close_mutations"], 1)
+            self.assertEqual(result["merge_count"], 1)
 
     def test_applied_git_and_review_effects_converge_without_confirmation(
         self,
