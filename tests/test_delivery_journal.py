@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +21,7 @@ from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.delivery import DeliveryError, StandardizedDelivery
 from herdr_orchestrator.delivery_journal import DeliveryJournal
 from herdr_orchestrator.delivery_protocol import DeliveryPlan, DeliveryTicket, TicketReceipt
+from herdr_orchestrator.delivery_recovery import DeliveryResult
 from herdr_orchestrator.git_workspace import Worktree
 from herdr_orchestrator.model import (
     AgentState,
@@ -2006,24 +2007,31 @@ class DeliveryJournalTests(unittest.TestCase):
             "result:publish",
         )
 
-        def setup(root: Path):
+        @dataclass
+        class DeliveryCase:
+            config: WorkflowConfig
+            goal: Path
+            external: dict[str, object] = field(default_factory=dict)
+            dispatcher: CompleteDispatcher = field(default_factory=CompleteDispatcher)
+            result: DeliveryResult | None = None
+
+        def setup(root: Path) -> DeliveryCase:
             repository = root / "repository"
             _initialize_repository(repository)
             goal = repository / "goal.md"
             goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
-            return _workflow(repository), goal, {}, CompleteDispatcher(), {}
+            return DeliveryCase(config=_workflow(repository), goal=goal)
 
-        def execute(case) -> None:
-            config, goal, external, dispatcher, completed = case
-            completed["result"] = StandardizedDelivery(
-                config,
-                dispatcher=dispatcher,
-                tracker=StableTracker(external),
+        def execute(case: DeliveryCase) -> None:
+            case.result = StandardizedDelivery(
+                case.config,
+                dispatcher=case.dispatcher,
+                tracker=StableTracker(case.external),
                 controller_harness=Harness.DROID,
                 worker_harnesses=(Harness.DROID,),
-            ).run(goal)
+            ).run(case.goal)
 
-        def run(case, boundary: str | None) -> None:
+        def run(case: DeliveryCase, boundary: str | None) -> None:
             if boundary is None:
                 execute(case)
                 return
@@ -2043,18 +2051,18 @@ class DeliveryJournalTests(unittest.TestCase):
                         raise
                     raise CrashInjected(boundary) from exc
 
-        def observe(case):
-            _, _, external, dispatcher, completed = case
-            result = completed["result"]
+        def observe(case: DeliveryCase) -> dict[str, object]:
+            result = case.result
+            assert result is not None
             integration = result.artifact_root / "worktrees/integration"
             subjects = _git(integration, "log", "--format=%s").stdout
             return {
                 "status": result.status,
-                "tracker": dict(external),
+                "tracker": dict(case.external),
                 "merge_count": subjects.count("Merge branch"),
                 "ticket_commit_count": subjects.count("feat: implement journal slice"),
                 "business_artifact": (integration / "slice-01.txt").read_bytes(),
-                "turn_count": len(dispatcher.prompts),
+                "turn_count": len(case.dispatcher.prompts),
             }
 
         results = run_public_operation_crash_matrix(

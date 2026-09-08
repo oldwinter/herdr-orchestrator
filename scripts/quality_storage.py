@@ -120,6 +120,20 @@ def discard_pending(pending: Path) -> None:
     shutil.rmtree(retired)
 
 
+def claim_run_directory(pending: Path, final: Path, *, reuse_completed: bool) -> None:
+    if final.exists() or final.is_symlink():
+        raise QualityBundleError("quality_run_reused")
+    if pending.exists() or pending.is_symlink():
+        require_dead_owner(pending)
+        if (pending / "manifest.json").exists():
+            if not reuse_completed:
+                raise QualityBundleError("quality_run_reused")
+            os.replace(pending, final)
+            return
+        discard_pending(pending)
+    claim_pending(pending)
+
+
 @dataclass(frozen=True)
 class ArtifactSnapshot:
     data: bytes
@@ -140,6 +154,20 @@ def object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, obje
 
 def reject_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def json_object(path: Path, error_code: str) -> dict[str, object]:
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=object_without_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError) as error:
+        raise QualityBundleError(error_code) from error
+    if not isinstance(payload, dict):
+        raise QualityBundleError(error_code)
+    return payload
 
 
 def _signature(metadata: os.stat_result) -> tuple[int, int, int, int]:

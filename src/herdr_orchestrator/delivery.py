@@ -403,7 +403,7 @@ class StandardizedDelivery(
         except (HarnessHealthError, ValueError) as exc:
             raise DeliveryError(str(exc)) from exc
 
-    def _run_claimed(self, run_id: str) -> DeliveryResult:
+    def _restore_previous_state(self) -> None:
         stage_state = self._require_journal().latest_stage_state()
         if stage_state is not None:
             _write_json(self._run_root / "state.json", stage_state)
@@ -418,6 +418,9 @@ class StandardizedDelivery(
                 self._write_state("failed", stage="stopped", error="DeliveryStateInvalid")
                 raise DeliveryError("delivery_state_invalid")
             self._previous_state = state
+
+    def _run_claimed(self, run_id: str) -> DeliveryResult:
+        self._restore_previous_state()
         try:
             completed_result = _load_completed_result(self._run_root / "result.json", run_id)
             if completed_result is None:

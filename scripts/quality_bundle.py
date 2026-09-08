@@ -158,6 +158,8 @@ def _run_id(commit: str, invocation_id: str, source_digest: str) -> str:
 _atomic_write_json = _quality_storage.atomic_write_json
 _atomic_write_bytes = _quality_storage.atomic_write_bytes
 _json_bytes = _quality_storage.json_bytes
+_json_object = _quality_storage.json_object
+_claim_run_directory = _quality_storage.claim_run_directory
 
 
 def _artifact_path(output_dir: Path, spec: ArtifactSpec) -> Path:
@@ -170,7 +172,6 @@ def _artifact_path(output_dir: Path, spec: ArtifactSpec) -> Path:
     return path
 
 
-_object_without_duplicates = _quality_storage.object_without_duplicates
 _artifact_snapshot = _quality_storage.artifact_snapshot
 _assert_artifact_unchanged = _quality_storage.assert_artifact_unchanged
 _parse_artifact_bytes = _quality_storage.parse_artifact_bytes
@@ -218,20 +219,6 @@ def _expanded_argv(command: CommandSpec, output_dir: Path) -> CommandInvocation:
     argv = tuple(argument.replace(OUTPUT_DIRECTORY, str(output_dir)) for argument in command.argv)
     inputs = _tracked_files() if command.include_tracked_files else ()
     return CommandInvocation((*argv, *inputs), len(inputs), _inventory_digest(inputs))
-
-
-def _claim_run_directory(pending: Path, final: Path, *, reuse_completed: bool) -> None:
-    if final.exists() or final.is_symlink():
-        raise QualityBundleError("quality_run_reused")
-    if pending.exists() or pending.is_symlink():
-        _quality_storage.require_dead_owner(pending)
-        if (pending / "manifest.json").exists():
-            if not reuse_completed:
-                raise QualityBundleError("quality_run_reused")
-            os.replace(pending, final)
-            return
-        _quality_storage.discard_pending(pending)
-    _quality_storage.claim_pending(pending)
 
 
 def run_quality(
@@ -518,20 +505,6 @@ def _run_quality_owned(
     _atomic_write_json(pending / "manifest.json", manifest)
     os.replace(pending, final)
     return CompletedBundle(final, final / "manifest.json", all_passed, bundle_exit_code)
-
-
-def _json_object(path: Path, error_code: str) -> dict[str, object]:
-    try:
-        payload = json.loads(
-            path.read_text(encoding="utf-8"),
-            object_pairs_hook=_object_without_duplicates,
-            parse_constant=_quality_storage.reject_constant,
-        )
-    except (OSError, TypeError, UnicodeError, ValueError, RecursionError) as error:
-        raise QualityBundleError(error_code) from error
-    if not isinstance(payload, dict):
-        raise QualityBundleError(error_code)
-    return payload
 
 
 def _string(payload: dict[str, object], key: str, error_code: str) -> str:
