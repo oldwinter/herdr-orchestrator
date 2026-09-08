@@ -39,7 +39,7 @@ class QualityCommandTests(unittest.TestCase):
         self.assertEqual(result.stderr.strip(), "quality_storage_unavailable")
         self.assertNotIn("Traceback", result.stderr)
 
-    def test_quality_bundle_result_write_failure_removes_published_bundle(self) -> None:
+    def test_quality_bundle_result_write_failure_preserves_completed_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             evidence_root = root / "quality"
@@ -71,11 +71,12 @@ class QualityCommandTests(unittest.TestCase):
             )
             runs = list((evidence_root / "runs").iterdir())
             results = list((evidence_root / "results").iterdir())
+            self.assertTrue((runs[0] / "manifest.json").is_file())
 
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), "quality_storage_unavailable")
         self.assertNotIn("Traceback", result.stderr)
-        self.assertEqual(runs, [])
+        self.assertEqual(len(runs), 1)
         self.assertEqual(results, [])
 
     def test_public_runner_binds_tracked_and_untracked_source_changes(self) -> None:

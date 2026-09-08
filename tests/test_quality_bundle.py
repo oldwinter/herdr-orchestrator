@@ -781,7 +781,8 @@ class QualityBundleRunTests(unittest.TestCase):
             def claim() -> str:
                 barrier.wait()
                 try:
-                    quality_bundle._claim_run_directory(pending, final)
+                    with quality_bundle._quality_storage.run_lock(root, "same-run"):
+                        quality_bundle._claim_run_directory(pending, final, reuse_completed=False)
                 except quality_bundle.QualityBundleError as error:
                     return str(error)
                 return "claimed"
@@ -956,7 +957,6 @@ class QualityBundleRunTests(unittest.TestCase):
 
                 try:
                     quality_bundle._quality_storage.publish_results(
-                        bundle_path=bundle,
                         default_path=defaults[label],
                         requested_path=shared,
                         payload={"writer": label},
@@ -976,7 +976,7 @@ class QualityBundleRunTests(unittest.TestCase):
 
             self.assertEqual(outcomes, ["failed", "passed"])
             self.assertTrue(shared.is_file())
-            self.assertEqual(sum(bundle.is_dir() for bundle in bundles.values()), 1)
+            self.assertEqual(sum(bundle.is_dir() for bundle in bundles.values()), 2)
 
     def test_persistent_unlocked_result_lock_is_reclaimed_after_owner_crash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -988,7 +988,6 @@ class QualityBundleRunTests(unittest.TestCase):
             lock.touch()
 
             quality_bundle._quality_storage.publish_results(
-                bundle_path=bundle,
                 default_path=result,
                 requested_path=None,
                 payload={"ok": True},
