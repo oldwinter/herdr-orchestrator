@@ -59,7 +59,7 @@ PYTHONPATH=src uv run pytest tests/test_crash_matrix.py tests/test_attempt_crash
 随后运行接入共享驱动器的完整 delivery boundary matrix 和 packed installer matrix。
 
 ```bash
-PYTHONPATH=src uv run pytest tests/test_delivery_journal.py::DeliveryJournalTests::test_crash_matrix_converges_before_and_after_each_delivery_boundary -q
+PYTHONPATH=src uv run pytest tests/test_delivery_journal.py -k test_crash_matrix_converges_before_and_after_each_delivery_boundary -q
 just test-installer-crash-matrix
 ```
 
