@@ -256,7 +256,7 @@ class CountingGithubTracker(GithubTracker):
 class DeliveryJournalRootReviewTests(unittest.TestCase):
     def test_marked_ticket_human_edit_conflicts_before_dispatch_or_git(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -334,7 +334,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
 
     def _assert_repair_receipt_conflict(self, phase: str) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -403,7 +403,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
 
     def _assert_adjudication_conflict(self, phase: str) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -477,7 +477,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
 
     def _assert_result_confirmation_conflict(self, phase: str) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -540,7 +540,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
         mutation: str,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -603,7 +603,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
 
     def test_completed_pre_journal_run_rebuilds_before_marker_adoption(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -682,7 +682,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -749,7 +749,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -832,7 +832,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
 
     def test_completed_pre_journal_conflict_has_zero_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -904,7 +904,7 @@ class DeliveryJournalRootReviewTests(unittest.TestCase):
 
     def _assert_legacy_post_matched_conflict(self, phase: str) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(

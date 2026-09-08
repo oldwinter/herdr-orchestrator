@@ -37,6 +37,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.config = replace(
+            load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+            state_db=Path(temporary.name) / "state.db",
+        )
+
     def test_readiness_probe_classifies_invalid_model_and_closes_created_agent(self) -> None:
         config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
 
@@ -73,7 +81,7 @@ class CliTests(unittest.TestCase):
         self.assertRegex(transport.closed[0], r"^doctor-hermes-[a-f0-9]{6}$")
 
     def test_doctor_fails_when_an_installed_harness_requires_auth(self) -> None:
-        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        config = self.config
         output = io.StringIO()
 
         def readiness_probe(
@@ -120,7 +128,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(droid["ok"])
 
     def test_doctor_can_filter_harnesses_and_reports_probe_timing(self) -> None:
-        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        config = self.config
         output = io.StringIO()
         probed: list[Harness] = []
 

@@ -20,7 +20,7 @@ from herdr_orchestrator.delivery_protocol import (
 class DeliveryProtocolTests(unittest.TestCase):
     def test_loads_dependency_ordered_tracer_bullet_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text(json.dumps(_plan()), encoding="utf-8")
 
             plan = load_delivery_plan(path)
@@ -31,7 +31,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_rejects_ticket_that_precedes_its_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             payload = _plan()
             payload["tickets"][0]["blocked_by"] = ["02"]
             path.write_text(json.dumps(payload), encoding="utf-8")
@@ -44,7 +44,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_proxy_requires_secret_and_production_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "decision.json"
+            path = Path(temporary).resolve() / "decision.json"
             path.write_text(
                 json.dumps(
                     {
@@ -81,7 +81,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_review_verdict_must_account_for_every_finding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_text(
                 json.dumps(
                     {
@@ -111,7 +111,7 @@ class DeliveryProtocolTests(unittest.TestCase):
             acceptance_criteria=("The behavior works.",),
         )
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "receipt.json"
+            path = Path(temporary).resolve() / "receipt.json"
             payload = _receipt()
             path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -128,7 +128,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_review_verdict_rejects_duplicate_finding_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_text(
                 json.dumps(
                     {
@@ -148,7 +148,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_rejects_duplicate_json_object_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_text(
                 """{
                     "accepted": [],
@@ -167,7 +167,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_invalid_utf8_is_reported_as_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_bytes(b"\xff")
 
             with self.assertRaisesRegex(
@@ -178,7 +178,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_oversized_json_integer_is_reported_as_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_text(
                 '{"accepted":' + "9" * 5_000 + ',"dismissed":[],"rationale":"valid"}',
                 encoding="utf-8",
@@ -199,7 +199,7 @@ class DeliveryProtocolTests(unittest.TestCase):
             acceptance_criteria=("The behavior works.",),
         )
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "missing.json"
+            path = Path(temporary).resolve() / "missing.json"
 
             with self.assertRaisesRegex(
                 DeliveryArtifactError,

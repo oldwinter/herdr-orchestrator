@@ -319,7 +319,7 @@ class SettledWithoutArtifactDispatcher:
 class StandardizedDeliveryTests(unittest.TestCase):
     def test_rejects_ticket_commit_with_divergent_history_before_merge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             repository = root / "repository"
             repository.mkdir()
             _git(repository, "init", "-b", "main")
@@ -347,7 +347,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_sanitizes_rationale_before_writing_decision_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             delivery_config = replace(
                 config.standardized_delivery,
@@ -378,7 +378,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_rejects_symlinked_delivery_artifact_and_runtime_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             outside = root / "outside"
             outside.mkdir()
             payload = {"use_wayfinder": False, "reason": "clear"}
@@ -398,7 +398,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_rejects_github_goal_secret_before_dispatch_or_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _git(root, "init", "-b", "main")
             _git(root, "config", "user.name", "Test User")
             _git(root, "config", "user.email", "test@example.com")
@@ -452,7 +452,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_rejects_github_plan_secret_before_tracker_call(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             delivery_config = replace(
                 config.standardized_delivery,
@@ -489,7 +489,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_runs_parallel_frontier_then_final_two_axis_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             repository.mkdir()
             _git(repository, "init", "-b", "main")
             _git(repository, "config", "user.name", "Test User")
@@ -578,7 +578,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_principal_proxy_answers_spec_authorized_worker_question(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             delivery_config = replace(
                 config.standardized_delivery,
@@ -614,7 +614,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_principal_proxy_escalates_sensitive_question_without_answering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             delivery_config = replace(
                 config.standardized_delivery,
@@ -647,7 +647,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_wayfinder_resolves_frontier_before_returning_to_spec(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             delivery_config = replace(
                 config.standardized_delivery,
@@ -680,7 +680,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_resume_reuses_validated_plan_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             delivery_config = replace(
                 config.standardized_delivery,
@@ -711,7 +711,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_resume_reuses_tracker_publication_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             delivery_config = replace(
                 config.standardized_delivery,
@@ -760,7 +760,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_missing_artifact_retries_once_on_same_ready_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             delivery_config = replace(
                 config.standardized_delivery,
@@ -796,7 +796,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_all_configured_repair_rounds_are_available(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             repository = root / "repository"
             repository.mkdir()
             _git(repository, "init", "-b", "main")
@@ -887,7 +887,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_review_does_not_reuse_stale_axis_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             repository = root / "repository"
             repository.mkdir()
             _git(repository, "init", "-b", "main")
@@ -954,7 +954,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_rejects_a_foreign_repository_at_ticket_worktree_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             repository = root / "repository"
             repository.mkdir()
             _git(repository, "init", "-b", "main")
@@ -1030,7 +1030,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_interrupted_run_keeps_its_original_base_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             repository = root / "repository"
             repository.mkdir()
             _git(repository, "init", "-b", "main")
@@ -1105,7 +1105,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_repair_budget_survives_an_interrupted_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             repository = root / "repository"
             repository.mkdir()
             _git(repository, "init", "-b", "main")
@@ -1228,7 +1228,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
     def test_same_delivery_run_cannot_claim_its_worktrees_twice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "run.lock"
+            path = Path(temporary).resolve() / "run.lock"
 
             def claim_again() -> None:
                 with _delivery_run_claim(path):

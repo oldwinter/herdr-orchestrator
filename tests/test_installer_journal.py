@@ -40,7 +40,7 @@ class InstallerJournalPackedTests(unittest.TestCase):
     @installer_crash_matrix
     def test_packed_installer_recovers_after_every_durable_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             package_directory = root / "package"
             extracted = root / "extracted"
             package_directory.mkdir()
@@ -538,7 +538,7 @@ class InstallerJournalPackedTests(unittest.TestCase):
     @installer_crash_matrix
     def test_current_package_recovers_pre_owner_pre_mode_v1_journals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             package_directory = root / "package"
             extracted = root / "extracted"
             package_directory.mkdir()
@@ -725,7 +725,7 @@ class InstallerJournalPackedTests(unittest.TestCase):
     @installer_crash_matrix
     def test_packed_legacy_mode_adjustment_is_recoverable_after_interrupt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             package_directory = root / "package"
             extracted = root / "extracted"
             project = root / "project"
@@ -1181,7 +1181,7 @@ class InstallerJournalPackedTests(unittest.TestCase):
 
     def test_current_package_finishes_an_older_package_transaction_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             package_directory = root / "packages"
             current_directory = root / "current"
             older_directory = root / "older"

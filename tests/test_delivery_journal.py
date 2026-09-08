@@ -910,7 +910,7 @@ class ProxyResponseCrashDispatcher(CompleteDispatcher):
 class DeliveryJournalTests(unittest.TestCase):
     def test_concurrent_loser_cannot_mutate_an_owned_delivery_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -970,7 +970,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_expired_owner_is_recovered_after_process_death(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1055,7 +1055,7 @@ class DeliveryJournalTests(unittest.TestCase):
                 ),
                 tempfile.TemporaryDirectory() as temporary,
             ):
-                run_root = Path(temporary) / "delivery-run"
+                run_root = Path(temporary).resolve() / "delivery-run"
                 run_root.mkdir()
                 now = [100.0]
                 tokens = iter(("1" * 32, "2" * 32))
@@ -1126,7 +1126,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_tracker_publication_replays_from_intent_without_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1190,7 +1190,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_agent_artifact_recovery_does_not_repeat_the_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1232,7 +1232,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_pending_artifact_stops_while_named_agent_is_working(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1262,7 +1262,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_duplicate_journal_keys_fail_before_external_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1298,7 +1298,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_effect_from_a_non_owner_token_invalidates_the_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1336,7 +1336,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_receipt_merge_and_close_recover_in_durable_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1403,7 +1403,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_final_result_recovers_after_write_before_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1471,7 +1471,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_final_result_rejects_a_commit_after_final_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1515,7 +1515,7 @@ class DeliveryJournalTests(unittest.TestCase):
         )
         for mutation, expected_error in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                repository = Path(temporary) / "repository"
+                repository = Path(temporary).resolve() / "repository"
                 _initialize_repository(repository)
                 config = _workflow(repository)
                 goal = repository / "goal.md"
@@ -1565,7 +1565,7 @@ class DeliveryJournalTests(unittest.TestCase):
         )
         for mutation, expected_error in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                repository = Path(temporary) / "repository"
+                repository = Path(temporary).resolve() / "repository"
                 _initialize_repository(repository)
                 config = _workflow(repository)
                 goal = repository / "goal.md"
@@ -1598,7 +1598,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_repair_commit_recovers_without_a_second_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -1654,7 +1654,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_repair_head_change_without_receipt_is_a_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -1700,7 +1700,7 @@ class DeliveryJournalTests(unittest.TestCase):
     def test_repair_crash_matrix_converges_before_and_after_commit(self) -> None:
         for transition in ("effect_intent", "effect_confirmed"):
             with self.subTest(transition=transition), tempfile.TemporaryDirectory() as temporary:
-                repository = Path(temporary) / "repository"
+                repository = Path(temporary).resolve() / "repository"
                 _initialize_repository(repository)
                 config = _workflow(repository)
                 config = replace(
@@ -1751,7 +1751,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_pre_journal_tracker_publication_is_adopted_before_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -1801,7 +1801,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_legacy_receipt_conflict_causes_zero_tracker_adoption_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -1847,7 +1847,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_proxy_response_recovers_without_sending_the_answer_twice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1887,7 +1887,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_pre_journal_receipt_merge_and_close_are_adopted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1947,7 +1947,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_parallel_sibling_survives_crash_after_first_ticket_close(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -2012,7 +2012,7 @@ class DeliveryJournalTests(unittest.TestCase):
                     ),
                     tempfile.TemporaryDirectory() as temporary,
                 ):
-                    repository = Path(temporary) / "repository"
+                    repository = Path(temporary).resolve() / "repository"
                     _initialize_repository(repository)
                     config = _workflow(repository)
                     goal = repository / "goal.md"
@@ -2076,7 +2076,7 @@ class DeliveryJournalTests(unittest.TestCase):
         )
         for target in targets:
             with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
-                repository = Path(temporary) / "repository"
+                repository = Path(temporary).resolve() / "repository"
                 _initialize_repository(repository)
                 config = _workflow(repository)
                 goal = repository / "goal.md"
@@ -2163,7 +2163,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_human_commit_after_confirmed_merge_stops_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -2222,7 +2222,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_completed_result_rejects_missing_confirmed_tracker_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"

@@ -15,11 +15,11 @@ install-manager:
 
 [positional-arguments]
 doctor *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{workflow}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator doctor --workflow {{quote(workflow)}} "$@"
 
 [positional-arguments]
 readiness-matrix *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator readiness-matrix --workflow {{workflow}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator readiness-matrix --workflow {{quote(workflow)}} "$@"
 
 test:
     @python3 scripts/quality_bundle.py run --producer test
@@ -64,65 +64,64 @@ docs-check:
 check:
     @uv sync --locked
     @PYTHONPATH=src {{python}} -m compileall -q src tests scripts
-    @just test-installer-crash-matrix || installer_status=$?; installer_status=${installer_status:-0}; root="${QUALITY_EVIDENCE_ROOT:-.orchestrator/quality}"; mkdir -p "$root/results"; result="$(mktemp "$root/results/check.XXXXXX.json")"; summary="${result%.json}.md"; set +e; python3 scripts/quality_bundle.py run --all --root "$root" --result "$result"; collect_status=$?; python3 scripts/quality_summary.py --result "$result" --root "$root" --output "$summary"; summary_status=$?; python3 scripts/quality_bundle.py enforce --result "$result" --root "$root" --require-full; enforce_status=$?; set -e; printf 'bundle=%s summary=%s collect=%s render=%s enforce=%s installer=%s\n' "$result" "$summary" "$collect_status" "$summary_status" "$enforce_status" "$installer_status"; if test "$installer_status" -ne 0; then exit "$installer_status"; fi; if test "$enforce_status" -ne 0; then exit "$enforce_status"; fi; if test "$summary_status" -ne 0; then exit "$summary_status"; fi; exit "$collect_status"
+    @just test-installer-crash-matrix || installer_status=$?; installer_status=${installer_status:-0}; root="${QUALITY_EVIDENCE_ROOT:-.orchestrator/quality}"; mkdir -p "$root/results"; result="$(python3 -c 'import sys, tempfile; print(tempfile.NamedTemporaryFile(dir=sys.argv[1], prefix="check.", suffix=".json", delete=False).name)' "$root/results")"; summary="${result%.json}.md"; set +e; python3 scripts/quality_bundle.py run --all --root "$root" --result "$result"; collect_status=$?; python3 scripts/quality_summary.py --result "$result" --root "$root" --output "$summary"; summary_status=$?; python3 scripts/quality_bundle.py enforce --result "$result" --root "$root" --require-full; enforce_status=$?; set -e; printf 'bundle=%s summary=%s collect=%s render=%s enforce=%s installer=%s\n' "$result" "$summary" "$collect_status" "$summary_status" "$enforce_status" "$installer_status"; if test "$installer_status" -ne 0; then exit "$installer_status"; fi; if test "$enforce_status" -ne 0; then exit "$enforce_status"; fi; if test "$summary_status" -ne 0; then exit "$summary_status"; fi; exit "$collect_status"
 
 seed:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator seed --workflow {{workflow}}
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator seed --workflow {{quote(workflow)}}
 
 status:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator status --workflow {{workflow}}
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator status --workflow {{quote(workflow)}}
 
 [positional-arguments]
 dashboard *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator dashboard --workflow {{workflow}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator dashboard --workflow {{quote(workflow)}} "$@"
 
 catalog:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{workflow}} --format text
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{quote(workflow)}} --format text
 
 catalog-json:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{workflow}} --format json
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{quote(workflow)}} --format json
 
 profile harness:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator profile --workflow {{workflow}} {{quote(harness)}}
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator profile --workflow {{quote(workflow)}} {{quote(harness)}}
 
-# enqueue: 入队任务。extra flag 转发必须用 {{args}}，勿改回 "$@"（positional 模式下 "$@" 含全部参数，会把已绑定参数重复传给 CLI）
 [positional-arguments]
 enqueue harness title prompt_file dedupe_key *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --harness {{quote(harness)}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} {{args}}
+    @shift 4; PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{quote(workflow)}} --harness {{quote(harness)}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} "$@"
 
 [positional-arguments]
 run-once *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} --once "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{quote(workflow)}} --once "$@"
 
 [positional-arguments]
 run-until-idle *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} --until-idle "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{quote(workflow)}} --until-idle "$@"
 
 run *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{workflow}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator run --workflow {{quote(workflow)}} "$@"
 
 [positional-arguments]
 retry job_id *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{workflow}} --job-id {{quote(job_id)}} {{args}}
+    @shift 1; PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{quote(workflow)}} --job-id {{quote(job_id)}} "$@"
 
 [positional-arguments]
 resume job_id response_file:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator resume --workflow {{workflow}} --job-id {{quote(job_id)}} --response-file {{quote(response_file)}}
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator resume --workflow {{quote(workflow)}} --job-id {{quote(job_id)}} --response-file {{quote(response_file)}}
 
 [positional-arguments]
 gc *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{workflow}} --succeeded-agents "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{quote(workflow)}} --succeeded-agents "$@"
 
 [positional-arguments]
 gc-failed *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{workflow}} --failed-agents "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{quote(workflow)}} --failed-agents "$@"
 
 enqueue-auto title prompt_file dedupe_key *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{workflow}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} {{args}}
+    @shift 3; PYTHONPATH=src {{python}} -m herdr_orchestrator enqueue --workflow {{quote(workflow)}} --title {{quote(title)}} --prompt-file {{quote(prompt_file)}} --dedupe-key {{quote(dedupe_key)}} "$@"
 
 [positional-arguments]
 deliver goal_file *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator deliver --workflow {{workflow}} --goal-file {{quote(goal_file)}} {{args}}
+    @shift 1; PYTHONPATH=src {{python}} -m herdr_orchestrator deliver --workflow {{quote(workflow)}} --goal-file {{quote(goal_file)}} "$@"
 
 smoke *args:
-    @PYTHONPATH=src {{python}} -m herdr_orchestrator smoke --workflow {{workflow}} "$@"
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator smoke --workflow {{quote(workflow)}} "$@"

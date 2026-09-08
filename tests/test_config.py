@@ -74,7 +74,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_rejects_unknown_harness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -87,7 +87,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_requires_planner_output_in_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -100,7 +100,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_allows_day_long_agent_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -123,7 +123,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_rejects_agent_timeout_above_day(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -142,7 +142,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_rejects_planner_prompt_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             outside_prompt = root.parent / "planner-outside.md"
             (root / "prompt.md").write_text("task", encoding="utf-8")
             outside_prompt.write_text("outside", encoding="utf-8")
@@ -160,7 +160,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_accepts_absolute_planner_prompt_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             prompt = root / "prompt.md"
             prompt.write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
@@ -178,7 +178,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_preserves_external_state_and_tracker_roots_for_trusted_workflows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             outside = root.parent / "shared-workflow-state"
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
@@ -201,7 +201,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_constrains_worktree_and_delivery_artifact_roots_to_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
 
             worktree_workflow = root / "worktree.toml"
@@ -229,7 +229,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_requires_lease_to_cover_agent_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -245,7 +245,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_defaults_missing_planner_harness_to_auto(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -260,7 +260,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_rejects_planner_worker_without_configured_worker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -273,7 +273,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_allows_explicit_controller_outside_worker_pool(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -291,7 +291,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_loads_configurable_github_delivery_backend(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -319,7 +319,7 @@ review_repair_rounds = 1
 
     def test_trims_optional_configuration_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
@@ -352,7 +352,7 @@ wayfinder = " auto "
 
     def test_rejects_invalid_workflow_encoding_as_config_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             workflow = root / "workflow.toml"
             workflow.write_bytes(b"schema_version = 1\n\xff")
 
@@ -361,7 +361,7 @@ wayfinder = " auto "
 
     def test_rejects_invalid_path_values_as_config_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
 
             with self.assertRaisesRegex(ConfigError, "workflow_path_invalid"):
@@ -381,7 +381,7 @@ wayfinder = " auto "
 
     def test_rejects_invalid_profile_encoding_as_config_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (root / "prompt.md").write_text("task", encoding="utf-8")
             profiles = root / "profiles"
             shutil.copytree(REPO_ROOT / "profiles/harnesses", profiles)
