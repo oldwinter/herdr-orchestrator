@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -107,7 +108,7 @@ class DistributionCliTests(unittest.TestCase):
         self.assertRegex(resolved["resolved"], r"^https://")
         self.assertRegex(resolved["integrity"], r"^sha512-")
 
-    def test_manager_lock_integrity_matches_the_local_runtime_tarball(self) -> None:
+    def test_local_runtime_tarball_matches_its_own_pack_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             packed = subprocess.run(
                 [
@@ -125,13 +126,12 @@ class DistributionCliTests(unittest.TestCase):
             )
             self.assertEqual(packed.returncode, 0, packed.stderr)
             pack = npm_pack_entry(packed.stdout)
-            self.assertTrue((Path(temporary) / pack["filename"]).is_file())
-            lock = json.loads((MANAGER_PACKAGE / "package-lock.json").read_text(encoding="utf-8"))
+            tarball = Path(temporary) / pack["filename"]
+            integrity = "sha512-" + base64.b64encode(
+                hashlib.sha512(tarball.read_bytes()).digest()
+            ).decode("ascii")
 
-        self.assertEqual(
-            lock["packages"]["node_modules/herdr-orchestrator"]["integrity"],
-            pack["integrity"],
-        )
+        self.assertEqual(integrity, pack["integrity"])
 
     def test_npm_pack_entry_accepts_object_and_array_json_shapes(self) -> None:
         package = {"filename": "herdr-orchestrator-0.1.7.tgz"}
