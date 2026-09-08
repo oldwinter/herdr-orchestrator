@@ -20,13 +20,13 @@ completion evidence、delivery recovery、installer recovery 和 quality publica
 | 61–64 | 模式隔离、Dashboard 只读、journal 隐私、无新增 runtime dependency | [AGENTS.md](../../AGENTS.md)、[dashboard tests](../../tests/test_dashboard.py)、[observability tests](../../tests/test_observability.py)、[package metadata](../../pyproject.toml) |
 | 65 | 各运行面共享中断、重启和可观察结果比较 | [crash-matrix driver](../../tests/crash_matrix.py) |
 
-## 剩余任务图
+## 本次补齐的任务
 
 - [#63](https://github.com/oldwinter/herdr-orchestrator/issues/63) 负责共享测试驱动器，比较正常运行与中断恢复的持久状态。
 - [#64](https://github.com/oldwinter/herdr-orchestrator/issues/64) 修复 quality publication 丢失 owner 的窗口，使用共享驱动器验证进程重启。
 - [#66](https://github.com/oldwinter/herdr-orchestrator/issues/66) 在 delivery 更新派生 state 快照前，将阶段变化追加到 owner-fenced journal。
 
-三个实现使用独立 worktree。最终集成依赖所有实现完成、专项测试通过、全量 gate 通过和独立 Standards/Spec review。
+最终验收包含专项测试、全量 gate 和独立 Standards/Spec review。
 
 ## 自动化验收边界
 
@@ -47,3 +47,22 @@ commit、package version、workspace identity、stable error 和 phase timing �
 preflight 返回 `not_in_herdr`，六项均为 `NOT VERIFIED`，未派发真实 harness turn。
 单元测试、crash matrix 和 GitHub-hosted CI 不构成实时兼容性证明。只有当前构建的所选 harness
 全部返回有效 readiness evidence，才可声明该次 matrix 为 VERIFIED。
+
+## 复验本次修复
+
+先运行新增驱动器、结构化幂等 completion、quality 发布恢复和 delivery 阶段恢复测试。
+
+```bash
+PYTHONPATH=src uv run pytest tests/test_crash_matrix.py tests/test_attempt_crash_matrix.py tests/test_completion_transport.py tests/test_quality_publication_recovery.py tests/test_quality_pytest_report.py tests/test_delivery_stage_journal.py -q
+```
+
+随后运行接入共享驱动器的完整 delivery boundary matrix 和 packed installer matrix。
+
+```bash
+PYTHONPATH=src uv run pytest tests/test_delivery_journal.py::DeliveryJournalTests::test_crash_matrix_converges_before_and_after_each_delivery_boundary -q
+just test-installer-crash-matrix
+```
+
+最后运行 `just check`。这些命令保留原有领域测试，不通过删减 interruption boundary 或放松
+verification 条件获得成功。Quality 测试也使用当前安装的 pytest 生成真实 JSON report，覆盖
+`subtests passed` 与省略零值计数的格式，并拒绝失败、跳过和计数矛盾的证据。
