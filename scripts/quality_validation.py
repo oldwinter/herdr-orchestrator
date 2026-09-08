@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections import Counter
 from collections.abc import Sequence
 from math import isfinite
 from pathlib import Path
@@ -200,37 +201,36 @@ def validate_artifact_payload(
             and payload.get("duration") >= 0
             and isinstance(payload.get("exitcode"), int)
             and not isinstance(payload.get("exitcode"), bool)
+            and payload.get("exitcode") == 0
             and (expected_exit_code is None or payload.get("exitcode") == expected_exit_code)
             and _nonempty_text(payload.get("root"))
             and isinstance(payload.get("environment"), dict)
             and isinstance(payload.get("collectors"), list)
             and isinstance(summary, dict)
-            and all(
-                _nonnegative_integer(summary.get(name))
-                for name in ("total", "passed", "collected", "deselected")
-            )
+            and all(_nonnegative_integer(summary.get(name)) for name in ("total", "collected"))
             and all(
                 isinstance(test, dict)
                 and _nonempty_text(test.get("nodeid"))
                 and _nonempty_text(test.get("outcome"))
-                and test.get("outcome") == "passed"
+                and test.get("outcome") in {"passed", "subtests passed"}
                 for test in tests
             )
         )
         if valid:
-            total = summary["total"]
-            passed = summary["passed"]
-            collected = summary["collected"]
-            deselected = summary["deselected"]
+            outcomes = Counter(test["outcome"] for test in tests)
             valid = (
-                isinstance(total, int)
-                and isinstance(passed, int)
-                and isinstance(collected, int)
-                and isinstance(deselected, int)
-                and total > 0
-                and passed == total
-                and collected >= total
-                and deselected <= collected
+                all(_nonnegative_integer(value) for value in summary.values())
+                and summary["total"] == len(tests)
+                and summary["collected"] == len(tests) + summary.get("deselected", 0)
+                and all(
+                    summary.get(outcome, 0) == outcomes[outcome]
+                    for outcome in ("passed", "subtests passed")
+                )
+                and all(
+                    value == 0
+                    for name, value in summary.items()
+                    if name not in {"total", "collected", "deselected", "passed", "subtests passed"}
+                )
             )
     elif producer == "stability" and key == "stability":
         runs = payload.get("runs")
