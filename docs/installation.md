@@ -266,6 +266,10 @@ npm audit --package-lock-only
 npm audit --package-lock-only --prefix packages/herdr-manager
 ```
 
+The lockfile integrity identifies the published registry tarball. A locally modified checkout
+produces different bytes when packed and must not replace that registry integrity. Verify the
+locked dependency with `npm ci --ignore-scripts --prefix packages/herdr-manager`.
+
 The manager policy treats terminal output as untrusted observations and scopes all visibility
 to the current Herdr session. It is intentionally not durable. Use the queue commands below
 for retries, deduplication, leases, unattended work, and receipts.

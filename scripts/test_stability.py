@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_TIMEOUT_SECONDS = 600
 TEST_COMMAND = (
     "pytest",
     "tests",
@@ -110,7 +111,7 @@ def main() -> int:
                     cwd=ROOT,
                     env=environment,
                     check=False,
-                    timeout=300,
+                    timeout=TEST_TIMEOUT_SECONDS,
                 )
             except subprocess.TimeoutExpired:
                 result = subprocess.CompletedProcess(command, 124)

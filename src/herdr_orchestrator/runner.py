@@ -284,6 +284,7 @@ class Coordinator:
         for job in jobs:
             if not job.recovery:
                 self._observe_transition(job, AttemptPhase.CLAIMED)
+        commit_error: Exception | None = None
         with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="harness") as executor:
             futures = {
                 executor.submit(
@@ -326,10 +327,18 @@ class Coordinator:
                         placement=job.placement,
                         correlation_id=job.correlation_id,
                     )
-                state = self.store.record_outcome(job, outcome)
-                self._record_health(job.harness, outcome)
-                self._observe_transition(job, self.store.attempt_phase(job.attempt_id))
-                results[state.value] += 1
+                try:
+                    state = self.store.record_outcome(job, outcome)
+                    self._record_health(job.harness, outcome)
+                    self._observe_transition(job, self.store.attempt_phase(job.attempt_id))
+                    results[state.value] += 1
+                except OperationInterrupted:
+                    raise
+                except Exception as exc:
+                    if commit_error is None:
+                        commit_error = exc
+        if commit_error is not None:
+            raise commit_error
         return self._run_report(
             results,
             claimed=len(jobs),

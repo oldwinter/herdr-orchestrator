@@ -70,6 +70,10 @@ identity、phase 和 sequence。这个 reconciliation 不增加 attempt：
 `attention` receipt 使用 `unsafe_turn_adoption`，明确表示无法证明 turn ownership，而不是普通
 agent question。
 
+Schema v9 将旧健康表的 `reason_code`、`consecutive_failures` 和 `probe_lease_token` 迁移为
+当前字段，并解除过期时间与 cooldown 的旧非空约束。迁移保留 observation、failure count 和
+probe ownership，不改写任务或收据；中断或复制失败时整笔事务回滚。
+
 Schema v6 为 `jobs`、`job_attempts` 和 `receipts` 增加 completion policy、verification class、
 completion status、有界 evidence summary 和稳定 completion error。Migration 不改写历史 job
 state、attempt、dedupe key 或 receipt。没有 receipt 的历史行投影为 `legacy-unverified`；既有
@@ -103,6 +107,8 @@ durably settled 的 operation 进入 `attention`，不会自动或人工重复�
 
 - 一次最多 claim `max_parallel` 个任务；
 - 每个 harness 最多同时占用 `replicas` 个 slot；默认 1，因此同 harness 任务默认串行；
+- `blocked`、进行中的 resume 和尚未恢复的过期 attempt 继续保留原 slot；过期 attempt 优先
+  恢复，pending job 只使用未被占用的 replica；
 - provisioning 后台 tab 与启动 agent 串行，避免布局竞争；
 - agent prompt 可并发等待；
 - `idle` / `done` 必须连续稳定 3 秒才算 agent settled；若期间重新进入 `working`，继续等待同一 deadline；
@@ -112,6 +118,8 @@ durably settled 的 operation 进入 `attention`，不会自动或人工重复�
 - enqueue 可声明 output-prefix 或 execution-root file receipt；声明后必须验证通过才能成功。
   output-prefix 只接受当前 turn 新增且不与 prompt 独立行歧义的输出，file receipt 必须在当前
   turn 新建或改变；分别记录 `agent_settled` 与 `task_verified`；
+  file receipt 只证明文件变化，不证明写入者。共享 execution root 的并发任务必须使用不同的
+  收据路径；需要校验 job、attempt 和 turn 身份时使用 `structured-v2`。
 - prompt 接受前的 `unknown`、timeout 和协议错误按失败与重试策略处理。prompt 接受后若 turn
   仍可能运行，则 job 进入 `attention`，不会自动重试。
 - `structured-v2` task 在 claim 后收到 immutable completion identity；transport 将 fresh envelope
@@ -125,6 +133,9 @@ dispatch。在没有 blocked job 时，它持续运行到当前 worker pool 没�
 blocked 会立即返回 `idle=false`、`reason=blocked`。结果用 `worker_pool_idle` 与
 `queue_idle` 明确区分所选 pool 和全局 queue；pool 外任务不会造成假死，也不会被误报为
 全局排空。
+
+一项任务的 outcome、health 或观测写入失败时，coordinator 继续收取并提交本波其他任务的结果，
+然后报告第一个错误。故障注入的 `OperationInterrupted` 仍立即中断，用于验证真实 crash 恢复。
 
 ### Readiness evidence
 

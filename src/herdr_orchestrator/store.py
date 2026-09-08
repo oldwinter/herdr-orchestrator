@@ -23,10 +23,16 @@ from herdr_orchestrator.model import (
     TaskReceipt,
 )
 from herdr_orchestrator.store_health import (
+    HEALTH_TABLE_COLUMNS as _HEALTH_TABLE_COLUMNS,
+)
+from herdr_orchestrator.store_health import (
     health_row_accepts_write as _health_row_accepts_write,
 )
 from herdr_orchestrator.store_health import (
     health_update_statement as _health_update_statement,
+)
+from herdr_orchestrator.store_health import (
+    migrate_legacy_health_table as _migrate_legacy_health_table,
 )
 from herdr_orchestrator.store_health import (
     normalize_health_write_fence as _normalize_health_write_fence,
@@ -53,7 +59,7 @@ from herdr_orchestrator.store_workspace import (
     workspace_matches as _workspace_matches,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 __all__ = ["HarnessProbeLease", "SCHEMA_VERSION", "Store", "StoreError"]
 
 _INITIALIZE_LOCK = threading.Lock()
@@ -66,6 +72,13 @@ class HarnessProbeLease:
     revision: int
     owner: str
     lease_until: float
+
+
+@dataclass(slots=True)
+class _SlotOccupancy:
+    active_counts: Counter[str]
+    reserved_counts: Counter[str]
+    owners: dict[str, set[int]]
 
 
 def _nullable_bool(value: object) -> bool | None:
@@ -163,7 +176,7 @@ class Store:
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            connection.executescript("""
+            connection.executescript(f"""
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     version INTEGER NOT NULL
                 );
@@ -239,20 +252,7 @@ class Store:
                     updated_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS harness_health (
-                    workflow TEXT NOT NULL,
-                    workspace TEXT NOT NULL,
-                    harness TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    observed_at REAL NOT NULL,
-                    revision INTEGER NOT NULL DEFAULT 0,
-                    expires_at REAL,
-                    cooldown_until REAL,
-                    retryable_failures INTEGER NOT NULL DEFAULT 0,
-                    probe_lease_until REAL,
-                    probe_owner TEXT,
-                    PRIMARY KEY(workflow, workspace, harness)
+                    {_HEALTH_TABLE_COLUMNS}
                 );
                 CREATE INDEX IF NOT EXISTS harness_health_scope
                     ON harness_health(workflow, workspace, harness);
@@ -285,8 +285,11 @@ class Store:
                 if version == 7:
                     self._migrate_v7_to_v8(connection)
                     version = 8
-                if version == SCHEMA_VERSION:
+                if version == 8:
                     self._ensure_v8_columns(connection)
+                    _migrate_legacy_health_table(connection)
+                    connection.execute("UPDATE schema_meta SET version = 9")
+                    version = 9
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
 
@@ -424,22 +427,9 @@ class Store:
 
     def _migrate_v6_to_v7(self, connection: sqlite3.Connection) -> None:
         self._add_column_if_missing(connection, "jobs", "workspace", "TEXT")
-        connection.execute("""
+        connection.execute(f"""
             CREATE TABLE IF NOT EXISTS harness_health (
-                workflow TEXT NOT NULL,
-                workspace TEXT NOT NULL,
-                harness TEXT NOT NULL,
-                status TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                source TEXT NOT NULL,
-                observed_at REAL NOT NULL,
-                revision INTEGER NOT NULL DEFAULT 0,
-                expires_at REAL,
-                cooldown_until REAL,
-                retryable_failures INTEGER NOT NULL DEFAULT 0,
-                probe_lease_until REAL,
-                probe_owner TEXT,
-                PRIMARY KEY(workflow, workspace, harness)
+                {_HEALTH_TABLE_COLUMNS}
             )
             """)
         connection.execute("""
@@ -606,7 +596,7 @@ class Store:
         )
         claimed: list[ClaimedJob] = []
         with self._transaction() as connection:
-            busy_counts, busy_names = self._busy_slots(
+            slots = self._busy_slots(
                 connection,
                 workflow,
                 now,
@@ -629,8 +619,7 @@ class Store:
                     allowed_values=allowed_values,
                     slot_names=slot_names,
                     slot_limits=slot_limits,
-                    busy_counts=busy_counts,
-                    busy_names=busy_names,
+                    slots=slots,
                     health_workspace=workspace if require_fresh_health else None,
                     static_validator=static_validator,
                 )
@@ -649,12 +638,12 @@ class Store:
         *,
         workspace: str | None = None,
         include_legacy: bool = False,
-    ) -> tuple[Counter[str], dict[str, set[str]]]:
+    ) -> _SlotOccupancy:
         query = """
-            SELECT jobs.harness, jobs.placement, jobs.agent_name FROM jobs AS jobs
-            WHERE jobs.workflow = ? AND jobs.state = ? AND jobs.lease_until > ?
+            SELECT jobs.id, jobs.harness, jobs.agent_name, jobs.lease_until FROM jobs AS jobs
+            WHERE jobs.workflow = ? AND jobs.state IN (?, ?)
         """
-        parameters: tuple[object, ...] = (workflow, JobState.RUNNING.value, now)
+        parameters: tuple[object, ...] = (workflow, JobState.RUNNING.value, JobState.BLOCKED.value)
         scope, scope_parameters = _workspace_clause(
             workspace,
             include_legacy=include_legacy,
@@ -662,15 +651,16 @@ class Store:
         query += scope
         parameters += scope_parameters
         rows = connection.execute(query, parameters).fetchall()
-        counts: Counter[str] = Counter()
-        names: dict[str, set[str]] = {}
+        slots = _SlotOccupancy(Counter(), Counter(), {})
         for row in rows:
             harness_value = str(row["harness"])
-            counts[harness_value] += 1
+            slots.reserved_counts[harness_value] += 1
+            if row["lease_until"] is not None and row["lease_until"] > now:
+                slots.active_counts[harness_value] += 1
             agent_name = row["agent_name"]
             if isinstance(agent_name, str) and agent_name:
-                names.setdefault(harness_value, set()).add(agent_name)
-        return counts, names
+                slots.owners.setdefault(agent_name, set()).add(int(row["id"]))
+        return slots
 
     @staticmethod
     def _claim_candidates(
@@ -703,7 +693,7 @@ class Store:
         )
         query += scope
         parameters += scope_parameters
-        query += " ORDER BY created_at, id"
+        query += " ORDER BY CASE WHEN state = 'running' THEN 0 ELSE 1 END, created_at, id"
         return connection.execute(query, parameters).fetchall()
 
     @staticmethod
@@ -716,8 +706,7 @@ class Store:
         allowed_values: set[str] | None,
         slot_names: Mapping[str, Sequence[str]] | None,
         slot_limits: Mapping[str, int] | None,
-        busy_counts: Counter[str],
-        busy_names: dict[str, set[str]],
+        slots: _SlotOccupancy,
         health_workspace: str | None,
         static_validator: Callable[[str], bool] | None,
     ) -> ClaimedJob | None:
@@ -743,13 +732,13 @@ class Store:
         limit = (
             slot_limits.get(harness_value, len(names)) if slot_limits is not None else len(names)
         )
-        if busy_counts[harness_value] >= limit:
+        if slots.active_counts[harness_value] >= limit:
             return None
         if row["state"] == JobState.RUNNING.value:
             persisted_name = row["agent_name"]
             if not isinstance(persisted_name, str) or not persisted_name:
                 raise StoreError("attempt_agent_missing")
-            if persisted_name in busy_names.get(harness_value, set()):
+            if slots.owners.get(persisted_name) != {int(row["id"])}:
                 return None
             recovered = AttemptLedger.reclaim(
                 connection,
@@ -757,11 +746,12 @@ class Store:
                 now=now,
                 lease_until=lease_until,
             )
-            busy_counts[harness_value] += 1
-            busy_names.setdefault(harness_value, set()).add(persisted_name)
+            slots.active_counts[harness_value] += 1
             return recovered
+        if slots.reserved_counts[harness_value] >= limit:
+            return None
         agent_name = next(
-            (name for name in names if name not in busy_names.get(harness_value, set())),
+            (name for name in names if name not in slots.owners),
             None,
         )
         if agent_name is None:
@@ -773,8 +763,9 @@ class Store:
             now=now,
             lease_until=lease_until,
         )
-        busy_counts[harness_value] += 1
-        busy_names.setdefault(harness_value, set()).add(agent_name)
+        slots.active_counts[harness_value] += 1
+        slots.reserved_counts[harness_value] += 1
+        slots.owners.setdefault(agent_name, set()).add(claimed.job_id)
         return claimed
 
     @staticmethod
