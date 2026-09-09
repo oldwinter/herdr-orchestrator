@@ -10,15 +10,18 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from unittest.mock import patch
+
+from crash_matrix import CrashInjected, run_public_operation_crash_matrix
 
 import herdr_orchestrator.delivery_recovery as recovery_module
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.delivery import DeliveryError, StandardizedDelivery
 from herdr_orchestrator.delivery_journal import DeliveryJournal
 from herdr_orchestrator.delivery_protocol import DeliveryPlan, DeliveryTicket, TicketReceipt
+from herdr_orchestrator.delivery_recovery import DeliveryResult
 from herdr_orchestrator.git_workspace import Worktree
 from herdr_orchestrator.model import (
     AgentState,
@@ -2003,67 +2006,82 @@ class DeliveryJournalTests(unittest.TestCase):
             "review:accept:1",
             "result:publish",
         )
-        for operation_key in boundaries:
-            for transition in ("effect_intent", "effect_confirmed"):
-                with (
-                    self.subTest(
-                        operation_key=operation_key,
-                        transition=transition,
-                    ),
-                    tempfile.TemporaryDirectory() as temporary,
-                ):
-                    repository = Path(temporary).resolve() / "repository"
-                    _initialize_repository(repository)
-                    config = _workflow(repository)
-                    goal = repository / "goal.md"
-                    goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
-                    external: dict[str, object] = {}
-                    interrupted = [False]
-                    interrupt = _interrupt_journal(
-                        DeliveryJournal._persist_event,
-                        transition,
-                        operation_key,
-                        interrupted,
-                    )
 
-                    first = StandardizedDelivery(
-                        config,
-                        dispatcher=CompleteDispatcher(),
-                        tracker=StableTracker(external),
-                        controller_harness=Harness.DROID,
-                        worker_harnesses=(Harness.DROID,),
-                    )
-                    with (
-                        patch.object(
-                            DeliveryJournal,
-                            "_persist_event",
-                            interrupt,
-                        ),
-                        self.assertRaisesRegex(
-                            RuntimeError,
-                            "journal interruption",
-                        ),
-                    ):
-                        first.run(goal)
-                    self.assertTrue(interrupted[0])
+        @dataclass
+        class DeliveryCase:
+            config: WorkflowConfig
+            goal: Path
+            external: dict[str, object] = field(default_factory=dict)
+            dispatcher: CompleteDispatcher = field(default_factory=CompleteDispatcher)
+            result: DeliveryResult | None = None
 
-                    result = StandardizedDelivery(
-                        config,
-                        dispatcher=CompleteDispatcher(),
-                        tracker=StableTracker(external),
-                        controller_harness=Harness.DROID,
-                        worker_harnesses=(Harness.DROID,),
-                    ).run(goal)
-                    log = _git(
-                        result.artifact_root / "worktrees/integration",
-                        "log",
-                        "--format=%s",
-                    ).stdout
+        def setup(root: Path) -> DeliveryCase:
+            repository = root / "repository"
+            _initialize_repository(repository)
+            goal = repository / "goal.md"
+            goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+            return DeliveryCase(config=_workflow(repository), goal=goal)
 
-                    self.assertEqual(result.status, "succeeded")
-                    self.assertEqual(external["publish_mutations"], 1)
-                    self.assertEqual(external["close_mutations"], 1)
-                    self.assertEqual(log.count("Merge branch"), 1)
+        def execute(case: DeliveryCase) -> None:
+            case.result = StandardizedDelivery(
+                case.config,
+                dispatcher=case.dispatcher,
+                tracker=StableTracker(case.external),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            ).run(case.goal)
+
+        def run(case: DeliveryCase, boundary: str | None) -> None:
+            if boundary is None:
+                execute(case)
+                return
+            transition, operation_key = boundary.split("/", 1)
+            interrupted = [False]
+            interrupt = _interrupt_journal(
+                DeliveryJournal._persist_event,
+                transition,
+                operation_key,
+                interrupted,
+            )
+            with patch.object(DeliveryJournal, "_persist_event", interrupt):
+                try:
+                    execute(case)
+                except RuntimeError as exc:
+                    if not interrupted[0] or str(exc) != "journal interruption":
+                        raise
+                    raise CrashInjected(boundary) from exc
+
+        def observe(case: DeliveryCase) -> dict[str, object]:
+            result = case.result
+            assert result is not None
+            integration = result.artifact_root / "worktrees/integration"
+            subjects = _git(integration, "log", "--format=%s").stdout
+            return {
+                "status": result.status,
+                "tracker": dict(case.external),
+                "merge_count": subjects.count("Merge branch"),
+                "ticket_commit_count": subjects.count("feat: implement journal slice"),
+                "business_artifact": (integration / "slice-01.txt").read_bytes(),
+                "turn_count": len(case.dispatcher.prompts),
+            }
+
+        results = run_public_operation_crash_matrix(
+            (
+                f"{transition}/{key}"
+                for key in boundaries
+                for transition in ("effect_intent", "effect_confirmed")
+            ),
+            setup=setup,
+            run=run,
+            restart=execute,
+            observe=observe,
+        )
+        self.assertEqual(len(results), 16)
+        for result in results.values():
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["tracker"]["publish_mutations"], 1)
+            self.assertEqual(result["tracker"]["close_mutations"], 1)
+            self.assertEqual(result["merge_count"], 1)
 
     def test_applied_git_and_review_effects_converge_without_confirmation(
         self,

@@ -14,7 +14,6 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Callable, Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -159,6 +158,8 @@ def _run_id(commit: str, invocation_id: str, source_digest: str) -> str:
 _atomic_write_json = _quality_storage.atomic_write_json
 _atomic_write_bytes = _quality_storage.atomic_write_bytes
 _json_bytes = _quality_storage.json_bytes
+_json_object = _quality_storage.json_object
+_claim_run_directory = _quality_storage.claim_run_directory
 
 
 def _artifact_path(output_dir: Path, spec: ArtifactSpec) -> Path:
@@ -171,7 +172,6 @@ def _artifact_path(output_dir: Path, spec: ArtifactSpec) -> Path:
     return path
 
 
-_object_without_duplicates = _quality_storage.object_without_duplicates
 _artifact_snapshot = _quality_storage.artifact_snapshot
 _assert_artifact_unchanged = _quality_storage.assert_artifact_unchanged
 _parse_artifact_bytes = _quality_storage.parse_artifact_bytes
@@ -221,22 +221,6 @@ def _expanded_argv(command: CommandSpec, output_dir: Path) -> CommandInvocation:
     return CommandInvocation((*argv, *inputs), len(inputs), _inventory_digest(inputs))
 
 
-def _claim_run_directory(pending: Path, final: Path) -> None:
-    if final.exists():
-        raise QualityBundleError("quality_run_reused")
-    try:
-        pending.mkdir()
-    except FileExistsError:
-        _quality_storage.reclaim_pending(pending)
-        try:
-            pending.mkdir()
-        except FileExistsError as error:
-            raise QualityBundleError("quality_run_reused") from error
-    _atomic_write_json(pending / "owner.json", {"pid": os.getpid()})
-    if final.exists():
-        raise QualityBundleError("quality_run_reused")
-
-
 def run_quality(
     *,
     root: Path,
@@ -257,12 +241,38 @@ def run_quality(
     if source.commit != commit.lower():
         raise QualityBundleError("quality_commit_mismatch")
     run_id = _run_id(commit, invocation_id, source.digest)
+    with _quality_storage.run_lock(root, run_id):
+        return _run_quality_owned(
+            root=root,
+            commit=commit,
+            invocation_id=invocation_id,
+            specs=specs,
+            source=source,
+            source_probe=source_probe,
+            reuse_completed=reuse_completed,
+            run_id=run_id,
+        )
+
+
+def _run_quality_owned(
+    *,
+    root: Path,
+    commit: str,
+    invocation_id: str,
+    specs: Sequence[ProducerSpec],
+    source: SourceIdentity,
+    source_probe: Callable[[], SourceIdentity] | None,
+    reuse_completed: bool,
+    run_id: str,
+) -> CompletedBundle:
     pending_root = root / ".pending"
     runs_root = root / "runs"
     pending_root.mkdir(parents=True, exist_ok=True)
     runs_root.mkdir(parents=True, exist_ok=True)
     pending = pending_root / run_id
     final = runs_root / run_id
+    if not (reuse_completed and final.is_dir()):
+        _claim_run_directory(pending, final, reuse_completed=reuse_completed)
     if reuse_completed and final.is_dir():
         manifest = load_completed_manifest(
             final / "manifest.json",
@@ -280,9 +290,7 @@ def run_quality(
             == 0
         )
         return CompletedBundle(final, final / "manifest.json", passed, 0 if passed else 1)
-    _claim_run_directory(pending, final)
     (pending / "producers").mkdir()
-    _atomic_write_json(pending / "owner.json", {"pid": os.getpid()})
     started_at = _utc_now()
     producer_payloads: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -479,8 +487,6 @@ def run_quality(
         all_passed = False
         if bundle_exit_code == 0:
             bundle_exit_code = 1
-    with suppress(OSError):
-        (pending / "owner.json").unlink()
     manifest = {
         "commit": commit.lower(),
         "completed_at": _utc_now(),
@@ -499,20 +505,6 @@ def run_quality(
     _atomic_write_json(pending / "manifest.json", manifest)
     os.replace(pending, final)
     return CompletedBundle(final, final / "manifest.json", all_passed, bundle_exit_code)
-
-
-def _json_object(path: Path, error_code: str) -> dict[str, object]:
-    try:
-        payload = json.loads(
-            path.read_text(encoding="utf-8"),
-            object_pairs_hook=_object_without_duplicates,
-            parse_constant=_quality_storage.reject_constant,
-        )
-    except (OSError, TypeError, UnicodeError, ValueError, RecursionError) as error:
-        raise QualityBundleError(error_code) from error
-    if not isinstance(payload, dict):
-        raise QualityBundleError(error_code)
-    return payload
 
 
 def _string(payload: dict[str, object], key: str, error_code: str) -> str:
@@ -687,6 +679,9 @@ def load_completed_manifest(
         if current_source != SourceIdentity(commit, source_digest, source_clean):
             raise QualityBundleError("quality_source_changed")
     expected_files: set[Path] = {Path("manifest.json")}
+    if (bundle / "owner.json").exists() or (bundle / "owner.json").is_symlink():
+        _quality_storage.validate_owner(bundle)
+        expected_files.add(Path("owner.json"))
     required = payload.get("required_producers")
     producers = payload.get("producers")
     if (
@@ -1472,7 +1467,6 @@ def main() -> int:
         )
         default_result = args.root / "results" / f"{bundle.path.name}.json"
         _quality_storage.publish_results(
-            bundle_path=bundle.path,
             default_path=default_result,
             requested_path=args.result,
             payload=result_payload,

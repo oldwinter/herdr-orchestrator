@@ -12,6 +12,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from crash_matrix import CrashInjected, run_public_operation_crash_matrix
+
 from herdr_orchestrator import __version__
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -283,6 +285,67 @@ class InstallerJournalPackedTests(unittest.TestCase):
                         expected_project,
                     )
                     self.assertEqual(len(initial_cutoffs), len(initial_events))
+
+                    def matrix_boundary(label: str) -> str:
+                        if label.startswith("journal:owner:removed:"):
+                            return "journal:owner:removed:<owner>"
+                        return label
+
+                    selected_cutoffs = {
+                        matrix_boundary(label.rsplit(":", 1)[0]): index
+                        for index, label in (
+                            initial_cutoffs[0],
+                            initial_cutoffs[len(initial_cutoffs) // 2],
+                            initial_cutoffs[-1],
+                        )
+                    }
+
+                    def matrix_setup(case_root: Path, template: Path = template) -> Path:
+                        project = case_root / "project"
+                        shutil.copytree(template, project)
+                        return project
+
+                    def matrix_run(
+                        project: Path,
+                        boundary: str | None,
+                        operation: str = operation,
+                        selected_cutoffs: dict[str, int] = selected_cutoffs,
+                    ) -> None:
+                        mutation_log = project.parent / "mutations.jsonl"
+                        outcome = run_cli(
+                            project,
+                            operation_arguments(operation),
+                            interrupt_after=selected_cutoffs[boundary] if boundary else None,
+                            extra_environment={
+                                "HERDR_ORCHESTRATOR_TEST_MUTATION_LOG": str(mutation_log)
+                            },
+                        )
+                        if boundary is not None:
+                            self.assertEqual(outcome.returncode, 86, outcome.stderr)
+                            events = mutation_log.read_text(encoding="utf-8").splitlines()
+                            self.assertEqual(len(events), selected_cutoffs[boundary])
+                            event = json.loads(events[-1])
+                            normalized = event["label"].replace(str(project.resolve()), "<project>")
+                            self.assertEqual(matrix_boundary(normalized), boundary)
+                            raise CrashInjected(boundary)
+                        self.assertEqual(outcome.returncode, 0, outcome.stderr)
+
+                    def matrix_restart(
+                        project: Path,
+                        operation: str = operation,
+                        expected_snapshot: dict[str, object] = expected_snapshot,
+                    ) -> None:
+                        outcome = run_cli(project, operation_arguments(operation))
+                        self.assertEqual(outcome.returncode, 0, outcome.stderr)
+                        assert_recovered(project, operation, expected_snapshot, "shared matrix")
+
+                    run_public_operation_crash_matrix(
+                        selected_cutoffs,
+                        setup=matrix_setup,
+                        run=matrix_run,
+                        restart=matrix_restart,
+                        observe=snapshot,
+                    )
 
                     def run_initial_cutoff(
                         cutoff: tuple[int, str],

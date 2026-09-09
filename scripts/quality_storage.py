@@ -9,8 +9,8 @@ import os
 import shutil
 import stat
 import tempfile
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,25 +54,84 @@ def json_bytes(payload: object) -> bytes:
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
 
 
-def reclaim_pending(pending: Path) -> None:
-    owner = pending / "owner.json"
-    if pending.is_symlink() or not pending.is_dir() or not owner.is_file():
+@contextmanager
+def run_lock(root: Path, run_id: str) -> Iterator[None]:
+    locks = root / ".locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(
+        locks / run_id, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise QualityBundleError("quality_run_reused")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise QualityBundleError("quality_run_reused") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def validate_owner(directory: Path) -> int:
+    owner = directory / "owner.json"
+    if directory.is_symlink() or not directory.is_dir() or owner.is_symlink():
         raise QualityBundleError("quality_run_reused")
     try:
-        owner_pid = int(json.loads(owner.read_text(encoding="utf-8"))["pid"])
+        payload = json.loads(
+            artifact_snapshot(owner).data, object_pairs_hook=object_without_duplicates
+        )
+        owner_pid = payload["pid"]
+        if (
+            type(owner_pid) is not int
+            or not 0 < owner_pid <= 2**31 - 1
+            or payload.get("run_id", directory.name) != directory.name
+        ):
+            raise ValueError("invalid owner")
     except (OSError, TypeError, ValueError, KeyError) as error:
         raise QualityBundleError("quality_run_reused") from error
-    if owner_pid <= 0 or owner_pid == os.getpid():
-        raise QualityBundleError("quality_run_reused")
+    return owner_pid
+
+
+def require_dead_owner(pending: Path) -> None:
+    owner_pid = validate_owner(pending)
     try:
         os.kill(owner_pid, 0)
     except ProcessLookupError:
-        pass
+        return
     except PermissionError as error:
         raise QualityBundleError("quality_run_reused") from error
-    else:
+    raise QualityBundleError("quality_run_reused")
+
+
+def claim_pending(pending: Path) -> None:
+    claims = pending.parent.parent / ".claims"
+    claims.mkdir(parents=True, exist_ok=True)
+    prepared = Path(tempfile.mkdtemp(prefix=f"{pending.name}.", dir=claims))
+    atomic_write_json(prepared / "owner.json", {"pid": os.getpid(), "run_id": pending.name})
+    os.replace(prepared, pending)
+
+
+def discard_pending(pending: Path) -> None:
+    claims = pending.parent.parent / ".claims"
+    claims.mkdir(parents=True, exist_ok=True)
+    retired = Path(tempfile.mkdtemp(prefix=f"{pending.name}.", suffix=".retired", dir=claims))
+    os.replace(pending, retired)
+    shutil.rmtree(retired)
+
+
+def claim_run_directory(pending: Path, final: Path, *, reuse_completed: bool) -> None:
+    if final.exists() or final.is_symlink():
         raise QualityBundleError("quality_run_reused")
-    shutil.rmtree(pending)
+    if pending.exists() or pending.is_symlink():
+        require_dead_owner(pending)
+        if (pending / "manifest.json").exists():
+            if not reuse_completed:
+                raise QualityBundleError("quality_run_reused")
+            os.replace(pending, final)
+            return
+        discard_pending(pending)
+    claim_pending(pending)
 
 
 @dataclass(frozen=True)
@@ -95,6 +154,20 @@ def object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, obje
 
 def reject_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def json_object(path: Path, error_code: str) -> dict[str, object]:
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=object_without_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError) as error:
+        raise QualityBundleError(error_code) from error
+    if not isinstance(payload, dict):
+        raise QualityBundleError(error_code)
+    return payload
 
 
 def _signature(metadata: os.stat_result) -> tuple[int, int, int, int]:
@@ -190,7 +263,6 @@ def inspect_artifact(path: Path, parser: str) -> tuple[str, dict[str, object] | 
 
 def publish_results(
     *,
-    bundle_path: Path,
     default_path: Path,
     requested_path: Path | None,
     payload: object,
@@ -215,8 +287,6 @@ def publish_results(
     except OSError:
         for _, descriptor in locks:
             os.close(descriptor)
-        with suppress(OSError, shutil.Error):
-            shutil.rmtree(bundle_path)
         raise
     new_paths = [path for path in paths if not path.exists()]
     try:
@@ -232,8 +302,6 @@ def publish_results(
                     path.unlink()
             except OSError:
                 pass
-        with suppress(OSError, shutil.Error):
-            shutil.rmtree(bundle_path)
         raise
     finally:
         for _, descriptor in locks:
