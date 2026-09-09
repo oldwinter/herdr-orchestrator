@@ -1673,7 +1673,7 @@ Options:
 function main() {
   try {
     const arguments_ = process.argv.slice(2);
-    const argv = basename(process.argv[1] ?? "") === "herdr-manager"
+    const argv = ["herdr-manager", "herdr-manager.mjs"].includes(basename(process.argv[1] ?? ""))
       ? ["manager", ...arguments_]
       : arguments_;
     if (argv.includes("--help") || argv.includes("-h")) {

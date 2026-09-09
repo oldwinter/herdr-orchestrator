@@ -13,8 +13,21 @@ From the target Git repository, check for `.herdr-orchestrator/manifest.json`. I
 missing, bootstrap the project:
 
 ```bash
-npx --yes herdr-orchestrator install --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator install --project .
 ```
+
+Version 0.1.7 published two bin names pointing to the same file, so npm could select
+`herdr-manager` for an orchestrator command. Use the explicit package/bin form for existing
+installs, then pin runtime calls to the installed manifest version:
+
+```bash
+HERDR_VERSION="$(node -p "require('./.herdr-orchestrator/manifest.json').version")"
+herdr_orchestrator() {
+  npm exec --yes --package="herdr-orchestrator@$HERDR_VERSION" -- herdr-orchestrator "$@"
+}
+```
+
+Keep the helper name distinct from native `herdr`, which owns `herdr agent` commands.
 
 The installer selects locally available harness CLIs. To choose explicitly, repeat
 `--harness`, for example `--harness droid --harness codex`.
@@ -22,17 +35,17 @@ The installer selects locally available harness CLIs. To choose explicitly, repe
 Always run diagnostics before real dispatch:
 
 ```bash
-npx --yes herdr-orchestrator doctor --project . --probe-timeout-seconds 30
+herdr_orchestrator doctor --project . --probe-timeout-seconds 30
 ```
 
-Exit code `1` is not success. Continue only when the JSON top-level `ok` is true and each
-selected harness has `readiness:<harness>.status = ready`. `installed` or a profile file alone
-does not prove authentication or model readiness.
+Continue only when top-level `ok`, `installation.ok`, and `runtime.ok` are true and each
+selected harness has `readiness:<harness>.status = ready`. `NOT VERIFIED` is not readiness
+evidence. Keep manifest-managed files unchanged; doctor reports edited files as modified.
 
 Read the compact catalog before choosing a worker or using automatic routing:
 
 ```bash
-npx --yes herdr-orchestrator catalog --project . --format text
+herdr_orchestrator catalog --project . --format text
 ```
 
 Stable harness names are `droid`, `grok`, `codex`, `pi`, `claude`, and `hermes`. Herdr may
@@ -80,41 +93,65 @@ deduplication, leases, unattended execution, or receipts.
 
 ## 2. Write and enqueue the task packet
 
+Inspect both the durable queue and live agents before dispatch:
+
+```bash
+herdr_orchestrator status --project .
+herdr agent list
+```
+
+Account for pending, running, blocked, and attention jobs before draining. If the queue belongs
+to unrelated work, install a separate controller project to get a separate state database.
+Preserve the old queue for audit. For dependent review and validation, dispatch one job at a
+time and inspect its report before enqueueing the next. Do not reuse a pane whose prior turn
+is still working or unresolved.
+
 Write the complete task contract to a UTF-8 file in the target repository before enqueueing.
 Use an ignored runtime path when the prompt should not be committed:
 
 ```bash
-mkdir -p .orchestrator/requests
+mkdir -p .orchestrator/requests .orchestrator/results
 $EDITOR .orchestrator/requests/inspect-readme.md
 ```
 
-For a read-only pane task with a machine-verifiable output line:
+For a read-only pane task, prefer a fresh file receipt:
 
 ```bash
-npx --yes herdr-orchestrator enqueue --project . \
+test ! -e .orchestrator/results/inspect-readme-v1.receipt || exit 1
+herdr_orchestrator enqueue --project . \
   --harness pi \
   --placement pane \
   --title "Inspect README" \
   --prompt-file .orchestrator/requests/inspect-readme.md \
   --dedupe-key inspect-readme-v1 \
-  --receipt-prefix "TASK-OK inspect-readme"
+  --receipt-file .orchestrator/results/inspect-readme-v1.receipt
 ```
 
-The receipt must appear at the start of its own terminal line. A prompt that merely mentions
-the text is not a receipt.
+Before enqueueing, verify that the receipt path does not exist. Require the worker to finish
+the report and write the non-empty receipt as its final action. For pane/tab placement, put
+the exact absolute receipt path in the prompt and pass its execution-root-relative form to
+`--receipt-file`. When inspecting another repository, the execution root still owns the receipt.
+
+Use `--receipt-prefix` only when terminal-only evidence is required. If a prompt line starts
+with the expected prefix, verification fails as `task_receipt_ambiguous`; an echoed instruction
+cannot prove authorship.
 
 Use `--placement tab` for an isolated tab. Use `--placement worktree` for repository writes
 and require a non-empty receipt file relative to that worktree's execution root:
 
 ```bash
-npx --yes herdr-orchestrator enqueue --project . \
+herdr_orchestrator enqueue --project . \
   --harness grok \
   --placement worktree \
   --title "Implement focused change" \
   --prompt-file .orchestrator/requests/implement-change.md \
   --dedupe-key implement-change-v1 \
-  --receipt-file .orchestrator/task-receipt.txt
+  --receipt-file .orchestrator/implement-change-v1.receipt
 ```
+
+For worktree placement, the execution root is assigned during provisioning. Instruct the
+worker to resolve the same relative receipt path from that assigned root, create its parent
+directory, and write it last. An absolute path to the source checkout would target the wrong root.
 
 `--placement auto` uses the workflow topology policy. The explicit values are:
 
@@ -127,7 +164,8 @@ npx --yes herdr-orchestrator enqueue --project . \
 For automatic worker selection, constrain the controller and candidate pool deliberately:
 
 ```bash
-npx --yes herdr-orchestrator enqueue --project . \
+test ! -e .orchestrator/results/inspect-agents-v1.receipt || exit 1
+herdr_orchestrator enqueue --project . \
   --harness auto \
   --controller-harness pi \
   --worker-harness pi \
@@ -136,7 +174,7 @@ npx --yes herdr-orchestrator enqueue --project . \
   --title "Inspect agent instructions" \
   --prompt-file .orchestrator/requests/inspect-agents.md \
   --dedupe-key inspect-agents-v1 \
-  --receipt-prefix "TASK-OK inspect-agents"
+  --receipt-file .orchestrator/results/inspect-agents-v1.receipt
 ```
 
 Automatic routing synchronously runs one controller agent turn before enqueue returns. Treat
@@ -151,7 +189,7 @@ Reusing the same `--dedupe-key` must return the existing job with `created = fal
 Use one bounded drain invocation for normal queued work:
 
 ```bash
-npx --yes herdr-orchestrator run --project . \
+herdr_orchestrator run --project . \
   --until-idle \
   --drain-timeout-seconds 86400
 ```
@@ -162,20 +200,64 @@ replica-limited wave is intentional. `seed` can be a successful no-op when the i
 workflow has no `seed_jobs`.
 
 ```bash
-npx --yes herdr-orchestrator status --project .
+herdr_orchestrator status --project .
 ```
 
-For an exhausted job, retain its dedupe identity and add attempt budget:
+When `agent_not_settled`, `agent_turn_not_observed`, `herdr_timeout`, or
+`task_receipt_missing` occurs, inspect the native agent and the expected report/receipt:
 
 ```bash
-npx --yes herdr-orchestrator retry --project . --job-id 42 --extra-attempts 1
+herdr agent get <agent-name>
+herdr agent read <agent-name> --source recent-unwrapped --lines 120
 ```
+
+Re-read live state until the prior turn has settled. If the bounded investigation ends without
+that evidence, stop and leave the job unresolved. Never retry or enqueue replacement work while
+the original agent is working or may still write the receipt; a transient idle snapshot is not
+proof. A late receipt does not retroactively make a failed job successful. Preserve its failed
+attempt and report the late artifact separately.
+
+Never retry blocked jobs. If `attempt_phase=attention`, stop: neither retry nor resume is
+supported, and replacement prompts are forbidden. An accepted unresolved timeout enters this
+state. Preserve it for operator investigation.
+
+For an ordinary blocked agent question, with a phase other than attention, explicit human review
+and the supplied response can resume the same agent, pane, and attempt:
+
+```bash
+herdr_orchestrator resume --project . --job-id 43 --response-file approval.txt
+```
+
+For an exhausted failed job whose prior turn is confirmed settled and whose file receipt is
+still absent, retain its dedupe identity and add attempt budget:
+
+```bash
+herdr_orchestrator retry --project . --job-id 42 --extra-attempts 1
+```
+
+If the receipt already exists or the contract must change, first confirm the original turn has
+settled and review any late artifact. Keep the old attempt. If more work is needed, enqueue a
+new task with a new dedupe key and a fresh receipt path. An unchanged existing file fails as
+`task_receipt_stale`.
+For `task_receipt_ambiguous`, replace the prefix contract with a file receipt.
+
+Inspect the installed workflow's `agent_timeout_seconds` before long work. The npm installer
+in 0.1.7 generates 300 seconds; source checkout workflows may use a longer budget. The wrapper
+does not expose workflow, state DB, lease, or agent-timeout overrides. A longer
+`--drain-timeout-seconds` only extends the drain loop, not the configured agent deadline.
+Keep installed turns small by collecting long validation logs first, then asking Grok to audit
+them and run short independent probes. This reduces exposure to background-task transitions;
+a transient idle snapshot alone does not establish the cause of a missing receipt.
+For reviews that need a longer turn, use the source checkout's documented workflow/just
+configuration. Put the untracked workflow under `.orchestrator/`, choose its own state DB,
+and set `lease_seconds >= agent_timeout_seconds + 90`. A tracked example may share an existing
+queue. Keep managed installer files unchanged.
 
 Preview cleanup of succeeded agent panes, then apply only when cleanup is requested:
 
 ```bash
-npx --yes herdr-orchestrator gc --project . --succeeded-agents
-npx --yes herdr-orchestrator gc --project . --succeeded-agents --apply
+herdr_orchestrator gc --project . --succeeded-agents
+herdr_orchestrator gc --project . --succeeded-agents --apply
 ```
 
 GC preserves every worktree workspace, checkout, and branch. A candidate needs a persisted
@@ -186,7 +268,7 @@ its verified agent pane, never the containing tab.
 Start the read-only operations view when a live view is useful:
 
 ```bash
-npx --yes herdr-orchestrator dashboard --project .
+herdr_orchestrator dashboard --project .
 ```
 
 Its default URL is `http://127.0.0.1:8765`.
@@ -196,10 +278,13 @@ Its default URL is `http://127.0.0.1:8765`.
 The orchestrator must run from a Herdr pane for real dispatch. A terminal `succeeded` job with
 `task_verified = true` satisfies its declared machine receipt. When no receipt was declared,
 `task_verified = null`: inspect the requested artifact before claiming the task is complete.
+For review and validation, also read the report and require the requested verdict. Queue idle
+only describes scheduling; it cannot replace `succeeded`, `task_verified=true`, and the verdict.
 
 `blocked`, `unknown`, timeout, a pane that merely exists, or `idle` / `done` without the
 declared receipt are not task success. Use `error_code` and bounded `error_summary` from
-`status`; keep failed or blocked work visible until it is retried or consciously left terminal.
+`status`; keep unresolved work visible. Retry only eligible failed jobs; resume ordinary blocked
+questions only through the explicit human-response flow. Attention remains halted.
 
 Never push, merge, publish, send, delete worktrees, change permissions, or touch production
 unless the user separately authorized that exact action.

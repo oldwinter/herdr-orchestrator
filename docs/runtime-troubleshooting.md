@@ -48,6 +48,61 @@ agent name 可带短 digest。诊断时不要根据 tab 标题推断 agent ident
 - retry receipt 必须保留每个 attempt，不能用最终成功覆盖第一次 timeout。
 - 后台 tab 使用 `--no-focus` 是正确行为；“当前 pane 没看到活动”不是运行证据。
 
+## 2026-09-03 编排经验
+
+这次演练最终通过独立 review 和证据审计完成验收。以下是可复用规则；原始 prompt、完整终端
+输出与 SQLite 状态属于本机运行证据，不进入 Git。
+
+| 信号 | 处理 |
+| --- | --- |
+| npm 安装却进入 manager | 0.1.7 的两个 bin 指向同一文件；使用显式 `npm exec --package=herdr-orchestrator -- herdr-orchestrator`。当前源码已拆分入口 |
+| `doctor` 报 installation modified | 保留托管文件原样；在源码 checkout 的独立 workflow 配置长任务预算 |
+| 队列已有 pending、running、blocked 或 attention | 先核对原任务与 live agent。无关任务保留审计，新任务用独立 controller project |
+| `agent_not_settled`、`herdr_timeout`、`task_receipt_missing` | 先读取原 agent、报告与收据。可能仍工作的 turn 不立即重试，也不通过新 job 绕过 attention |
+| `task_receipt_stale` | 新 turn 没有改变既有 receipt。需要更换收据契约时，在原 turn 收敛后使用新 dedupe key 和新 receipt，保留失败 attempt |
+| `task_receipt_ambiguous` | prompt 行与预期 prefix 重合，默认改用 file receipt |
+| queue idle 或 report 已存在 | 仍须核对 `succeeded`、`task_verified=true` 和报告 verdict |
+
+`agent_turn_not_observed` 也是需要先核对 live turn 的错误，但这次保留的 telemetry 主要记录
+`agent_not_settled`、timeout 和 receipt 错误。后台 Task 附近的瞬时 idle 是 missing receipt 的
+待验证解释，不能只根据一个 snapshot 认定因果。
+
+收据相对路径以 job 的 `execution_path` 为根。pane/tab 的 prompt 应写清该根目录下的绝对路径；
+新建 worktree 的根目录由 provisioning 决定，worker 必须在分配后的根目录解析相对路径。
+收据在入队前应不存在，worker 完成报告后最后写入。独立 review 与 validation 逐个派发，
+每个阶段检查报告后再开始下一阶段。
+
+npm 安装生成的默认 agent deadline 是 300 秒；源码示例 workflow 使用 28800 秒。
+`--drain-timeout-seconds` 控制总排空期限，不能延长单次 agent deadline。
+长验证先生成命令日志与汇总，再让 Grok 审计并执行短探针。需要长 review 时使用源码入口的
+`just --set workflow <path> run-until-idle`，配置独立 state DB，且
+`lease_seconds >= agent_timeout_seconds + 90`。
+npm wrapper 没有这些覆盖参数，不应修改托管 workflow 来规避限制。
+将自定义 workflow 放在忽略的 `.orchestrator/` 中，并指定独立 `state_db`；直接运行 tracked
+示例可能复用已有队列。排查到期仍不能确认原 turn 已结束时停止，不创建 replacement job。
+只有失败任务的原 turn 已确认结束且 receipt 仍不存在时才增加 retry budget。
+普通 blocked 问题经人工审查后用 `resume --response-file` 恢复原 attempt。
+`attempt_phase=attention` 拒绝 retry 和 resume，也不能发送 replacement prompt；保留状态供人工排查。
+
+## CLI 与 session 路由
+
+遇到 `protocol_mismatch` 时，先用 `type -a herdr` 和 `herdr --version` 核对外层 shell、
+Herdr pane 和 server 使用的版本。机器上可以同时存在多个安装；固定同一个 binary 的绝对路径
+启动专用 session，并在该 pane 中统一 `PATH` 后重新运行 targeted doctor。
+不要为了修复测试 session 而停止其他 session 或远程 agent。
+
+2026-09-09 的本机复验发现，0.8.2 server 与 0.9.0 CLI 混用会报协议不匹配。
+统一版本后，独立 session 中的 Grok readiness probe 通过。该结果不代表所有跨版本组合兼容。
+
+连接远程机器后，TUI 当前焦点可能已经切换。自动化前先读取目标 session 的 workspace 和 pane，
+再用 `herdr --session <name> pane run <pane-id> <command>` 定向执行，并读取同一 pane 确认结果。
+不要将向 TUI stdin 输入文本当作本地 shell 命令。真实调度仍必须从 Herdr 管理的 pane 发起，
+不能在外部 shell 伪造 `HERDR_ENV` 或 pane identity。
+
+测试中的 PATH 替身也可能改变 shim 路由。justfile 回归曾将假的 `just` 放入 PATH，导致
+mise shim 转发到空桩，根本没有运行目标 recipe。该测试现保留真实 just，只替换耗时的 `uv`；
+定位同类问题时核对实际执行入口，不能只看退出码 0。
+
 ## 当前防回归行为
 
 - 新 agent 固定 settle 后，有界等待 `interactive_ready=true`。

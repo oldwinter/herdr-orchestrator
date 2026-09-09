@@ -40,8 +40,11 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
         frontmatter = skill.split("---", 2)[1]
 
         self.assertIn("name: herdr-orchestrator", frontmatter)
-        self.assertIn("npx --yes herdr-orchestrator install --project .", skill)
-        self.assertIn("npx --yes herdr-orchestrator doctor --project .", skill)
+        self.assertIn(
+            "npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator install --project .",
+            skill,
+        )
+        self.assertIn("herdr_orchestrator doctor --project .", skill)
         self.assertIn("herdr-manager", skill)
         self.assertNotIn("PYTHONPATH=src", skill)
         self.assertNotIn("workflows/multi-harness.toml", skill)
@@ -83,8 +86,10 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
         for block in re.findall(r"```bash\n(.*?)```", skill, flags=re.DOTALL):
             normalized = block.replace("\\\n", " ")
             for line in normalized.splitlines():
-                if line.startswith("npx --yes herdr-orchestrator "):
-                    commands.append(shlex.split(line)[3:])
+                if line.startswith("herdr_orchestrator "):
+                    commands.append(shlex.split(line)[1:])
+                elif line.startswith("npm exec --yes --package=herdr-orchestrator -- "):
+                    commands.append(shlex.split(line)[6:])
 
         runtime_commands = {
             "catalog",
@@ -92,6 +97,7 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             "doctor",
             "enqueue",
             "gc",
+            "resume",
             "retry",
             "run",
             "status",
@@ -116,6 +122,9 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             ]
             parsed = parser.parse_args(arguments)
             self.assertEqual(parsed.command, command[0])
+            if parsed.command == "enqueue":
+                self.assertIsNotNone(parsed.receipt_file)
+                self.assertIsNone(parsed.receipt_prefix)
 
     def test_canonical_skill_has_only_exact_opt_in_keyword_triggers(self) -> None:
         skill = (SKILLS / "standardized-delivery/SKILL.md").read_text(encoding="utf-8")
