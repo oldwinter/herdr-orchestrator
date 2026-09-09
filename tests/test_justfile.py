@@ -21,10 +21,9 @@ class JustfileTests(unittest.TestCase):
             commands = root / "commands.jsonl"
             environment = {**os.environ, "PATH": f"{root}{os.pathsep}{os.environ['PATH']}"}
             environment["QUALITY_EVIDENCE_ROOT"] = str(root / "quality root")
-            for name in ("uv", "just"):
-                executable = root / name
-                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                executable.chmod(0o755)
+            uv = root / "uv"
+            uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            uv.chmod(0o755)
             python = root / "python3"
             python.write_text(
                 f"#!{sys.executable}\n"

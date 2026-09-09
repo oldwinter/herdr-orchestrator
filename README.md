@@ -71,9 +71,25 @@ npx skills add oldwinter/herdr-orchestrator \
 
 # 在目标 Git 仓库安装 runtime 与默认 workflow
 cd /path/to/target-repository
-npx --yes herdr-orchestrator install --project .
-npx --yes herdr-orchestrator doctor --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator install --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator doctor --project .
 ```
+
+已发布的 0.1.7 把两个 bin 指向同一文件，npm 可能把 orchestrator 安装命令送入 manager。
+上面的显式 package/bin 写法适用于旧版本；当前源码已拆分入口文件，并通过本地 tarball 安装测试。
+日常运行按 manifest 固定版本，避免每次拉取不同 runtime：
+
+```bash
+HERDR_VERSION="$(node -p "require('./.herdr-orchestrator/manifest.json').version")"
+herdr_orchestrator() {
+  npm exec --yes --package="herdr-orchestrator@$HERDR_VERSION" -- herdr-orchestrator "$@"
+}
+herdr_orchestrator status --project .
+herdr agent list
+```
+
+包装函数使用 `herdr_orchestrator` 名称，保留原生 `herdr agent` 命令。
+队列隔离、晚到收据和长任务处理见[运行排障](docs/runtime-troubleshooting.md#2026-09-03-编排经验)。
 
 `doctor` 不是纯静态检查。对于环境与 CLI 均可用的 harness，它会启动或复用 agent，提交一个
 带 output receipt 的真实只读 readiness turn，并在 probe 后关闭本次创建的临时 agent。
@@ -81,7 +97,7 @@ npx --yes herdr-orchestrator doctor --project .
 安装器默认检测本机可执行的 harness。也可显式固定：
 
 ```bash
-npx --yes herdr-orchestrator install --project . \
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator install --project . \
   --harness droid --harness codex
 ```
 
@@ -97,8 +113,8 @@ Skill。项目内 symlinked `.git` / exclude 会在写入前被拒绝；Git 原�
 会复用但不会接管它。
 
 ```bash
-npx --yes herdr-orchestrator upgrade --project .
-npx --yes herdr-orchestrator uninstall --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator upgrade --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator uninstall --project .
 ```
 
 完整安装契约见 [`docs/installation.md`](docs/installation.md)。
@@ -295,9 +311,9 @@ just enqueue grok build workflows/prompts/grok-build-check.md build-v1
 just enqueue codex review-isolated workflows/prompts/codex-architecture.md review-isolated-v1 --placement worktree
 just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v2 --placement pane
 
-# 需要内容级机器验收时声明 output 或 file receipt（二选一）
+# 需要内容级机器验收时，要求 prompt 最后写入这个新的 file receipt
 just enqueue pi inspect workflows/prompts/pi-config-check.md inspect-v3 \
-  --placement pane --receipt-prefix "TASK-OK inspect"
+  --placement pane --receipt-file .orchestrator/results/inspect-v3.receipt
 
 # 新任务可要求绑定当前 job / attempt / fencing token 的 structured-v2 envelope
 just enqueue codex inspect workflows/prompts/codex-architecture.md inspect-v4 \

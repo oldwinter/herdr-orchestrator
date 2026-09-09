@@ -14,7 +14,7 @@
   "type": "module",
   "packageManager": "npm@12.0.2",
   "bin": {
-    "herdr-manager": "bin/herdr-orchestrator.mjs",
+    "herdr-manager": "bin/herdr-manager.mjs",
     "herdr-orchestrator": "bin/herdr-orchestrator.mjs"
   },
   "files": [

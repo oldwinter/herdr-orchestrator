@@ -24,7 +24,22 @@ herdr-orchestrator` explicitly and only copies that directory.
 From the target Git repository:
 
 ```bash
-npx --yes herdr-orchestrator install --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator install --project .
+```
+
+Version 0.1.7 published both executable names with the same target, allowing npm to infer
+`herdr-manager` for an orchestrator command. Current source gives the manager a separate entry
+file. The explicit package/bin form above also works with existing published versions.
+
+Pin subsequent runtime calls to the installed manifest, while leaving native Herdr available:
+
+```bash
+HERDR_VERSION="$(node -p "require('./.herdr-orchestrator/manifest.json').version")"
+herdr_orchestrator() {
+  npm exec --yes --package="herdr-orchestrator@$HERDR_VERSION" -- herdr-orchestrator "$@"
+}
+herdr_orchestrator status --project .
+herdr agent list
 ```
 
 The npm package has no runtime npm dependencies. Its executable:
@@ -65,7 +80,7 @@ block, login, secret, approval, or task question.
 To bypass automatic harness detection:
 
 ```bash
-npx --yes herdr-orchestrator install --project . \
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator install --project . \
   --harness droid \
   --harness codex
 ```
@@ -75,7 +90,7 @@ Supported names are `droid`, `grok`, `codex`, `pi`, `claude`, and `hermes`.
 If `.agents/skills/` already exists, project Skill injection is opt-in:
 
 ```bash
-npx --yes herdr-orchestrator install --project . --install-skill
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator install --project . --install-skill
 ```
 
 `upgrade --skip-skill` removes only an unchanged Skill owned by the manifest. A modified or
@@ -187,7 +202,7 @@ remain in those suites.
 ## Diagnostics
 
 ```bash
-npx --yes herdr-orchestrator doctor --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator doctor --project .
 ```
 
 `doctor` returns one JSON document with:
@@ -279,15 +294,15 @@ for retries, deduplication, leases, unattended work, and receipts.
 The wrapper supplies the installed workflow path, so callers only identify the project:
 
 ```bash
-npx --yes herdr-orchestrator catalog --project .
-npx --yes herdr-orchestrator status --project .
-npx --yes herdr-orchestrator run --project . --once
-npx --yes herdr-orchestrator run --project . --until-idle
-npx --yes herdr-orchestrator retry --project . --job-id 42
-npx --yes herdr-orchestrator resume --project . --job-id 43 --response-file approval.txt
-npx --yes herdr-orchestrator gc --project . --succeeded-agents
-npx --yes herdr-orchestrator gc --project . --failed-agents
-npx --yes herdr-orchestrator dashboard --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator catalog --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator status --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator run --project . --once
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator run --project . --until-idle
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator retry --project . --job-id 42
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator resume --project . --job-id 43 --response-file approval.txt
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator gc --project . --succeeded-agents
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator gc --project . --failed-agents
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator dashboard --project .
 ```
 
 The wrapper rejects a forwarded `--workflow` option. Runtime commands always use the installed
@@ -296,20 +311,43 @@ project workflow.
 Arguments not consumed by the wrapper are passed to the Python CLI. For example:
 
 ```bash
-npx --yes herdr-orchestrator enqueue --project . \
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator enqueue --project . \
   --harness codex \
   --title "Review architecture" \
   --prompt-file prompts/review.md \
   --dedupe-key review-architecture-v1 \
-  --receipt-prefix "TASK-OK review-architecture"
+  --receipt-file .orchestrator/results/review-architecture-v1.receipt
 ```
+
+Before enqueueing, ensure that the receipt path is absent. The prompt must require a non-empty
+receipt as the final action after completing the report. Receipt paths resolve against the
+job's execution root, even when it inspects a different repository. For pane/tab jobs, include
+that absolute path in the prompt; for provisioned worktrees, resolve the relative path from
+the assigned execution root. Prefix receipts remain supported, but a prompt line starting with
+the expected prefix fails as `task_receipt_ambiguous`.
+
+Inspect `status` and native `herdr agent list` before draining a queue with prior work. Preserve
+unrelated jobs and use a separate controller project when isolation is needed. Inspect late
+reports and receipts after a timeout or missing receipt. A report alone does not change the
+recorded state. An accepted unresolved turn enters `attempt_phase=attention`; leave it halted
+for operator investigation, without retry, resume, or replacement prompts. Retry only exhausted
+failed jobs whose prior turn is confirmed settled and whose receipt is still absent.
+Complete dependent review before enqueueing validation.
+
+The npm installer generates a 300-second agent deadline. `--drain-timeout-seconds` bounds the
+drain loop and cannot extend that deadline. The wrapper exposes no workflow/state/lease/agent
+timeout override; editing manifest-managed files fails installation integrity checks. For long
+validation, collect command logs first and dispatch a bounded evidence audit. For a longer
+review turn, use a source checkout with `just --set workflow <path> run-until-idle`,
+a distinct state database, and a lease at least 90 seconds longer than the agent deadline.
 
 `run --once` reports the claimed wave in `batch` and the ending global counts in `queue`.
 `--until-idle` repeats waves until the selected worker pool has no pending/running/blocked work or
 the bounded drain timeout expires. A blocked job returns `idle=false`, `reason=blocked`. Read
 `worker_pool_idle` and `queue_idle` separately when the worker pool is narrowed. Retry retains job
 identity and adds attempt budget only to a failed job. After human review, `resume` sends the
-response file to the exact recorded blocked agent and pane without incrementing the attempt or
+response file for an ordinary blocked question, never attention, to the exact recorded agent
+and pane without incrementing the attempt or
 repeating the task prompt. GC is dry-run unless `--apply` is present. Succeeded and failed agents
 use separate explicit scopes; blocked agents are never regular GC candidates. GC never removes
 worktrees; cleanup requires a
@@ -319,8 +357,8 @@ for tab-placed jobs, and never closes the containing tab.
 ## Upgrade and uninstall
 
 ```bash
-npx --yes herdr-orchestrator upgrade --project .
-npx --yes herdr-orchestrator uninstall --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator upgrade --project .
+npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator uninstall --project .
 ```
 
 `update` is an alias for `upgrade`. Passing `--harness` during upgrade reconciles the selected
