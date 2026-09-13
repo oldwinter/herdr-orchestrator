@@ -64,7 +64,7 @@ X-Accel-Buffering: no
 | `GET /assets/<name>` | `200`，白名单静态资源 | 非白名单为 `404` |
 | `GET /api/health` | 有快照时 `200` | 无快照时 `503`；两者都有 JSON |
 | `GET /api/snapshot` | 有快照时 `200` + snapshot envelope | 无快照时 `503 {"error":"snapshot_not_ready"}` |
-| `GET /api/events` | `200`，持续 SSE stream | 连接断开即结束该 handler |
+| `GET /api/events` | `200`，持续 SSE stream | 超过 16 条活动连接时 `503 {"error":"dashboard_sse_limit"}`；连接断开即结束该 handler |
 
 允许的静态资源名只有：
 
@@ -226,7 +226,7 @@ Dashboard 不读取或返回 `jobs.prompt`。`receipt_value` 也不出现在 sna
 - durable blocked：`critical / job_blocked`
 - durable failed：`critical / job_failed`
 - 每个 runtime drift：`warning / <drift-code>`
-- running job 超过 300 秒没有 durable state change：`warning / job_stale`
+- running job 没有 lease，且超过 300 秒没有 durable state change：`warning / job_stale`
 
 一个 job 可产生多个 attention 项；`summary.needs_attention` 因而不是受影响 job 的去重数。
 

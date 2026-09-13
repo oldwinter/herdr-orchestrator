@@ -23,6 +23,7 @@ ASSET_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
 }
+DEFAULT_SSE_CONNECTION_LIMIT = 16
 
 _STATE_DB_REQUIRED_COLUMNS = {
     "schema_meta": frozenset({"version"}),
@@ -130,6 +131,27 @@ class SnapshotFeed:
             return self._event_id, self._snapshot
 
 
+class SseConnectionBudget:
+    def __init__(self, maximum: int = DEFAULT_SSE_CONNECTION_LIMIT) -> None:
+        if type(maximum) is not int or maximum < 1:
+            raise ValueError("dashboard_sse_limit_invalid")
+        self.maximum = maximum
+        self._lock = threading.Lock()
+        self._active = 0
+
+    def acquire(self) -> bool:
+        with self._lock:
+            if self._active >= self.maximum:
+                return False
+            self._active += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            if self._active:
+                self._active -= 1
+
+
 def _validate_state_db(path: Path) -> None:
     try:
         resolved = path.resolve()
@@ -223,6 +245,7 @@ class DashboardServer:
         port: int = 8765,
         poll_seconds: float = 2.0,
         projector: RuntimeProjector | None = None,
+        max_sse_connections: int = DEFAULT_SSE_CONNECTION_LIMIT,
     ) -> None:
         if host not in {"127.0.0.1", "localhost"}:
             raise ValueError("dashboard_host_must_be_loopback")
@@ -235,6 +258,7 @@ class DashboardServer:
         self.host = host
         self.port = port
         self.feed = SnapshotFeed()
+        self.sse_budget = SseConnectionBudget(max_sse_connections)
         self.projector = projector or RuntimeProjector(
             config.name,
             SqliteObserver(config.state_db, config.name),
@@ -245,7 +269,7 @@ class DashboardServer:
             self.feed,
             poll_seconds=poll_seconds,
         )
-        handler = _handler(self.feed)
+        handler = _handler(self.feed, self.sse_budget)
         try:
             self.httpd = ThreadingHTTPServer((host, port), handler)
         except OSError as exc:
@@ -290,7 +314,10 @@ class DashboardServer:
             self.httpd.server_close()
 
 
-def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
+def _handler(
+    feed: SnapshotFeed,
+    sse_budget: SseConnectionBudget,
+) -> type[BaseHTTPRequestHandler]:
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "HerdrDashboard/1"
         sys_version = ""
@@ -356,38 +383,49 @@ def _handler(feed: SnapshotFeed) -> type[BaseHTTPRequestHandler]:
             )
 
         def _events(self) -> None:
-            requested = self.headers.get("Last-Event-ID", "0")
-            try:
-                event_id = max(0, int(requested))
-            except ValueError:
-                event_id = 0
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            self.close_connection = True
-            try:
-                while True:
-                    next_id, snapshot = feed.wait_after(event_id, timeout=15)
-                    if feed.is_closed():
-                        return
-                    if snapshot is None:
-                        self.wfile.write(b": heartbeat\n\n")
-                    else:
-                        payload = json.dumps(
-                            snapshot,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ).encode()
-                        self.wfile.write(
-                            f"id: {next_id}\nevent: snapshot\ndata: ".encode() + payload + b"\n\n"
-                        )
-                        event_id = next_id
-                    self.wfile.flush()
-            except OSError:
+            if not sse_budget.acquire():
+                self._json(
+                    {"error": "dashboard_sse_limit"},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
                 return
+            try:
+                requested = self.headers.get("Last-Event-ID", "0")
+                try:
+                    event_id = max(0, int(requested))
+                except ValueError:
+                    event_id = 0
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    while True:
+                        next_id, snapshot = feed.wait_after(event_id, timeout=15)
+                        if feed.is_closed():
+                            return
+                        if snapshot is None:
+                            self.wfile.write(b": heartbeat\n\n")
+                        else:
+                            payload = json.dumps(
+                                snapshot,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ).encode()
+                            self.wfile.write(
+                                f"id: {next_id}\nevent: snapshot\ndata: ".encode()
+                                + payload
+                                + b"\n\n"
+                            )
+                            event_id = next_id
+                        self.wfile.flush()
+                except OSError:
+                    return
+            finally:
+                sse_budget.release()
 
         def _asset(self, name: str) -> None:
             if name not in {

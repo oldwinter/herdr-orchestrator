@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from herdr_orchestrator.completion import (
     CompletionIdentity,
     CompletionPolicy,
     CompletionResult,
     CompletionStatus,
+    FileReceiptSnapshot,
     VerificationClass,
+    file_receipt_snapshot,
     parse_structured_completion,
 )
+from herdr_orchestrator.protocol import TransportError
 
 
 class CompletionProtocolTests(unittest.TestCase):
@@ -205,6 +212,46 @@ class CompletionProtocolTests(unittest.TestCase):
                 self.assertEqual(result.verification, VerificationClass.VERIFIED)
                 self.assertEqual(result.status, status)
                 self.assertEqual(result.evidence_summary, "tests passed token=[REDACTED]")
+
+
+class FileReceiptSnapshotTests(unittest.TestCase):
+    def test_missing_file_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = file_receipt_snapshot(Path(temporary) / "missing.txt")
+
+        self.assertEqual(snapshot, FileReceiptSnapshot(False, None, None))
+
+    def test_hashes_a_regular_sentinel_file(self) -> None:
+        payload = b"sentinel\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.txt"
+            path.write_bytes(payload)
+            snapshot = file_receipt_snapshot(path)
+
+        self.assertEqual(
+            snapshot,
+            FileReceiptSnapshot(True, len(payload), hashlib.sha256(payload).hexdigest()),
+        )
+
+    def test_rejects_a_file_over_the_byte_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.bin"
+            path.write_bytes(b"123456789")
+            with (
+                patch("herdr_orchestrator.completion.MAX_FILE_RECEIPT_BYTES", 8),
+                self.assertRaisesRegex(TransportError, "task_receipt_too_large"),
+            ):
+                file_receipt_snapshot(path)
+
+    def test_rejects_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.txt"
+            target.write_text("secret\n", encoding="utf-8")
+            link = root / "receipt.txt"
+            link.symlink_to(target.name)
+            with self.assertRaisesRegex(TransportError, "task_receipt_unreadable"):
+                file_receipt_snapshot(link)
 
 
 def _envelope(**overrides: object) -> str:

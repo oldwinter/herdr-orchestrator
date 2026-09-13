@@ -645,6 +645,40 @@ class StandardizedDeliveryTests(unittest.TestCase):
         self.assertEqual(dispatcher.dispatch_calls, 1)
         self.assertEqual(dispatcher.responses, [])
 
+    def test_principal_proxy_escalates_secret_shapes_without_keyword_words(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            delivery_config = replace(
+                config.standardized_delivery,
+                artifact_root=root / ".orchestrator/deliveries",
+                tracker_root=root / ".scratch/delivery",
+            )
+            config = replace(config, standardized_delivery=delivery_config)
+            secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"  # pragma: allowlist secret
+            dispatcher = BlockedDispatcher(f"Continue with {secret} for the local checkout.")
+            delivery = StandardizedDelivery(
+                config,
+                dispatcher=dispatcher,
+                tracker=LocalMarkdownTracker(delivery_config.tracker_root),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            delivery._goal = "Implement the accepted local behavior."
+            delivery._run_root = delivery_config.artifact_root / "proxy-secret-shape"
+            delivery._run_root.mkdir(parents=True)
+
+            with self.assertRaisesRegex(DeliveryEscalation, "sensitive"):
+                delivery._dispatch_with_proxy(
+                    root,
+                    Harness.DROID,
+                    "Implement it.",
+                    role="worker",
+                )
+
+        self.assertEqual(dispatcher.dispatch_calls, 1)
+        self.assertEqual(dispatcher.responses, [])
+
     def test_wayfinder_resolves_frontier_before_returning_to_spec(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

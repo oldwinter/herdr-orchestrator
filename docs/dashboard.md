@@ -22,8 +22,9 @@ Dashboard 只允许绑定 `127.0.0.1` 或 `localhost`。默认每 2 秒生成一
 浏览器通过 Server-Sent Events 异步接收；断线会自动重连。
 Dashboard 要求 `state_db` 已存在且为当前兼容 schema。它只读打开该数据库，不会创建或迁移
 状态；首次运行请先使用 `seed` 或 `enqueue` 初始化数据库。
-服务关闭时 `shutdown()` 会先唤醒并结束活动 SSE 连接，再停止监听。`shutdown()` 可以重复调用，
-也可以在服务尚未进入监听循环时调用。
+同一进程最多同时保持 16 条 `/api/events` 连接；超出时该请求返回 `503` 和
+`{"error":"dashboard_sse_limit"}`，已有连接不受影响。服务关闭时 `shutdown()` 会先唤醒并结束
+活动 SSE 连接，再停止监听。`shutdown()` 可以重复调用，也可以在服务尚未进入监听循环时调用。
 
 连接指示器在稳定 `Live` 状态保持静止。进入 `Reconnecting` 时保留一次 360ms pill
 transition，重新连通时 dot 只播放一次 640ms pulse；后续普通 SSE snapshot 不重播。

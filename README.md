@@ -464,7 +464,9 @@ artifact、恢复和退出码见
 
 仓库跟踪多个声明式 workflow。默认多 harness 示例是
 [`workflows/multi-harness.toml`](workflows/multi-harness.toml)，研究示例是
-[`workflows/grok-research.toml`](workflows/grok-research.toml)。多 harness 示例声明：
+[`workflows/grok-research.toml`](workflows/grok-research.toml)，Grok-only campaign
+示例是 [`workflows/grok-army.toml`](workflows/grok-army.toml) 和
+[`workflows/grok-burst.toml`](workflows/grok-burst.toml)。多 harness 示例声明：
 
 - coordinator 的轮询、并发、lease 和重试策略；
 - 六个 harness worker，包括 Grok Build；

@@ -130,13 +130,14 @@ mise shim 转发到空桩，根本没有运行目标 recipe。该测试现保留
   只用于现有 fatal signal 分类；完整 output 不进入 SQLite、receipt 或日志摘要。
 - durable `receipt_observed` 的 `task_verified=true` 在成功和 settled fatal recovery 中都保留；
   只有 verification 缺失或不为 true 才返回 `task_receipt_recovery_unverified`。
-- stale phase 和 outcome 会保留为 `is_stale=1` receipt。status、resume 和 GC 不读取 stale
-  receipt 作为当前 identity 或 pane ownership。
+- stale phase 和 outcome 会保留为 `is_stale=1` receipt。status、resume、GC 和 Dashboard
+  timeline 不读取 stale receipt 作为当前 identity、pane ownership 或实时历史。
 - settled output 命中登录墙、device login、provider retry exhaustion 或 invalid model 时，
   不会记成功，并保留稳定错误码与有界摘要。
 - 声明的 output/file receipt 缺失返回 `task_receipt_missing`，即使 agent 已 idle/done。
   output-prefix 必须来自当前 turn 的新增输出，独立 prompt echo 返回
-  `task_receipt_ambiguous`；未改变的既有 file receipt 返回 `task_receipt_stale`。
+  `task_receipt_ambiguous`；未改变的既有 file receipt 返回 `task_receipt_stale`；超过 1 MiB
+  的 file receipt 返回 `task_receipt_too_large`。
 
 ## 诊断顺序
 
@@ -222,6 +223,7 @@ herdr integration status
 | `task_receipt_missing` | 声明的输出前缀或非空文件不存在 | 按 attempt 失败处理 |
 | `task_receipt_ambiguous` | output-prefix 与 prompt 独立行重合，无法证明 authorship | 按 attempt 失败处理 |
 | `task_receipt_stale` | file receipt 在当前 turn 前后未改变 | 按 attempt 失败处理 |
+| `task_receipt_too_large` | file receipt 超过 1 MiB | 按 attempt 失败处理；收据应是 sentinel，不是构建产物 |
 | `lease_expired_unaccepted` | reconciliation 证明原 operation 未接受输入 | abandon 原 operation；dispatch 可按 budget 创建 replacement |
 | `unsafe_turn_adoption` | runtime identity 或 sequence 不能证明同一 accepted turn | terminal attention；不发送 replacement prompt |
 | `task_receipt_recovery_unverified` | settled recovery 的 durable verification 缺失或不为 true | terminal attention；不重复执行任务 |

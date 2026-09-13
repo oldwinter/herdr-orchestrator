@@ -53,6 +53,7 @@ claimed -> runtime_acquired -> prompt_accepted -> settled
 pending job 的新 claim 在 `BEGIN IMMEDIATE` 事务内创建 attempt，并增加 `jobs.attempts`。每次
 phase 或 outcome 更新都比较 job、current attempt、fencing token、lease owner 和 operation
 token。旧 coordinator 可以追加 `is_stale=1` 的 audit receipt，但不能修改当前 job 或 attempt。
+Dashboard timeline 与 status、resume、GC 一样只读取 `is_stale = 0` 的 receipt。
 
 `running` lease 过期时，coordinator 先在原 attempt 上轮换 lease owner，再检查持久化的 Herdr
 identity、phase 和 sequence。这个 reconciliation 不增加 attempt：
@@ -118,8 +119,9 @@ durably settled 的 operation 进入 `attention`，不会自动或人工重复�
 - enqueue 可声明 output-prefix 或 execution-root file receipt；声明后必须验证通过才能成功。
   output-prefix 只接受当前 turn 新增且不与 prompt 独立行歧义的输出，file receipt 必须在当前
   turn 新建或改变；分别记录 `agent_settled` 与 `task_verified`；
-  file receipt 只证明文件变化，不证明写入者。共享 execution root 的并发任务必须使用不同的
-  收据路径；需要校验 job、attempt 和 turn 身份时使用 `structured-v2`。
+  file receipt 只证明文件变化，不证明写入者。读取走不跟随 symlink 的文件描述符，并拒绝超过
+  1 MiB 的文件。共享 execution root 的并发任务必须使用不同的收据路径；需要校验 job、attempt
+  和 turn 身份时使用 `structured-v2`。
 - prompt 接受前的 `unknown`、timeout 和协议错误按失败与重试策略处理。prompt 接受后若 turn
   仍可能运行，则 job 进入 `attention`，不会自动重试。
 - `structured-v2` task 在 claim 后收到 immutable completion identity；transport 将 fresh envelope

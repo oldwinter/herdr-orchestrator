@@ -54,11 +54,12 @@ from herdr_orchestrator.delivery_protocol import (
     load_wayfinder_route,
     map_payload,
 )
-from herdr_orchestrator.delivery_recovery import (
+from herdr_orchestrator.delivery_recovery import DeliveryRecoveryMixin
+from herdr_orchestrator.delivery_repair import DeliveryRepairMixin
+from herdr_orchestrator.delivery_support import (
     DeliveryError as DeliveryError,
 )
-from herdr_orchestrator.delivery_recovery import (
-    DeliveryRecoveryMixin,
+from herdr_orchestrator.delivery_support import (
     DeliveryResult,
     _agent_is_active,
     _effect_absent,
@@ -74,7 +75,6 @@ from herdr_orchestrator.delivery_recovery import (
     _validate_worktree_ownership,
     _write_json,
 )
-from herdr_orchestrator.delivery_repair import DeliveryRepairMixin
 from herdr_orchestrator.git_workspace import GitWorkspace, GitWorkspaceError, Worktree
 from herdr_orchestrator.harness_health import (
     EligibilitySnapshot,
@@ -1134,7 +1134,7 @@ class StandardizedDelivery(
             except TransportError as exc:
                 raise DeliveryError(f"principal_proxy_read_failed:{exc.code}") from exc
             question_hash = hashlib.sha256(question.encode()).hexdigest()[:12]
-            if SENSITIVE_QUESTION.search(question):
+            if SENSITIVE_QUESTION.search(question) or contains_high_confidence_secret(question):
                 self._record(
                     "principal_proxy_escalated",
                     {

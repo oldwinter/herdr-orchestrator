@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from herdr_orchestrator.attempts import AttemptLedger, StoreError
+from herdr_orchestrator.attempts_legacy import (
+    migrate_v4_to_v5 as _migrate_attempts_v4_to_v5,
+)
 from herdr_orchestrator.completion import CompletionPolicy, VerificationClass
 from herdr_orchestrator.model import (
     AttemptPhase,
@@ -327,7 +330,7 @@ class Store:
         connection.execute("UPDATE schema_meta SET version = 4")
 
     def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
-        AttemptLedger.migrate_v4_to_v5(connection, self._add_column_if_missing)
+        _migrate_attempts_v4_to_v5(connection, self._add_column_if_missing)
 
     def _migrate_v5_to_v6(self, connection: sqlite3.Connection) -> None:
         for table in ("jobs", "job_attempts", "receipts"):
