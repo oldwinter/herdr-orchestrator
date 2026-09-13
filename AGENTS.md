@@ -16,7 +16,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只向 coordinat
 
 ## 工作流
 
-仓库包含多个声明式工作流。`workflows/multi-harness.toml` 是多 harness 示例，`workflows/grok-research.toml` 是 Grok research 示例。每个文件都声明 coordinator 策略、worker、catalog 目录、planner 和可选 seed 任务。改 TOML 字段前读 `docs/workflow-schema.md`。
+仓库包含多个声明式工作流。`workflows/multi-harness.toml` 是多 harness 示例，`workflows/grok-research.toml` 是 Grok research 示例，`workflows/grok-army.toml` 和 `workflows/grok-burst.toml` 是 Grok-only campaign 示例。每个文件都声明 coordinator 策略、worker、catalog 目录、planner 和可选 seed 任务。改 TOML 字段前读 `docs/workflow-schema.md`。
 
 仓库运行面各自独立，不要混用其状态语义：
 
