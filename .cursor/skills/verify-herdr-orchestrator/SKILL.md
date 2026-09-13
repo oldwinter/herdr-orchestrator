@@ -128,7 +128,7 @@ PYTHONPATH=src python3 -m herdr_orchestrator enqueue --workflow "$WORKFLOW" \
 .cursor/skills/verify-herdr-orchestrator/helpers/capture-dashboard.sh
 ```
 
-Chrome 需要 `--no-sandbox`（容器里）。每个 run 用自己的 `--user-data-dir`，避免碰到操作者的浏览器 profile。
+不要用 `chrome --dump-dom` / `--screenshot` 直接打开 Dashboard：页面会挂上 `EventSource /api/events`，headless 会一直等 network idle。`capture-dashboard.sh` 走 Node CDP（`helpers/capture-dashboard.mjs`），等 `.job-card[data-job-id]` 出现再截图。Chrome 用 `/usr/bin/google-chrome-stable` 或 `/opt/google/chrome/chrome`，**不要**用 `/usr/local/bin/google-chrome` 这类会劫持 profile / 9222 的包装器。每个 run 用自己的 `--user-data-dir`。需要 `--no-sandbox`。
 
 ## Evidence
 
@@ -163,7 +163,8 @@ Chrome 需要 `--no-sandbox`（容器里）。每个 run 用自己的 `--user-da
 | `helpers/launch.sh` | 隔离 seed + Dashboard |
 | `helpers/doctor.sh` | 只读健康检查 |
 | `helpers/drive-dashboard-board.sh` | 证明看板 |
-| `helpers/capture-dashboard.sh` | Chrome 截图 + dump-dom |
+| `helpers/capture-dashboard.sh` | CDP 截图 + outerHTML |
+| `helpers/capture-dashboard.mjs` | 被 capture 调用的 Node CDP 驱动 |
 | `helpers/cleanup.sh` | 拆掉本 run，保留证据 |
 | `helpers/common.sh` | 被 source，不要直接跑 |
 

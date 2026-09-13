@@ -58,8 +58,18 @@ if [[ "$STATE_DB" == "$ROOT/.orchestrator/state.db" ]]; then
 fi
 
 LOG="$SCRATCH/dashboard.log"
-ho dashboard --workflow "$WORKFLOW" --host 127.0.0.1 --port 0 --poll-seconds 1 \
-  >"$LOG" 2>"$SCRATCH/dashboard.err" &
+# exec so $! is the Python dashboard, not this helper's bash wrapper.
+(
+  cd "$ROOT"
+  export PYTHONPATH=src
+  if command -v uv >/dev/null 2>&1; then
+    exec uv run python -m herdr_orchestrator dashboard \
+      --workflow "$WORKFLOW" --host 127.0.0.1 --port 0 --poll-seconds 1
+  else
+    exec python3 -m herdr_orchestrator dashboard \
+      --workflow "$WORKFLOW" --host 127.0.0.1 --port 0 --poll-seconds 1
+  fi
+) >"$LOG" 2>"$SCRATCH/dashboard.err" &
 DASH_PID=$!
 printf '%s\n' "$DASH_PID" >"$SCRATCH/dashboard.pid"
 
