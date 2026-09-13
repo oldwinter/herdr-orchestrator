@@ -72,6 +72,40 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.coordinator.lease_seconds, 32400)
         self.assertEqual(config.coordinator.agent_timeout_seconds, 28800)
 
+    def test_loads_grok_only_army_campaign_workflow(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/grok-army.toml")
+
+        self.assertEqual(config.name, "grok-army")
+        self.assertTrue(config.planner.enabled)
+        self.assertEqual(config.planner.harness, Harness.GROK)
+        self.assertEqual(config.planner.worker_harnesses, (Harness.GROK,))
+        self.assertEqual([worker.harness for worker in config.workers], [Harness.GROK])
+        self.assertEqual({job.harness for job in config.seed_jobs}, {Harness.GROK})
+        self.assertGreaterEqual(config.workers[0].replicas, 2)
+        self.assertGreaterEqual(config.coordinator.max_parallel, 2)
+        self.assertEqual(config.coordinator.agent_timeout_seconds, 28800)
+        self.assertGreaterEqual(config.coordinator.lease_seconds, 28800 + 90)
+        placements = {
+            worker.placement for worker in config.workers if worker.placement is not None
+        } | {job.placement for job in config.seed_jobs if job.placement is not None}
+        self.assertIn(PlacementTarget.TAB, placements)
+        self.assertIn(PlacementTarget.PANE, placements)
+
+    def test_loads_grok_only_burst_campaign_workflow(self) -> None:
+        config = load_workflow(REPO_ROOT / "workflows/grok-burst.toml")
+
+        self.assertEqual(config.name, "grok-burst")
+        self.assertTrue(config.planner.enabled)
+        self.assertEqual(config.planner.harness, Harness.GROK)
+        self.assertEqual(config.planner.worker_harnesses, (Harness.GROK,))
+        self.assertEqual([worker.harness for worker in config.workers], [Harness.GROK])
+        self.assertEqual({job.harness for job in config.seed_jobs}, {Harness.GROK})
+        self.assertGreaterEqual(config.workers[0].replicas, 10)
+        self.assertGreaterEqual(config.coordinator.max_parallel, 10)
+        self.assertEqual(config.coordinator.agent_timeout_seconds, 10800)
+        self.assertGreaterEqual(config.coordinator.lease_seconds, 10800 + 90)
+        self.assertGreaterEqual(len(config.seed_jobs), 10)
+
     def test_rejects_unknown_harness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

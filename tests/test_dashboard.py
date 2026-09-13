@@ -22,7 +22,11 @@ from herdr_orchestrator.dashboard.observer import (
     SqliteObserver,
 )
 from herdr_orchestrator.dashboard.projector import RuntimeProjector
-from herdr_orchestrator.dashboard.server import DashboardServer, SnapshotFeed
+from herdr_orchestrator.dashboard.server import (
+    DashboardServer,
+    SnapshotFeed,
+    SseConnectionBudget,
+)
 from herdr_orchestrator.model import (
     AgentState,
     DispatchOutcome,
@@ -773,6 +777,71 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("receipt_value", observation.jobs[0])
         self.assertNotIn("error_summary", observation.receipts[0])
 
+    def test_sqlite_observer_omits_stale_audit_receipts_from_the_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            store = Store(path)
+            store.initialize()
+            store.enqueue(
+                NewJob(
+                    workflow="example",
+                    title="Recovered job",
+                    harness=Harness.CODEX,
+                    prompt="Read only.",
+                    dedupe_key="stale-receipt-v1",
+                    max_attempts=2,
+                )
+            )
+            claimed = store.claim("example", limit=1, lease_seconds=60)[0]
+            store.record_outcome(
+                claimed,
+                DispatchOutcome(
+                    "worker",
+                    AgentState.DONE,
+                    False,
+                    "w1:p1",
+                    placement=PlacementTarget.TAB,
+                    execution_path="/repo",
+                    herdr_workspace_id="w1",
+                ),
+            )
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    "UPDATE receipts SET is_stale = 1 WHERE job_id = ?",
+                    (claimed.job_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO receipts (
+                        job_id, attempt, state, agent_name, agent_state, member_reused,
+                        pane_id, error_code, placement, execution_path, herdr_workspace_id,
+                        agent_settled, task_verified, correlation_id, observed_at, is_stale
+                    )
+                    VALUES (?, 2, 'succeeded', 'worker', 'done', 0, 'w1:p1', NULL, 'tab',
+                            '/repo', 'w1', 1, 1, 'live-correlation', 3.0, 0)
+                    """,
+                    (claimed.job_id,),
+                )
+
+            observation = SqliteObserver(path, "example").observe()
+            snapshot = RuntimeProjector(
+                "example",
+                FakeQueueObserver(observation),
+                FakeHerdrObserver(HerdrObservation("ok", None, (), (), (), (), ())),
+                clock=lambda: 4.0,
+            ).snapshot()
+
+        self.assertEqual(len(observation.receipts), 1)
+        self.assertEqual(observation.receipts[0]["attempt"], 2)
+        self.assertEqual(
+            [event["type"] for event in snapshot["timeline"] if event["type"] == "receipt"],
+            ["receipt"],
+        )
+        self.assertEqual(
+            [event["attempt"] for event in snapshot["timeline"] if event["type"] == "receipt"],
+            [2],
+        )
+
     def test_projector_correlates_jobs_and_reports_runtime_drift(self) -> None:
         now = 2_000.0
         jobs = (
@@ -895,10 +964,49 @@ class DashboardTests(unittest.TestCase):
                 "running_agent_missing",
                 "terminal_job_agent_working",
                 "lease_expired",
-                "job_stale",
             },
             attention_codes,
         )
+        self.assertNotIn("job_stale", attention_codes)
+
+    def test_running_job_with_a_valid_lease_is_not_stale(self) -> None:
+        now = 2_000.0
+        jobs = (
+            {
+                **_job_row(1, "Long dispatch", "running", now - 400, "worker-one"),
+                "lease_until": now + 20_000,
+            },
+        )
+        projector = RuntimeProjector(
+            "example",
+            FakeQueueObserver(QueueObservation(jobs, ())),
+            FakeHerdrObserver(HerdrObservation("ok", None, (), (), (), (), ())),
+            clock=lambda: now,
+        )
+
+        attention_codes = {item["code"] for item in projector.snapshot()["attention"]}
+
+        self.assertNotIn("job_stale", attention_codes)
+        self.assertNotIn("lease_expired", attention_codes)
+
+    def test_running_job_without_a_lease_is_stale_after_five_minutes(self) -> None:
+        now = 2_000.0
+        jobs = (
+            {
+                **_job_row(1, "Unleased", "running", now - 400, "worker-one"),
+                "lease_until": None,
+            },
+        )
+        projector = RuntimeProjector(
+            "example",
+            FakeQueueObserver(QueueObservation(jobs, ())),
+            FakeHerdrObserver(HerdrObservation("ok", None, (), (), (), (), ())),
+            clock=lambda: now,
+        )
+
+        attention_codes = {item["code"] for item in projector.snapshot()["attention"]}
+
+        self.assertIn("job_stale", attention_codes)
 
     def test_topology_does_not_cross_join_foreign_entities(self) -> None:
         herdr = HerdrObservation(
@@ -1234,6 +1342,75 @@ class DashboardTests(unittest.TestCase):
                 if serve_thread.is_alive():
                     server.shutdown()
                     serve_thread.join(timeout=2)
+
+    def test_sse_connection_budget_rejects_the_limit(self) -> None:
+        budget = SseConnectionBudget(1)
+
+        self.assertTrue(budget.acquire())
+        self.assertFalse(budget.acquire())
+        budget.release()
+        self.assertTrue(budget.acquire())
+
+    def test_sse_connection_budget_rejects_a_non_positive_limit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "dashboard_sse_limit_invalid"):
+            SseConnectionBudget(0)
+
+    def test_http_server_rejects_excess_sse_clients(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(base, state_db=Path(temporary) / "state.db")
+            Store(config.state_db).initialize()
+            projector = FakeProjector(
+                {
+                    "schema_version": 1,
+                    "workflow": "example",
+                    "generated_at": 1.0,
+                    "source_health": {"queue": "ok", "herdr": "ok"},
+                    "summary": {},
+                    "jobs": [],
+                    "attention": [],
+                    "topology": {"workspaces": []},
+                    "timeline": [],
+                }
+            )
+            server = DashboardServer(
+                config,
+                port=0,
+                poll_seconds=60,
+                projector=projector,
+                max_sse_connections=1,
+            )
+            serve_thread = threading.Thread(target=server.serve_forever)
+            first: HTTPConnection | None = None
+            second: HTTPConnection | None = None
+            try:
+                serve_thread.start()
+                deadline = time.monotonic() + 2
+                while server.feed.current()[1] is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("dashboard monitor did not publish a snapshot")
+                    time.sleep(0.01)
+
+                host, port = server.address
+                first = HTTPConnection(host, port, timeout=2)
+                first.request("GET", "/api/events")
+                first_response = first.getresponse()
+                self.assertEqual(first_response.status, 200)
+
+                second = HTTPConnection(host, port, timeout=2)
+                second.request("GET", "/api/events")
+                second_response = second.getresponse()
+                body = json.loads(second_response.read().decode())
+
+                self.assertEqual(second_response.status, 503)
+                self.assertEqual(body, {"error": "dashboard_sse_limit"})
+            finally:
+                if first is not None:
+                    first.close()
+                if second is not None:
+                    second.close()
+                server.shutdown()
+                serve_thread.join(timeout=2)
 
     def test_server_shutdown_before_serving_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

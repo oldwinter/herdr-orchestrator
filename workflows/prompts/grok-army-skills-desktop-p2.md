@@ -1,0 +1,1 @@
+在 `/Users/oldwinter/Code/grok-army-campaign/skills-desktop` 做第二轮「架构」工作。跳过已有 empty inventory issue。找另一个具体架构问题。`gh issue create --repo oldwinter/skills-desktop`，标题或正文含「架构」。本地改进，不要 push/PR/merge。追加写入 `/Users/oldwinter/Code/herdr-orchestrator/.orchestrator/grok-army/issues.txt`。

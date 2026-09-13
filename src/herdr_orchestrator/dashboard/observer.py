@@ -74,6 +74,7 @@ class SqliteObserver:
                 FROM receipts
                 JOIN jobs ON jobs.id = receipts.job_id
                 WHERE jobs.workflow = ?
+                  AND receipts.is_stale = 0
                 ORDER BY receipts.observed_at, receipts.id
                 """,
                 (self.workflow,),

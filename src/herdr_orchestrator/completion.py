@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,6 +17,8 @@ STRUCTURED_COMPLETION_MARKER = "HERDR-COMPLETION-V2 "
 MAX_COMPLETION_OUTPUT_BYTES = 32 * 1024
 MAX_COMPLETION_ENVELOPE_BYTES = 2 * 1024
 MAX_EVIDENCE_SUMMARY_BYTES = 1_000
+MAX_FILE_RECEIPT_BYTES = 1_048_576
+FILE_RECEIPT_READ_CHUNK_BYTES = 65_536
 _ENVELOPE_KEYS = frozenset(
     {
         "schema_version",
@@ -317,13 +321,33 @@ def receipt_file_path(receipt: TaskReceipt, execution_workspace: Path) -> Path:
 
 
 def file_receipt_snapshot(candidate: Path) -> FileReceiptSnapshot:
-    if not candidate.is_file():
-        return FileReceiptSnapshot(False, None, None)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        content = candidate.read_bytes()
+        descriptor = os.open(candidate, flags)
+    except FileNotFoundError:
+        return FileReceiptSnapshot(False, None, None)
     except OSError as exc:
         raise TransportError("task_receipt_unreadable") from exc
-    return FileReceiptSnapshot(True, len(content), hashlib.sha256(content).hexdigest())
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return FileReceiptSnapshot(False, None, None)
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, FILE_RECEIPT_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_FILE_RECEIPT_BYTES:
+                raise TransportError("task_receipt_too_large")
+            digest.update(chunk)
+        return FileReceiptSnapshot(True, size, digest.hexdigest())
+    except TransportError:
+        raise
+    except OSError as exc:
+        raise TransportError("task_receipt_unreadable") from exc
+    finally:
+        os.close(descriptor)
 
 
 def line_starts_with_receipt(line: str, receipt: str) -> bool:

@@ -1988,7 +1988,6 @@ if (primaryCoarsePointer) {
     primaryCoarsePointer.addListener(syncTopologyTouchOwnership);
   }
 }
-
 syncTopologyTouchOwnership();
 loadInitial();
 connectEvents();

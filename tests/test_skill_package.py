@@ -188,10 +188,53 @@ class RepositoryCheckerTests(unittest.TestCase):
             root = Path(temporary)
             source = root / "sample.py"
             source.write_text("value = 1\n", encoding="utf-8")
-            with patch.object(CHECK_REPOSITORY, "MAX_SOURCE_LINES", 1):
+            with patch.object(CHECK_REPOSITORY, "MAX_SOURCE_LINES", 2):
                 failures = CHECK_REPOSITORY.repository_failures(root, (source,))
 
         self.assertEqual(failures, [])
+
+    def test_repository_checker_requires_line_headroom(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sample.py"
+            source.write_text("value = 1\n", encoding="utf-8")
+            with patch.object(CHECK_REPOSITORY, "MAX_SOURCE_LINES", 1):
+                failures = CHECK_REPOSITORY.repository_failures(root, (source,))
+
+        self.assertEqual(
+            failures,
+            ["sample.py: 1 lines leaves no headroom under 1"],
+        )
+
+    def test_tracked_text_files_keep_one_line_below_the_repository_limit(self) -> None:
+        files = CHECK_REPOSITORY.tracked_files()
+        failures = []
+        for path in files:
+            if not path.is_file():
+                continue
+            relative = path.relative_to(CHECK_REPOSITORY.ROOT).as_posix()
+            if path.suffix not in CHECK_REPOSITORY.TEXT_SUFFIXES:
+                continue
+            if relative in CHECK_REPOSITORY.EXEMPT_LINE_PATHS:
+                continue
+            lines = len(path.read_text(encoding="utf-8").splitlines())
+            maximum = CHECK_REPOSITORY.line_limit(path)
+            if lines + CHECK_REPOSITORY.LINE_HEADROOM > maximum:
+                failures.append(f"{relative}: {lines} lines leaves no headroom under {maximum}")
+
+        self.assertEqual(failures, [])
+
+    def test_import_linter_covers_split_orchestration_modules(self) -> None:
+        text = (REPO_ROOT / ".importlinter").read_text(encoding="utf-8")
+
+        for required in (
+            "[importlinter:contract:dashboard-is-read-only]",
+            "[importlinter:contract:delivery-support-is-shared]",
+            "herdr_orchestrator.attempts",
+            "herdr_orchestrator.dashboard",
+            "herdr_orchestrator.delivery_support",
+        ):
+            self.assertIn(required, text)
 
     def test_docs_checker_requires_every_key_document(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -278,10 +321,13 @@ class RepositoryCheckerTests(unittest.TestCase):
         )
 
     def test_documented_workflows_are_all_tracked_examples(self) -> None:
-        workflows = sorted(
-            path.relative_to(REPO_ROOT).as_posix()
-            for path in (REPO_ROOT / "workflows").glob("*.toml")
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--", "workflows/*.toml"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=True,
         )
+        workflows = sorted(path.decode() for path in result.stdout.split(b"\0") if path)
         documentation = "\n".join(
             (REPO_ROOT / name).read_text(encoding="utf-8") for name in ("README.md", "AGENTS.md")
         )

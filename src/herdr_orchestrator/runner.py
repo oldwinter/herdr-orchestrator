@@ -116,6 +116,7 @@ class Coordinator:
         readiness_probe: HealthProbe | None = None,
     ) -> None:
         self.config = config
+        self._workspace_key = str(config.workspace.resolve())
         self.store = store or Store(config.state_db)
         self.dispatcher = dispatcher or HerdrTransport(config.name, config.workspace)
         self.controller_harness = controller_harness
@@ -147,7 +148,7 @@ class Coordinator:
             _, created = self.store.enqueue(
                 NewJob(
                     workflow=self.config.name,
-                    workspace=str(self.config.workspace.resolve()),
+                    workspace=self._workspace_key,
                     title=seed.title,
                     harness=seed.harness,
                     prompt=prompt,
@@ -191,7 +192,7 @@ class Coordinator:
             placement=placement,
             receipt=receipt,
             completion_policy=completion_policy,
-            workspace=str(self.config.workspace.resolve()),
+            workspace=self._workspace_key,
         )
         if existing is not None:
             job_id, existing_harness = existing
@@ -209,7 +210,7 @@ class Coordinator:
         job_id, created = self.store.enqueue(
             NewJob(
                 workflow=self.config.name,
-                workspace=str(self.config.workspace.resolve()),
+                workspace=self._workspace_key,
                 title=title,
                 harness=selected,
                 prompt=prompt,
@@ -269,7 +270,7 @@ class Coordinator:
             slot_names=slot_names,
             slot_limits={worker.harness.value: worker.replicas for worker in self.config.workers},
             allowed_harnesses=eligible_workers,
-            workspace=str(self.config.workspace.resolve()),
+            workspace=self._workspace_key,
             require_fresh_health=self.health is not None,
             include_legacy=True,
             static_validator=self._static_harness_available if self.health is not None else None,
@@ -373,7 +374,7 @@ class Coordinator:
         claimed: int,
         health_snapshot: EligibilitySnapshot | None = None,
     ) -> dict[str, object]:
-        workspace = str(self.config.workspace.resolve())
+        workspace = self._workspace_key
         report: dict[str, object] = {
             **batch,
             "claimed": claimed,
@@ -400,23 +401,18 @@ class Coordinator:
         aggregate = {state.value: 0 for state in JobState}
         total_claimed = 0
         waves = 0
-        workspace = str(self.config.workspace.resolve())
+        workspace = self._workspace_key
         last_queue = self.store.status_counts(
             self.config.name,
             workspace=workspace,
             include_legacy=True,
         )
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return self._drain_report(
-                    aggregate,
-                    idle=False,
-                    reason="drain_timeout",
-                    waves=waves,
-                    claimed=total_claimed,
-                    queue=last_queue,
-                )
+        idle = False
+        reason = "drain_timeout"
+        worker_pool_idle = False
+        queue_idle = False
+        health_snapshot: EligibilitySnapshot | None = None
+        while deadline - time.monotonic() > 0:
             try:
                 report = self.run_once(dispatch_deadline=deadline)
             except _DispatchDeadlineExceeded:
@@ -425,23 +421,17 @@ class Coordinator:
                     workspace=workspace,
                     include_legacy=True,
                 )
-                active = self.store.status_counts(
-                    self.config.name,
-                    allowed_harnesses=self.worker_harnesses,
-                    workspace=workspace,
-                    include_legacy=True,
+                worker_pool_idle = _queue_is_idle(
+                    self.store.status_counts(
+                        self.config.name,
+                        allowed_harnesses=self.worker_harnesses,
+                        workspace=workspace,
+                        include_legacy=True,
+                    )
                 )
-                return self._drain_report(
-                    aggregate,
-                    idle=False,
-                    reason="drain_timeout",
-                    waves=waves,
-                    claimed=total_claimed,
-                    queue=last_queue,
-                    worker_pool_idle=_queue_is_idle(active),
-                    queue_idle=_queue_is_idle(last_queue),
-                    health_snapshot=self._last_health_snapshot,
-                )
+                queue_idle = _queue_is_idle(last_queue)
+                health_snapshot = self._last_health_snapshot
+                break
             waves += 1
             claimed = _integer(report["claimed"])
             total_claimed += claimed
@@ -461,59 +451,39 @@ class Coordinator:
             worker_pool_idle = _queue_is_idle(active)
             queue_idle = _queue_is_idle(last_queue)
             if active[JobState.BLOCKED.value] > 0:
-                return self._drain_report(
-                    aggregate,
-                    idle=False,
-                    reason="blocked",
-                    waves=waves,
-                    claimed=total_claimed,
-                    queue=last_queue,
-                    worker_pool_idle=False,
-                    queue_idle=queue_idle,
-                )
+                reason = "blocked"
+                break
             if self._capacity_degraded(
                 last_queue,
                 dispatch_deadline=deadline,
                 health_snapshot=self._last_health_snapshot,
             ):
-                return self._drain_report(
-                    aggregate,
-                    idle=False,
-                    reason="degraded_capacity",
-                    waves=waves,
-                    claimed=total_claimed,
-                    queue=last_queue,
-                    worker_pool_idle=False,
-                    queue_idle=queue_idle,
-                    health_snapshot=self._last_health_snapshot,
-                )
+                reason = "degraded_capacity"
+                worker_pool_idle = False
+                health_snapshot = self._last_health_snapshot
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return self._drain_report(
-                    aggregate,
-                    idle=False,
-                    reason="drain_timeout",
-                    waves=waves,
-                    claimed=total_claimed,
-                    queue=last_queue,
-                    worker_pool_idle=worker_pool_idle,
-                    queue_idle=queue_idle,
-                    health_snapshot=self._last_health_snapshot,
-                )
+                health_snapshot = self._last_health_snapshot
+                break
             if worker_pool_idle:
-                return self._drain_report(
-                    aggregate,
-                    idle=True,
-                    reason="queue_idle" if queue_idle else "worker_pool_idle",
-                    waves=waves,
-                    claimed=total_claimed,
-                    queue=last_queue,
-                    worker_pool_idle=True,
-                    queue_idle=queue_idle,
-                    health_snapshot=self._last_health_snapshot,
-                )
+                idle = True
+                reason = "queue_idle" if queue_idle else "worker_pool_idle"
+                health_snapshot = self._last_health_snapshot
+                break
             if claimed == 0:
                 time.sleep(min(self.config.coordinator.poll_seconds, remaining))
+        return self._drain_report(
+            aggregate,
+            idle=idle,
+            reason=reason,
+            waves=waves,
+            claimed=total_claimed,
+            queue=last_queue,
+            worker_pool_idle=worker_pool_idle,
+            queue_idle=queue_idle,
+            health_snapshot=health_snapshot,
+        )
 
     def resume_blocked(
         self,
@@ -530,7 +500,7 @@ class Coordinator:
             self.config.name,
             job_id,
             lease_seconds=self.config.coordinator.lease_seconds,
-            workspace=str(self.config.workspace.resolve()),
+            workspace=self._workspace_key,
             include_legacy=True,
         )
         if not job.recovery:
@@ -603,7 +573,7 @@ class Coordinator:
             "task_verified": outcome.task_verified,
             "queue": self.store.status_counts(
                 self.config.name,
-                workspace=str(self.config.workspace.resolve()),
+                workspace=self._workspace_key,
                 include_legacy=True,
             ),
         }
@@ -660,7 +630,7 @@ class Coordinator:
         }:
             raise ValueError("gc_states_invalid")
         self.initialize()
-        workspace = str(self.config.workspace.resolve())
+        workspace = self._workspace_key
         rows = self.store.jobs(
             self.config.name,
             workspace=workspace,
@@ -768,7 +738,7 @@ class Coordinator:
         )
 
     def _refresh_harnesses_for_run(self) -> tuple[Harness, ...]:
-        workspace = str(self.config.workspace.resolve())
+        workspace = self._workspace_key
         pending = set(
             self.store.pending_harnesses(
                 self.config.name,
@@ -827,7 +797,7 @@ class Coordinator:
         pending = set(
             self.store.pending_harnesses(
                 self.config.name,
-                workspace=str(self.config.workspace.resolve()),
+                workspace=self._workspace_key,
                 include_legacy=True,
             )
         ) & set(self.worker_harnesses)
@@ -873,7 +843,7 @@ class Coordinator:
         deferred: list[dict[str, object]] = []
         for job in self.store.jobs(
             self.config.name,
-            workspace=str(self.config.workspace.resolve()),
+            workspace=self._workspace_key,
             include_legacy=True,
         ):
             if job["state"] != JobState.PENDING.value:
@@ -1068,7 +1038,7 @@ class Coordinator:
                 )
         for row in self.store.jobs(
             self.config.name,
-            workspace=str(self.config.workspace.resolve()),
+            workspace=self._workspace_key,
             include_legacy=True,
         ):
             if row["placement"] != PlacementTarget.WORKTREE.value:
@@ -1095,7 +1065,7 @@ class Coordinator:
         for row in self.store.unplaced_jobs(
             self.config.name,
             allowed_harnesses=self.worker_harnesses,
-            workspace=str(self.config.workspace.resolve()),
+            workspace=self._workspace_key,
             include_legacy=True,
         ):
             self._dispatch_timeout(dispatch_deadline)
@@ -1157,39 +1127,26 @@ class Coordinator:
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.unlink(missing_ok=True)
         try:
-            try:
-                outcome = self.dispatcher.dispatch(
+            outcome = self._dispatch_controller_turn(
+                controller,
+                topology_decision_prompt(
+                    title,
+                    prompt,
+                    output_file,
+                    supports_worktree=self._supports_worktree(),
+                ),
+                agent_name=_controller_agent_name(
+                    self.config.name,
+                    self.config.workspace,
                     controller,
-                    topology_decision_prompt(
-                        title,
-                        prompt,
-                        output_file,
-                        supports_worktree=self._supports_worktree(),
-                    ),
-                    timeout_seconds=self._dispatch_timeout(dispatch_deadline),
-                    agent_name=_controller_agent_name(
-                        self.config.name,
-                        self.config.workspace,
-                        controller,
-                    ),
-                    context=DispatchContext(
-                        PlacementTarget.TAB,
-                        "Topology decision",
-                        f"topology:{job_id}",
-                    ),
-                )
-            except Exception as exc:
-                self._record_dispatch_exception(controller, exc)
-                raise
-            self._record_health(controller, outcome)
+                ),
+                task_title="Topology decision",
+                task_key=f"topology:{job_id}",
+                dispatch_deadline=dispatch_deadline,
+            )
             self._dispatch_timeout(dispatch_deadline)
-            if outcome.error_code is not None or outcome.state not in {
-                AgentState.IDLE,
-                AgentState.DONE,
-            }:
-                raise ValueError(
-                    f"topology_selection_failed:{outcome.error_code or outcome.state.value}"
-                )
+            if (failure := _controller_turn_failed(outcome)) is not None:
+                raise ValueError(f"topology_selection_failed:{failure}")
             return load_topology_decision(
                 output_file,
                 supports_worktree=self._supports_worktree(),
@@ -1243,34 +1200,21 @@ class Coordinator:
         output_file.unlink(missing_ok=True)
         outcome: DispatchOutcome | None = None
         try:
-            try:
-                outcome = self.dispatcher.dispatch(
-                    controller,
-                    worker_selection_prompt(
-                        f"Title: {title}\n\nPrompt:\n{prompt}",
-                        output_file,
-                        render_compact_catalog(profiles),
-                        allowed_harnesses,
-                    ),
-                    timeout_seconds=self._dispatch_timeout(dispatch_deadline),
-                    agent_name=controller_name,
-                    context=DispatchContext(
-                        PlacementTarget.TAB,
-                        "Worker routing",
-                        f"route:{dedupe_key}",
-                    ),
-                )
-            except Exception as exc:
-                self._record_dispatch_exception(controller, exc)
-                raise
-            self._record_health(controller, outcome)
-            if outcome.error_code is not None or outcome.state not in {
-                AgentState.IDLE,
-                AgentState.DONE,
-            }:
-                raise ValueError(
-                    f"worker_selection_failed:{outcome.error_code or outcome.state.value}"
-                )
+            outcome = self._dispatch_controller_turn(
+                controller,
+                worker_selection_prompt(
+                    f"Title: {title}\n\nPrompt:\n{prompt}",
+                    output_file,
+                    render_compact_catalog(profiles),
+                    allowed_harnesses,
+                ),
+                agent_name=controller_name,
+                task_title="Worker routing",
+                task_key=f"route:{dedupe_key}",
+                dispatch_deadline=dispatch_deadline,
+            )
+            if (failure := _controller_turn_failed(outcome)) is not None:
+                raise ValueError(f"worker_selection_failed:{failure}")
             return load_worker_selection(
                 output_file,
                 allowed_harnesses=allowed_harnesses,
@@ -1341,43 +1285,32 @@ class Coordinator:
         if not self.store.reserve_planner_run(
             self.config.name,
             planner.interval_seconds,
-            workspace=str(self.config.workspace.resolve()),
+            workspace=self._workspace_key,
         ):
             return
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)
         planner.output_file.unlink(missing_ok=True)
         profiles = self._worker_profiles(allowed_harnesses)
-        try:
-            outcome = self.dispatcher.dispatch(
+        outcome = self._dispatch_controller_turn(
+            controller,
+            planner_prompt(
+                planner.prompt_file.read_text(encoding="utf-8"),
+                planner.output_file,
+                planner.max_tasks,
+                render_compact_catalog(profiles),
+                allowed_harnesses,
+            ),
+            agent_name=_controller_agent_name(
+                self.config.name,
+                self.config.workspace,
                 controller,
-                planner_prompt(
-                    planner.prompt_file.read_text(encoding="utf-8"),
-                    planner.output_file,
-                    planner.max_tasks,
-                    render_compact_catalog(profiles),
-                    allowed_harnesses,
-                ),
-                timeout_seconds=self._dispatch_timeout(dispatch_deadline),
-                agent_name=_controller_agent_name(
-                    self.config.name,
-                    self.config.workspace,
-                    controller,
-                ),
-                context=DispatchContext(
-                    PlacementTarget.TAB,
-                    "Planner",
-                    f"planner:{self.config.name}",
-                ),
-            )
-        except Exception as exc:
-            self._record_dispatch_exception(controller, exc)
-            raise
-        self._record_health(controller, outcome)
+            ),
+            task_title="Planner",
+            task_key=f"planner:{self.config.name}",
+            dispatch_deadline=dispatch_deadline,
+        )
         self._dispatch_timeout(dispatch_deadline)
-        if outcome.error_code is not None or outcome.state not in {
-            AgentState.IDLE,
-            AgentState.DONE,
-        }:
+        if _controller_turn_failed(outcome) is not None:
             return
         try:
             tasks = load_planner_tasks(planner.output_file, max_tasks=planner.max_tasks)
@@ -1390,7 +1323,7 @@ class Coordinator:
             self.store.enqueue(
                 NewJob(
                     workflow=self.config.name,
-                    workspace=str(self.config.workspace.resolve()),
+                    workspace=self._workspace_key,
                     title=task.title,
                     harness=task.harness,
                     prompt=task.prompt,
@@ -1404,6 +1337,30 @@ class Coordinator:
                     ),
                 )
             )
+
+    def _dispatch_controller_turn(
+        self,
+        controller: Harness,
+        prompt: str,
+        *,
+        agent_name: str,
+        task_title: str,
+        task_key: str,
+        dispatch_deadline: float | None,
+    ) -> DispatchOutcome:
+        try:
+            outcome = self.dispatcher.dispatch(
+                controller,
+                prompt,
+                timeout_seconds=self._dispatch_timeout(dispatch_deadline),
+                agent_name=agent_name,
+                context=DispatchContext(PlacementTarget.TAB, task_title, task_key),
+            )
+        except Exception as exc:
+            self._record_dispatch_exception(controller, exc)
+            raise
+        self._record_health(controller, outcome)
+        return outcome
 
     def _dispatch_timeout(self, dispatch_deadline: float | None) -> float:
         timeout_seconds = float(self.config.coordinator.agent_timeout_seconds)
@@ -1436,6 +1393,14 @@ def _integer(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError("integer_value_invalid")
     return int(value)
+
+
+def _controller_turn_failed(outcome: DispatchOutcome) -> str | None:
+    if outcome.error_code is not None:
+        return outcome.error_code
+    if outcome.state not in {AgentState.IDLE, AgentState.DONE}:
+        return outcome.state.value
+    return None
 
 
 def _queue_is_idle(counts: dict[str, int]) -> bool:

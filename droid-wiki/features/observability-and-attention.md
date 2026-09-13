@@ -1,8 +1,6 @@
 # 可观测性与 Attention
 Active contributors: oldwinter, chendongdong
 
-Active contributors: oldwinter, chendongdong
-
 本系统采用 local-first、best-effort 的可观测性：每次 dispatch attempt 用 correlation ID 串起 durable job、receipt、结构化 JSONL 和 Dashboard timeline；网络 exporter 全部默认关闭。Dashboard 的 Attention 则把 queue 状态、Herdr 运行时和两者之间的 drift 投影成人可处理的告警项，不修改 queue。
 
 相关页面：[Durable execution](durable-execution.md) · [Coordinator 与队列](../systems/coordinator-and-queue.md) · [Dashboard](../systems/dashboard.md) · [安全边界](../security.md)
@@ -96,7 +94,7 @@ Attention 是从快照即时计算的投影，不是 `alerts.jsonl` 的镜像，
 | warning | `terminal_job_agent_working` | job 已 `succeeded`/`blocked`/`failed`，agent 却仍为 `working` |
 | warning | `workspace_mismatch` | receipt/job 中的 Herdr workspace 与 runtime agent 不一致 |
 | warning | `lease_expired` | job 仍为 `running`，但 `lease_until <= generated_at` |
-| warning | `job_stale` | `running` job 超过 5 分钟没有 durable state 变化 |
+| warning | `job_stale` | `running` job 没有 lease，且超过 5 分钟没有 durable state 变化 |
 
 同一 job 可以同时产生多个 attention item，例如缺 agent、lease 过期且 stale。`summary.needs_attention` 是 item 数，不是去重后的 job 数；`summary.active_agents` 统计 `working`/`blocked` runtime agents。timeline 按时间倒序，最多投影 100 条 enqueued/receipt 事件。更完整的 UI、SSE 和 loopback-only 访问语义见 [Dashboard](../systems/dashboard.md)。
 

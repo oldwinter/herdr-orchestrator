@@ -1,0 +1,1 @@
+在 `/Users/oldwinter/Code/grok-army-campaign/baoyu-skills` 做一轮「设计」工作。读文档结构与目录命名，找一个具体设计问题。用 `gh issue create --repo oldwinter/baoyu-skills` 开 issue，标题或正文必须包含「设计」。在该 clone 做对应本地改进。不要 push/PR/merge。把 issue URL 与改动文件追加到 `/Users/oldwinter/Code/herdr-orchestrator/.orchestrator/grok-army/issues.txt`。复用已有 clone。停止条件：issue 可打开且本地有对应改动。
