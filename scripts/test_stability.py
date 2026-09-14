@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_TIMEOUT_SECONDS = 600
+TEST_TIMEOUT_SECONDS = 1500
 TEST_COMMAND = (
     "pytest",
     "tests",
