@@ -22,10 +22,12 @@ from typing import Literal, cast
 try:
     import quality_storage as _quality_storage
     import quality_validation as _quality_validation
+    import test_stability as _test_stability
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import quality_storage as _quality_storage
     import quality_validation as _quality_validation
+    import test_stability as _test_stability
 
 QualityBundleError = _quality_validation.QualityBundleError
 _inventory_digest = _quality_validation.inventory_digest
@@ -38,6 +40,13 @@ NAME = re.compile(r"[a-z][a-z0-9-]*")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 OUTPUT_DIRECTORY = "${QUALITY_OUTPUT_DIR}"
 COMMAND_TIMEOUT_SECONDS = 1800
+NPM_AUDIT = (
+    "npm",
+    "audit",
+    "--package-lock-only",
+    "--registry",
+    "https://registry.npmjs.org",
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +70,7 @@ class ProducerSpec:
     name: str
     commands: tuple[CommandSpec, ...]
     artifacts: tuple[ArtifactSpec, ...]
+    timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -339,7 +349,7 @@ def _run_quality_owned(
                             env=environment,
                             stdout=stdout,
                             check=False,
-                            timeout=COMMAND_TIMEOUT_SECONDS,
+                            timeout=producer.timeout_seconds or COMMAND_TIMEOUT_SECONDS,
                         )
                         exit_code = result.returncode
                     except subprocess.TimeoutExpired:
@@ -1104,20 +1114,13 @@ def _security_spec() -> ProducerSpec:
                 version_argv=("uv", "run", "pip-audit", "--version"),
             ),
             CommandSpec(
-                argv=("npm", "audit", "--package-lock-only", "--json"),
+                argv=(*NPM_AUDIT, "--json"),
                 tool="npm",
                 version_argv=("npm", "--version"),
                 stdout_artifact="npm-audit-root.json",
             ),
             CommandSpec(
-                argv=(
-                    "npm",
-                    "audit",
-                    "--package-lock-only",
-                    "--prefix",
-                    "packages/herdr-manager",
-                    "--json",
-                ),
+                argv=(*NPM_AUDIT, "--prefix", "packages/herdr-manager", "--json"),
                 tool="npm",
                 version_argv=("npm", "--version"),
                 stdout_artifact="npm-audit-manager.json",
@@ -1225,6 +1228,7 @@ def _stability_spec() -> ProducerSpec:
             ),
         ),
         artifacts=(ArtifactSpec("stability", "stability.json", "json"),),
+        timeout_seconds=3 * _test_stability.TEST_TIMEOUT_SECONDS + 300,
     )
 
 

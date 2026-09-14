@@ -150,7 +150,8 @@ class DistributionCliTests(unittest.TestCase):
         self.assertIn("npm audit --package-lock-only", security)
         self.assertIn("packages/herdr-manager", security)
         self.assertIn("quality_bundle.py run --producer security", justfile)
-        self.assertEqual(quality_bundle.count('"--package-lock-only"'), 2)
+        self.assertIn('NPM_AUDIT, "--json"', quality_bundle)
+        self.assertIn('NPM_AUDIT, "--prefix", "packages/herdr-manager"', quality_bundle)
         self.assertIn('"packages/herdr-manager"', quality_bundle)
 
     def test_missing_option_value_returns_a_stable_cli_error(self) -> None:
