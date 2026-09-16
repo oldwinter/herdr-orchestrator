@@ -443,6 +443,8 @@ def _command_status(config: WorkflowConfig, args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
+    if not jobs:
+        print("queue_empty: run just seed or just enqueue", file=sys.stderr)
     return 0
 
 
