@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -518,6 +518,24 @@ class CliTests(unittest.TestCase):
         self.assertFalse(args.succeeded_agents)
         self.assertTrue(args.failed_agents)
         self.assertFalse(args.apply)
+
+    def test_gc_missing_scope_hints_just_recipes(self) -> None:
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            cli_module.main(["gc", "--workflow", "workflow.toml"])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(stderr.getvalue(), "gc_scope_required: run just gc or just gc-failed\n")
+
+    def test_gc_help_prefers_just_recipes(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:
+            build_parser().parse_args(["gc", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("just gc", text)
+        self.assertIn("just gc-failed", text)
+        self.assertIn("dry-run", text)
+        self.assertIn("--apply", text)
 
     def test_smoke_uses_target_files_and_requires_an_output_receipt(self) -> None:
         base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
