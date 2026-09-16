@@ -72,7 +72,10 @@ class DashboardTests(unittest.TestCase):
             path = Path(temporary) / "missing" / "state.db"
             config = replace(base, state_db=path)
 
-            with self.assertRaisesRegex(ValueError, "dashboard_state_db_not_found"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^dashboard_state_db_not_found: run just seed or just enqueue$",
+            ):
                 DashboardServer(config, port=0, projector=FakeProjector({}))
 
             self.assertFalse(path.exists())
