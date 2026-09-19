@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,9 +29,11 @@ from herdr_orchestrator.model import (
     DispatchContext,
     DispatchOutcome,
     Harness,
+    NewJob,
     ReceiptKind,
 )
 from herdr_orchestrator.readiness import BuildIdentity, ReadinessEnvironment
+from herdr_orchestrator.store import Store, StoreError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -622,6 +624,47 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.review_repair_rounds, 2)
         self.assertEqual(args.controller_harness, "grok")
         self.assertEqual(args.worker_harness, ["codex"])
+
+    def test_retry_missing_job_hints_status(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch.object(cli_module, "load_workflow", return_value=self.config),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(
+                cli_module.main(["retry", "--workflow", "workflow.toml", "--job-id", "1"]),
+                2,
+            )
+        self.assertEqual(stderr.getvalue(), "job_not_found: run just status\n")
+
+    def test_retry_pending_job_hints_status(self) -> None:
+        store = Store(self.config.state_db)
+        store.initialize()
+        job_id, _ = store.enqueue(
+            NewJob(
+                workflow=self.config.name,
+                title="pending",
+                harness=Harness.CODEX,
+                prompt="review",
+                dedupe_key="pending-retry-v1",
+                max_attempts=1,
+                workspace=str(self.config.workspace.resolve()),
+            )
+        )
+        args = Namespace(job_id=job_id, extra_attempts=1)
+
+        with self.assertRaisesRegex(StoreError, r"^job_not_retryable: run just status$"):
+            cli_module._command_retry(self.config, args)
+
+    def test_retry_keeps_other_store_errors(self) -> None:
+        args = Namespace(job_id=1, extra_attempts=1)
+        store = MagicMock()
+        store.retry_failed.side_effect = StoreError("extra_attempts_out_of_range")
+        with (
+            patch.object(cli_module, "Store", return_value=store),
+            self.assertRaisesRegex(StoreError, r"^extra_attempts_out_of_range$"),
+        ):
+            cli_module._command_retry(self.config, args)
 
 
 class CliCommandDispatchTests(unittest.TestCase):
