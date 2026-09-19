@@ -440,7 +440,7 @@ function buildDesiredFiles(harnesses, installSkill) {
     ".herdr-orchestrator/workflows/prompts/planner.md",
     readFileSync(join(PACKAGE_ROOT, "workflows/prompts/planner.md")),
   );
-  for (const filename of ["AGENTS.md", "CLAUDE.md"]) {
+  for (const filename of ["AGENTS.md"]) {
     stageFile(
       desiredFiles,
       `.herdr-orchestrator/manager/${filename}`,

@@ -53,7 +53,7 @@ Herdr 是 terminal runtime，不是推理主控。planner agent 只向 coordinat
 - `workflows/prompts/`：任务 prompt 文件
 - `profiles/harnesses/*.toml`：主控预加载的紧凑 harness catalog 真源
 - `profiles/harnesses/*.md`：选中 harness 后才按需加载的完整执行上下文
-- `manager/`：手动 Herdr 管理会话的 canonical policy 与 Claude adapter
+- `manager/`：手动 Herdr 管理会话的 canonical policy
 - `.agents/skills/standardized-delivery/`：opt-in 标准交付 Skill 与分阶段 reference
 - `.agent/skills`、`.claude/skills`：指向 `.agents/skills` 的兼容 symlink，不是独立真源
 - `docs/architecture.md`：恢复、lease、planner、delivery 运行语义
