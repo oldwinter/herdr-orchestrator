@@ -158,7 +158,7 @@ def _validate_state_db(path: Path) -> None:
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError("dashboard_state_db_invalid") from exc
     if not resolved.is_file():
-        raise ValueError("dashboard_state_db_not_found")
+        raise ValueError("dashboard_state_db_not_found: run just seed or just enqueue")
 
     try:
         with closing(
