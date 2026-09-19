@@ -127,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
             gc_parser.exit(2, "gc_scope_required: run just gc or just gc-failed\n")
         _gc_error(message)
 
-    gc_parser.error = _hint_just_gc  # type: ignore[method-assign]
+    gc_parser.error = _hint_just_gc  # type: ignore[assignment]
 
     smoke_parser = subparsers.add_parser("smoke")
     smoke_parser.add_argument("--workflow", required=True)
