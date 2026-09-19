@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import subprocess
-import tarfile
 import tempfile
 import time
 import tomllib
@@ -1281,7 +1280,6 @@ class DistributionCliTests(DistributionCliMixin, unittest.TestCase):
                 manager.stderr.strip(),
                 "manager_default_harness_not_found: install grok, codex, or claude",
             )
-
 
 
 if __name__ == "__main__":
