@@ -679,7 +679,6 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "queue_empty: run just seed or just enqueue\n")
 
 
-
 class CliCommandDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
