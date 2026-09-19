@@ -228,13 +228,19 @@ def _command_seed(config: WorkflowConfig, args: argparse.Namespace) -> int:
 def _command_retry(config: WorkflowConfig, args: argparse.Namespace) -> int:
     store = Store(config.state_db)
     store.initialize()
-    result = store.retry_failed(
-        config.name,
-        args.job_id,
-        extra_attempts=args.extra_attempts,
-        workspace=str(config.workspace.resolve()),
-        include_legacy=True,
-    )
+    try:
+        result = store.retry_failed(
+            config.name,
+            args.job_id,
+            extra_attempts=args.extra_attempts,
+            workspace=str(config.workspace.resolve()),
+            include_legacy=True,
+        )
+    except StoreError as exc:
+        code = str(exc)
+        if code in {"job_not_found", "job_not_retryable"}:
+            raise StoreError(f"{code}: run just status") from exc
+        raise
     print(json.dumps(result, sort_keys=True))
     return 0
 
