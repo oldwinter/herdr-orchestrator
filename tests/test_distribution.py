@@ -1,1 +1,34 @@
-PLACEHOLDER_USE_LOCAL_FILE
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import subprocess
+import tarfile
+import tempfile
+import time
+import tomllib
+import unittest
+from pathlib import Path
+
+from herdr_orchestrator import __version__
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CLI = REPO_ROOT / "bin/herdr-orchestrator.mjs"
+MANAGER_PACKAGE = REPO_ROOT / "packages/herdr-manager"
+INSTALLER_FAULT_LOADER = REPO_ROOT / "tests/installer_fault_loader.mjs"
+INSTALLER_FAULT_ENV = {
+    "HERDR_ORCHESTRATOR_TEST_FAIL_ON_JOURNAL_CLAIM",
+    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AFTER_MUTATION",
+    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL",
+    "HERDR_ORCHESTRATOR_TEST_INTERRUPT_AT_LABEL_PREFIX",
+    "HERDR_ORCHESTRATOR_TEST_JOURNAL_CLAIM_BARRIER",
+    "HERDR_ORCHESTRATOR_TEST_PAUSE_AT_LABEL_PREFIX",
+    "HERDR_ORCHESTRATOR_TEST_PAUSE_BARRIER",
+    "HERDR_ORCHESTRATOR_TEST_REWRITE_AFTER_MUTATION",
+    "HERDR_ORCHESTRATOR_TEST_REWRITE_AT_LABEL_PREFIX",
+    "HERDR_ORCHESTRATOR_TEST_PLANNING_BARRIER",
+    "HERDR_ORCHESTRATOR_TEST_UNINSTALL_EXCLUDE_BARRIER",
+    "HERDR_ORCHESTRATOR_TEST_UNINSTALL_TRANSACTION_BARRIER",
+}
