@@ -684,6 +684,18 @@ class CliTests(unittest.TestCase):
         ):
             cli_module._command_retry(self.config, args)
 
+    def test_status_empty_queue_hints_seed_or_enqueue(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(cli_module._command_status(self.config, Namespace()), 0)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["jobs"], [])
+        self.assertEqual(payload["counts"]["pending"], 0)
+        self.assertEqual(stderr.getvalue(), "queue_empty: run just seed or just enqueue\n")
+
 
 class CliCommandDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -710,6 +722,23 @@ class CliCommandDispatchTests(unittest.TestCase):
             self.assertEqual(cli_module._command_status(self.config, args), 0)
         self.assertIn('"added": 2', output.getvalue())
         store.initialize.assert_called()
+
+    def test_status_populated_queue_skips_empty_hint(self) -> None:
+        args = Namespace()
+        store = MagicMock()
+        store.status_counts.return_value = {"pending": 1}
+        store.jobs.return_value = [{"id": 1, "state": "succeeded", "harness": "codex"}]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(cli_module, "Store", return_value=store),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(cli_module._command_status(self.config, args), 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload["jobs"]), 1)
+        self.assertNotIn("queue_empty", stderr.getvalue())
 
     def test_enqueue_and_run_modes_forward_typed_arguments(self) -> None:
         coordinator = MagicMock()
