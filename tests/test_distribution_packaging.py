@@ -9,12 +9,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from herdr_orchestrator import __version__
-from tests.test_distribution import (
+from test_distribution import (
     MANAGER_PACKAGE,
     REPO_ROOT,
     DistributionCliMixin,
 )
+
+from herdr_orchestrator import __version__
 
 
 class DistributionCliPackagingTests(DistributionCliMixin, unittest.TestCase):
@@ -1228,7 +1229,6 @@ class DistributionCliPackagingTests(DistributionCliMixin, unittest.TestCase):
                 "# BEGIN herdr-orchestrator managed paths",
                 exclude.read_text(encoding="utf-8"),
             )
-
 
 
 if __name__ == "__main__":
