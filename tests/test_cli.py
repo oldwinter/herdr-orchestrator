@@ -528,6 +528,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
         self.assertEqual(stderr.getvalue(), "gc_scope_required: run just gc or just gc-failed\n")
 
+    def test_gc_conflicting_scopes_report_argument_conflict(self) -> None:
+        for first, second in (
+            ("--succeeded-agents", "--failed-agents"),
+            ("--failed-agents", "--succeeded-agents"),
+        ):
+            with self.subTest(first=first, second=second):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+                    cli_module.main(["gc", "--workflow", "workflow.toml", first, second])
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn(
+                    f"argument {second}: not allowed with argument {first}", stderr.getvalue()
+                )
+                self.assertNotIn("gc_scope_required", stderr.getvalue())
+
     def test_gc_help_prefers_just_recipes(self) -> None:
         stdout = io.StringIO()
         with redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:

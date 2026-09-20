@@ -123,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     _gc_error = gc_parser.error
 
     def _hint_just_gc(message: str) -> None:
-        if "succeeded-agents" in message and "failed-agents" in message:
+        if message == "one of the arguments --succeeded-agents --failed-agents is required":
             gc_parser.exit(2, "gc_scope_required: run just gc or just gc-failed\n")
         _gc_error(message)
 
