@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -89,6 +90,12 @@ else:
 print(json.dumps(payload))
 """
 
+def require_node() -> str:
+    node = shutil.which("node")
+    if node is None:
+        raise unittest.SkipTest("node is required for manager-light JavaScript tests")
+    return node
+
 
 def run_projection(expression, payload):
     script = f"""
@@ -97,7 +104,7 @@ const input = JSON.parse(process.argv[1]);
 process.stdout.write(JSON.stringify({expression}));
 """
     result = subprocess.run(
-        ["node", "--input-type=module", "--eval", script, json.dumps(payload)],
+        [require_node(), "--input-type=module", "--eval", script, json.dumps(payload)],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -113,7 +120,7 @@ const input = JSON.parse(process.argv[1]);
 process.stdout.write(JSON.stringify({expression}));
 """
     result = subprocess.run(
-        ["node", "--input-type=module", "--eval", script, json.dumps(payload)],
+        [require_node(), "--input-type=module", "--eval", script, json.dumps(payload)],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -250,7 +257,7 @@ try {{ tokenPatchFor("paused"); }} catch (error) {{
 }}
 """
         result = subprocess.run(
-            ["node", "--input-type=module", "--eval", script],
+            [require_node(), "--input-type=module", "--eval", script],
             cwd=ROOT,
             check=True,
             capture_output=True,
@@ -282,7 +289,7 @@ class ManagerLightHookTests(unittest.TestCase):
                 environment["HERDR_PLUGIN_EVENT"] = "pane.agent_status_changed"
                 environment["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(event)
             result = subprocess.run(
-                ["node", str(HOOK)],
+                [require_node(), str(HOOK)],
                 cwd=ROOT,
                 env=environment,
                 check=False,
@@ -386,7 +393,7 @@ class ManagerLightHookTests(unittest.TestCase):
             )
 
             result = subprocess.run(
-                ["node", str(HOOK)],
+                [require_node(), str(HOOK)],
                 cwd=ROOT,
                 env=environment,
                 check=False,
@@ -418,7 +425,7 @@ class ManagerLightConfigTests(unittest.TestCase):
 
     def run_cli(self, action, environment):
         return subprocess.run(
-            ["node", str(CLI), "manager-light", action],
+            [require_node(), str(CLI), "manager-light", action],
             cwd=ROOT,
             env=environment,
             check=False,

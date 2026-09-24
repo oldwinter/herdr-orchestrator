@@ -38,6 +38,10 @@ def installer_crash_matrix(function):
     return pytest.mark.installer_crash_matrix(function)
 
 
+@unittest.skipUnless(
+    shutil.which("node") and shutil.which("npm"),
+    "node and npm are required for packed installer journal tests",
+)
 class InstallerJournalPackedTests(unittest.TestCase):
     @installer_crash_matrix
     def test_packed_installer_recovers_after_every_durable_mutation(self) -> None:

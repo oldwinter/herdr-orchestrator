@@ -1039,29 +1039,29 @@ class StoreTests(unittest.TestCase):
 
     def test_resume_lease_has_a_fence_and_persists_correlation(self) -> None:
         job_id, _ = self.store.enqueue(_job("resume-fence", max_attempts=1))
-        claimed = self.store.claim("example", limit=1, lease_seconds=30)[0]
-        self.store.record_outcome(
-            claimed,
-            DispatchOutcome(
-                claimed.agent_name,
-                AgentState.BLOCKED,
-                False,
-                "w1:p2",
-                "agent_blocked",
-            ),
-        )
-
-        with patch("herdr_orchestrator.store.time.time", return_value=time.time()):
+        baseline = time.time() + 1
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline):
+            claimed = self.store.claim("example", limit=1, lease_seconds=30)[0]
+            self.store.record_outcome(
+                claimed,
+                DispatchOutcome(
+                    claimed.agent_name,
+                    AgentState.BLOCKED,
+                    False,
+                    "w1:p2",
+                    "agent_blocked",
+                ),
+            )
             first_resume, _ = self.store.claim_blocked_for_resume(
                 "example",
                 job_id,
                 lease_seconds=30,
             )
-        self.assertNotEqual(first_resume.correlation_id, "")
-        with self.assertRaisesRegex(StoreError, "job_resume_in_progress"):
-            self.store.claim_blocked_for_resume("example", job_id, lease_seconds=30)
+            self.assertNotEqual(first_resume.correlation_id, "")
+            with self.assertRaisesRegex(StoreError, "job_resume_in_progress"):
+                self.store.claim_blocked_for_resume("example", job_id, lease_seconds=30)
 
-        resume_time = time.time() + 31
+        resume_time = baseline + 31
         with patch("herdr_orchestrator.store.time.time", return_value=resume_time):
             second_resume, _ = self.store.claim_blocked_for_resume(
                 "example",

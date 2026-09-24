@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -45,6 +46,17 @@ def npm_pack_entry(stdout: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise AssertionError("npm pack returned an unexpected package shape")
     return payload
+
+def require_node() -> str:
+    node = shutil.which("node")
+    if node is None:
+        raise unittest.SkipTest("node is required for CLI subprocess tests")
+    return node
+
+
+def require_npm() -> None:
+    if shutil.which("npm") is None:
+        raise unittest.SkipTest("npm is required for package tests")
 
 
 class DistributionCliTests(unittest.TestCase):
@@ -109,6 +121,7 @@ class DistributionCliTests(unittest.TestCase):
         self.assertRegex(resolved["integrity"], r"^sha512-")
 
     def test_local_runtime_tarball_matches_its_own_pack_integrity(self) -> None:
+        require_npm()
         with tempfile.TemporaryDirectory() as temporary:
             packed = subprocess.run(
                 [
@@ -2223,6 +2236,7 @@ class DistributionCliTests(unittest.TestCase):
             )
 
     def test_packed_npm_cli_runs_outside_the_source_checkout(self) -> None:
+        require_npm()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package_directory = root / "package"
@@ -2337,6 +2351,7 @@ class DistributionCliTests(unittest.TestCase):
             self.assertTrue((project / ".agents/skills/herdr-orchestrator/SKILL.md").is_file())
 
     def test_packed_herdr_manager_package_runs_outside_the_source_checkout(self) -> None:
+        require_npm()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package_directory = root / "packages"
@@ -2527,7 +2542,7 @@ class DistributionCliTests(unittest.TestCase):
         cli: Path,
         env: dict[str, str] | None,
     ) -> list[str]:
-        command = ["node"]
+        command = [require_node()]
         if env is not None and INSTALLER_FAULT_ENV.intersection(env):
             command.extend(["--no-warnings", "--loader", str(INSTALLER_FAULT_LOADER)])
         command.append(str(cli))

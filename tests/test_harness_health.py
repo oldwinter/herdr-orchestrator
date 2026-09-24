@@ -674,10 +674,11 @@ class HarnessHealthTests(unittest.TestCase):
                 )
             )
             calls: list[Harness] = []
+            probe_timeouts: list[int] = []
 
-            def probe(_workflow, harness, _timeout):
+            def probe(_workflow, harness, timeout):
                 calls.append(harness)
-                time.sleep(1.2)
+                probe_timeouts.append(timeout)
                 return {"status": "ready"}
 
             class Dispatcher:
@@ -692,17 +693,17 @@ class HarnessHealthTests(unittest.TestCase):
                     )
 
             health = HarnessHealth(store, config, probe=probe, allow_live_probe=True)
-            started = time.monotonic()
             result = Coordinator(
                 config,
                 store=store,
                 dispatcher=Dispatcher(),
                 health=health,
                 readiness_probe=probe,
-            ).run_until_idle(timeout_seconds=6)
-            elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 3)
+            ).run_until_idle(timeout_seconds=30)
             self.assertEqual(calls, [Harness.DROID])
+            # The probe budget is clamped by the drain deadline instead of the
+            # configured 30s probe timeout, proving refreshes share it.
+            self.assertLess(probe_timeouts[0], 30)
             self.assertTrue(result["idle"])
 
     def test_health_telemetry_has_no_prompt_or_terminal_material(self) -> None:

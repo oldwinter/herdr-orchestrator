@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, suppress
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -694,16 +694,19 @@ class CoordinatorTests(unittest.TestCase):
                 for store in stores
             ]
             barrier = threading.Barrier(2)
-            metadata_float = Store.metadata_float
+            reserve_planner_run = Store.reserve_planner_run
 
-            def delayed_metadata_float(store: Store, key: str) -> float | None:
-                value = metadata_float(store, key)
-                with suppress(threading.BrokenBarrierError):
-                    barrier.wait(timeout=2)
-                return value
+            def delayed_reserve_planner_run(
+                store: Store,
+                workflow: str,
+                interval_seconds: int,
+                **kwargs: object,
+            ) -> bool:
+                barrier.wait(timeout=2)
+                return reserve_planner_run(store, workflow, interval_seconds, **kwargs)
 
             with (
-                patch.object(Store, "metadata_float", delayed_metadata_float),
+                patch.object(Store, "reserve_planner_run", delayed_reserve_planner_run),
                 ThreadPoolExecutor(max_workers=2) as executor,
             ):
                 futures = [
@@ -957,6 +960,203 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(dispatcher.responses, 0)
         self.assertEqual(len(dispatcher.recoveries), 1)
         assert dispatcher.recoveries[0][2].prompt_accepted_sequence == 21
+
+    def test_run_until_idle_counts_a_stale_outcome_and_recovers_the_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(
+                base,
+                state_db=Path(temporary).resolve() / "state.db",
+                coordinator=replace(
+                    base.coordinator,
+                    lease_seconds=30,
+                    agent_timeout_seconds=10,
+                ),
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            clock = [100.0]
+
+            class LeaseLosingDispatcher(FakeDispatcher):
+                def dispatch(
+                    self,
+                    harness: Harness,
+                    prompt: str,
+                    *,
+                    timeout_seconds: float,
+                    agent_name: str | None = None,
+                    context: DispatchContext | None = None,
+                ) -> DispatchOutcome:
+                    clock[0] = 160.0
+                    return super().dispatch(
+                        harness,
+                        prompt,
+                        timeout_seconds=timeout_seconds,
+                        agent_name=agent_name,
+                        context=context,
+                    )
+
+                def recover(
+                    self,
+                    harness: Harness,
+                    prompt: str,
+                    *,
+                    timeout_seconds: float,
+                    agent_name: str,
+                    context: DispatchContext,
+                    runtime: AttemptRuntime,
+                ) -> DispatchOutcome:
+                    del harness, prompt, timeout_seconds, agent_name, context, runtime
+                    return DispatchOutcome(
+                        "droid-worker",
+                        AgentState.DONE,
+                        True,
+                        "w1:p2",
+                    )
+
+            dispatcher = LeaseLosingDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "droid-worker",
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                    )
+                }
+            )
+
+            with patch(
+                "herdr_orchestrator.store.time.time",
+                side_effect=lambda: clock[0],
+            ):
+                store.enqueue(_job(config.name, Harness.DROID))
+                result = Coordinator(
+                    config,
+                    store=store,
+                    dispatcher=dispatcher,
+                ).run_until_idle(timeout_seconds=10)
+
+            job = store.jobs(config.name)[0]
+            with closing(sqlite3.connect(config.state_db)) as connection:
+                stale = connection.execute(
+                    "SELECT event_kind FROM receipts WHERE is_stale = 1"
+                ).fetchall()
+
+        self.assertTrue(result["idle"])
+        self.assertEqual(result["stale"], 1)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+        self.assertEqual(stale, [("stale:outcome",)])
+
+    def test_stale_progress_write_does_not_abort_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary).resolve() / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "droid-worker",
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                    )
+                }
+            )
+
+            original_dispatch = dispatcher.dispatch
+
+            def dispatch(
+                harness: Harness,
+                prompt: str,
+                *,
+                timeout_seconds: float,
+                agent_name: str | None = None,
+                context: DispatchContext | None = None,
+            ) -> DispatchOutcome:
+                assert context is not None and context.attempt_progress is not None
+                context.attempt_progress(
+                    AttemptProgress(
+                        AttemptPhase.RUNTIME_ACQUIRED,
+                        agent_name or "droid-worker",
+                        pane_id="w1:p2",
+                    )
+                )
+                return original_dispatch(
+                    harness,
+                    prompt,
+                    timeout_seconds=timeout_seconds,
+                    agent_name=agent_name,
+                    context=context,
+                )
+
+            dispatcher.dispatch = dispatch
+            with patch.object(
+                store,
+                "record_attempt_progress",
+                side_effect=record_attempt_progress,
+            ):
+                result = Coordinator(
+                    config,
+                    store=store,
+                    dispatcher=dispatcher,
+                ).run_once()
+
+            job = store.jobs(config.name)[0]
+
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["stale"], 0)
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+        self.assertEqual(job["attempt_phase"], AttemptPhase.OUTCOME_COMMITTED.value)
+
+    def test_resume_blocked_reports_a_structured_failure_when_the_lease_is_lost(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary).resolve() / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            dispatcher = ResumeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "droid-worker",
+                        AgentState.BLOCKED,
+                        False,
+                        "w1:p2",
+                        "agent_blocked",
+                    )
+                },
+                DispatchOutcome(
+                    "droid-worker",
+                    AgentState.DONE,
+                    True,
+                    "w1:p2",
+                ),
+            )
+            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+            job_id, _ = store.enqueue(_job(config.name, Harness.DROID))
+            coordinator.run_once()
+
+            def record_resume_outcome(job, outcome):
+                raise StoreError("job_lease_lost")
+
+            with patch.object(
+                store,
+                "record_resume_outcome",
+                side_effect=record_resume_outcome,
+            ):
+                result = coordinator.resume_blocked(job_id, "Approve this local action.")
+
+        self.assertEqual(result["job_id"], job_id)
+        self.assertEqual(result["state"], JobState.BLOCKED.value)
+        self.assertEqual(result["error_code"], "job_lease_lost")
+        self.assertEqual(result["agent_state"], AgentState.DONE.value)
+        self.assertEqual(len(dispatcher.responses), 1)
 
     def test_run_until_idle_does_not_report_idle_after_the_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
