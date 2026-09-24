@@ -12,7 +12,7 @@ from herdr_orchestrator.model import Harness, PlannerTask
 
 DEDUPE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 MAX_PLANNER_TASKS = 100
-MAX_PLANNER_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_PLANNER_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_WORKER_SELECTION_OUTPUT_BYTES = 4 * 1024
 _TASK_KEYS = frozenset({"title", "harness", "prompt", "dedupe_key"})
 

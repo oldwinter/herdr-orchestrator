@@ -7,7 +7,6 @@ from pathlib import Path
 
 from herdr_orchestrator.model import Harness
 from herdr_orchestrator.planner import (
-    MAX_PLANNER_OUTPUT_BYTES,
     PlannerOutputError,
     load_planner_tasks,
     load_worker_selection,
@@ -233,11 +232,19 @@ class PlannerTests(unittest.TestCase):
         ):
             load_planner_tasks(Path(temporary).resolve(), max_tasks=10)
 
+    def test_accepts_planner_output_within_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "plan.json"
+            payload = b'{"tasks": []}'
+            path.write_bytes(payload + b" " * (7 * 1024 * 1024 - len(payload)))
+
+            self.assertEqual(load_planner_tasks(path, max_tasks=10), ())
+
     def test_rejects_oversized_planner_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary).resolve() / "plan.json"
             with path.open("wb") as output:
-                output.truncate(MAX_PLANNER_OUTPUT_BYTES + 1)
+                output.truncate(9 * 1024 * 1024)
 
             with self.assertRaisesRegex(PlannerOutputError, "planner_output_too_large"):
                 load_planner_tasks(path, max_tasks=10)
