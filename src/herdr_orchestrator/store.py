@@ -797,6 +797,8 @@ class Store:
                 now=now,
                 lease_until=lease_until,
             )
+            if recovered is None:
+                return None
             slots.active_counts[harness_value] += 1
             return recovered
         if slots.reserved_counts[harness_value] >= limit:

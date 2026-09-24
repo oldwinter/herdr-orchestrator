@@ -1299,6 +1299,32 @@ class StoreTests(unittest.TestCase):
         self.assertNotEqual(second.lease_owner, first.lease_owner)
         self.assertTrue(second.recovery)
 
+    def test_claim_skips_candidate_when_reclaim_loses_lease(self) -> None:
+        self.store.enqueue(_job("stale-lease", max_attempts=3))
+        self.store.enqueue(_job("pending", Harness.DROID))
+        baseline = time.time() + 1
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline):
+            first = self.store.claim("example", limit=1, lease_seconds=30)[0]
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE jobs SET lease_until = ? WHERE id = ?",
+                (baseline + 1, first.job_id),
+            )
+            connection.execute(
+                "UPDATE job_attempts SET lease_until = ? WHERE id = ?",
+                (baseline + 60, first.attempt_id),
+            )
+            connection.commit()
+
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline + 31):
+            claimed = self.store.claim("example", limit=1, lease_seconds=30)
+
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0].dedupe_key, "pending")
+        current = self.store.jobs("example")
+        stale = next(job for job in current if job["id"] == first.job_id)
+        self.assertEqual(stale["state"], JobState.RUNNING.value)
+
     def test_reclaim_clears_previous_attempt_projection(self) -> None:
         self.store.enqueue(_job("clear-projection", max_attempts=3))
         baseline = time.time() + 1

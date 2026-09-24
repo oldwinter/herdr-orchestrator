@@ -446,7 +446,7 @@ class AttemptLedger:
         *,
         now: float,
         lease_until: float,
-    ) -> ClaimedJob:
+    ) -> ClaimedJob | None:
         attempt_id = row["current_attempt_id"]
         if attempt_id is None:
             raise StoreError("current_attempt_missing")
@@ -456,6 +456,8 @@ class AttemptLedger:
         ).fetchone()
         if attempt is None:
             raise StoreError("current_attempt_missing")
+        if attempt["lease_until"] is not None and float(attempt["lease_until"]) > now:
+            return None
         owner = uuid.uuid4().hex
         correlation = uuid.uuid4().hex
         attempt_cursor = connection.execute(
@@ -483,7 +485,7 @@ class AttemptLedger:
             ),
         )
         if attempt_cursor.rowcount != 1 or job_cursor.rowcount != 1:
-            raise StoreError("job_lease_lost")
+            return None
         return ClaimedJob(
             int(row["id"]),
             str(row["workflow"]),
