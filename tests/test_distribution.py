@@ -948,6 +948,55 @@ class DistributionCliTests(unittest.TestCase):
             "manager_harness_not_enabled: claude",
         )
 
+    def test_manager_rejects_explicit_harnesses_outside_the_manager_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            probe = root / "manager-probe"
+            for name in ("grok", "codex", "claude"):
+                harness = commands / name
+                harness.write_text(
+                    "#!/bin/sh\n"
+                    f'printf "{name}\\n" >> "$MANAGER_PROBE"\n',
+                    encoding="utf-8",
+                )
+                harness.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HERDR_BIN_PATH": "/bin/true",
+                    "HERDR_ENV": "1",
+                    "MANAGER_PROBE": str(probe),
+                    "PATH": f"{commands}{os.pathsep}{environment['PATH']}",
+                }
+            )
+
+            for name in ("droid", "pi", "hermes"):
+                manager = self._run("manager", name, env=environment)
+                self.assertEqual(manager.returncode, 2, name)
+                self.assertEqual(
+                    manager.stderr.strip(),
+                    f"manager_harness_unsupported: {name}",
+                )
+            manager = self._run("manager", "--harness", "droid", env=environment)
+            self.assertEqual(manager.returncode, 2)
+            self.assertEqual(
+                manager.stderr.strip(),
+                "manager_harness_unsupported: droid",
+            )
+            manager = self._run("manager", "bogus", env=environment)
+            self.assertEqual(manager.returncode, 2)
+            self.assertEqual(manager.stderr.strip(), "unsupported_harness: bogus")
+
+            for name in ("grok", "codex", "claude"):
+                manager = self._run("manager", name, env=environment)
+                self.assertEqual(manager.returncode, 0, manager.stderr)
+            self.assertEqual(
+                probe.read_text(encoding="utf-8").splitlines(),
+                ["grok", "codex", "claude"],
+            )
+
     def test_manager_default_respects_project_enabled_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
