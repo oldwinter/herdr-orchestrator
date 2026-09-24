@@ -133,9 +133,10 @@ def _select_auto_controller(
         )
         eligible = set(snapshot.eligible_harnesses)
     for harness in AUTO_CONTROLLER_ORDER:
-        if harness in eligible and (
-            health is not None or executable_finder(harness.value) is not None
-        ):
+        # The executable check is unconditional: a health snapshot built without
+        # an environment skips static executable checks, so selection must not
+        # trust eligibility alone.
+        if harness in eligible and executable_finder(harness.value) is not None:
             if health is not None and snapshot is not None:
                 health.record_selection(snapshot, role="controller", selected=harness)
             return harness

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -116,23 +117,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(seen, {"argv": command.argv, "cwd": "/tmp", "timeout": 1.5})
 
     def test_subprocess_runner_captures_text_without_shell(self) -> None:
-        process = subprocess.CompletedProcess(["herdr"], 0, "output", "")
-
-        with patch(
-            "herdr_orchestrator.protocol.subprocess.run",
-            return_value=process,
-        ) as mocked_run:
-            result = subprocess_runner(["herdr", "agent", "read"], cwd="/tmp", timeout=2.0)
-
-        self.assertIs(result, process)
-        mocked_run.assert_called_once_with(
-            ["herdr", "agent", "read"],
+        result = subprocess_runner(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('out'); sys.stderr.write('err')",
+            ],
             cwd="/tmp",
-            timeout=2.0,
-            capture_output=True,
-            text=True,
-            check=False,
+            timeout=10.0,
         )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "out")
+        self.assertEqual(result.stderr, "err")
 
     def test_rejects_malformed_json_text(self) -> None:
         process = subprocess.CompletedProcess(["herdr"], 0, "{not-json", "")
@@ -198,6 +195,35 @@ class ProtocolTests(unittest.TestCase):
         output = run_text(runner, Command(["herdr", "agent", "read"], Path("/tmp"), 10))
 
         self.assertEqual(output, "terminal text\n")
+
+    def test_rejects_oversized_runner_output(self) -> None:
+        oversized = "x" * (16 * 1024 * 1024 + 1)
+        for process in (
+            subprocess.CompletedProcess(["herdr"], 0, oversized, ""),
+            subprocess.CompletedProcess(["herdr"], 0, "", oversized),
+        ):
+            for function in (run_json, run_text):
+                with self.subTest(function=function.__name__):
+                    with self.assertRaisesRegex(TransportError, "herdr_output_oversized"):
+                        function(
+                            _return_process(process),
+                            Command(["herdr"], Path("/tmp"), 10),
+                        )
+
+    def test_subprocess_runner_rejects_oversized_output(self) -> None:
+        with patch(
+            "herdr_orchestrator.protocol.MAX_OUTPUT_BYTES",
+            1024,
+        ):
+            with self.assertRaisesRegex(TransportError, "herdr_output_oversized"):
+                run_text(
+                    subprocess_runner,
+                    Command(
+                        ["python3", "-c", "print('x' * 2048)"],
+                        Path("/tmp"),
+                        10,
+                    ),
+                )
 
 
 def _return_process(

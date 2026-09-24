@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -60,6 +61,7 @@ from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.store import Store, StoreError
 from herdr_orchestrator.tracker import TrackerError
 
+RESPONSE_FILE_MAX_BYTES = 1024 * 1024
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Durable multi-harness orchestration over Herdr.")
@@ -289,9 +291,14 @@ def _command_resume(config: WorkflowConfig, args: argparse.Namespace) -> int:
     response_file = Path(args.response_file).expanduser().resolve()
     if not response_file.is_file():
         raise ValueError(f"response_file_not_found: {response_file}")
+    if response_file.stat().st_size > RESPONSE_FILE_MAX_BYTES:
+        raise ValueError("response_file_oversized")
+    response = response_file.read_text(encoding="utf-8").strip()
+    if not response:
+        raise ValueError("response_file_empty")
     result = Coordinator(config).resume_blocked(
         args.job_id,
-        response_file.read_text(encoding="utf-8").strip(),
+        response,
     )
     print(json.dumps(result, sort_keys=True))
     return 0 if result["state"] == JobState.SUCCEEDED.value else 1
@@ -301,7 +308,7 @@ def _command_gc(config: WorkflowConfig, args: argparse.Namespace) -> int:
     coordinator = Coordinator(config)
     result = (
         coordinator.gc_succeeded_agents(dry_run=not args.apply)
-        if getattr(args, "succeeded_agents", True)
+        if args.succeeded_agents
         else coordinator.gc_failed_agents(dry_run=not args.apply)
     )
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -542,6 +549,9 @@ def main(argv: list[str] | None = None) -> int:
     except DeliveryEscalation as exc:
         print(str(exc), file=sys.stderr)
         return 3
+    except (OSError, sqlite3.Error) as exc:
+        print(f"herdr_internal_error: {exc}", file=sys.stderr)
+        return 2
     except (
         CatalogError,
         ConfigError,
@@ -788,17 +798,17 @@ def _doctor_system_checks(
         {
             "check": "HERDR_ENV",
             "ok": environ.get("HERDR_ENV") == "1",
-            "value": environ.get("HERDR_ENV"),
+            "value": environ.get("HERDR_ENV") == "1",
         },
         {
             "check": "HERDR_PANE_ID",
             "ok": bool(environ.get("HERDR_PANE_ID")),
-            "value": environ.get("HERDR_PANE_ID"),
+            "value": bool(environ.get("HERDR_PANE_ID")),
         },
         {
             "check": "HERDR_WORKSPACE_ID",
             "ok": bool(environ.get("HERDR_WORKSPACE_ID")),
-            "value": environ.get("HERDR_WORKSPACE_ID"),
+            "value": bool(environ.get("HERDR_WORKSPACE_ID")),
         },
     ]
     herdr_path = which("herdr")

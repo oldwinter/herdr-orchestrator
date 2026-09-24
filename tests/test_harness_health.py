@@ -92,6 +92,7 @@ class HarnessHealthTests(unittest.TestCase):
                     config,
                     worker_harnesses=(Harness.DROID, Harness.GROK),
                     health=health,
+                    executable_finder=lambda command: command,
                 ),
                 Harness.GROK,
             )

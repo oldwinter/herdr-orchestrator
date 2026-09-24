@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import io
 import json
 import re
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+
+# Bound stdout/stderr captured from a harness transport so a runaway process
+# cannot exhaust memory; oversized output fails closed as a transport error.
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 
 
 class CommandRunner(Protocol):
@@ -50,14 +56,28 @@ def subprocess_runner(
     cwd: str,
     timeout: float | None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        argv,
-        cwd=cwd,
-        timeout=timeout,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            timeout=timeout,
+            stdout=stdout,
+            stderr=stderr,
+            check=False,
+        )
+        if (
+            stdout.seek(0, io.SEEK_END) > MAX_OUTPUT_BYTES
+            or stderr.seek(0, io.SEEK_END) > MAX_OUTPUT_BYTES
+        ):
+            raise TransportError("herdr_output_oversized")
+        stdout.seek(0)
+        stderr.seek(0)
+        return subprocess.CompletedProcess(
+            argv,
+            completed.returncode,
+            stdout.read().decode("utf-8"),
+            stderr.read().decode("utf-8"),
+        )
 
 
 def _run_command(
@@ -65,7 +85,7 @@ def _run_command(
     command: Command,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return runner(
+        process = runner(
             command.argv,
             cwd=str(command.cwd),
             timeout=command.timeout_seconds,
@@ -76,6 +96,12 @@ def _run_command(
         raise TransportError("herdr_unavailable") from exc
     except UnicodeDecodeError as exc:
         raise TransportError("herdr_invalid_response") from exc
+    if any(
+        isinstance(stream, (str, bytes, bytearray)) and len(stream) > MAX_OUTPUT_BYTES
+        for stream in (process.stdout, process.stderr)
+    ):
+        raise TransportError("herdr_output_oversized")
+    return process
 
 
 def run_json(

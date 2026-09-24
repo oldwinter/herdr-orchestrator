@@ -132,10 +132,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
             ".orchestrator/worktrees",
         ),
     )
-    if (
-        not placement.worktree_root.is_relative_to(workspace)
-        or ".orchestrator" not in placement.worktree_root.parts
-    ):
+    if not _in_workspace_runtime(placement.worktree_root, workspace, ".orchestrator"):
         raise ConfigError("placement_worktree_root_must_be_in_workspace_runtime")
 
     standardized_delivery = _load_standardized_delivery(workspace, raw)
@@ -145,7 +142,7 @@ def load_workflow(path: str | Path) -> WorkflowConfig:
         base,
         _string(planner_raw, "output_file", maximum=4096),
     )
-    if not planner_output.is_relative_to(workspace) or ".orchestrator" not in planner_output.parts:
+    if not _in_workspace_runtime(planner_output, workspace, ".orchestrator"):
         raise ConfigError("planner_output_must_be_in_workspace_runtime")
     workers, harnesses = _load_workers(raw)
 
@@ -227,8 +224,14 @@ def _load_standardized_delivery(
         "artifact_root",
         ".orchestrator/deliveries",
     )
-    if not artifact_root.is_relative_to(workspace) or ".orchestrator" not in artifact_root.parts:
+    if not _in_workspace_runtime(artifact_root, workspace, ".orchestrator"):
         raise ConfigError("delivery_artifact_root_must_be_in_workspace_runtime")
+    if tracker_root.is_relative_to(workspace) and not _in_workspace_runtime(
+        tracker_root,
+        workspace,
+        ".scratch",
+    ):
+        raise ConfigError("delivery_tracker_root_must_be_in_workspace_runtime")
     github_repository = _optional_nullable_string(
         delivery_raw,
         "github_repository",
@@ -555,3 +558,12 @@ def _existing_file(base: Path, data: Mapping[str, Any], key: str) -> Path:
     if not path.is_file():
         raise ConfigError(f"{key}_not_found: {path}")
     return path
+
+
+def _in_workspace_runtime(path: Path, workspace: Path, runtime_dir: str) -> bool:
+    """Require ``path`` to live under ``workspace/<runtime_dir>`` exactly."""
+    try:
+        relative = path.relative_to(workspace)
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0] == runtime_dir

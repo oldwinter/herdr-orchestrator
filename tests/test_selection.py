@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 from herdr_orchestrator.config import load_workflow
+from herdr_orchestrator.harness_health import HarnessHealth
 from herdr_orchestrator.model import Harness
 from herdr_orchestrator.selection import (
     effective_worker_harnesses,
     select_controller_harness,
 )
+from herdr_orchestrator.store import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,6 +67,31 @@ class SelectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "has_no_worker"):
             effective_worker_harnesses(config, (Harness.CLAUDE,))
+
+    def test_auto_controller_requires_executable_even_with_health_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                self.config,
+                state_db=Path(temporary) / "state.db",
+            )
+            health = HarnessHealth(Store(config.state_db), config)
+            health.record_probe(Harness.GROK, {"status": "ready"})
+
+            with self.assertRaisesRegex(ValueError, "controller_harness_unavailable"):
+                select_controller_harness(
+                    config,
+                    worker_harnesses=(Harness.GROK,),
+                    health=health,
+                    executable_finder=lambda _: None,
+                )
+
+            selected = select_controller_harness(
+                config,
+                worker_harnesses=(Harness.GROK,),
+                health=health,
+                executable_finder=lambda command: f"/bin/{command}",
+            )
+            self.assertEqual(selected, Harness.GROK)
 
 
 if __name__ == "__main__":

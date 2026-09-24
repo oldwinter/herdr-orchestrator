@@ -122,6 +122,54 @@ context_file = "../outside.md"
             with self.assertRaisesRegex(CatalogError, "context_path_invalid"):
                 load_harness_profiles(root)
 
+    def test_rejects_symlinked_profile_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "real.toml"
+            target.write_text(
+                """
+schema_version = 1
+harness = "droid"
+display_name = "Droid"
+summary = "Summary"
+strengths = ["one"]
+best_for = ["one"]
+avoid_for = ["one"]
+traits = ["one"]
+context_file = "droid.md"
+""",
+                encoding="utf-8",
+            )
+            (root / "droid.md").write_text("context", encoding="utf-8")
+            (root / "linked.toml").symlink_to(target)
+
+            with self.assertRaisesRegex(CatalogError, "profile_invalid_file"):
+                load_harness_profiles(root)
+
+    def test_rejects_symlinked_context_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "real.md"
+            target.write_text("context", encoding="utf-8")
+            (root / "droid.md").symlink_to(target)
+            (root / "droid.toml").write_text(
+                """
+schema_version = 1
+harness = "droid"
+display_name = "Droid"
+summary = "Summary"
+strengths = ["one"]
+best_for = ["one"]
+avoid_for = ["one"]
+traits = ["one"]
+context_file = "droid.md"
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(CatalogError, "profile_context_path_invalid"):
+                load_harness_profiles(root)
+
     def test_rejects_invalid_profile_encoding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
