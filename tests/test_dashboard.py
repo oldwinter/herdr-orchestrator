@@ -12,7 +12,11 @@ from copy import deepcopy
 from dataclasses import replace
 from http.client import HTTPConnection
 from pathlib import Path
+from unittest.mock import patch
 from urllib.request import urlopen
+
+from herdr_orchestrator.dashboard import observer as observer_module
+from herdr_orchestrator.dashboard import server as server_module
 
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.dashboard.observer import (
@@ -23,6 +27,7 @@ from herdr_orchestrator.dashboard.observer import (
 )
 from herdr_orchestrator.dashboard.projector import RuntimeProjector
 from herdr_orchestrator.dashboard.server import (
+    DashboardMonitor,
     DashboardServer,
     SnapshotFeed,
     SseConnectionBudget,
@@ -845,6 +850,32 @@ class DashboardTests(unittest.TestCase):
             [2],
         )
 
+    def test_sqlite_observer_keeps_the_most_recent_jobs_within_the_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            store = Store(path)
+            store.initialize()
+            for index in range(5):
+                store.enqueue(
+                    NewJob(
+                        workflow="example",
+                        title=f"Job {index}",
+                        harness=Harness.CODEX,
+                        prompt="Read only.",
+                        dedupe_key=f"limit-{index}",
+                        max_attempts=1,
+                    )
+                )
+
+            with patch.object(observer_module, "MAX_OBSERVED_JOBS", 3):
+                observation = SqliteObserver(path, "example").observe()
+
+        self.assertEqual(
+            [row["title"] for row in observation.jobs],
+            ["Job 2", "Job 3", "Job 4"],
+        )
+
+
     def test_projector_correlates_jobs_and_reports_runtime_drift(self) -> None:
         now = 2_000.0
         jobs = (
@@ -1247,6 +1278,58 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(observation.health, "unavailable")
         self.assertEqual(observation.error_code, "herdr_invalid_response")
 
+    def test_herdr_observer_returns_unavailable_when_the_deadline_is_exhausted(self) -> None:
+        workspace = Path("/repo")
+
+        def runner(
+            argv: list[str],
+            *,
+            cwd: str,
+            timeout: float | None,
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({"id": "test", "result": {f"{argv[1]}s": []}}),
+                "",
+            )
+
+        with patch.object(observer_module, "OBSERVE_DEADLINE_SECONDS", 0):
+            observation = HerdrObserver(workspace, runner=runner).observe()
+
+        self.assertEqual(observation.health, "unavailable")
+        self.assertEqual(observation.error_code, "herdr_timeout")
+
+    def test_herdr_observer_bounds_each_command_by_the_observe_deadline(self) -> None:
+        workspace = Path("/repo")
+        timeouts: list[float | None] = []
+
+        def runner(
+            argv: list[str],
+            *,
+            cwd: str,
+            timeout: float | None,
+        ) -> subprocess.CompletedProcess[str]:
+            timeouts.append(timeout)
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({"id": "test", "result": {f"{argv[1]}s": []}}),
+                "",
+            )
+
+        with patch.object(observer_module, "OBSERVE_DEADLINE_SECONDS", 5):
+            observation = HerdrObserver(workspace, runner=runner).observe()
+
+        self.assertEqual(observation.health, "ok")
+        self.assertEqual(len(timeouts), 3)
+        for timeout in timeouts:
+            self.assertIsNotNone(timeout)
+            assert timeout is not None
+            self.assertLessEqual(timeout, 5)
+            self.assertLessEqual(timeout, observer_module.CONTROL_TIMEOUT_SECONDS)
+
+
     def test_snapshot_feed_waits_for_new_event(self) -> None:
         feed = SnapshotFeed()
         self.assertEqual(feed.current(), (0, None))
@@ -1414,6 +1497,99 @@ class DashboardTests(unittest.TestCase):
                     second.close()
                 server.shutdown()
                 serve_thread.join(timeout=2)
+
+    def test_sse_dead_connection_releases_budget_within_write_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(base, state_db=Path(temporary) / "state.db")
+            Store(config.state_db).initialize()
+            projector = FakeProjector(
+                {
+                    "schema_version": 1,
+                    "workflow": "example",
+                    "generated_at": 1.0,
+                    "source_health": {"queue": "ok", "herdr": "ok"},
+                    "summary": {},
+                    "jobs": [],
+                    "attention": [],
+                    "topology": {"workspaces": []},
+                    "timeline": [],
+                    "padding": "x" * (32 * 1024 * 1024),
+                }
+            )
+            server = DashboardServer(
+                config,
+                port=0,
+                poll_seconds=60,
+                projector=projector,
+                max_sse_connections=1,
+            )
+            serve_thread = threading.Thread(target=server.serve_forever)
+            connection: HTTPConnection | None = None
+            with patch.object(server_module, "SSE_WRITE_TIMEOUT_SECONDS", 0.5):
+                try:
+                    serve_thread.start()
+                    deadline = time.monotonic() + 2
+                    while server.feed.current()[1] is None:
+                        if time.monotonic() >= deadline:
+                            self.fail("dashboard monitor did not publish a snapshot")
+                        time.sleep(0.01)
+
+                    host, port = server.address
+                    connection = HTTPConnection(host, port, timeout=5)
+                    connection.request("GET", "/api/events")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+
+                    deadline = time.monotonic() + 5
+                    while not server.sse_budget.acquire():
+                        if time.monotonic() >= deadline:
+                            self.fail("dead SSE connection did not release its slot")
+                        time.sleep(0.05)
+                    server.sse_budget.release()
+                finally:
+                    if connection is not None:
+                        connection.close()
+                    server.shutdown()
+                    serve_thread.join(timeout=2)
+
+    def test_monitor_skips_publish_when_the_snapshot_is_unchanged(self) -> None:
+        feed = SnapshotFeed()
+        calls = {"count": 0}
+        state = {"value": 1}
+
+        def snapshot() -> dict[str, object]:
+            calls["count"] += 1
+            return {"value": state["value"], "generated_at": calls["count"]}
+
+        monitor = DashboardMonitor(snapshot, feed, poll_seconds=0.25)
+        monitor.start()
+        try:
+            deadline = time.monotonic() + 2
+            while calls["count"] < 3:
+                if time.monotonic() >= deadline:
+                    self.fail("dashboard monitor did not poll")
+                time.sleep(0.01)
+
+            event_id, first = feed.current()
+            self.assertEqual(event_id, 1)
+            self.assertIsNotNone(first)
+
+            state["value"] = 2
+            deadline = time.monotonic() + 2
+            while feed.current()[0] < 2:
+                if time.monotonic() >= deadline:
+                    self.fail("dashboard monitor did not publish a changed snapshot")
+                time.sleep(0.01)
+
+            event_id, second = feed.current()
+            self.assertEqual(event_id, 2)
+            self.assertIsNotNone(second)
+            assert isinstance(second, dict)
+            self.assertEqual(second["value"], 2)
+        finally:
+            monitor.stop()
+
 
     def test_server_shutdown_before_serving_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

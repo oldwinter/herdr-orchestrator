@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,9 @@ from herdr_orchestrator.protocol import (
 )
 
 CONTROL_TIMEOUT_SECONDS = 10
+OBSERVE_DEADLINE_SECONDS = 60.0
+MAX_OBSERVED_JOBS = 500
+MAX_OBSERVED_RECEIPTS = 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +63,12 @@ class SqliteObserver:
                        task_verified, error_summary, correlation_id, created_at, updated_at
                 FROM jobs
                 WHERE workflow = ?
-                ORDER BY created_at, id
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
                 """,
-                (self.workflow,),
+                (self.workflow, MAX_OBSERVED_JOBS),
             ).fetchall()
+            jobs.reverse()
             receipts = connection.execute(
                 """
                 SELECT receipts.id, receipts.job_id, receipts.attempt, receipts.state,
@@ -75,10 +81,12 @@ class SqliteObserver:
                 JOIN jobs ON jobs.id = receipts.job_id
                 WHERE jobs.workflow = ?
                   AND receipts.is_stale = 0
-                ORDER BY receipts.observed_at, receipts.id
+                ORDER BY receipts.observed_at DESC, receipts.id DESC
+                LIMIT ?
                 """,
-                (self.workflow,),
+                (self.workflow, MAX_OBSERVED_RECEIPTS),
             ).fetchall()
+            receipts.reverse()
         finally:
             connection.close()
         return QueueObservation(
@@ -98,14 +106,15 @@ class HerdrObserver:
         self.runner = runner
 
     def observe(self) -> HerdrObservation:
+        deadline = time.monotonic() + OBSERVE_DEADLINE_SECONDS
         try:
-            agents, workspaces, worktrees = self._base_rows()
+            agents, workspaces, worktrees = self._base_rows(deadline)
             workspace_ids = self._relevant_workspace_ids(
                 workspaces,
                 agents,
                 worktrees,
             )
-            tabs, panes = self._workspace_rows(workspace_ids)
+            tabs, panes = self._workspace_rows(workspace_ids, deadline)
             panes = _scoped_panes(tabs, panes, self.workspace)
             agents = _scoped_agents(agents, self.workspace)
         except TransportError as exc:
@@ -135,13 +144,17 @@ class HerdrObserver:
 
     def _base_rows(
         self,
+        deadline: float,
     ) -> tuple[
         list[dict[str, object]],
         list[dict[str, object]],
         list[dict[str, object]],
     ]:
-        agents = _rows(self._run(["herdr", "agent", "list"]), "agents")
-        workspaces = _rows(self._run(["herdr", "workspace", "list"]), "workspaces")
+        agents = _rows(self._run(["herdr", "agent", "list"], deadline), "agents")
+        workspaces = _rows(
+            self._run(["herdr", "workspace", "list"], deadline),
+            "workspaces",
+        )
         worktrees = _rows(
             self._run(
                 [
@@ -150,7 +163,8 @@ class HerdrObserver:
                     "list",
                     "--cwd",
                     str(self.workspace),
-                ]
+                ],
+                deadline,
             ),
             "worktrees",
         )
@@ -159,12 +173,13 @@ class HerdrObserver:
     def _workspace_rows(
         self,
         workspace_ids: set[str],
+        deadline: float,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         tabs: list[dict[str, object]] = []
         panes: list[dict[str, object]] = []
         for workspace_id in sorted(workspace_ids):
-            tabs.extend(self._workspace_rows_for_id(workspace_id, "tab", "tabs"))
-            panes.extend(self._workspace_rows_for_id(workspace_id, "pane", "panes"))
+            tabs.extend(self._workspace_rows_for_id(workspace_id, "tab", "tabs", deadline))
+            panes.extend(self._workspace_rows_for_id(workspace_id, "pane", "panes", deadline))
         return tabs, panes
 
     def _workspace_rows_for_id(
@@ -172,6 +187,7 @@ class HerdrObserver:
         workspace_id: str,
         resource: str,
         key: str,
+        deadline: float,
     ) -> list[dict[str, object]]:
         rows = _rows(
             self._run(
@@ -181,16 +197,20 @@ class HerdrObserver:
                     "list",
                     "--workspace",
                     workspace_id,
-                ]
+                ],
+                deadline,
             ),
             key,
         )
         return [row for row in rows if row.get("workspace_id") == workspace_id]
 
-    def _run(self, argv: list[str]) -> Mapping[str, Any]:
+    def _run(self, argv: list[str], deadline: float) -> Mapping[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TransportError("herdr_timeout")
         return run_json(
             self.runner,
-            Command(argv, self.workspace, CONTROL_TIMEOUT_SECONDS),
+            Command(argv, self.workspace, min(CONTROL_TIMEOUT_SECONDS, remaining)),
         )
 
     def _relevant_workspace_ids(
