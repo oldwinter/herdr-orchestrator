@@ -130,6 +130,85 @@ class NpmReleasePlanTests(unittest.TestCase):
             },
         )
 
+    def test_missing_registry_package_on_stdout_is_publishable(self) -> None:
+        result, _ = self._run_plan(
+            "0.1.0",
+            "[]",
+            npm_exit=1,
+            npm_stdout="npm error code E404\nnpm error 404 Not Found\n",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "name": "example-package",
+                "publish": True,
+                "reason": "version_missing",
+                "version": "0.1.0",
+            },
+        )
+
+    def test_manager_release_requires_exact_orchestrator_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps({"name": "herdr-orchestrator", "version": "0.1.7"}),
+                encoding="utf-8",
+            )
+            manager_dir = root / "packages" / "herdr-manager"
+            manager_dir.mkdir(parents=True)
+            package = manager_dir / "package.json"
+            package.write_text(
+                json.dumps(
+                    {
+                        "name": "herdr-manager",
+                        "version": "0.1.2",
+                        "dependencies": {"herdr-orchestrator": "0.1.6"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result, _ = self._run_plan("0.1.2", '["0.1.2"]', package_path=package)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "manager_dependency_mismatch")
+
+    def test_manager_release_accepts_exact_orchestrator_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps({"name": "herdr-orchestrator", "version": "0.1.7"}),
+                encoding="utf-8",
+            )
+            manager_dir = root / "packages" / "herdr-manager"
+            manager_dir.mkdir(parents=True)
+            package = manager_dir / "package.json"
+            package.write_text(
+                json.dumps(
+                    {
+                        "name": "herdr-manager",
+                        "version": "0.1.2",
+                        "dependencies": {"herdr-orchestrator": "0.1.7"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result, _ = self._run_plan("0.1.2", '["0.1.1"]', package_path=package)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "name": "herdr-manager",
+                "publish": True,
+                "reason": "version_missing",
+                "version": "0.1.2",
+            },
+        )
+
     def _run_plan(
         self,
         version: str,
@@ -137,20 +216,26 @@ class NpmReleasePlanTests(unittest.TestCase):
         *,
         npm_exit: int = 0,
         npm_stderr: str = "",
+        npm_stdout: str = "",
+        package_path: Path | None = None,
         write_github_output: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            package = root / "package.json"
-            package.write_text(
-                json.dumps(
-                    {
-                        "name": "example-package",
-                        "version": version,
-                    }
-                ),
-                encoding="utf-8",
-            )
+            if package_path is None:
+                package = root / "package.json"
+                package.write_text(
+                    json.dumps(
+                        {
+                            "name": "example-package",
+                            "version": version,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                package = package_path
+            name = json.loads(package.read_text(encoding="utf-8"))["name"]
             fake_bin = root / "bin"
             fake_bin.mkdir()
             npm = fake_bin / "npm"
@@ -158,11 +243,12 @@ class NpmReleasePlanTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import os\n"
                 "import sys\n"
-                "expected = ['view', 'example-package', 'versions', '--json']\n"
+                "expected = ['view', os.environ['PACKAGE_NAME'], 'versions', '--json']\n"
                 "if sys.argv[1:] != expected:\n"
                 "    raise SystemExit(9)\n"
                 "sys.stderr.write(os.environ['NPM_STDERR'])\n"
                 "if os.environ['NPM_EXIT'] != '0':\n"
+                "    sys.stdout.write(os.environ['NPM_STDOUT'])\n"
                 "    raise SystemExit(int(os.environ['NPM_EXIT']))\n"
                 "print(os.environ['REGISTRY_VERSIONS'])\n",
                 encoding="utf-8",
@@ -173,6 +259,8 @@ class NpmReleasePlanTests(unittest.TestCase):
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "NPM_EXIT": str(npm_exit),
                 "NPM_STDERR": npm_stderr,
+                "NPM_STDOUT": npm_stdout,
+                "PACKAGE_NAME": name,
                 "REGISTRY_VERSIONS": registry_versions,
             }
             github_output = root / "github-output.txt"

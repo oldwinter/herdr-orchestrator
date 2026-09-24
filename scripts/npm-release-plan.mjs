@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const PACKAGE_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
@@ -26,9 +26,21 @@ function packageIdentity(path) {
     throw new Error("package_identity_invalid");
   }
   return {
+    dependencies: payload.dependencies ?? {},
     name: payload.name,
     version: payload.version,
   };
+}
+
+function assertManagerPin(identity, path) {
+  if (identity.name !== "herdr-manager") {
+    return;
+  }
+  const rootPackage = resolve(dirname(path), "..", "..", "package.json");
+  const rootVersion = JSON.parse(readFileSync(rootPackage, "utf8")).version;
+  if (identity.dependencies["herdr-orchestrator"] !== rootVersion) {
+    throw new Error("manager_dependency_mismatch");
+  }
 }
 
 function registryVersions(name) {
@@ -40,7 +52,7 @@ function registryVersions(name) {
     throw new Error("npm_registry_query_failed");
   }
   if (result.status !== 0) {
-    if (/(?:^|\s)E404(?:\s|$)|404 Not Found/m.test(result.stderr)) {
+    if (/(?:^|\s)E404(?:\s|$)|404 Not Found/m.test(`${result.stderr}\n${result.stdout}`)) {
       return [];
     }
     throw new Error("npm_registry_query_failed");
@@ -54,7 +66,9 @@ function registryVersions(name) {
 
 function main() {
   try {
-    const identity = packageIdentity(packageJsonPath(process.argv.slice(2)));
+    const path = packageJsonPath(process.argv.slice(2));
+    const identity = packageIdentity(path);
+    assertManagerPin(identity, path);
     const exists = registryVersions(identity.name).includes(identity.version);
     const plan = {
       name: identity.name,

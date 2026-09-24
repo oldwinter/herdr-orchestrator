@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -26,6 +27,14 @@ BOUNDARIES = (
     "default_result_published",
     "requested_result_published",
 )
+
+
+def _source(commit: str) -> "quality_bundle.SourceIdentity":
+    return quality_bundle.SourceIdentity(
+        commit.lower(),
+        hashlib.sha256(f"fixture\0{commit.lower()}".encode()).hexdigest(),
+        True,
+    )
 
 
 def producer_spec():
@@ -104,6 +113,7 @@ def run_child(project: Path, target: str | None) -> int:
         bundle = quality_bundle.run_quality(
             root=root,
             commit=COMMIT,
+            source=_source(COMMIT),
             invocation_id=INVOCATION,
             specs=(producer_spec(),),
             reuse_completed=True,

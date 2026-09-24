@@ -39,6 +39,14 @@ def _expectations(path: Path, *, expected_commit: str | None = None) -> dict[str
     }
 
 
+def _source(commit: str) -> "quality_bundle.SourceIdentity":
+    return quality_bundle.SourceIdentity(
+        commit.lower(),
+        hashlib.sha256(f"fixture\0{commit.lower()}".encode()).hexdigest(),
+        True,
+    )
+
+
 class QualityBundleRunTests(unittest.TestCase):
     def test_two_runs_isolate_fixed_artifact_names_by_commit_and_invocation(self) -> None:
         first_commit = "1" * 40
@@ -50,12 +58,14 @@ class QualityBundleRunTests(unittest.TestCase):
             first = quality_bundle.run_quality(
                 root=quality_root,
                 commit=first_commit,
+                source=_source(first_commit),
                 invocation_id="fixture-1",
                 specs=(first_spec,),
             )
             second = quality_bundle.run_quality(
                 root=quality_root,
                 commit=second_commit,
+                source=_source(second_commit),
                 invocation_id="fixture-2",
                 specs=(second_spec,),
             )
@@ -89,6 +99,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="digest-mismatch",
                 specs=(spec,),
             )
@@ -123,6 +134,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="lint-result",
                 specs=(spec,),
             )
@@ -145,6 +157,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="missing-tool-version",
                 specs=(spec,),
             )
@@ -169,6 +182,7 @@ class QualityBundleRunTests(unittest.TestCase):
             quality_bundle.run_quality(
                 root=root,
                 commit=commit,
+                source=_source(commit),
                 invocation_id="reused",
                 specs=(self._coverage_spec(90.0),),
             )
@@ -180,6 +194,7 @@ class QualityBundleRunTests(unittest.TestCase):
                 quality_bundle.run_quality(
                     root=root,
                     commit=commit,
+                    source=_source(commit),
                     invocation_id="reused",
                     specs=(self._coverage_spec(91.0),),
                 )
@@ -192,6 +207,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="artifact-matrix",
                 specs=(spec,),
             )
@@ -233,6 +249,7 @@ class QualityBundleRunTests(unittest.TestCase):
             duplicate = quality_bundle.run_quality(
                 root=root / "duplicate",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="duplicate-key",
                 specs=(spec,),
             )
@@ -258,6 +275,7 @@ class QualityBundleRunTests(unittest.TestCase):
             incomplete = quality_bundle.run_quality(
                 root=root / "incomplete",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="missing-producer",
                 specs=(spec,),
             )
@@ -295,6 +313,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="profile-eof",
                 specs=(spec,),
             )
@@ -330,6 +349,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="profile-semantic-corruption",
                 specs=(spec,),
             )
@@ -362,6 +382,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="nan-coverage",
                 specs=(spec,),
             )
@@ -409,6 +430,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="profile-fuzz",
                 specs=(spec,),
             )
@@ -470,6 +492,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=root / "base",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="plan-contract",
                 specs=(spec,),
             )
@@ -541,6 +564,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="builtin-plan",
                 specs=(spec,),
             )
@@ -561,6 +585,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="extra-file",
                 specs=(spec,),
             )
@@ -611,6 +636,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="inventory-contract",
                 specs=(spec,),
             )
@@ -679,6 +705,7 @@ class QualityBundleRunTests(unittest.TestCase):
                 bundle = quality_bundle.run_quality(
                     root=Path(temporary) / "quality",
                     commit=commit,
+                    source=_source(commit),
                     invocation_id=label,
                     specs=(spec,),
                 )
@@ -701,6 +728,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="artifact-swap",
                 specs=(spec,),
             )
@@ -755,6 +783,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="producer-snapshot",
                 specs=(spec,),
             )
@@ -812,6 +841,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="command-timeout",
                 specs=(spec,),
             )
@@ -875,6 +905,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="stability-run-count",
                 specs=(spec,),
             )
@@ -912,6 +943,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="foreign-root",
                 specs=(spec,),
             )
@@ -1018,6 +1050,7 @@ class QualityBundleRunTests(unittest.TestCase):
                 quality_bundle.run_quality(
                     root=root,
                     commit=commit,
+                    source=_source(commit),
                     invocation_id="finalize-crash",
                     specs=(spec,),
                 )
@@ -1025,6 +1058,7 @@ class QualityBundleRunTests(unittest.TestCase):
             adopted = quality_bundle.run_quality(
                 root=root,
                 commit=commit,
+                source=_source(commit),
                 invocation_id="finalize-crash",
                 specs=(spec,),
                 reuse_completed=True,
@@ -1171,6 +1205,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="security-finding",
                 specs=(spec,),
             )
@@ -1204,6 +1239,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=root / "base",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="semantic-matrix",
                 specs=(spec,),
             )
@@ -1260,6 +1296,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="malformed-enums",
                 specs=(spec,),
             )
@@ -1291,6 +1328,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="result-mismatch",
                 specs=(spec,),
             )
@@ -1335,6 +1373,7 @@ class QualityBundleRunTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=Path(temporary) / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="manifest-enforce",
                 specs=(spec,),
             )

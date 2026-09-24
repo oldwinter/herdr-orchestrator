@@ -10,7 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 KEY_DOC_NAMES = ("README.md", "AGENTS.md", "CONTRIBUTING.md")
 MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
-JUST_COMMAND = re.compile(r"`?just ([a-z][a-z0-9-]*)")
+JUST_COMMAND = re.compile(r"`just ([a-z][a-z0-9-]*)")
+JUST_BLOCK_COMMAND = re.compile(r"^just ([a-z][a-z0-9-]*)", re.MULTILINE)
 JUST_RECIPE = re.compile(r"^([a-z][a-z0-9-]*)(?: [^:]*)?:$", re.MULTILINE)
 SHELL_BLOCK = re.compile(r"```(?:bash|sh|shell|console)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 CODE_SPAN = re.compile(r"`([^`\n]+)`")
@@ -60,7 +61,6 @@ def documentation_failures(root: Path = ROOT) -> list[str]:
         names.extend(
             path.relative_to(root).as_posix()
             for path in sorted(docs_root.rglob("*.md"))
-            if path.name != "installation.md"
         )
     for name in dict.fromkeys(names):
         document = root / name
@@ -83,7 +83,10 @@ def documentation_failures(root: Path = ROOT) -> list[str]:
                     failures.append(f"{document.name}: local link escapes repository {target}")
                 elif not target_path.exists():
                     failures.append(f"{document.name}: missing local link {target}")
-        for recipe in JUST_COMMAND.findall(text):
+        mentions = set(JUST_COMMAND.findall(text))
+        for block in SHELL_BLOCK.findall(text):
+            mentions.update(JUST_BLOCK_COMMAND.findall(block))
+        for recipe in mentions:
             if recipe not in recipes:
                 failures.append(f"{document.name}: unknown just recipe {recipe}")
         failures.extend(_command_path_failures(document, text, root, repository_roots))

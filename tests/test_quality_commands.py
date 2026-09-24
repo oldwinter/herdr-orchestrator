@@ -156,6 +156,7 @@ class QualityCommandTests(unittest.TestCase):
                         "--result",
                         str(result_path),
                         "--require-clean",
+                        "--allow-partial",
                     ],
                     cwd=REPO_ROOT,
                     capture_output=True,
@@ -288,6 +289,77 @@ class QualityCommandTests(unittest.TestCase):
         self.assertEqual(enforce.returncode, 0, enforce.stderr)
         self.assertIn("Coverage: **91.0%**", summary)
         self.assertIn("Security: **0** medium/high Bandit findings", summary)
+
+    def test_enforce_requires_full_producers_unless_allow_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence_root = root / "quality"
+            result_path = root / "partial-result.json"
+            commands = root / "bin"
+            commands.mkdir()
+            self._write_full_quality_tools(commands)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{commands}{os.pathsep}{environment['PATH']}"
+
+            collect = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/quality_bundle.py",
+                    "run",
+                    "--root",
+                    str(evidence_root),
+                    "--producer",
+                    "build",
+                    "--result",
+                    str(result_path),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+            enforce = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/quality_bundle.py",
+                    "enforce",
+                    "--root",
+                    str(evidence_root),
+                    "--result",
+                    str(result_path),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+            partial = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/quality_bundle.py",
+                    "enforce",
+                    "--root",
+                    str(evidence_root),
+                    "--result",
+                    str(result_path),
+                    "--allow-partial",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+
+        self.assertEqual(collect.returncode, 0, collect.stderr)
+        self.assertEqual(enforce.returncode, 1, enforce.stderr)
+        self.assertEqual(partial.returncode, 0, partial.stderr)
+
 
     def test_full_bundle_rejects_each_omitted_missing_and_corrupt_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

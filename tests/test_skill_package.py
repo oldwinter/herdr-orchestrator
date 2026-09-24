@@ -320,6 +320,59 @@ class RepositoryCheckerTests(unittest.TestCase):
             failures,
         )
 
+    def test_docs_checker_ignores_prose_just_mentions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "justfile").write_text("check:\n\t@true\n", encoding="utf-8")
+            for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
+                (root / name).write_text("", encoding="utf-8")
+            (root / "README.md").write_text(
+                "Adjust the timeout before you adjust the retries.\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK_DOCS.documentation_failures(root)
+
+        self.assertEqual(failures, [])
+
+    def test_docs_checker_flags_unknown_recipes_in_spans_and_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "justfile").write_text("check:\n\t@true\n", encoding="utf-8")
+            for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
+                (root / name).write_text("", encoding="utf-8")
+            (root / "README.md").write_text(
+                "Run `just bogus-span` first.\n```bash\njust bogus-block\n```\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK_DOCS.documentation_failures(root)
+
+        self.assertEqual(
+            sorted(failures),
+            [
+                "README.md: unknown just recipe bogus-block",
+                "README.md: unknown just recipe bogus-span",
+            ],
+        )
+
+    def test_docs_checker_covers_installation_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "justfile").write_text("check:\n\t@true\n", encoding="utf-8")
+            for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
+                (root / name).write_text("", encoding="utf-8")
+            docs = root / "docs"
+            docs.mkdir()
+            (docs / "installation.md").write_text(
+                "[missing](missing.md)\n", encoding="utf-8"
+            )
+
+            failures = CHECK_DOCS.documentation_failures(root)
+
+        self.assertEqual(failures, ["installation.md: missing local link missing.md"])
+
+
     def test_documented_workflows_are_all_tracked_examples(self) -> None:
         result = subprocess.run(
             ["git", "ls-files", "-z", "--", "workflows/*.toml"],
