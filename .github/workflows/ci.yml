@@ -256,36 +256,45 @@ jobs:
           ORCHESTRATOR_PUBLISH: ${{ needs.release-plan.outputs.orchestrator_publish }}
           ORCHESTRATOR_VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
         run: |
+          status=0
           if test "$ORCHESTRATOR_PUBLISH" = true; then
-            if ! npm publish --access public; then
-              printf '%s\n' 'orchestrator publish failed; registry verification will decide whether retry is needed'
-            fi
+            npm publish --access public || status=$?
           fi
           if test "$MANAGER_PUBLISH" = true; then
-            if ! npm publish --access public ./packages/herdr-manager; then
-              printf '%s\n' 'manager publish failed; registry verification will decide whether retry is needed'
-            fi
+            npm publish --access public ./packages/herdr-manager || status=$?
           fi
+          exit "$status"
       - name: Verify package versions
         if: always() && !cancelled()
         env:
           MANAGER_NAME: ${{ needs.release-plan.outputs.manager_name }}
+          MANAGER_PUBLISH: ${{ needs.release-plan.outputs.manager_publish }}
           MANAGER_VERSION: ${{ needs.release-plan.outputs.manager_version }}
           ORCHESTRATOR_NAME: ${{ needs.release-plan.outputs.orchestrator_name }}
+          ORCHESTRATOR_PUBLISH: ${{ needs.release-plan.outputs.orchestrator_publish }}
           ORCHESTRATOR_VERSION: ${{ needs.release-plan.outputs.orchestrator_version }}
         run: |
           set -eu
           verify_version() {
             name="$1"
             version="$2"
+            published="$3"
             actual="$(npm view "$name@$version" version 2>/dev/null || true)"
             if test "$actual" != "$version"; then
               printf 'registry version missing: %s@%s\n' "$name" "$version" >&2
               return 1
             fi
+            if test "$published" = true; then
+              git_head="$(npm view "$name@$version" gitHead 2>/dev/null || true)"
+              if test "$git_head" != "$GITHUB_SHA"; then
+                printf 'registry gitHead mismatch: %s@%s published by %s, expected %s\n' \
+                  "$name" "$version" "${git_head:-<none>}" "$GITHUB_SHA" >&2
+                return 1
+              fi
+            fi
           }
-          verify_version "$ORCHESTRATOR_NAME" "$ORCHESTRATOR_VERSION"
-          verify_version "$MANAGER_NAME" "$MANAGER_VERSION"
+          verify_version "$ORCHESTRATOR_NAME" "$ORCHESTRATOR_VERSION" "$ORCHESTRATOR_PUBLISH"
+          verify_version "$MANAGER_NAME" "$MANAGER_VERSION" "$MANAGER_PUBLISH"
 
   github-release:
     if: >-
