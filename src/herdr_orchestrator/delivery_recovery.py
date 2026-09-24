@@ -38,6 +38,7 @@ from herdr_orchestrator.delivery_support import (
     DeliveryError,
     DeliveryResult,
     _agent_is_active,
+    _assert_source_workspace_stable,
     _effect_absent,
     _effect_conflict,
     _effect_matched,
@@ -244,6 +245,7 @@ class DeliveryRecoveryMixin:
             raise DeliveryError("delivery_result_tracker_publication_mismatch")
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
         base_commit = self._delivery_base_commit(git)
+        _assert_source_workspace_stable(git, base_commit)
         integration = Worktree(
             self._run_root / "worktrees/integration",
             result.integration_branch,

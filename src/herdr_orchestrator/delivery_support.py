@@ -150,6 +150,23 @@ def _git_succeeds(git: GitWorkspace, cwd: Path, *args: str) -> bool:
         raise DeliveryError("delivery_git_query_failed") from exc
 
 
+def _assert_source_workspace_stable(git: GitWorkspace, base_commit: str) -> None:
+    head = _git_output(git, git.repository, "rev-parse", "HEAD")
+    try:
+        anchored = head == base_commit or git.is_ancestor(
+            git.repository,
+            base_commit,
+            head,
+        )
+        clean = git.is_clean(git.repository, include_untracked=False)
+    except GitWorkspaceError as exc:
+        raise DeliveryError(str(exc)) from exc
+    if not anchored:
+        raise DeliveryError("delivery_source_workspace_drifted")
+    if not clean:
+        raise DeliveryError("delivery_source_workspace_dirty")
+
+
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     write_artifact_text(
         path,

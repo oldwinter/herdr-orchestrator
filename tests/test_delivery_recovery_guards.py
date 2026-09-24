@@ -8,7 +8,15 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from test_delivery_journal import _artifact_path, _git, _initialize_repository, _workflow
+from test_delivery_journal import (
+    CompleteDispatcher,
+    CrashAfterPlanDispatcher,
+    StableTracker,
+    _artifact_path,
+    _git,
+    _initialize_repository,
+    _workflow,
+)
 
 from herdr_orchestrator.delivery import DeliveryError, StandardizedDelivery
 from herdr_orchestrator.delivery_journal import DeliveryJournal
@@ -25,6 +33,7 @@ from herdr_orchestrator.model import (
     Harness,
     WayfinderMode,
 )
+from herdr_orchestrator.protocol import TransportError
 
 
 class InspectingDispatcher:
@@ -150,6 +159,30 @@ class FrontierOverflowDispatcher:
         timeout_seconds: int,
     ) -> DispatchOutcome:
         raise AssertionError("Wayfinder controller should not block")
+
+
+class MissingAgentDispatcher(CompleteDispatcher):
+    """inspect_agent reports agent_not_found for every agent."""
+
+    def inspect_agent(
+        self,
+        workspace: Path,
+        name: str,
+        harness: Harness,
+    ) -> DispatchOutcome | None:
+        return None
+
+
+class NotReadyAgentDispatcher(CompleteDispatcher):
+    """inspect_agent reports an agent that exists but is not interactive-ready."""
+
+    def inspect_agent(
+        self,
+        workspace: Path,
+        name: str,
+        harness: Harness,
+    ) -> DispatchOutcome | None:
+        raise TransportError("agent_identity_mismatch")
 
 
 class DeliveryRecoveryGuardTests(unittest.TestCase):
@@ -318,6 +351,128 @@ class DeliveryRecoveryGuardTests(unittest.TestCase):
                     )
 
             self.assertEqual(dispatcher.responses, 1)
+
+    def test_publish_rejects_source_workspace_drift(self) -> None:
+        mutations = (
+            ("rewrite", "delivery_source_workspace_drifted"),
+            ("dirty", "delivery_source_workspace_dirty"),
+        )
+        for mutation, expected_error in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                repository = Path(temporary).resolve() / "repository"
+                _initialize_repository(repository)
+                config = _workflow(repository)
+                goal = repository / "goal.md"
+                goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+                delivery = StandardizedDelivery(
+                    config,
+                    dispatcher=CompleteDispatcher(),
+                    tracker=StableTracker(),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                )
+                review = delivery._review_and_repair
+
+                def drift_after_review(plan, integration):
+                    rounds = review(plan, integration)
+                    if mutation == "rewrite":
+                        (repository / "drift.txt").write_text(
+                            "drifted\n", encoding="utf-8"
+                        )
+                        _git(repository, "add", "drift.txt")
+                        _git(
+                            repository,
+                            "commit",
+                            "--amend",
+                            "-m",
+                            "chore: rewritten history",
+                        )
+                    else:
+                        with (repository / "README.md").open("a", encoding="utf-8") as handle:
+                            handle.write("dirty\n")
+                    return rounds
+
+                with (
+                    patch.object(
+                        delivery,
+                        "_review_and_repair",
+                        side_effect=drift_after_review,
+                    ),
+                    self.assertRaisesRegex(DeliveryError, expected_error),
+                ):
+                    delivery.run(goal)
+
+    def test_completed_result_rejects_source_workspace_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary).resolve() / "repository"
+            _initialize_repository(repository)
+            config = _workflow(repository)
+            goal = repository / "goal.md"
+            goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+            external: dict[str, object] = {}
+            result = StandardizedDelivery(
+                config,
+                dispatcher=CompleteDispatcher(),
+                tracker=StableTracker(external),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            ).run(goal)
+            self.assertEqual(result.status, "succeeded")
+            (repository / "drift.txt").write_text("drifted\n", encoding="utf-8")
+            _git(repository, "add", "drift.txt")
+            _git(repository, "commit", "--amend", "-m", "chore: rewritten history")
+
+            with self.assertRaisesRegex(
+                DeliveryError,
+                "delivery_source_workspace_drifted",
+            ):
+                StandardizedDelivery(
+                    config,
+                    dispatcher=CompleteDispatcher(),
+                    tracker=StableTracker(external),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                ).run(goal)
+
+    def test_artifact_recovery_matches_when_agent_inspection_is_inconclusive(self) -> None:
+        for dispatcher_type in (MissingAgentDispatcher, NotReadyAgentDispatcher):
+            with self.subTest(dispatcher=dispatcher_type.__name__):
+                with tempfile.TemporaryDirectory() as temporary:
+                    repository = Path(temporary).resolve() / "repository"
+                    _initialize_repository(repository)
+                    config = _workflow(repository)
+                    goal = repository / "goal.md"
+                    goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+                    crashed_dispatcher = CrashAfterPlanDispatcher()
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "controller died after plan artifact",
+                    ):
+                        StandardizedDelivery(
+                            config,
+                            dispatcher=crashed_dispatcher,
+                            tracker=StableTracker(),
+                            controller_harness=Harness.DROID,
+                            worker_harnesses=(Harness.DROID,),
+                        ).run(goal)
+
+                    resumed_dispatcher = dispatcher_type()
+                    result = StandardizedDelivery(
+                        config,
+                        dispatcher=resumed_dispatcher,
+                        tracker=StableTracker(),
+                        controller_harness=Harness.DROID,
+                        worker_harnesses=(Harness.DROID,),
+                    ).run(goal)
+
+                    self.assertEqual(result.status, "succeeded")
+                    self.assertEqual(crashed_dispatcher.calls, 1)
+                    self.assertFalse(
+                        any(
+                            "Create one accepted specification" in prompt
+                            for prompt in resumed_dispatcher.prompts
+                        )
+                    )
 
     def test_wayfinder_refuses_to_write_a_map_over_the_decision_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

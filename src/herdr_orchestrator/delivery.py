@@ -10,13 +10,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Protocol
 
 from herdr_orchestrator.catalog import (
     profile_for_harness,
     render_compact_catalog,
 )
 from herdr_orchestrator.delivery_completed_legacy import CompletedLegacyRecoveryMixin
+from herdr_orchestrator.delivery_dispatcher import (
+    DeliveryDispatcher,
+    HerdrDeliveryDispatcher,
+)
 from herdr_orchestrator.delivery_identity import (
     delivery_run_id,
     recoverable_delivery_identity,
@@ -83,7 +86,6 @@ from herdr_orchestrator.harness_health import (
     HarnessHealthError,
     HealthProbe,
 )
-from herdr_orchestrator.herdr import HerdrTransport
 from herdr_orchestrator.model import (
     AgentState,
     DispatchOutcome,
@@ -98,7 +100,7 @@ from herdr_orchestrator.planner import (
     load_worker_selection,
     worker_selection_prompt,
 )
-from herdr_orchestrator.protocol import Command, TransportError, run_json
+from herdr_orchestrator.protocol import TransportError
 from herdr_orchestrator.selection import (
     AUTO_CONTROLLER_ORDER,
     effective_worker_harnesses,
@@ -132,139 +134,6 @@ _delivery_run_claim = partial(exclusive_file_claim, error_type=DeliveryError)
 
 class DeliveryEscalation(DeliveryError):
     pass
-
-
-class DeliveryDispatcher(Protocol):
-    def dispatch(
-        self,
-        workspace: Path,
-        harness: Harness,
-        prompt: str,
-        *,
-        timeout_seconds: int,
-        agent_name: str,
-    ) -> DispatchOutcome: ...
-
-    def read_agent(self, workspace: Path, name: str, *, lines: int = 120) -> str: ...
-
-    def respond(
-        self,
-        workspace: Path,
-        name: str,
-        harness: Harness,
-        response: str,
-        *,
-        timeout_seconds: int,
-    ) -> DispatchOutcome: ...
-
-
-class HerdrDeliveryDispatcher:
-    def __init__(self, workflow: WorkflowConfig) -> None:
-        self.workflow = workflow
-        self._transports: dict[Path, HerdrTransport] = {}
-        self._lock = threading.Lock()
-
-    def dispatch(
-        self,
-        workspace: Path,
-        harness: Harness,
-        prompt: str,
-        *,
-        timeout_seconds: int,
-        agent_name: str,
-    ) -> DispatchOutcome:
-        return self._transport(workspace).dispatch(
-            harness,
-            prompt,
-            timeout_seconds=timeout_seconds,
-            agent_name=agent_name,
-        )
-
-    def read_agent(self, workspace: Path, name: str, *, lines: int = 120) -> str:
-        return self._transport(workspace).read_agent(name, lines=lines)
-
-    def respond(
-        self,
-        workspace: Path,
-        name: str,
-        harness: Harness,
-        response: str,
-        *,
-        timeout_seconds: int,
-    ) -> DispatchOutcome:
-        return self._transport(workspace).respond(
-            name,
-            harness,
-            response,
-            timeout_seconds=timeout_seconds,
-        )
-
-    def inspect_agent(
-        self,
-        workspace: Path,
-        name: str,
-        harness: Harness,
-    ) -> DispatchOutcome | None:
-        transport = self._transport(workspace)
-        try:
-            result = run_json(
-                transport.runner,
-                Command(
-                    ["herdr", "agent", "get", name],
-                    workspace,
-                    10,
-                ),
-            )
-        except TransportError as exc:
-            if exc.code == "agent_not_found":
-                return None
-            raise
-        agent = result.get("agent")
-        if not isinstance(agent, dict):
-            raise TransportError("herdr_invalid_response")
-        state_value = agent.get("agent_status")
-        pane_id = agent.get("pane_id")
-        workspace_id = agent.get("workspace_id")
-        if (
-            agent.get("name") not in {None, name}
-            or agent.get("agent") != harness.value
-            or not isinstance(state_value, str)
-            or not isinstance(pane_id, str)
-            or not pane_id
-            or not isinstance(agent.get("interactive_ready"), bool)
-            or not agent["interactive_ready"]
-            or any(
-                not isinstance(agent.get(key), str)
-                or Path(agent[key]).resolve() != workspace.resolve()
-                for key in ("cwd", "foreground_cwd")
-            )
-            or (
-                workspace_id is not None and (not isinstance(workspace_id, str) or not workspace_id)
-            )
-        ):
-            raise TransportError("agent_identity_mismatch")
-        try:
-            state = AgentState(state_value)
-        except ValueError as exc:
-            raise TransportError("herdr_invalid_response") from exc
-        return DispatchOutcome(
-            name,
-            state,
-            True,
-            pane_id,
-            execution_path=str(workspace.resolve()),
-            herdr_workspace_id=workspace_id,
-            agent_settled=state in {AgentState.IDLE, AgentState.DONE},
-        )
-
-    def _transport(self, workspace: Path) -> HerdrTransport:
-        resolved = workspace.resolve()
-        with self._lock:
-            transport = self._transports.get(resolved)
-            if transport is None:
-                transport = HerdrTransport(self.workflow.name, resolved)
-                self._transports[resolved] = transport
-            return transport
 
 
 class StandardizedDelivery(
@@ -947,23 +816,23 @@ class StandardizedDelivery(
             expected: dict[str, object] | None,
             started: bool,
         ) -> DeliveryEffectObservation:
-            inspection_supported = False
-            inspected: DispatchOutcome | None = None
+            inspection_failed = False
             if started or self._legacy_reconstruction_read_only:
                 try:
-                    inspection_supported, inspected = self._inspect_delivery_agent(
+                    _, inspected = self._inspect_delivery_agent(
                         workspace,
                         agent_name,
                         harness,
                     )
                 except TransportError:
-                    return _effect_conflict()
-                if _agent_is_active(inspected):
-                    return _effect_conflict()
+                    inspection_failed = True
+                else:
+                    if _agent_is_active(inspected):
+                        return _effect_conflict()
             if not output_file.is_file():
+                if inspection_failed:
+                    return _effect_conflict()
                 return _effect_absent()
-            if inspection_supported and inspected is None:
-                return _effect_conflict()
             invariant = {
                 "role": role,
                 "artifact": artifact,
