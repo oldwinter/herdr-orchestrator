@@ -19,7 +19,12 @@ from crash_matrix import CrashInjected, run_public_operation_crash_matrix
 import herdr_orchestrator.delivery_recovery as recovery_module
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.delivery import DeliveryError, StandardizedDelivery
-from herdr_orchestrator.delivery_journal import DeliveryJournal
+from herdr_orchestrator.delivery_journal import (
+    DeliveryEffect,
+    DeliveryEffectObservation,
+    DeliveryEffectState,
+    DeliveryJournal,
+)
 from herdr_orchestrator.delivery_protocol import DeliveryPlan, DeliveryTicket, TicketReceipt
 from herdr_orchestrator.delivery_recovery import DeliveryResult
 from herdr_orchestrator.git_workspace import Worktree
@@ -40,6 +45,9 @@ JournalPersist = Callable[
     None,
 ]
 OwnerProjectionWrite = Callable[[DeliveryJournal, str, float], None]
+
+class TrackerPublishInterrupted(BaseException):
+    pass
 
 
 def _interrupt_journal(
@@ -1190,6 +1198,131 @@ class DeliveryJournalTests(unittest.TestCase):
             self.assertEqual(first_tracker.publish_calls, 1)
             self.assertEqual(second_tracker.publish_calls, 0)
             self.assertTrue((run_root / "tracker-publication.json").is_file())
+
+    def test_tracker_publish_stage_crash_before_intent_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary).resolve() / "repository"
+            _initialize_repository(repository)
+            config = _workflow(repository)
+            config = replace(
+                config,
+                standardized_delivery=replace(
+                    config.standardized_delivery,
+                    tracker_backend=TrackerBackend.GITHUB,
+                    github_repository="owner/project",
+                ),
+            )
+            goal = repository / "goal.md"
+            goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+            external: dict[str, object] = {}
+            first_tracker = StableTracker(external)
+            first = StandardizedDelivery(
+                config,
+                dispatcher=PlanningThenStoppingDispatcher(),
+                tracker=first_tracker,
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+
+            original_reconcile = DeliveryJournal.reconcile
+
+            def crash_before_intent(
+                journal: DeliveryJournal,
+                effect: DeliveryEffect,
+            ) -> dict[str, object]:
+                if effect.key == "tracker:publish":
+                    raise TrackerPublishInterrupted()
+                return original_reconcile(journal, effect)
+
+            with (
+                patch.object(DeliveryJournal, "reconcile", crash_before_intent),
+                self.assertRaises(TrackerPublishInterrupted),
+            ):
+                first.run(goal)
+
+            run_root = next(config.standardized_delivery.artifact_root.iterdir())
+            state = json.loads((run_root / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["status"], "running")
+            self.assertEqual(state["stage"], "tracker-publish")
+            self.assertEqual(first_tracker.publish_calls, 0)
+
+            second_tracker = StableTracker(external)
+            second = StandardizedDelivery(
+                config,
+                dispatcher=PlanningThenStoppingDispatcher(),
+                tracker=second_tracker,
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            )
+            with self.assertRaisesRegex(RuntimeError, "stop after tracker recovery"):
+                second.run(goal)
+
+            self.assertEqual(second_tracker.publish_calls, 1)
+            self.assertTrue((run_root / "tracker-publication.json").is_file())
+
+    def test_cross_kind_effect_conflict_stays_loadable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve() / "delivery-run"
+            run_root.mkdir()
+            intent = {"markers": {"nonce": "a" * 32}}
+            confirmed = {"tickets": {"01": "https://tracker.example/tickets/01"}}
+
+            def matched(
+                expected: dict[str, object] | None,
+                started: bool,
+            ) -> DeliveryEffectObservation:
+                return DeliveryEffectObservation(
+                    DeliveryEffectState.MATCHED,
+                    dict(confirmed),
+                )
+
+            with DeliveryJournal.claim(
+                run_root,
+                "a" * 12,
+                5.0,
+                error_type=DeliveryError,
+            ) as journal:
+                journal.reconcile(
+                    DeliveryEffect(
+                        key="tracker:publish",
+                        kind="tracker.publish",
+                        intent=intent,
+                        observe=matched,
+                        apply=lambda: dict(confirmed),
+                    )
+                )
+                with self.assertRaisesRegex(
+                    DeliveryError,
+                    "delivery_recovery_conflict:result.publish",
+                ):
+                    journal.reconcile(
+                        DeliveryEffect(
+                            key="tracker:publish",
+                            kind="result.publish",
+                            intent=intent,
+                            observe=matched,
+                            apply=lambda: dict(confirmed),
+                        )
+                    )
+
+            reloaded = DeliveryJournal(
+                run_root,
+                "a" * 12,
+                "f" * 32,
+                5.0,
+                error_type=DeliveryError,
+            )
+            self.assertEqual(reloaded._intent_details("tracker:publish"), intent)
+            self.assertEqual(
+                reloaded.require_confirmed("tracker:publish"),
+                confirmed,
+            )
+            conflict_kinds = [
+                event.effect_kind
+                for event in reloaded._events
+                if event.event == "effect_conflict"
+            ]
+            self.assertEqual(conflict_kinds, ["result.publish"])
 
     def test_agent_artifact_recovery_does_not_repeat_the_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

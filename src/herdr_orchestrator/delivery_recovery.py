@@ -442,10 +442,6 @@ class DeliveryRecoveryMixin:
         if journal is None:
             payload = self._publish_tracker_effect(plan, None)
         else:
-            if self._tracker_publish_was_interrupted() and not journal.has_intent(
-                "tracker:publish"
-            ):
-                raise DeliveryError("delivery_tracker_publish_interrupted")
             recorded = journal._intent_details("tracker:publish")
             markers = (
                 tracker_markers(self._run_id, plan)
@@ -704,13 +700,6 @@ class DeliveryRecoveryMixin:
                 raise DeliveryError("delivery_tracker_publication_invalid")
             self.tracker.spec_url = spec_url
         return references
-
-    def _tracker_publish_was_interrupted(self) -> bool:
-        if self.config.standardized_delivery.tracker_backend.value != "github":
-            return False
-        return any(
-            self._previous_state.get(key) == "tracker-publish" for key in ("stage", "failed_stage")
-        )
 
     def _implement_plan(self, plan: DeliveryPlan) -> tuple[Worktree, int]:
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
