@@ -910,8 +910,8 @@ class AttemptLedger:
         if attempt is None:
             raise StoreError("current_attempt_missing")
         phase = AttemptPhase(str(attempt["phase"]))
-        if phase is AttemptPhase.ATTENTION:
-            raise StoreError("job_not_resumable")
+        # ATTENTION stays resumable: an explicit operator resume starts a fresh
+        # resume operation that abandons the ambiguous turn bookkeeping.
         pane_id = attempt["pane_id"]
         if not isinstance(attempt["agent_name"], str) or not attempt["agent_name"]:
             raise StoreError("blocked_agent_missing")

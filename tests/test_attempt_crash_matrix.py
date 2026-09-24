@@ -537,22 +537,13 @@ def test_resume_terminal_crash_matrix_restarts_and_converges(
         )
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 102.0)
-            if terminal_phase is AttemptPhase.ABANDONED:
-                report = restarted.resume_blocked(job_id, "Approved")
-                assert report["state"] == "succeeded"
-                assert restarted_dispatcher.response_count == 1
-            else:
-                with pytest.raises(StoreError, match="job_not_resumable"):
-                    restarted.resume_blocked(job_id, "Approved")
-                assert restarted_dispatcher.response_count == 0
+            report = restarted.resume_blocked(job_id, "Approved")
+            assert report["state"] == "succeeded"
+            assert restarted_dispatcher.response_count == 1
         job = restarted.store.jobs(config.name)[0]
 
-    assert job["state"] == ("succeeded" if terminal_phase is AttemptPhase.ABANDONED else "blocked")
-    assert job["attempt_phase"] == (
-        AttemptPhase.OUTCOME_COMMITTED.value
-        if terminal_phase is AttemptPhase.ABANDONED
-        else AttemptPhase.ATTENTION.value
-    )
+    assert job["state"] == "succeeded"
+    assert job["attempt_phase"] == AttemptPhase.OUTCOME_COMMITTED.value
 
 
 def test_run_once_crash_matrix_converges_with_one_prompt() -> None:

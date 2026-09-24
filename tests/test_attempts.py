@@ -469,6 +469,52 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
         self.assertEqual(job["state"], JobState.BLOCKED.value)
         self.assertEqual(job["error_code"], "agent_not_settled")
 
+    def test_attention_attempt_resumes_with_fresh_operation(self) -> None:
+        claimed = self._claimed("attention-resume")
+        self._advance(claimed, AttemptPhase.RECEIPT_OBSERVED)
+        self.store.record_outcome(
+            claimed,
+            _outcome(
+                claimed.agent_name,
+                AgentState.WORKING,
+                correlation_id=claimed.correlation_id,
+            ),
+        )
+        self.assertEqual(
+            self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ATTENTION
+        )
+
+        resumed, pane_id = self.store.claim_blocked_for_resume(
+            "attention-resume", claimed.job_id, lease_seconds=60
+        )
+
+        self.assertEqual(pane_id, "w1:p2")
+        self.assertFalse(resumed.recovery)
+        self.assertEqual(resumed.operation_sequence, 1)
+        self.assertEqual(resumed.phase, AttemptPhase.CLAIMED)
+        with self.assertRaisesRegex(StoreError, "job_resume_in_progress"):
+            self.store.claim_blocked_for_resume(
+                "attention-resume", claimed.job_id, lease_seconds=60
+            )
+
+        state = self.store.record_resume_outcome(
+            resumed,
+            _outcome(
+                resumed.agent_name,
+                AgentState.DONE,
+                agent_settled=True,
+                correlation_id=resumed.correlation_id,
+            ),
+        )
+
+        self.assertEqual(state, JobState.SUCCEEDED)
+        self.assertEqual(
+            self._job_row("attention-resume")["state"], JobState.SUCCEEDED.value
+        )
+        self.assertEqual(
+            self.store.attempt_phase(claimed.attempt_id), AttemptPhase.OUTCOME_COMMITTED
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

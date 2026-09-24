@@ -361,7 +361,7 @@ class StoreTests(unittest.TestCase):
             (AttemptPhase.ABANDONED.value, first.attempt_id, first.fencing_token),
         )
 
-    def test_unsafe_accepted_recovery_enters_non_resumable_attention(self) -> None:
+    def test_unsafe_accepted_recovery_enters_resumable_attention(self) -> None:
         with patch("herdr_orchestrator.store.time.time", return_value=100.0):
             job_id, _ = self.store.enqueue(_job("unsafe-recovery"))
             first = self.store.claim("example", limit=1, lease_seconds=60)[0]
@@ -419,8 +419,26 @@ class StoreTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(phase, AttemptPhase.ATTENTION.value)
         self.assertEqual(event, AttemptPhase.ATTENTION.value)
-        with self.assertRaisesRegex(StoreError, "job_not_resumable"):
-            self.store.claim_blocked_for_resume("example", job_id, lease_seconds=60)
+        resumed, _ = self.store.claim_blocked_for_resume(
+            "example", job_id, lease_seconds=60
+        )
+        self.assertFalse(resumed.recovery)
+        self.assertEqual(resumed.operation_sequence, 1)
+        state = self.store.record_resume_outcome(
+            resumed,
+            DispatchOutcome(
+                resumed.agent_name,
+                AgentState.DONE,
+                True,
+                "w1:p2",
+                agent_settled=True,
+                correlation_id=resumed.correlation_id,
+            ),
+        )
+        self.assertEqual(state, JobState.SUCCEEDED)
+        self.assertEqual(
+            self.store.jobs("example")[0]["state"], JobState.SUCCEEDED.value
+        )
         with patch("herdr_orchestrator.store.time.time", return_value=500.0):
             self.assertEqual(self.store.claim("example", limit=1, lease_seconds=60), [])
 
@@ -1906,6 +1924,86 @@ class StoreTests(unittest.TestCase):
                 connection.execute("SELECT version FROM schema_meta").fetchone()[0],
                 SCHEMA_VERSION,
             )
+
+    def test_enqueue_rejects_zero_attempt_budget(self) -> None:
+        with self.assertRaisesRegex(StoreError, "max_attempts_invalid"):
+            self.store.enqueue(_job("no-budget", max_attempts=0))
+        with self.assertRaisesRegex(StoreError, "max_attempts_invalid"):
+            self.store.enqueue(_job("negative-budget", max_attempts=-1))
+        self.assertEqual(self.store.jobs("example"), [])
+
+    def test_retry_failed_clears_stale_agent_and_attempt_projection(self) -> None:
+        job_id, _ = self.store.enqueue(_job("stale-agent", max_attempts=1))
+        failed = self.store.claim("example", limit=1, lease_seconds=60)[0]
+        self.store.record_outcome(
+            failed,
+            DispatchOutcome(
+                "worker",
+                AgentState.UNKNOWN,
+                False,
+                None,
+                "agent_provider_failed",
+            ),
+        )
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
+            before = connection.execute(
+                "SELECT agent_name, current_attempt_id FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        self.assertIsNotNone(before[0])
+        self.assertIsNotNone(before[1])
+
+        self.store.retry_failed("example", job_id, extra_attempts=1)
+
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
+            after = connection.execute(
+                "SELECT agent_name, current_attempt_id, state FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        self.assertIsNone(after[0])
+        self.assertIsNone(after[1])
+        self.assertEqual(after[2], JobState.PENDING.value)
+
+    def test_v9_migration_indexes_receipts_and_constrains_schema_meta(self) -> None:
+        path = Path(self.temporary.name) / "v9.db"
+        Store(path).initialize()
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute("DROP INDEX receipts_job_id")
+            connection.execute("ALTER TABLE schema_meta RENAME TO schema_meta_v9")
+            connection.execute("CREATE TABLE schema_meta (version INTEGER NOT NULL)")
+            connection.execute(
+                "INSERT INTO schema_meta(version) SELECT version FROM schema_meta_v9"
+            )
+            connection.execute("DROP TABLE schema_meta_v9")
+            connection.execute("UPDATE schema_meta SET version = 9")
+
+        store = Store(path)
+        store.initialize()
+        store.initialize()
+
+        with closing(sqlite3.connect(path)) as connection, connection:
+            version = connection.execute("SELECT version FROM schema_meta").fetchone()[0]
+            indexes = {
+                row[1] for row in connection.execute("PRAGMA index_list(receipts)")
+            }
+            meta_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(schema_meta)")
+            }
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("INSERT INTO schema_meta(id, version) VALUES (2, 10)")
+
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertIn("receipts_job_id", indexes)
+        self.assertEqual(meta_columns, {"id", "version"})
+
+    def test_operational_errors_surface_as_stable_store_error(self) -> None:
+        path = Path(self.temporary.name) / "locked.db"
+        store = Store(path)
+        store.initialize()
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute("PRAGMA query_only = ON")
+            with self.assertRaisesRegex(StoreError, "store_unavailable"):
+                store.set_metadata_float("blocked", 1.0)
 
 
 def _job(
