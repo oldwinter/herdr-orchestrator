@@ -58,7 +58,7 @@ from herdr_orchestrator.selection import (
     eligible_worker_harnesses,
     select_controller_harness,
 )
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import Store, StoreError
 from herdr_orchestrator.topology import (
     TopologyDecisionError,
     load_topology_decision,
@@ -282,7 +282,7 @@ class Coordinator:
             include_legacy=True,
             static_validator=self._static_harness_available if self.health is not None else None,
         )
-        results = {state.value: 0 for state in JobState}
+        results = {state.value: 0 for state in JobState} | {"stale": 0}
         if not jobs:
             return self._run_report(
                 results,
@@ -342,6 +342,11 @@ class Coordinator:
                     results[state.value] += 1
                 except OperationInterrupted:
                     raise
+                except StoreError as exc:
+                    if str(exc) == "job_lease_lost":
+                        results["stale"] += 1
+                    elif commit_error is None:
+                        commit_error = exc
                 except Exception as exc:
                     if commit_error is None:
                         commit_error = exc
@@ -358,7 +363,12 @@ class Coordinator:
         job: ClaimedJob,
         progress: AttemptProgress,
     ) -> None:
-        self.store.record_attempt_progress(job, progress)
+        try:
+            self.store.record_attempt_progress(job, progress)
+        except StoreError as exc:
+            if str(exc) != "job_lease_lost":
+                raise
+            return
         self._observe_transition(job, progress.phase)
 
     def _observe_transition(self, job: ClaimedJob, phase: AttemptPhase) -> None:
@@ -405,7 +415,7 @@ class Coordinator:
             raise ValueError("drain_timeout_must_be_positive")
         self.initialize()
         deadline = time.monotonic() + timeout_seconds
-        aggregate = {state.value: 0 for state in JobState}
+        aggregate = {state.value: 0 for state in JobState} | {"stale": 0}
         total_claimed = 0
         waves = 0
         workspace = self._workspace_key
@@ -446,6 +456,7 @@ class Coordinator:
             assert isinstance(batch, dict)
             for state in JobState:
                 aggregate[state.value] += _integer(batch[state.value])
+            aggregate["stale"] += _integer(batch["stale"])
             queue = report["queue"]
             assert isinstance(queue, dict)
             last_queue = {str(key): _integer(value) for key, value in queue.items()}
@@ -565,7 +576,43 @@ class Coordinator:
                 placement=job.placement,
                 correlation_id=job.correlation_id,
             )
-        state = self.store.record_resume_outcome(job, outcome)
+        try:
+            state = self.store.record_resume_outcome(job, outcome)
+        except StoreError as exc:
+            if str(exc) != "job_lease_lost":
+                raise
+            current = next(
+                (
+                    row
+                    for row in self.store.jobs(
+                        self.config.name,
+                        workspace=self._workspace_key,
+                        include_legacy=True,
+                    )
+                    if _integer(row["id"]) == job.job_id
+                ),
+                None,
+            )
+            return {
+                "job_id": job.job_id,
+                "state": (
+                    str(current["state"])
+                    if current is not None
+                    else JobState.BLOCKED.value
+                ),
+                "attempt": job.attempt,
+                "agent_name": job.agent_name,
+                "pane_id": expected_pane_id,
+                "agent_state": outcome.state.value,
+                "error_code": "job_lease_lost",
+                "agent_settled": outcome.agent_settled,
+                "task_verified": outcome.task_verified,
+                "queue": self.store.status_counts(
+                    self.config.name,
+                    workspace=self._workspace_key,
+                    include_legacy=True,
+                ),
+            }
         self._record_health(job.harness, outcome)
         self._observe_transition(job, self.store.attempt_phase(job.attempt_id))
         return {

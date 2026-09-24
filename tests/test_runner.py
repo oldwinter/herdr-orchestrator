@@ -1095,6 +1095,10 @@ class CoordinatorTests(unittest.TestCase):
                 )
 
             dispatcher.dispatch = dispatch
+
+            def record_attempt_progress(job, progress):
+                raise StoreError("job_lease_lost")
+
             with patch.object(
                 store,
                 "record_attempt_progress",
