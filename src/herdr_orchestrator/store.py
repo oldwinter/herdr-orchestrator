@@ -866,6 +866,18 @@ class Store:
         if not recorded:
             raise StoreError("job_lease_lost")
 
+    def renew_lease(self, job: ClaimedJob, *, lease_seconds: float) -> None:
+        """Extend the attempt lease for an in-flight dispatch."""
+        with self._transaction() as connection:
+            renewed = AttemptLedger.renew_lease(
+                connection,
+                job,
+                lease_seconds=lease_seconds,
+                now=time.time(),
+            )
+        if not renewed:
+            raise StoreError("job_lease_lost")
+
     def record_outcome(self, job: ClaimedJob, outcome: DispatchOutcome) -> JobState:
         with self._transaction() as connection:
             state, recorded = AttemptLedger.record_outcome(
@@ -1067,31 +1079,6 @@ class Store:
                 """,
                 (workflow, str(workspace), harness.value, observed_at),
             )
-
-    def acquire_harness_probe(
-        self,
-        *,
-        workflow: str,
-        workspace: str | Path,
-        harness: Harness,
-        owner: str,
-        now: float,
-        lease_seconds: float,
-        force: bool = False,
-    ) -> bool:
-        """Atomically reserve one readiness refresh without touching task leases."""
-        return (
-            self.acquire_harness_probe_lease(
-                workflow=workflow,
-                workspace=str(workspace),
-                harness=harness,
-                owner=owner,
-                now=now,
-                lease_seconds=lease_seconds,
-                force=force,
-            )
-            is not None
-        )
 
     def acquire_harness_probe_lease(
         self,

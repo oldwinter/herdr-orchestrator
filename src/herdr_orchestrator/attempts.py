@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from herdr_orchestrator.completion import (
@@ -29,6 +32,46 @@ from herdr_orchestrator.observability import sanitize
 
 class StoreError(RuntimeError):
     pass
+
+
+@contextmanager
+def lease_heartbeat(
+    renew: Callable[..., None],
+    job: ClaimedJob,
+    *,
+    lease_seconds: float,
+) -> Iterator[None]:
+    """Renew the attempt lease while a dispatch turn is in flight.
+
+    ``lease_until`` is fixed at claim time, so a dispatch lasting past
+    ``lease_seconds`` becomes reclaimable while the original worker still
+    drives the pane.  Renewal is fenced by the attempt's lease/operation
+    tokens, so a reclaimed attempt can never be revived by a stale owner.
+    """
+    stop = threading.Event()
+    interval = max(1.0, lease_seconds / 3)
+
+    def beat() -> None:
+        while not stop.wait(interval):
+            try:
+                renew(job, lease_seconds=lease_seconds)
+            except StoreError as exc:
+                if str(exc) == "job_lease_lost":
+                    return
+            except Exception:
+                return
+
+    thread = threading.Thread(
+        target=beat,
+        name=f"lease-heartbeat-{job.job_id}-{job.attempt}",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,6 +656,50 @@ class AttemptLedger:
                 job.job_id,
                 job.attempt_id,
             ),
+        )
+        return True
+
+    @staticmethod
+    def renew_lease(
+        connection: sqlite3.Connection,
+        job: ClaimedJob,
+        *,
+        lease_seconds: float,
+        now: float,
+    ) -> bool:
+        """Extend the live attempt lease while the owner is still dispatching.
+
+        Fencing tokens guard the update: a reclaimed attempt rotates
+        ``lease_owner``/``operation_token``, so a stale owner can never revive
+        it.  ``lease_until > now`` is intentionally not required — renewing an
+        expired-but-unreclaimed lease is exactly the recovery this provides.
+        """
+        lease_until = now + lease_seconds
+        cursor = connection.execute(
+            """
+            UPDATE job_attempts
+            SET lease_until = ?, updated_at = ?
+            WHERE id = ? AND job_id = ? AND fencing_token = ?
+              AND lease_owner = ? AND operation_token = ? AND lease_until IS NOT NULL
+            """,
+            (
+                lease_until,
+                now,
+                job.attempt_id,
+                job.job_id,
+                job.fencing_token,
+                job.lease_owner,
+                job.operation_token,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return False
+        connection.execute(
+            """
+            UPDATE jobs SET lease_until = ?, updated_at = ?
+            WHERE id = ? AND current_attempt_id = ?
+            """,
+            (lease_until, now, job.job_id, job.attempt_id),
         )
         return True
 

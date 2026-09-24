@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from herdr_orchestrator.attempts import lease_heartbeat
 from herdr_orchestrator.catalog import (
     execution_prompt,
     profile_for_harness,
@@ -312,31 +313,14 @@ class Coordinator:
                 except OperationInterrupted:
                     raise
                 except TransportError as exc:
-                    outcome = DispatchOutcome(
-                        agent_name=job.agent_name,
-                        state=(
-                            AgentState.BLOCKED
-                            if exc.code == "agent_blocked"
-                            else AgentState.UNKNOWN
-                        ),
-                        member_reused=False,
-                        pane_id=None,
-                        error_code=exc.code,
-                        placement=job.placement,
+                    outcome = _failure_outcome(
+                        job,
+                        exc.code,
                         error_summary=exc.summary,
                         agent_settled=exc.agent_settled,
-                        correlation_id=job.correlation_id,
                     )
                 except Exception:
-                    outcome = DispatchOutcome(
-                        agent_name=job.agent_name,
-                        state=AgentState.UNKNOWN,
-                        member_reused=False,
-                        pane_id=None,
-                        error_code="dispatcher_unhandled_error",
-                        placement=job.placement,
-                        correlation_id=job.correlation_id,
-                    )
+                    outcome = _failure_outcome(job, "dispatcher_unhandled_error")
                 try:
                     state = self.store.record_outcome(job, outcome)
                     self._record_health(job.harness, outcome)
@@ -536,48 +520,47 @@ class Coordinator:
             attempt_progress=lambda progress: self._record_attempt_progress(job, progress),
             completion_identity=_completion_identity(job),
         )
-        try:
-            if job.recovery:
-                outcome = self._recover_job(
+        with lease_heartbeat(
+            self.store.renew_lease,
+            job,
+            lease_seconds=float(self.config.coordinator.lease_seconds),
+        ):
+            try:
+                if job.recovery:
+                    outcome = self._recover_job(
+                        job,
+                        response,
+                        timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                        context=context,
+                    )
+                else:
+                    outcome = responder(
+                        job.agent_name,
+                        job.harness,
+                        response,
+                        timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                        expected_pane_id=expected_pane_id,
+                        context=context,
+                    )
+                outcome = replace(outcome, correlation_id=job.correlation_id)
+            except OperationInterrupted:
+                raise
+            except TransportError as exc:
+                outcome = _failure_outcome(
                     job,
-                    response,
-                    timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-                    context=context,
+                    exc.code,
+                    member_reused=True,
+                    pane_id=expected_pane_id,
+                    error_summary=exc.summary,
+                    agent_settled=exc.agent_settled,
                 )
-            else:
-                outcome = responder(
-                    job.agent_name,
-                    job.harness,
-                    response,
-                    timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-                    expected_pane_id=expected_pane_id,
-                    context=context,
+            except Exception:
+                outcome = _failure_outcome(
+                    job,
+                    "resume_unhandled_error",
+                    member_reused=True,
+                    pane_id=expected_pane_id,
                 )
-            outcome = replace(outcome, correlation_id=job.correlation_id)
-        except OperationInterrupted:
-            raise
-        except TransportError as exc:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
-                member_reused=True,
-                pane_id=expected_pane_id,
-                error_code=exc.code,
-                placement=job.placement,
-                error_summary=exc.summary,
-                agent_settled=exc.agent_settled,
-                correlation_id=job.correlation_id,
-            )
-        except Exception:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.UNKNOWN,
-                member_reused=True,
-                pane_id=expected_pane_id,
-                error_code="resume_unhandled_error",
-                placement=job.placement,
-                correlation_id=job.correlation_id,
-            )
         try:
             state = self.store.record_resume_outcome(job, outcome)
         except StoreError as exc:
@@ -944,42 +927,26 @@ class Coordinator:
                 "placement": job.placement.value,
             },
         )
-        try:
-            outcome = self._dispatch_job_turn(job, batch_key, dispatch_deadline)
-        except OperationInterrupted:
-            raise
-        except TransportError as exc:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
-                member_reused=False,
-                pane_id=None,
-                error_code=exc.code,
-                placement=job.placement,
-                error_summary=exc.summary,
-                agent_settled=exc.agent_settled,
-                correlation_id=job.correlation_id,
-            )
-        except _DispatchDeadlineExceeded:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.UNKNOWN,
-                member_reused=False,
-                pane_id=None,
-                error_code="herdr_timeout",
-                placement=job.placement,
-                correlation_id=job.correlation_id,
-            )
-        except Exception:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.UNKNOWN,
-                member_reused=False,
-                pane_id=None,
-                error_code="dispatcher_unhandled_error",
-                placement=job.placement,
-                correlation_id=job.correlation_id,
-            )
+        with lease_heartbeat(
+            self.store.renew_lease,
+            job,
+            lease_seconds=float(self.config.coordinator.lease_seconds),
+        ):
+            try:
+                outcome = self._dispatch_job_turn(job, batch_key, dispatch_deadline)
+            except OperationInterrupted:
+                raise
+            except TransportError as exc:
+                outcome = _failure_outcome(
+                    job,
+                    exc.code,
+                    error_summary=exc.summary,
+                    agent_settled=exc.agent_settled,
+                )
+            except _DispatchDeadlineExceeded:
+                outcome = _failure_outcome(job, "herdr_timeout")
+            except Exception:
+                outcome = _failure_outcome(job, "dispatcher_unhandled_error")
         duration = time.monotonic() - started
         fields = {
             "attempt": job.attempt,
@@ -1456,6 +1423,30 @@ def _completion_identity(job: ClaimedJob) -> CompletionIdentity | None:
     if job.completion_policy is not CompletionPolicy.STRUCTURED_V2:
         return None
     return CompletionIdentity(job.job_id, job.attempt, job.fencing_token)
+
+
+def _failure_outcome(
+    job: ClaimedJob,
+    error_code: str,
+    *,
+    member_reused: bool = False,
+    pane_id: str | None = None,
+    error_summary: str | None = None,
+    agent_settled: bool | None = None,
+) -> DispatchOutcome:
+    return DispatchOutcome(
+        agent_name=job.agent_name,
+        state=(
+            AgentState.BLOCKED if error_code == "agent_blocked" else AgentState.UNKNOWN
+        ),
+        member_reused=member_reused,
+        pane_id=pane_id,
+        error_code=error_code,
+        placement=job.placement,
+        error_summary=error_summary,
+        agent_settled=agent_settled,
+        correlation_id=job.correlation_id,
+    )
 
 
 def _controller_agent_name(

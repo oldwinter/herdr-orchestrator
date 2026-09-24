@@ -1145,6 +1145,45 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(job["state"], JobState.SUCCEEDED.value)
         self.assertEqual(job["attempt_phase"], AttemptPhase.OUTCOME_COMMITTED.value)
 
+    def test_dispatch_outliving_the_claim_lease_still_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(
+                base,
+                state_db=Path(temporary).resolve() / "state.db",
+                coordinator=replace(
+                    base.coordinator,
+                    lease_seconds=1,
+                    agent_timeout_seconds=5,
+                ),
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(_job(config.name, Harness.DROID))
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "droid-worker",
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                    )
+                },
+                delay_seconds=1.6,
+            )
+
+            result = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+            ).run_once()
+
+            job = store.jobs(config.name)[0]
+
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["stale"], 0)
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+
     def test_resume_blocked_reports_a_structured_failure_when_the_lease_is_lost(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
