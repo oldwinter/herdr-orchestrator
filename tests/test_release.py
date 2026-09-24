@@ -592,6 +592,40 @@ class QualityScriptTests(unittest.TestCase):
         self.assertIn("no:cacheprovider", command)
         self.assertEqual(payload["executions"][0]["error_code"], "report_missing")
 
+    def test_test_stability_baselines_on_first_valid_report(self) -> None:
+        reports = [
+            None,
+            {"tests": [{"nodeid": "test_a", "outcome": "passed"}]},
+            {"tests": [{"nodeid": "test_a", "outcome": "failed"}]},
+        ]
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            calls.append(command)
+            report = reports[len(calls) - 1]
+            if report is not None:
+                target = Path(command[-1].split("=", 1)[1])
+                target.write_text(json.dumps(report), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "stability.json"
+            with (
+                patch.object(test_stability.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["test_stability.py", "--runs", "3", "--output", str(output)],
+                ),
+            ):
+                status = test_stability.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["executions"][0]["error_code"], "report_missing")
+        self.assertEqual(payload["unstable"], ["test_a"])
+
 
 if __name__ == "__main__":
     unittest.main()
