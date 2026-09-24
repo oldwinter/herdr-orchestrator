@@ -1465,6 +1465,129 @@ class DeliveryJournalTests(unittest.TestCase):
                 ).run(goal)
             self.assertEqual(dispatcher.calls, 0)
 
+    def test_claim_preserves_owner_snapshot_when_lease_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            (run_root / "journal.jsonl").write_text(
+                json.dumps(
+                    {
+                        "sequence": 1,
+                        "run_id": "a" * 12,
+                        "owner_token": "1" * 32,
+                        "recorded_at": 50.0,
+                        "event": "owner_acquired",
+                        "operation_key": None,
+                        "effect_kind": None,
+                        "details": {
+                            "status": "active",
+                            "last_renewed_at": 50.0,
+                            "lease_deadline": 100.0,
+                        },
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            sentinel = b'{"status": "active", "sentinel": true}\n'
+            (run_root / "run-owner.json").write_bytes(sentinel)
+
+            with self.assertRaisesRegex(DeliveryError, "delivery_run_active"):
+                with DeliveryJournal.claim(
+                    run_root,
+                    "a" * 12,
+                    60,
+                    error_type=DeliveryError,
+                    clock=lambda: 60.0,
+                ):
+                    pass
+
+            self.assertEqual((run_root / "run-owner.json").read_bytes(), sentinel)
+
+    def test_release_failure_does_not_mask_the_primary_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            caught: RuntimeError | None = None
+
+            with patch.object(
+                DeliveryJournal,
+                "release",
+                side_effect=DeliveryError("delivery_owner_lost"),
+            ):
+                try:
+                    with DeliveryJournal.claim(
+                        run_root,
+                        "a" * 12,
+                        60,
+                        error_type=DeliveryError,
+                    ):
+                        raise RuntimeError("primary failure")
+                except RuntimeError as exc:
+                    caught = exc
+
+            self.assertIsNotNone(caught)
+            assert caught is not None
+            self.assertEqual(str(caught), "primary failure")
+            self.assertTrue(
+                any("delivery_owner_lost" in note for note in caught.__notes__),
+                caught.__notes__,
+            )
+
+    def test_oversized_journal_fails_with_stable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            with DeliveryJournal.claim(
+                run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ):
+                pass
+
+            with (
+                patch.object(DeliveryJournal, "_JOURNAL_MAX_BYTES", 16),
+                self.assertRaisesRegex(DeliveryError, "delivery_journal_too_large"),
+            ):
+                DeliveryJournal(
+                    run_root,
+                    "a" * 12,
+                    "f" * 32,
+                    60,
+                    error_type=DeliveryError,
+                )
+
+    def test_pending_effects_survive_journal_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            with DeliveryJournal.claim(
+                run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ) as journal:
+                journal.record_intent(
+                    DeliveryEffect(
+                        key="agent:artifact:plan",
+                        kind="agent.dispatch",
+                        intent={"role": "plan"},
+                        observe=lambda expected, started: DeliveryEffectObservation(
+                            DeliveryEffectState.ABSENT
+                        ),
+                        apply=lambda: {},
+                    )
+                )
+
+            with DeliveryJournal.claim(
+                run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ) as reloaded:
+                pending = reloaded.pending_effects()
+
+            self.assertEqual([effect.key for effect in pending], ["agent:artifact:plan"])
+            self.assertFalse(pending[0].started)
+
 
 def _workflow(repository: Path):
     config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")

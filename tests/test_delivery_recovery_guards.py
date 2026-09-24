@@ -202,7 +202,7 @@ class DeliveryRecoveryGuardTests(unittest.TestCase):
 
             with DeliveryJournal.claim(
                 run_root,
-                "run",
+                "a" * 12,
                 60,
                 error_type=DeliveryError,
             ) as journal:
@@ -255,7 +255,7 @@ class DeliveryRecoveryGuardTests(unittest.TestCase):
 
             with DeliveryJournal.claim(
                 run_root,
-                "run",
+                "a" * 12,
                 60,
                 error_type=DeliveryError,
             ) as journal:
@@ -317,7 +317,7 @@ class DeliveryRecoveryGuardTests(unittest.TestCase):
 
             with DeliveryJournal.claim(
                 run_root,
-                "run",
+                "a" * 12,
                 60,
                 error_type=DeliveryError,
             ) as journal:
@@ -492,8 +492,15 @@ class DeliveryRecoveryGuardTests(unittest.TestCase):
             delivery._goal = "Deliver a recoverable slice."
             map_path = run_root / "wayfinder-map.json"
 
-            with self.assertRaisesRegex(DeliveryError, "wayfinder_decision_limit"):
-                delivery._run_wayfinder()
+            with DeliveryJournal.claim(
+                run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ) as journal:
+                delivery._journal = journal
+                with self.assertRaisesRegex(DeliveryError, "wayfinder_decision_limit"):
+                    delivery._run_wayfinder()
 
             self.assertEqual(len(load_wayfinder_map(map_path).decisions), 100)
 

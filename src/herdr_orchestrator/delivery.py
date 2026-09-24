@@ -415,14 +415,13 @@ class StandardizedDelivery(
             reason = "configured_never"
         else:
             output = self._run_root / "wayfinder-route.json"
-            if self._journal is not None or not output.is_file():
-                self._dispatch_artifact(
-                    self.config.workspace,
-                    self.controller,
-                    wayfinder_route_prompt(self._goal, output),
-                    output,
-                    role="way-route",
-                )
+            self._dispatch_artifact(
+                self.config.workspace,
+                self.controller,
+                wayfinder_route_prompt(self._goal, output),
+                output,
+                role="way-route",
+            )
             route = load_wayfinder_route(output)
             use_wayfinder = route.use_wayfinder
             reason = route.reason
@@ -433,14 +432,13 @@ class StandardizedDelivery(
         if not use_wayfinder:
             return None
         map_path = self._run_root / "wayfinder-map.json"
-        if self._journal is not None or not map_path.is_file():
-            self._dispatch_artifact(
-                self.config.workspace,
-                self.controller,
-                wayfinder_chart_prompt(self._goal, map_path),
-                map_path,
-                role="way-chart",
-            )
+        self._dispatch_artifact(
+            self.config.workspace,
+            self.controller,
+            wayfinder_chart_prompt(self._goal, map_path),
+            map_path,
+            role="way-chart",
+        )
         map_ = load_wayfinder_map(map_path)
         iterations = 0
         while any(not ticket.resolution for ticket in map_.decisions):
@@ -503,14 +501,13 @@ class StandardizedDelivery(
 
     def _create_plan(self, wayfinder: WayfinderMap | None) -> DeliveryPlan:
         output = self._run_root / "delivery-plan.json"
-        if self._journal is not None or not output.is_file():
-            self._dispatch_artifact(
-                self.config.workspace,
-                self.controller,
-                plan_prompt(self._goal, output, wayfinder=wayfinder),
-                output,
-                role="plan",
-            )
+        self._dispatch_artifact(
+            self.config.workspace,
+            self.controller,
+            plan_prompt(self._goal, output, wayfinder=wayfinder),
+            output,
+            role="plan",
+        )
         plan = load_delivery_plan(output)
         if (
             self.config.standardized_delivery.tracker_backend.value == "github"
@@ -542,8 +539,7 @@ class StandardizedDelivery(
             integration,
         )
         _validate_worktree_clean(git, integration.path)
-        if self._journal is not None:
-            self._assert_integration_frontier(git, integration)
+        self._assert_integration_frontier(git, integration)
         head_before = git.validate_commit(integration)
         self._reconstruct_review_artifacts(
             plan,
@@ -678,22 +674,21 @@ class StandardizedDelivery(
             report, expected = observed()
         except (DeliveryArtifactError, GitWorkspaceError) as exc:
             raise DeliveryError("delivery_recovery_conflict:review.accept") from exc
-        journal = self._journal
-        if journal is not None:
-            payload = journal.reconcile(
-                DeliveryEffect(
-                    key=f"review:accept:{round_number}",
-                    kind="review.accept",
-                    intent={
-                        "round": round_number,
-                        "integration_commit": integration_commit,
-                    },
-                    observe=observe,
-                    apply=lambda: expected,
-                )
+        journal = self._require_journal()
+        payload = journal.reconcile(
+            DeliveryEffect(
+                key=f"review:accept:{round_number}",
+                kind="review.accept",
+                intent={
+                    "round": round_number,
+                    "integration_commit": integration_commit,
+                },
+                observe=observe,
+                apply=lambda: expected,
             )
-            if payload != expected:
-                raise DeliveryError("delivery_recovery_conflict:review.accept")
+        )
+        if payload != expected:
+            raise DeliveryError("delivery_recovery_conflict:review.accept")
         return report
 
     def _select_worker(self, title: str, prompt: str, dedupe_key: str) -> Harness:
@@ -717,19 +712,18 @@ class StandardizedDelivery(
         output = self._run_root / "routes" / f"{digest}.json"
         _safe_delivery_path(output, root=self._run_root)
         output.parent.mkdir(parents=True, exist_ok=True)
-        if self._journal is not None or not output.is_file():
-            self._dispatch_artifact(
-                self.config.workspace,
-                self.controller,
-                worker_selection_prompt(
-                    f"Title: {title}\n\nPrompt:\n{prompt}",
-                    output,
-                    render_compact_catalog(profiles),
-                    allowed_harnesses,
-                ),
+        self._dispatch_artifact(
+            self.config.workspace,
+            self.controller,
+            worker_selection_prompt(
+                f"Title: {title}\n\nPrompt:\n{prompt}",
                 output,
-                role=f"route-{digest[:5]}",
-            )
+                render_compact_catalog(profiles),
+                allowed_harnesses,
+            ),
+            output,
+            role=f"route-{digest[:5]}",
+        )
         try:
             selected = load_worker_selection(
                 output,
@@ -757,19 +751,7 @@ class StandardizedDelivery(
     ) -> None:
         _safe_delivery_path(output_file, root=self._run_root)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        journal = self._journal
-        if journal is None:
-            output_file.unlink(missing_ok=True)
-            self._run_artifact_dispatch(
-                workspace,
-                harness,
-                prompt,
-                output_file,
-                role=role,
-                use_principal_proxy=use_principal_proxy,
-                agent_name_override=agent_name_override,
-            )
-            return
+        journal = self._require_journal()
         normalized_role = re.sub(r"[^a-z0-9.-]+", "-", role.lower()).strip("-")
         operation_key = f"agent:artifact:{normalized_role}"
         artifact = str(output_file.relative_to(self._run_root))
@@ -1082,14 +1064,7 @@ class StandardizedDelivery(
                 )
             except HarnessHealthError as exc:
                 raise DeliveryError(str(exc)) from exc
-        if self._journal is None:
-            return self.dispatcher.respond(
-                workspace,
-                agent_name,
-                harness,
-                decision.response,
-                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-            )
+        journal = self._require_journal()
         result: DispatchOutcome | None = None
         workspace_key = (
             "source"
@@ -1152,7 +1127,7 @@ class StandardizedDelivery(
             observed = details(inspected)
             return _effect_matched(observed)
 
-        payload = self._journal.reconcile(
+        payload = journal.reconcile(
             DeliveryEffect(
                 key=f"agent:response:{agent_name}:{question_hash}:{proxy_round}",
                 kind="agent.respond",
@@ -1177,9 +1152,7 @@ class StandardizedDelivery(
         )
 
     def _recover_proxy_responses(self) -> None:
-        journal = self._journal
-        if journal is None:
-            return
+        journal = self._require_journal()
         for pending in journal.pending_effects(kind="agent.respond"):
             intent = pending.intent
             worker = intent.get("worker")

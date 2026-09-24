@@ -74,9 +74,20 @@ def _journal_payload(value: dict[str, object]) -> dict[str, object]:
     return payload
 
 
+_ARTIFACT_HASH_MAX_BYTES = 256 * 1024 * 1024
+
+
 def _file_sha256(path: Path) -> str:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        consumed = 0
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                consumed += len(chunk)
+                if consumed > _ARTIFACT_HASH_MAX_BYTES:
+                    raise DeliveryError("delivery_artifact_too_large")
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError as exc:
         raise DeliveryError("delivery_artifact_unreadable") from exc
 

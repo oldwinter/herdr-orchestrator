@@ -221,32 +221,14 @@ class DeliveryRepairMixin:
                 )
                 _require_success(outcome, f"repair_{selected_round}")
 
-            if self._journal is None:
-                outcome = self._dispatch_with_proxy(
-                    integration.path,
-                    harness,
-                    execution_prompt(
-                        profile,
-                        repair_prompt(plan, must_fix, repair_number),
-                    ),
-                    role=f"repair-{repair_number}",
-                )
-                _require_success(outcome, f"repair_{repair_number}")
-                _validate_worktree_ownership(
-                    git,
-                    self._run_root / "worktrees" / "integration",
-                    integration,
-                )
-                after = git.validate_commit(Worktree(integration.path, integration.branch, before))
-            else:
-                after = self._reconcile_repair_commit(
-                    git,
-                    integration,
-                    repair_number,
-                    before,
-                    dispatch=dispatch_repair,
-                    harness=harness,
-                )
+            after = self._reconcile_repair_commit(
+                git,
+                integration,
+                repair_number,
+                before,
+                dispatch=dispatch_repair,
+                harness=harness,
+            )
             self._complete_repair_attempt(repair_number, after)
             repair_attempts = repair_number
 
@@ -281,14 +263,13 @@ class DeliveryRepairMixin:
             raise DeliveryError("delivery_repair_state_invalid")
         current = git.head(integration)
         if current != before:
-            if self._journal is not None:
-                current = self._reconcile_repair_commit(
-                    git,
-                    integration,
-                    round_number,
-                    before,
-                    dispatch=None,
-                )
+            current = self._reconcile_repair_commit(
+                git,
+                integration,
+                round_number,
+                before,
+                dispatch=None,
+            )
             attempts = round_number
             self._record(
                 "review_repair_recovered",
