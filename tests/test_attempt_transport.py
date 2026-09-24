@@ -810,7 +810,7 @@ def test_settled_fatal_recovery_follows_store_retry_policy() -> None:
                     Harness.CODEX,
                     "must not be sent",
                     "recover-settled-fatal",
-                    2,
+                    3,
                 )
             )
             claimed = store.claim(

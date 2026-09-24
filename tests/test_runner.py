@@ -598,7 +598,7 @@ class CoordinatorTests(unittest.TestCase):
             job = store.jobs(config.name)[0]
 
         self.assertEqual(result["blocked"], 1)
-        self.assertEqual(job["attempts"], 1)
+        self.assertEqual(job["attempts"], 2)
         self.assertEqual(job["attempt_phase"], AttemptPhase.ATTENTION.value)
         self.assertEqual(job["error_code"], "unsafe_turn_adoption")
         self.assertEqual(len(dispatcher.recoveries), 1)
@@ -660,7 +660,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(len(dispatcher.recoveries), 1)
         self.assertEqual(
             attempt,
-            (1, AttemptPhase.ATTENTION.value, 10, None),
+            (2, AttemptPhase.ATTENTION.value, 10, None),
         )
 
     def test_planner_reservation_is_atomic_across_coordinators(self) -> None:

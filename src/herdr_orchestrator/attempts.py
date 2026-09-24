@@ -283,6 +283,8 @@ def _normalize(
             state = JobState.PENDING
         else:
             state = JobState.FAILED
+        if state is JobState.BLOCKED and error_code is None:
+            error_code = "agent_blocked"
         available_at = (
             now + min(60, 2 ** max(0, job.attempt - 1)) if state is JobState.PENDING else now
         )
@@ -458,14 +460,16 @@ class AttemptLedger:
         correlation = uuid.uuid4().hex
         attempt_cursor = connection.execute(
             """
-            UPDATE job_attempts SET lease_owner = ?, lease_until = ?, updated_at = ?
+            UPDATE job_attempts SET attempt = attempt + 1, lease_owner = ?, lease_until = ?,
+                updated_at = ?
             WHERE id = ? AND job_id = ? AND fencing_token = ? AND lease_until <= ?
             """,
             (owner, lease_until, now, attempt["id"], row["id"], attempt["fencing_token"], now),
         )
         job_cursor = connection.execute(
             """
-            UPDATE jobs SET lease_until = ?, correlation_id = ?, updated_at = ?
+            UPDATE jobs SET attempts = attempts + 1, lease_until = ?, correlation_id = ?,
+                updated_at = ?
             WHERE id = ? AND state = ? AND current_attempt_id = ? AND lease_until <= ?
             """,
             (
@@ -487,7 +491,7 @@ class AttemptLedger:
             Harness(str(row["harness"])),
             str(row["prompt"]),
             str(row["dedupe_key"]),
-            int(attempt["attempt"]),
+            int(attempt["attempt"]) + 1,
             int(row["max_attempts"]),
             str(attempt["agent_name"]),
             PlacementTarget(str(row["placement"])),

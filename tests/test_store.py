@@ -251,7 +251,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(phase, AttemptPhase.CLAIMED.value)
         self.assertIsNotNone(lease_until)
 
-    def test_expired_attempt_is_reacquired_before_retry_budget_is_consumed(self) -> None:
+    def test_expired_attempt_is_reacquired_and_consumes_retry_budget(self) -> None:
         with patch("herdr_orchestrator.store.time.time", return_value=100.0):
             self.store.enqueue(_job("recover-accepted"))
             first = self.store.claim("example", limit=1, lease_seconds=60)[0]
@@ -287,7 +287,7 @@ class StoreTests(unittest.TestCase):
 
         self.assertTrue(recovered.recovery)
         self.assertEqual(recovered.attempt_id, first.attempt_id)
-        self.assertEqual(recovered.attempt, first.attempt)
+        self.assertEqual(recovered.attempt, first.attempt + 1)
         self.assertEqual(recovered.fencing_token, first.fencing_token)
         self.assertEqual(recovered.operation_token, first.operation_token)
         self.assertNotEqual(recovered.lease_owner, first.lease_owner)
@@ -302,7 +302,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(recovered.runtime.prompt_baseline_sequence, 10)
         self.assertEqual(recovered.runtime.prompt_accepted_sequence, 11)
         self.assertEqual(recovered.runtime.state_change_sequence, 11)
-        self.assertEqual(self.store.jobs("example")[0]["attempts"], 1)
+        self.assertEqual(self.store.jobs("example")[0]["attempts"], 2)
         with closing(sqlite3.connect(self.store.path)) as connection, connection:
             attempt_count = connection.execute("SELECT COUNT(*) FROM job_attempts").fetchone()[0]
             self.assertEqual(attempt_count, 1)
@@ -328,12 +328,12 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(state, JobState.PENDING)
         self.assertEqual(recovered.attempt_id, first.attempt_id)
-        self.assertEqual(self.store.jobs("example")[0]["attempts"], 1)
+        self.assertEqual(self.store.jobs("example")[0]["attempts"], 2)
         with patch("herdr_orchestrator.store.time.time", return_value=163.0):
             replacement = self.store.claim("example", limit=1, lease_seconds=60)[0]
 
         self.assertFalse(replacement.recovery)
-        self.assertEqual(replacement.attempt, 2)
+        self.assertEqual(replacement.attempt, 3)
         self.assertNotEqual(replacement.attempt_id, first.attempt_id)
         self.assertNotEqual(replacement.fencing_token, first.fencing_token)
         with closing(sqlite3.connect(self.store.path)) as connection, connection:
@@ -543,6 +543,38 @@ class StoreTests(unittest.TestCase):
             [job.agent_name for job in claimed],
             ["ho-grok-01-slot", "ho-grok-02-slot"],
         )
+
+    def test_blocked_job_does_not_reserve_a_harness_slot(self) -> None:
+        self.store.enqueue(_job("blocked", Harness.GROK))
+        blocked = self.store.claim(
+            "example",
+            limit=1,
+            lease_seconds=60,
+            slot_names={"grok": ("ho-grok-01-slot", "ho-grok-02-slot")},
+        )[0]
+        self.store.record_outcome(
+            blocked,
+            DispatchOutcome(
+                blocked.agent_name,
+                AgentState.BLOCKED,
+                False,
+                "w1:p2",
+                "agent_blocked",
+            ),
+        )
+        self.store.enqueue(_job("pending", Harness.GROK))
+
+        claimed = self.store.claim(
+            "example",
+            limit=1,
+            lease_seconds=60,
+            slot_names={"grok": ("ho-grok-01-slot", "ho-grok-02-slot")},
+            slot_limits={"grok": 1},
+        )
+
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0].agent_name, "ho-grok-02-slot")
+        self.assertEqual(claimed[0].title, "pending")
 
     def test_claim_respects_runtime_worker_pool(self) -> None:
         self.store.enqueue(_job("codex", Harness.CODEX))
@@ -1243,7 +1275,7 @@ class StoreTests(unittest.TestCase):
             second = self.store.claim("example", limit=1, lease_seconds=30)[0]
 
         self.assertEqual(first.job_id, second.job_id)
-        self.assertEqual(second.attempt, 1)
+        self.assertEqual(second.attempt, 2)
         self.assertEqual(second.attempt_id, first.attempt_id)
         self.assertEqual(second.fencing_token, first.fencing_token)
         self.assertNotEqual(second.lease_owner, first.lease_owner)
@@ -1254,10 +1286,12 @@ class StoreTests(unittest.TestCase):
         baseline = time.time() + 1
         with patch("herdr_orchestrator.store.time.time", return_value=baseline):
             first = self.store.claim("example", limit=1, lease_seconds=30)[0]
+        with patch("herdr_orchestrator.store.time.time", return_value=baseline + 31):
+            reclaimed = self.store.claim("example", limit=1, lease_seconds=30)[0]
             self.store.record_outcome(
-                first,
+                reclaimed,
                 DispatchOutcome(
-                    first.agent_name,
+                    reclaimed.agent_name,
                     AgentState.UNKNOWN,
                     False,
                     "old-pane",
@@ -1272,7 +1306,9 @@ class StoreTests(unittest.TestCase):
         with patch("herdr_orchestrator.store.time.time", return_value=baseline + 120):
             second = self.store.claim("example", limit=1, lease_seconds=30)[0]
 
-        self.assertEqual(second.attempt, 2)
+        self.assertTrue(reclaimed.recovery)
+        self.assertEqual(reclaimed.attempt, 2)
+        self.assertEqual(second.attempt, 3)
         current = self.store.jobs("example")[0]
         self.assertEqual(current["state"], JobState.RUNNING.value)
         for field in (
@@ -1313,7 +1349,7 @@ class StoreTests(unittest.TestCase):
         with patch("herdr_orchestrator.store.time.time", return_value=baseline + 31):
             second = self.store.claim("example", limit=1, lease_seconds=30)[0]
 
-        self.assertEqual(second.attempt, 1)
+        self.assertEqual(second.attempt, 2)
         self.assertTrue(second.recovery)
         current = self.store.jobs("example")[0]
         self.assertEqual(current["error_code"], "stale-error")
@@ -1329,54 +1365,36 @@ class StoreTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(receipt_count, 0)
 
-    def test_exhausted_lease_records_failed_attempt_receipt(self) -> None:
+    def test_exhausted_lease_fails_without_reclaim(self) -> None:
         self.store.enqueue(_job("lease-exhausted", max_attempts=1))
         baseline = time.time() + 1
         with patch("herdr_orchestrator.store.time.time", return_value=baseline):
             first = self.store.claim("example", limit=1, lease_seconds=30)[0]
         with patch("herdr_orchestrator.store.time.time", return_value=baseline + 31):
-            recovered = self.store.claim("example", limit=1, lease_seconds=30)[0]
-            state = self.store.record_outcome(
-                recovered,
-                DispatchOutcome(
-                    recovered.agent_name,
-                    AgentState.UNKNOWN,
-                    True,
-                    None,
-                    "lease_expired_unaccepted",
-                    correlation_id=recovered.correlation_id,
-                ),
-            )
+            self.assertEqual(self.store.claim("example", limit=1, lease_seconds=30), [])
+            self.assertEqual(self.store.claim("example", limit=1, lease_seconds=30), [])
 
-        self.assertEqual(state, JobState.FAILED)
-        self.assertEqual(self.store.jobs("example")[0]["state"], JobState.FAILED.value)
+        job = self.store.jobs("example")[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "attempts_exhausted")
+        self.assertEqual(job["attempt_phase"], AttemptPhase.ABANDONED.value)
         with closing(sqlite3.connect(self.store.path)) as connection, connection:
-            receipt = connection.execute(
-                """
-                SELECT attempt, state, agent_name, agent_state, error_code,
-                       placement, correlation_id
-                FROM receipts WHERE job_id = ?
-                """,
-                (first.job_id,),
-            ).fetchone()
-        self.assertEqual(
-            receipt,
-            (
-                1,
-                JobState.FAILED.value,
-                first.agent_name,
-                AgentState.UNKNOWN.value,
-                "lease_expired_unaccepted",
-                PlacementTarget.TAB.value,
-                recovered.correlation_id,
-            ),
-        )
-        with closing(sqlite3.connect(self.store.path)) as connection, connection:
-            phase = connection.execute(
-                "SELECT phase FROM job_attempts WHERE id = ?",
+            attempt = connection.execute(
+                "SELECT phase, finished_at FROM job_attempts WHERE id = ?",
                 (first.attempt_id,),
+            ).fetchone()
+            lease_until = connection.execute(
+                "SELECT lease_until FROM jobs WHERE id = ?",
+                (first.job_id,),
             ).fetchone()[0]
-        self.assertEqual(phase, AttemptPhase.ABANDONED.value)
+            receipt_count = connection.execute(
+                "SELECT COUNT(*) FROM receipts WHERE job_id = ?",
+                (first.job_id,),
+            ).fetchone()[0]
+        self.assertEqual(attempt[0], AttemptPhase.ABANDONED.value)
+        self.assertIsNotNone(attempt[1])
+        self.assertIsNone(lease_until)
+        self.assertEqual(receipt_count, 0)
 
     def test_migrates_v1_jobs_and_receipts_to_current_schema(self) -> None:
         path = Path(self.temporary.name) / "v1.db"
@@ -1745,6 +1763,38 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(recovered.fencing_token, "dispatch-correlation")
         self.assertEqual(recovered.operation_sequence, 1)
         self.assertEqual(pane_id, "w1:p2")
+
+    def test_v4_migration_marks_multi_receipt_dispatch_as_dispatch_not_resume(self) -> None:
+        path = Path(self.temporary.name) / "v4-multi-receipt.db"
+        _create_schema_version(path, 4)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute("""
+                UPDATE jobs
+                SET state = 'succeeded', attempts = 1, lease_until = NULL,
+                    agent_name = 'legacy-worker', correlation_id = 'legacy-correlation',
+                    updated_at = 10
+                WHERE id = 1
+                """)
+            connection.execute("""
+                INSERT INTO receipts(
+                    job_id, attempt, state, agent_name, agent_state, member_reused,
+                    pane_id, error_code, placement, observed_at
+                ) VALUES (1, 1, 'succeeded', 'legacy-worker', 'done', 0,
+                          'v1:p1', NULL, 'tab', 9)
+                """)
+
+        Store(path).initialize()
+
+        with closing(sqlite3.connect(path)) as connection, connection:
+            attempt = connection.execute("""
+                SELECT operation_kind, operation_sequence, phase
+                FROM job_attempts WHERE job_id = 1 AND attempt = 1
+                """).fetchone()
+
+        self.assertEqual(
+            attempt,
+            ("dispatch", 1, AttemptPhase.OUTCOME_COMMITTED.value),
+        )
 
     def test_v1_v3_migration_separates_inflight_resume_from_dispatch_identity(self) -> None:
         for version in range(1, 4):

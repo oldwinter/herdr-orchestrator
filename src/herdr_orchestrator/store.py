@@ -643,7 +643,8 @@ class Store:
         include_legacy: bool = False,
     ) -> _SlotOccupancy:
         query = """
-            SELECT jobs.id, jobs.harness, jobs.agent_name, jobs.lease_until FROM jobs AS jobs
+            SELECT jobs.id, jobs.harness, jobs.agent_name, jobs.lease_until, jobs.state
+            FROM jobs AS jobs
             WHERE jobs.workflow = ? AND jobs.state IN (?, ?)
         """
         parameters: tuple[object, ...] = (workflow, JobState.RUNNING.value, JobState.BLOCKED.value)
@@ -657,7 +658,8 @@ class Store:
         slots = _SlotOccupancy(Counter(), Counter(), {})
         for row in rows:
             harness_value = str(row["harness"])
-            slots.reserved_counts[harness_value] += 1
+            if row["state"] == JobState.RUNNING.value:
+                slots.reserved_counts[harness_value] += 1
             if row["lease_until"] is not None and row["lease_until"] > now:
                 slots.active_counts[harness_value] += 1
             agent_name = row["agent_name"]
@@ -742,6 +744,41 @@ class Store:
             if not isinstance(persisted_name, str) or not persisted_name:
                 raise StoreError("attempt_agent_missing")
             if slots.owners.get(persisted_name) != {int(row["id"])}:
+                return None
+            if int(row["attempts"]) >= int(row["max_attempts"]):
+                connection.execute(
+                    """
+                    UPDATE jobs SET state = ?, error_code = ?, lease_until = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND state = ?
+                    """,
+                    (
+                        JobState.FAILED.value,
+                        "attempts_exhausted",
+                        now,
+                        row["id"],
+                        JobState.RUNNING.value,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE job_attempts SET phase = ?, finished_at = ?, updated_at = ?
+                    WHERE id = ? AND job_id = ?
+                    """,
+                    (
+                        AttemptPhase.ABANDONED.value,
+                        now,
+                        now,
+                        row["current_attempt_id"],
+                        row["id"],
+                    ),
+                )
+                slots.reserved_counts[harness_value] -= 1
+                owners = slots.owners.get(persisted_name)
+                if owners is not None:
+                    owners.discard(int(row["id"]))
+                    if not owners:
+                        del slots.owners[persisted_name]
                 return None
             recovered = AttemptLedger.reclaim(
                 connection,
