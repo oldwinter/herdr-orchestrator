@@ -5,7 +5,7 @@ import json
 import re
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from functools import partial
@@ -153,6 +153,7 @@ class StandardizedDelivery(
         lease_seconds: float | None = None,
         health: HarnessHealth | None = None,
         readiness_probe: HealthProbe | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
         self.dispatcher = dispatcher or HerdrDeliveryDispatcher(config)
@@ -195,6 +196,7 @@ class StandardizedDelivery(
         if lease_seconds is not None and (not _finite_number(lease_seconds) or lease_seconds <= 0):
             raise DeliveryError("delivery_lease_seconds_invalid")
         self._lease_seconds = lease_seconds
+        self._clock = clock
 
     def run(self, goal_file: Path) -> DeliveryResult:
         goal_path = _safe_delivery_path(goal_file)
@@ -243,6 +245,7 @@ class StandardizedDelivery(
             lease_seconds,
             error_type=DeliveryError,
             payload_validator=_journal_payload,
+            clock=self._clock,
         ) as journal:
             self._journal = journal
             try:

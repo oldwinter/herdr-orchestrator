@@ -7,7 +7,6 @@ import re
 import subprocess
 import tempfile
 import threading
-import time
 import unittest
 from collections.abc import Callable
 from dataclasses import replace
@@ -1000,12 +999,12 @@ class DeliveryJournalTests(unittest.TestCase):
                 controller_harness=Harness.DROID,
                 worker_harnesses=(Harness.DROID,),
                 lease_seconds=0.75,
+                clock=lambda: crashed_owner["lease_deadline"] - 0.05,
             )
             with self.assertRaisesRegex(DeliveryError, "delivery_run_active"):
                 unexpired.run(goal)
             self.assertEqual(unexpired_dispatcher.calls, 0)
 
-            time.sleep(max(0.0, crashed_owner["lease_deadline"] - time.time()) + 0.05)
             recovered_dispatcher = StoppingDispatcher()
             recovered = StandardizedDelivery(
                 config,
@@ -1014,6 +1013,7 @@ class DeliveryJournalTests(unittest.TestCase):
                 controller_harness=Harness.DROID,
                 worker_harnesses=(Harness.DROID,),
                 lease_seconds=0.75,
+                clock=lambda: crashed_owner["lease_deadline"] + 0.05,
             )
             with self.assertRaisesRegex(RuntimeError, "stop recovered delivery"):
                 recovered.run(goal)
