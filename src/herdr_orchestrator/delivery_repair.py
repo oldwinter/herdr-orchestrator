@@ -31,6 +31,7 @@ from herdr_orchestrator.delivery_protocol import (
 )
 from herdr_orchestrator.delivery_support import (
     DeliveryError,
+    _agent_is_active,
     _effect_absent,
     _effect_conflict,
     _effect_matched,
@@ -49,6 +50,7 @@ from herdr_orchestrator.model import (
     HarnessProfile,
     WorkflowConfig,
 )
+from herdr_orchestrator.protocol import TransportError
 
 
 class _Record(Protocol):
@@ -131,6 +133,11 @@ class DeliveryRepairMixin:
     _preflight_legacy_agent: Callable[[Path, Harness, str], None]
     _require_journal: Callable[[], DeliveryJournal]
     _is_legacy_migration: Callable[[], bool]
+    _inspect_delivery_agent: Callable[
+        [Path, str, Harness],
+        tuple[bool, DispatchOutcome | None],
+    ]
+    _delivery_agent_name: Callable[[Path, Harness, str], str]
 
     def _review_and_repair(self, plan: DeliveryPlan, integration: Worktree) -> int:
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
@@ -238,6 +245,7 @@ class DeliveryRepairMixin:
                     repair_number,
                     before,
                     dispatch=dispatch_repair,
+                    harness=harness,
                 )
             self._complete_repair_attempt(repair_number, after)
             repair_attempts = repair_number
@@ -300,6 +308,7 @@ class DeliveryRepairMixin:
         before: str,
         *,
         dispatch: Callable[[], None] | None,
+        harness: Harness | None = None,
     ) -> str:
         journal = self._require_journal()
         receipt_file = self._repair_receipt_path(round_number)
@@ -353,6 +362,21 @@ class DeliveryRepairMixin:
             if current == before:
                 if receipt_file.exists() or started:
                     return _effect_conflict()
+                if harness is not None:
+                    try:
+                        _, inspected = self._inspect_delivery_agent(
+                            integration.path,
+                            self._delivery_agent_name(
+                                integration.path,
+                                harness,
+                                f"repair-{round_number}",
+                            ),
+                            harness,
+                        )
+                    except TransportError:
+                        return _effect_conflict()
+                    if _agent_is_active(inspected):
+                        return _effect_conflict()
                 return _effect_absent()
             try:
                 return _effect_matched(repair_details())

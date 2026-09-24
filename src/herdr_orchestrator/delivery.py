@@ -44,6 +44,7 @@ from herdr_orchestrator.delivery_protocol import (
     ProxyDecision,
     ReviewReport,
     WayfinderMap,
+    WAYFINDER_MAP_MAX_DECISIONS,
     append_artifact_text,
     exclusive_file_claim,
     load_delivery_plan,
@@ -115,6 +116,12 @@ MAX_PROXY_ROUNDS = 8
 ARTIFACT_PROMPT_ATTEMPTS = 2
 DELIVERY_LEASE_GRACE_SECONDS = 30.0
 MINIMUM_DELIVERY_LEASE_SECONDS = 60.0
+_STATE_DETAIL_KEYS = {
+    "running": {"controller"},
+    "succeeded": {"controller", "integration_branch", "integration_commit"},
+    "failed": {"controller", "error", "failed_stage"},
+    "blocked": {"controller", "error", "failed_stage"},
+}
 SENSITIVE_QUESTION = re.compile(
     r"(?i)\b(api[ _-]?key|credential|password|secret|token|production|prod)\b"
 )
@@ -602,6 +609,8 @@ class StandardizedDelivery(
                 )
                 + resolution.new_decisions
             )
+            if len(decisions) > WAYFINDER_MAP_MAX_DECISIONS:
+                raise DeliveryError("wayfinder_decision_limit")
             map_ = WayfinderMap(
                 destination=map_.destination,
                 notes=map_.notes,
@@ -1262,7 +1271,9 @@ class StandardizedDelivery(
             except TransportError:
                 return _effect_conflict()
             if not supported:
-                return _effect_absent() if expected is None else _effect_matched(expected)
+                if expected is not None:
+                    return _effect_matched(expected)
+                return _effect_conflict() if started else _effect_absent()
             if inspected is None:
                 return _effect_conflict()
             if inspected.state is AgentState.BLOCKED:
@@ -1448,6 +1459,8 @@ class StandardizedDelivery(
         state = journal.latest_stage_state() or {}
         if not state and isinstance(self._previous_state.get("controller"), str):
             state["controller"] = self._previous_state["controller"]
+        allowed = _STATE_DETAIL_KEYS.get(status, set())
+        state = {key: value for key, value in state.items() if key in allowed}
         state.update({"status": status, "stage": stage, **details})
         journal.record_stage(state)
         _write_json(self._run_root / "state.json", state)

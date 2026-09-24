@@ -9,11 +9,13 @@ from herdr_orchestrator.delivery_protocol import (
     AuthorityCategory,
     DeliveryArtifactError,
     DeliveryTicket,
+    MAX_ARTIFACT_BYTES,
     ProxyAction,
     load_delivery_plan,
     load_proxy_decision,
     load_review_verdict,
     load_ticket_receipt,
+    read_artifact_text,
 )
 
 
@@ -206,6 +208,14 @@ class DeliveryProtocolTests(unittest.TestCase):
                 "ticket_receipt_missing",
             ):
                 load_ticket_receipt(path, ticket)
+
+    def test_oversized_artifact_is_rejected_before_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "verdict.json"
+            with path.open("wb") as stream:
+                stream.truncate(MAX_ARTIFACT_BYTES + 1)
+            with self.assertRaisesRegex(DeliveryArtifactError, "verdict_too_large"):
+                read_artifact_text(path, "verdict")
 
 
 def _plan() -> dict[str, object]:

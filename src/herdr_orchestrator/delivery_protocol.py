@@ -18,6 +18,9 @@ SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 TICKET_ID = re.compile(r"\d{2,3}\Z")
 COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
+MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+WAYFINDER_MAP_MAX_DECISIONS = 100
+
 
 class DeliveryArtifactError(ValueError):
     pass
@@ -72,8 +75,11 @@ def read_artifact_text(path: Path, artifact: str, *, root: Path | None = None) -
     except OSError as exc:
         raise DeliveryArtifactError(f"{artifact}_unreadable") from exc
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
             raise DeliveryArtifactError(f"{artifact}_unreadable")
+        if status.st_size > MAX_ARTIFACT_BYTES:
+            raise DeliveryArtifactError(f"{artifact}_too_large")
         with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
             descriptor = -1
             return stream.read()
@@ -413,7 +419,12 @@ def load_wayfinder_map(path: Path) -> WayfinderMap:
         },
         "wayfinder_map",
     )
-    rows = _object_list(payload, "decisions", 100, "wayfinder_map")
+    rows = _object_list(
+        payload,
+        "decisions",
+        WAYFINDER_MAP_MAX_DECISIONS,
+        "wayfinder_map",
+    )
     decisions: list[DecisionTicket] = []
     seen: set[str] = set()
     for row in rows:
