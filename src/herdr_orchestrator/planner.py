@@ -101,8 +101,14 @@ def load_planner_tasks(
     path: Path,
     *,
     max_tasks: int,
+    allowed_harnesses: Iterable[Harness] | None = None,
 ) -> tuple[PlannerTask, ...]:
     _validate_max_tasks(max_tasks)
+    allowed = (
+        None
+        if allowed_harnesses is None
+        else _normalize_allowed_harnesses(allowed_harnesses, "planner")
+    )
     payload = _load_json(
         path,
         artifact="planner_output",
@@ -130,6 +136,8 @@ def load_planner_tasks(
             harness = Harness(harness_value)
         except ValueError as exc:
             raise PlannerOutputError("planner_harness_unsupported") from exc
+        if allowed is not None and harness not in allowed:
+            raise PlannerOutputError("planner_harness_not_allowed")
         tasks.append(PlannerTask(title, harness, prompt, dedupe_key))
         dedupe_keys.add(dedupe_key)
     return tuple(tasks)

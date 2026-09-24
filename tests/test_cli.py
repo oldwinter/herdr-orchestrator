@@ -774,6 +774,33 @@ class CliCommandDispatchTests(unittest.TestCase):
             self.assertEqual(cli_module._command_run(self.config, args), 0)
         coordinator.enqueue_prompt_file.assert_called_once()
 
+    def test_enqueue_rejects_invalid_inputs_with_stable_error_code(self) -> None:
+        cases = (
+            (["--dedupe-key", "a b!"], "dedupe_key_invalid"),
+            (["--title", "t" * 201], "title_invalid"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            prompt_file = Path(temporary) / "task.md"
+            prompt_file.write_text("Inspect the repository.", encoding="utf-8")
+            for overrides, error_code in cases:
+                argv = [
+                    "enqueue",
+                    "--workflow",
+                    str(REPO_ROOT / "workflows/multi-harness.toml"),
+                    "--title",
+                    "Inspect",
+                    "--prompt-file",
+                    str(prompt_file),
+                    "--dedupe-key",
+                    "inspect-v1",
+                ]
+                for index in range(0, len(overrides), 2):
+                    argv[argv.index(overrides[index]) + 1] = overrides[index + 1]
+                stderr = io.StringIO()
+                with self.subTest(error_code=error_code), redirect_stderr(stderr):
+                    self.assertEqual(cli_module.main(argv), 2)
+                self.assertIn(error_code, stderr.getvalue())
+
     def test_run_rejects_unbounded_drain(self) -> None:
         args = Namespace(
             controller_harness=None,

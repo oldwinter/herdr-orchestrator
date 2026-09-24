@@ -87,6 +87,48 @@ class PlannerTests(unittest.TestCase):
                     allowed_harnesses=(Harness.GROK, Harness.CODEX),
                 )
 
+    def test_rejects_task_harness_outside_allowed_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "plan.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "title": "Review config",
+                                "harness": "claude",
+                                "prompt": "Read only.",
+                                "dedupe_key": "review-config-v1",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(PlannerOutputError, "planner_harness_not_allowed"):
+                load_planner_tasks(
+                    path,
+                    max_tasks=10,
+                    allowed_harnesses=(Harness.GROK, Harness.CODEX),
+                )
+
+            tasks = load_planner_tasks(
+                path,
+                max_tasks=10,
+                allowed_harnesses=(Harness.CLAUDE,),
+            )
+
+        self.assertEqual(tasks[0].harness, Harness.CLAUDE)
+
+    def test_rejects_invalid_allowed_harness_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "plan.json"
+            path.write_text('{"tasks": []}', encoding="utf-8")
+
+            with self.assertRaisesRegex(PlannerOutputError, "planner_harnesses_invalid"):
+                load_planner_tasks(path, max_tasks=10, allowed_harnesses=())
+
     def test_rejects_shell_command_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary).resolve() / "plan.json"

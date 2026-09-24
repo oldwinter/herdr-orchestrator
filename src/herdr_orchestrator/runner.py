@@ -18,6 +18,7 @@ from herdr_orchestrator.completion import (
     CompletionPolicy,
     structured_completion_prompt,
 )
+from herdr_orchestrator.config import DEDUPE_KEY
 from herdr_orchestrator.harness_health import (
     HarnessHealth,
     HealthProbe,
@@ -177,12 +178,18 @@ class Coordinator:
         receipt: TaskReceipt | None = None,
         completion_policy: CompletionPolicy | None = None,
     ) -> tuple[int, bool, Harness]:
+        if not isinstance(dedupe_key, str) or not DEDUPE_KEY.fullmatch(dedupe_key):
+            raise ValueError("dedupe_key_invalid")
+        if not isinstance(title, str) or not title.strip() or len(title) > 200:
+            raise ValueError("title_invalid")
         self.initialize()
         if not prompt_file.is_file():
             raise ValueError(f"prompt_file_not_found: {prompt_file}")
         prompt = prompt_file.read_text(encoding="utf-8").strip()
         if not prompt:
             raise ValueError("prompt_file_empty")
+        if len(prompt) > 50_000:
+            raise ValueError("prompt_too_large")
         existing = self.store.existing_job_for_enqueue(
             self.config.name,
             dedupe_key,
@@ -1313,11 +1320,17 @@ class Coordinator:
         if _controller_turn_failed(outcome) is not None:
             return
         try:
-            tasks = load_planner_tasks(planner.output_file, max_tasks=planner.max_tasks)
-        except PlannerOutputError:
-            return
-        allowed_set = set(allowed_harnesses)
-        if any(task.harness not in allowed_set for task in tasks):
+            tasks = load_planner_tasks(
+                planner.output_file,
+                max_tasks=planner.max_tasks,
+                allowed_harnesses=allowed_harnesses,
+            )
+        except PlannerOutputError as exc:
+            self.observability.event(
+                "planner_output_rejected",
+                correlation_id="",
+                fields={"reason": str(exc)},
+            )
             return
         for task in tasks:
             self.store.enqueue(

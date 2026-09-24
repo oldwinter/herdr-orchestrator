@@ -101,8 +101,9 @@ class FakeDispatcher:
 
 
 class PlannerDispatcher:
-    def __init__(self, output_file: Path) -> None:
+    def __init__(self, output_file: Path, payload: str = '{"tasks": []}') -> None:
         self.output_file = output_file
+        self.payload = payload
         self.calls: list[Harness] = []
         self._lock = threading.Lock()
 
@@ -119,7 +120,7 @@ class PlannerDispatcher:
         with self._lock:
             self.calls.append(harness)
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
-        self.output_file.write_text('{"tasks": []}', encoding="utf-8")
+        self.output_file.write_text(self.payload, encoding="utf-8")
         return DispatchOutcome("planner", AgentState.DONE, False, "w1:p1")
 
 
@@ -712,6 +713,96 @@ class CoordinatorTests(unittest.TestCase):
                     future.result()
 
         self.assertEqual(dispatcher.calls, [Harness.DROID])
+
+    def test_planner_output_outside_allowed_pool_is_rejected_and_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            planner_prompt_file = root / "planner.md"
+            planner_prompt_file.write_text("Plan one task.", encoding="utf-8")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(
+                    base.planner,
+                    enabled=True,
+                    interval_seconds=60,
+                    prompt_file=planner_prompt_file,
+                    output_file=root / "plans/planner.json",
+                ),
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            dispatcher = PlannerDispatcher(
+                config.planner.output_file,
+                payload=json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "title": "Rogue task",
+                                "harness": "droid",
+                                "prompt": "Do work.",
+                                "dedupe_key": "rogue-v1",
+                            }
+                        ]
+                    }
+                ),
+            )
+            coordinator = Coordinator(
+                config,
+                store=store,
+                dispatcher=dispatcher,
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.CODEX,),
+            )
+
+            coordinator._run_planner_if_due()
+
+            jobs = store.jobs(config.name)
+            events = (root / "telemetry" / "events.jsonl").read_text(encoding="utf-8")
+
+        self.assertEqual(jobs, [])
+        self.assertEqual(dispatcher.calls, [Harness.DROID])
+        self.assertIn("planner_output_rejected", events)
+        self.assertIn("planner_harness_not_allowed", events)
+
+    def test_enqueue_prompt_file_rejects_invalid_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=root / "state.db",
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text("Inspect the repository.", encoding="utf-8")
+            oversized_prompt = root / "oversized.md"
+            oversized_prompt.write_text("x" * 50_001, encoding="utf-8")
+            coordinator = Coordinator(config, dispatcher=FakeDispatcher({}))
+
+            with self.assertRaisesRegex(ValueError, "dedupe_key_invalid"):
+                coordinator.enqueue_prompt_file(
+                    harness=Harness.PI,
+                    title="Inspect",
+                    prompt_file=prompt_file,
+                    dedupe_key="a b!",
+                )
+            self.assertFalse(config.state_db.exists())
+
+            with self.assertRaisesRegex(ValueError, "title_invalid"):
+                coordinator.enqueue_prompt_file(
+                    harness=Harness.PI,
+                    title="t" * 201,
+                    prompt_file=prompt_file,
+                    dedupe_key="long-title",
+                )
+
+            with self.assertRaisesRegex(ValueError, "prompt_too_large"):
+                coordinator.enqueue_prompt_file(
+                    harness=Harness.PI,
+                    title="Oversized",
+                    prompt_file=oversized_prompt,
+                    dedupe_key="oversized-prompt",
+                )
 
     def test_run_until_idle_reports_blocked_instead_of_idle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
