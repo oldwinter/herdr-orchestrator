@@ -945,6 +945,13 @@ h2 {
   min-height: 100px;
 }
 
+.overflow-note {
+  padding: var(--space-2) var(--space-3);
+  color: var(--muted);
+  font: 500 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: center;
+}
+
 .error-state {
   color: var(--muted-strong);
 }

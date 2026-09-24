@@ -2114,6 +2114,44 @@ class DashboardTests(unittest.TestCase):
             "a valid scroll-owned column must win over stale navigation focus",
         )
 
+    def test_kanban_and_timeline_rendering_stay_bounded_with_overflow_notes(self) -> None:
+        static = REPO_ROOT / "src/herdr_orchestrator/dashboard/static"
+        dashboard_script = (static / "dashboard.js").read_text()
+        dashboard_css = (static / "dashboard.css").read_text()
+
+        render = dashboard_script[
+            dashboard_script.index("function renderKanban") : dashboard_script.index(
+                "function kanbanCardMotion"
+            )
+        ]
+        self.assertIn("const KANBAN_COLUMN_CARD_LIMIT = 200;", dashboard_script)
+        self.assertIn("selected.slice(0, KANBAN_COLUMN_CARD_LIMIT)", render)
+        self.assertIn(
+            "overflowNote(selected.length - KANBAN_COLUMN_CARD_LIMIT)",
+            render,
+        )
+
+        timeline = dashboard_script[
+            dashboard_script.index("function renderTimeline") : dashboard_script.index(
+                "function timelineVisualId"
+            )
+        ]
+        self.assertIn("events.slice(0, 24)", timeline)
+        self.assertIn(
+            "overflowNote(events.length - visible.length)",
+            timeline,
+        )
+        self.assertIn("events.length, ...nextVisuals", timeline)
+
+        note = dashboard_script[
+            dashboard_script.index("function overflowNote") : dashboard_script.index(
+                "function kanbanColumnId"
+            )
+        ]
+        self.assertIn('class="overflow-note"', note)
+        self.assertIn("hidden > 0", note)
+        self.assertIn(".overflow-note {", dashboard_css)
+
 
 def _job_row(
     job_id: int,
