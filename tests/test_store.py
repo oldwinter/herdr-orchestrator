@@ -1999,11 +1999,14 @@ class StoreTests(unittest.TestCase):
     def test_operational_errors_surface_as_stable_store_error(self) -> None:
         path = Path(self.temporary.name) / "locked.db"
         store = Store(path)
-        store.initialize()
-        with closing(sqlite3.connect(path)) as connection, connection:
-            connection.execute("PRAGMA query_only = ON")
-            with self.assertRaisesRegex(StoreError, "store_unavailable"):
-                store.set_metadata_float("blocked", 1.0)
+        with (
+            patch(
+                "herdr_orchestrator.store.sqlite3.connect",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+            self.assertRaisesRegex(StoreError, "store_unavailable: database is locked"),
+        ):
+            store.initialize()
 
 
 def _job(

@@ -25,24 +25,60 @@ PRIMARY KEY(workflow, workspace, harness)
 """
 
 
+def _legacy_health_expression(columns: set[str], column: str) -> str:
+    """Map one v9 column onto the legacy schema, tolerating absent columns."""
+    if column == "reason":
+        status = "status" if "status" in columns else "''"
+        reason = "reason_code" if "reason_code" in columns else "NULL"
+        return (
+            f"COALESCE({reason}, CASE WHEN {status} = 'ready'"
+            " THEN 'readiness_ready' ELSE 'health_unknown' END)"
+        )
+    source = {"retryable_failures": "consecutive_failures", "probe_owner": "probe_lease_token"}
+    if column in columns:
+        return column
+    if source.get(column, column) in columns:
+        return source.get(column, column)
+    defaults = {
+        "status": "'unknown'",
+        "source": "'none'",
+        "observed_at": "0",
+        "revision": "0",
+        "retryable_failures": "0",
+    }
+    return defaults.get(column, "NULL")
+
+
 def migrate_legacy_health_table(connection: sqlite3.Connection) -> None:
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(harness_health)")}
     if "reason_code" not in columns:
         return
+    targets = (
+        "workflow",
+        "workspace",
+        "harness",
+        "status",
+        "reason",
+        "source",
+        "observed_at",
+        "revision",
+        "expires_at",
+        "cooldown_until",
+        "retryable_failures",
+        "probe_lease_until",
+        "probe_owner",
+    )
+    expressions = ", ".join(_legacy_health_expression(columns, name) for name in targets)
     connection.execute(f"""
         CREATE TABLE harness_health_v9 (
             {HEALTH_TABLE_COLUMNS}
         )
         """)
-    connection.execute("""
+    connection.execute(f"""
         INSERT INTO harness_health_v9
-        SELECT workflow, workspace, harness, status,
-               COALESCE(reason_code, CASE WHEN status = 'ready'
-                   THEN 'readiness_ready' ELSE 'health_unknown' END),
-               source, observed_at, revision, expires_at, cooldown_until,
-               consecutive_failures, probe_lease_until, probe_lease_token
+        SELECT {expressions}
         FROM harness_health
-        """)
+        """)  # nosec B608: expressions are fixed literals from a column allowlist
     connection.execute("DROP TABLE harness_health")
     connection.execute("ALTER TABLE harness_health_v9 RENAME TO harness_health")
     connection.execute("""
@@ -90,11 +126,10 @@ def health_row_accepts_write(
         if observed_at < persisted_at:
             return False
         return not (observed_at == persisted_at and current_revision != 0)
-    return not (
-        observed_at < persisted_at
-        or current_revision != expected_revision
-        or existing["probe_owner"] != expected_owner
-    )
+    # A fenced writer proved ownership via revision + probe_owner; the row is
+    # untouched since lease acquisition, so the monotonic timestamp rule does
+    # not apply to the legitimate holder.
+    return current_revision == expected_revision and existing["probe_owner"] == expected_owner
 
 
 def health_update_statement(

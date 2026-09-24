@@ -44,6 +44,9 @@ from herdr_orchestrator.store_metadata import (
     metadata_float as _metadata_float,
 )
 from herdr_orchestrator.store_metadata import (
+    migrate_v9_to_v10 as _migrate_v9_to_v10,
+)
+from herdr_orchestrator.store_metadata import (
     reserve_planner_run as _reserve_planner_run,
 )
 from herdr_orchestrator.store_metadata import (
@@ -62,7 +65,7 @@ from herdr_orchestrator.store_workspace import (
     workspace_matches as _workspace_matches,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 __all__ = ["HarnessProbeLease", "SCHEMA_VERSION", "Store", "StoreError"]
 
 _INITIALIZE_LOCK = threading.Lock()
@@ -181,6 +184,7 @@ class Store:
         with self._connect() as connection:
             connection.executescript(f"""
                 CREATE TABLE IF NOT EXISTS schema_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
                     version INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -249,6 +253,8 @@ class Store:
                     is_stale INTEGER NOT NULL DEFAULT 0,
                     observed_at REAL NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS receipts_job_id
+                    ON receipts(job_id);
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -293,6 +299,9 @@ class Store:
                     _migrate_legacy_health_table(connection)
                     connection.execute("UPDATE schema_meta SET version = 9")
                     version = 9
+                if version == 9:
+                    _migrate_v9_to_v10(connection)
+                    version = 10
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
 
@@ -472,6 +481,8 @@ class Store:
 
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
+        if job.max_attempts < 1:
+            raise StoreError("max_attempts_invalid")
         completion_policy = _completion_policy(job.receipt, job.completion_policy)
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -1164,16 +1175,18 @@ class Store:
         workspace: str | Path,
         harness: Harness,
         owner: str,
+        lease_until: float,
     ) -> None:
+        """Release only the exact lease generation the caller still holds."""
         with self._transaction() as connection:
             connection.execute(
                 """
                 UPDATE harness_health
                 SET probe_lease_until = NULL, probe_owner = NULL
                 WHERE workflow = ? AND workspace = ? AND harness = ?
-                  AND probe_owner = ?
+                  AND probe_owner = ? AND probe_lease_until = ?
                 """,
-                (workflow, str(workspace), harness.value, owner),
+                (workflow, str(workspace), harness.value, owner, lease_until),
             )
 
     def pending_harnesses(
@@ -1294,6 +1307,7 @@ class Store:
                 """
                 UPDATE jobs
                 SET state = ?, max_attempts = ?, available_at = ?, lease_until = NULL,
+                    agent_name = NULL, current_attempt_id = NULL,
                     error_code = NULL, error_summary = NULL, agent_settled = NULL,
                     task_verified = NULL, verification_class = ?, completion_status = NULL,
                     completion_evidence_summary = NULL, completion_error_code = NULL,
@@ -1460,16 +1474,19 @@ class Store:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        with closing(sqlite3.connect(self.path, timeout=10)) as connection:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
-            try:
-                yield connection
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+        try:
+            with closing(sqlite3.connect(self.path, timeout=10)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA journal_mode = WAL")
+                try:
+                    yield connection
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+        except sqlite3.OperationalError as exc:
+            raise StoreError(f"store_unavailable: {exc}") from exc
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
