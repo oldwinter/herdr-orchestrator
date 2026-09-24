@@ -146,6 +146,8 @@ class Coordinator:
         existing = 0
         for seed in self.config.seed_jobs:
             prompt = seed.prompt_file.read_text(encoding="utf-8").strip()
+            if not prompt:
+                raise ValueError("prompt_file_empty")
             _, created = self.store.enqueue(
                 NewJob(
                     workflow=self.config.name,
@@ -744,15 +746,26 @@ class Coordinator:
         if not callable(closer):
             raise ValueError("dispatcher_cleanup_unsupported")
         candidates = list(candidates_by_name.values())
-        actions = [
-            closer(
-                str(candidate["agent_name"]),
-                PlacementTarget(str(candidate["placement"])),
-                expected_pane_id=str(candidate["pane_id"]),
-                dry_run=dry_run,
-            )
-            for candidate in candidates
-        ]
+        actions: list[dict[str, object]] = []
+        for candidate in candidates:
+            try:
+                actions.append(
+                    closer(
+                        str(candidate["agent_name"]),
+                        PlacementTarget(str(candidate["placement"])),
+                        expected_pane_id=str(candidate["pane_id"]),
+                        dry_run=dry_run,
+                    )
+                )
+            except Exception as exc:
+                actions.append(
+                    {
+                        "agent_name": candidate["agent_name"],
+                        "placement": candidate["placement"],
+                        "action": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
         return {
             "dry_run": dry_run,
             "candidate_count": len(candidates),
@@ -1174,12 +1187,18 @@ class Coordinator:
             dispatch_deadline,
             health_snapshot=health_snapshot,
         )
+        controller_name = _controller_agent_name(
+            self.config.name,
+            self.config.workspace,
+            controller,
+        )
         digest = hashlib.sha256(f"{self.config.name}\0topology\0{dedupe_key}".encode()).hexdigest()[
             :12
         ]
         output_file = self.config.planner.output_file.parent / f"topology-{digest}.json"
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.unlink(missing_ok=True)
+        outcome: DispatchOutcome | None = None
         try:
             outcome = self._dispatch_controller_turn(
                 controller,
@@ -1189,11 +1208,7 @@ class Coordinator:
                     output_file,
                     supports_worktree=self._supports_worktree(),
                 ),
-                agent_name=_controller_agent_name(
-                    self.config.name,
-                    self.config.workspace,
-                    controller,
-                ),
+                agent_name=controller_name,
                 task_title="Topology decision",
                 task_key=f"topology:{job_id}",
                 dispatch_deadline=dispatch_deadline,
@@ -1209,6 +1224,7 @@ class Coordinator:
             raise ValueError(str(exc)) from exc
         finally:
             output_file.unlink(missing_ok=True)
+            self._close_ephemeral_controller(controller_name, outcome)
 
     def _supports_worktree(self) -> bool:
         return (self.config.workspace / ".git").exists()
@@ -1345,58 +1361,62 @@ class Coordinator:
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)
         planner.output_file.unlink(missing_ok=True)
         profiles = self._worker_profiles(allowed_harnesses)
-        outcome = self._dispatch_controller_turn(
+        controller_name = _controller_agent_name(
+            self.config.name,
+            self.config.workspace,
             controller,
-            planner_prompt(
-                planner.prompt_file.read_text(encoding="utf-8"),
-                planner.output_file,
-                planner.max_tasks,
-                render_compact_catalog(profiles),
-                allowed_harnesses,
-            ),
-            agent_name=_controller_agent_name(
-                self.config.name,
-                self.config.workspace,
-                controller,
-            ),
-            task_title="Planner",
-            task_key=f"planner:{self.config.name}",
-            dispatch_deadline=dispatch_deadline,
         )
-        self._dispatch_timeout(dispatch_deadline)
-        if _controller_turn_failed(outcome) is not None:
-            return
+        outcome: DispatchOutcome | None = None
         try:
-            tasks = load_planner_tasks(
-                planner.output_file,
-                max_tasks=planner.max_tasks,
-                allowed_harnesses=allowed_harnesses,
+            outcome = self._dispatch_controller_turn(
+                controller,
+                planner_prompt(
+                    planner.prompt_file.read_text(encoding="utf-8"),
+                    planner.output_file,
+                    planner.max_tasks,
+                    render_compact_catalog(profiles),
+                    allowed_harnesses,
+                ),
+                agent_name=controller_name,
+                task_title="Planner",
+                task_key=f"planner:{self.config.name}",
+                dispatch_deadline=dispatch_deadline,
             )
-        except PlannerOutputError as exc:
-            self.observability.event(
-                "planner_output_rejected",
-                correlation_id="",
-                fields={"reason": str(exc)},
-            )
-            return
-        for task in tasks:
-            self.store.enqueue(
-                NewJob(
-                    workflow=self.config.name,
-                    workspace=self._workspace_key,
-                    title=task.title,
-                    harness=task.harness,
-                    prompt=task.prompt,
-                    dedupe_key=task.dedupe_key,
-                    max_attempts=self.config.coordinator.max_attempts,
-                    placement=self._static_placement(
-                        task.title,
-                        task.prompt,
-                        task.harness,
-                        None,
-                    ),
-                )
-            )
+            self._dispatch_timeout(dispatch_deadline)
+            if _controller_turn_failed(outcome) is None:
+                try:
+                    tasks = load_planner_tasks(
+                        planner.output_file,
+                        max_tasks=planner.max_tasks,
+                        allowed_harnesses=allowed_harnesses,
+                    )
+                except PlannerOutputError as exc:
+                    self.observability.event(
+                        "planner_output_rejected",
+                        correlation_id="",
+                        fields={"reason": str(exc)},
+                    )
+                else:
+                    for task in tasks:
+                        self.store.enqueue(
+                            NewJob(
+                                workflow=self.config.name,
+                                workspace=self._workspace_key,
+                                title=task.title,
+                                harness=task.harness,
+                                prompt=task.prompt,
+                                dedupe_key=task.dedupe_key,
+                                max_attempts=self.config.coordinator.max_attempts,
+                                placement=self._static_placement(
+                                    task.title,
+                                    task.prompt,
+                                    task.harness,
+                                    None,
+                                ),
+                            )
+                        )
+        finally:
+            self._close_ephemeral_controller(controller_name, outcome)
 
     def _dispatch_controller_turn(
         self,

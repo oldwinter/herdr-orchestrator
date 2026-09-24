@@ -27,6 +27,7 @@ from herdr_orchestrator.model import (
     NewJob,
     PlacementTarget,
     ReceiptKind,
+    SeedJobConfig,
     TaskReceipt,
 )
 from herdr_orchestrator.runner import Coordinator
@@ -105,6 +106,7 @@ class PlannerDispatcher:
         self.output_file = output_file
         self.payload = payload
         self.calls: list[Harness] = []
+        self.closed_created_agents: list[str] = []
         self._lock = threading.Lock()
 
     def dispatch(
@@ -122,6 +124,9 @@ class PlannerDispatcher:
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
         self.output_file.write_text(self.payload, encoding="utf-8")
         return DispatchOutcome("planner", AgentState.DONE, False, "w1:p1")
+
+    def close_created_agent(self, name: str) -> None:
+        self.closed_created_agents.append(name)
 
 
 class ExplodingDispatcher(FakeDispatcher):
@@ -267,6 +272,29 @@ class CleanupDispatcher(FakeDispatcher):
             "pane_id": expected_pane_id,
             "action": "would_close" if dry_run else "closed",
         }
+
+
+class FlakyCleanupDispatcher(CleanupDispatcher):
+    def __init__(self, failing_names: set[str]) -> None:
+        super().__init__()
+        self.failing_names = failing_names
+
+    def close_agent_terminal(
+        self,
+        name: str,
+        placement: PlacementTarget,
+        *,
+        expected_pane_id: str,
+        dry_run: bool,
+    ) -> dict[str, object]:
+        if name in self.failing_names:
+            raise RuntimeError("close failed")
+        return super().close_agent_terminal(
+            name,
+            placement,
+            expected_pane_id=expected_pane_id,
+            dry_run=dry_run,
+        )
 
 
 class ResumeDispatcher(FakeDispatcher):
@@ -1578,6 +1606,78 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result["skipped_blocked"], 1)
         self.assertEqual(dispatcher.closed, [])
 
+    def test_gc_records_a_close_failure_without_aborting_other_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                state_db=Path(temporary).resolve() / "state.db",
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            store.enqueue(
+                replace(
+                    _job(config.name, Harness.DROID, suffix="gc-fail"),
+                    max_attempts=1,
+                    placement=PlacementTarget.TAB,
+                )
+            )
+            store.enqueue(
+                replace(
+                    _job(config.name, Harness.GROK, suffix="gc-ok"),
+                    max_attempts=1,
+                    placement=PlacementTarget.TAB,
+                )
+            )
+            droid_name = replica_slot_names(
+                config.name,
+                config.workspace,
+                Harness.DROID,
+                1,
+            )[0]
+            grok_name = replica_slot_names(
+                config.name,
+                config.workspace,
+                Harness.GROK,
+                1,
+            )[0]
+            claimed = store.claim(
+                config.name,
+                limit=2,
+                lease_seconds=60,
+                slot_names={
+                    Harness.DROID.value: (droid_name,),
+                    Harness.GROK.value: (grok_name,),
+                },
+            )
+            for job in claimed:
+                store.record_outcome(
+                    job,
+                    DispatchOutcome(
+                        job.agent_name,
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                        placement=job.placement,
+                    ),
+                )
+            dispatcher = FlakyCleanupDispatcher({droid_name})
+            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+
+            result = coordinator.gc_succeeded_agents(dry_run=False)
+
+        self.assertEqual(result["candidate_count"], 2)
+        self.assertEqual(len(result["actions"]), 2)
+        failed = next(
+            action for action in result["actions"] if action["agent_name"] == droid_name
+        )
+        closed = next(
+            action for action in result["actions"] if action["agent_name"] == grok_name
+        )
+        self.assertEqual(failed["action"], "error")
+        self.assertIn("close failed", str(failed["error"]))
+        self.assertEqual(closed["action"], "closed")
+        self.assertEqual(dispatcher.closed, [(grok_name, PlacementTarget.TAB, "w1:p2")])
+
     def test_enqueue_carries_declared_receipt_through_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -1628,6 +1728,30 @@ class CoordinatorTests(unittest.TestCase):
 
         self.assertEqual(first, (6, 0))
         self.assertEqual(second, (0, 6))
+
+    def test_seed_rejects_an_empty_prompt_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            empty_prompt = root / "empty.md"
+            empty_prompt.write_text("   \n", encoding="utf-8")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                seed_jobs=(
+                    SeedJobConfig(
+                        title="Empty seed",
+                        harness=Harness.DROID,
+                        prompt_file=empty_prompt,
+                        dedupe_key="empty-seed",
+                    ),
+                ),
+            )
+            coordinator = Coordinator(config, dispatcher=FakeDispatcher({}))
+            with self.assertRaisesRegex(ValueError, "prompt_file_empty"):
+                coordinator.seed()
+
+            self.assertEqual(coordinator.store.jobs(config.name), [])
 
     def test_auto_enqueue_uses_controller_to_select_worker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1837,6 +1961,90 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(dispatcher.contexts[0].placement, PlacementTarget.TAB)
         self.assertEqual(dispatcher.contexts[1].placement, PlacementTarget.PANE)
         self.assertIsNotNone(dispatcher.contexts[1].batch_key)
+
+    def test_topology_decision_closes_the_ephemeral_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(
+                    base.planner,
+                    output_file=root / "plans/planner.json",
+                ),
+            )
+            prompt_file = root / "task.md"
+            prompt_file.write_text(
+                "Determine the best execution approach.",
+                encoding="utf-8",
+            )
+            dispatcher = FakeDispatcher(
+                {
+                    Harness.DROID: DispatchOutcome(
+                        "controller",
+                        AgentState.DONE,
+                        False,
+                        "w1:p1",
+                    ),
+                    Harness.GROK: DispatchOutcome(
+                        "worker",
+                        AgentState.DONE,
+                        False,
+                        "w1:p2",
+                    ),
+                },
+                topology_placement="pane",
+            )
+            coordinator = Coordinator(
+                config,
+                dispatcher=dispatcher,
+                controller_harness=Harness.DROID,
+            )
+            coordinator.enqueue_prompt_file(
+                harness=Harness.GROK,
+                title="Determine next step",
+                prompt_file=prompt_file,
+                dedupe_key="ephemeral-topology",
+            )
+
+            result = coordinator.run_once()
+
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(len(dispatcher.closed_created_agents), 1)
+        self.assertTrue(
+            dispatcher.closed_created_agents[0].startswith("ho-control-droid-")
+        )
+
+    def test_planner_closes_the_ephemeral_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+            planner_prompt_file = root / "planner.md"
+            planner_prompt_file.write_text("Plan one task.", encoding="utf-8")
+            config = replace(
+                base,
+                state_db=root / "state.db",
+                planner=replace(
+                    base.planner,
+                    enabled=True,
+                    interval_seconds=60,
+                    prompt_file=planner_prompt_file,
+                    output_file=root / "plans/planner.json",
+                ),
+            )
+            store = Store(config.state_db)
+            store.initialize()
+            dispatcher = PlannerDispatcher(config.planner.output_file)
+            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+
+            coordinator._run_planner_if_due()
+
+        self.assertEqual(dispatcher.calls, [Harness.DROID])
+        self.assertEqual(len(dispatcher.closed_created_agents), 1)
+        self.assertTrue(
+            dispatcher.closed_created_agents[0].startswith("ho-control-droid-")
+        )
 
 
 def _job(workflow: str, harness: Harness, *, suffix: str = "") -> NewJob:

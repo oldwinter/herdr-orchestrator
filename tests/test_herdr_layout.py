@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from herdr_orchestrator.herdr_layout import HerdrLayout
@@ -270,6 +271,47 @@ class HerdrLayoutTests(unittest.TestCase):
 
         failed = layout.provision(context)
         layout.cleanup_failed(failed)
+        retried = layout.provision(context)
+
+        self.assertEqual(retried.tab_id, "w1:t3")
+        creates = [call for call in runner.calls if call[:3] == ["herdr", "tab", "create"]]
+        self.assertEqual(len(creates), 2)
+        self.assertFalse(any(call[:3] == ["herdr", "pane", "layout"] for call in runner.calls))
+
+    def test_batch_entry_is_dropped_once_its_last_pane_is_released(self) -> None:
+        runner = FakeRunner(
+            [
+                _result(
+                    {
+                        "root_pane": {"pane_id": "w1:p2"},
+                        "tab": {"tab_id": "w1:t2"},
+                    }
+                ),
+                _result({}),
+                _result(
+                    {
+                        "root_pane": {"pane_id": "w1:p3"},
+                        "tab": {"tab_id": "w1:t3"},
+                    }
+                ),
+            ]
+        )
+        layout = HerdrLayout("example", Path("/repo"), "w1", runner)
+        context = DispatchContext(
+            PlacementTarget.PANE,
+            "inspect",
+            "inspect-v1",
+            batch_key="run-1",
+        )
+
+        terminal = layout.provision(context)
+        layout.close_temporary(
+            replace(
+                terminal,
+                cleanup_kind="pane",
+                cleanup_id=terminal.pane_id,
+            )
+        )
         retried = layout.provision(context)
 
         self.assertEqual(retried.tab_id, "w1:t3")

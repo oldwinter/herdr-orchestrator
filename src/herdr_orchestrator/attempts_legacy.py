@@ -208,7 +208,7 @@ def _legacy_operation(
         phase = AttemptPhase.ABANDONED.value
     updated_at = float(latest["observed_at"] if latest is not None else job["updated_at"])
     sequence = len(receipts) if blocked_resume else max(0, len(receipts) - 1)
-    kind = "resume" if blocked_resume or sequence > 0 else "dispatch"
+    kind = "resume" if blocked_resume else "dispatch"
     return _LegacyOperation(
         job["lease_until"] if active else None,
         phase,
