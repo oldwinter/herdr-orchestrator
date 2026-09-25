@@ -7,6 +7,7 @@ from pathlib import Path
 
 from herdr_orchestrator.model import PlacementMode, PlacementTarget
 from herdr_orchestrator.topology import (
+    PLACEMENT_KEYS,
     TopologyDecisionError,
     load_topology_decision,
     short_display_label,
@@ -138,6 +139,8 @@ class TopologyTests(unittest.TestCase):
             prompt,
         )
         self.assertNotIn('"placement":"tab|pane|worktree"', prompt)
+        schema = json.loads(prompt.split("Exact schema:\n", 1)[1].split("\n", 1)[0])
+        self.assertEqual(set(schema), set(PLACEMENT_KEYS))
 
     def test_rejects_worktree_without_git_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

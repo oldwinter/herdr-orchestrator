@@ -539,6 +539,51 @@ class CliTests(unittest.TestCase):
         self.assertIn("dry-run", text)
         self.assertIn("--apply", text)
 
+    def test_root_help_names_justfile_as_stable_entry(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:
+            build_parser().parse_args(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("justfile", text)
+        self.assertIn("just --list", text)
+        self.assertIn("just seed", text)
+        self.assertIn("just status", text)
+
+    def test_subcommand_help_prefers_just_recipes(self) -> None:
+        cases = (
+            ("seed", "just seed"),
+            ("status", "just status"),
+            ("doctor", "just doctor"),
+            ("retry", "just retry JOB_ID"),
+            ("resume", "just resume JOB_ID FILE"),
+            ("run", "just run-once"),
+            ("enqueue", "just enqueue"),
+        )
+        for command, recipe in cases:
+            with self.subTest(command=command):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:
+                    build_parser().parse_args([command, "--help"])
+                self.assertEqual(ctx.exception.code, 0)
+                self.assertIn(recipe, stdout.getvalue())
+
+    def test_run_help_maps_modes_to_just_recipes(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit):
+            build_parser().parse_args(["run", "--help"])
+        text = stdout.getvalue()
+        self.assertIn("just run-once", text)
+        self.assertIn("just run-until-idle", text)
+
+    def test_retry_and_resume_help_explain_job_id_source(self) -> None:
+        for command in ("retry", "resume"):
+            with self.subTest(command=command):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaises(SystemExit):
+                    build_parser().parse_args([command, "--help"])
+                self.assertIn("just status", stdout.getvalue())
+
     def test_smoke_uses_target_files_and_requires_an_output_receipt(self) -> None:
         base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
 

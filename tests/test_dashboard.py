@@ -126,6 +126,30 @@ class DashboardTests(unittest.TestCase):
             self.assertFalse(path.with_name(f"{path.name}-wal").exists())
             self.assertFalse(path.with_name(f"{path.name}-journal").exists())
 
+    def test_shell_uses_system_font_stack_and_skip_link(self) -> None:
+        static = REPO_ROOT / "src/herdr_orchestrator/dashboard/static"
+        index = (static / "index.html").read_text()
+        dashboard_css = (static / "dashboard.css").read_text()
+
+        self.assertNotIn("Inter", dashboard_css)
+        self.assertNotIn("font-src", index)
+
+        body_start = index.index("<body>")
+        skip_link = index.index('<a class="skip-link" href="#kanban">')
+        self.assertLess(body_start, skip_link)
+        self.assertLess(skip_link, index.index('class="shell"'))
+        self.assertIn('id="kanban"', index)
+
+        skip_style = dashboard_css[
+            dashboard_css.index(".skip-link {") : dashboard_css.index(".skip-link:focus-visible {")
+        ]
+        self.assertIn("position: absolute;", skip_style)
+        self.assertIn("transform: translateY(-300%);", skip_style)
+        self.assertIn(
+            ".skip-link:focus-visible {\n  transform: none;",
+            dashboard_css,
+        )
+
     def test_source_warning_recovery_preserves_layout_continuity(self) -> None:
         static = REPO_ROOT / "src/herdr_orchestrator/dashboard/static"
         index = (static / "index.html").read_text()

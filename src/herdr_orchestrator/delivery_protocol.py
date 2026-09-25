@@ -18,6 +18,41 @@ SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 TICKET_ID = re.compile(r"\d{2,3}\Z")
 COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
+# Canonical key sets for model-facing artifacts: the prompt examples in
+# delivery_prompts and the fail-closed loaders below both derive from these
+# tuples so the field names cannot drift apart.
+WAYFINDER_ROUTE_KEYS = ("use_wayfinder", "reason")
+WAYFINDER_MAP_KEYS = ("destination", "notes", "decisions", "not_yet_specified", "out_of_scope")
+DECISION_TICKET_KEYS = ("id", "title", "question", "kind", "blocked_by", "resolution")
+DELIVERY_PLAN_KEYS = (
+    "slug",
+    "title",
+    "problem_statement",
+    "solution",
+    "user_stories",
+    "implementation_decisions",
+    "testing_decisions",
+    "out_of_scope",
+    "further_notes",
+    "seams",
+    "tickets",
+)
+DELIVERY_TICKET_KEYS = ("id", "title", "what_to_build", "blocked_by", "acceptance_criteria")
+WAYFINDER_RESOLUTION_KEYS = (
+    "ticket_id",
+    "resolution",
+    "new_decisions",
+    "not_yet_specified",
+    "out_of_scope",
+)
+TICKET_RECEIPT_KEYS = ("ticket_id", "commit", "acceptance", "checks", "summary")
+ACCEPTANCE_RESULT_KEYS = ("criterion", "passed", "evidence")
+REPAIR_RECEIPT_KEYS = ("round", "before_commit", "commit")
+REVIEW_REPORT_KEYS = ("standards", "spec")
+REVIEW_VERDICT_KEYS = ("accepted", "dismissed", "rationale")
+PROXY_DECISION_KEYS = ("action", "category", "response", "rationale")
+REVIEW_FINDING_KEYS = ("severity", "summary", "evidence", "source")
+
 
 class DeliveryArtifactError(ValueError):
     pass
@@ -390,7 +425,7 @@ def load_tracker_publication(
 
 def load_wayfinder_route(path: Path) -> WayfinderRoute:
     payload = _load_object(path, "wayfinder_route")
-    _exact_keys(payload, {"use_wayfinder", "reason"}, "wayfinder_route")
+    _exact_keys(payload, set(WAYFINDER_ROUTE_KEYS), "wayfinder_route")
     use_wayfinder = payload["use_wayfinder"]
     if not isinstance(use_wayfinder, bool):
         raise DeliveryArtifactError("wayfinder_route_use_wayfinder_invalid")
@@ -404,13 +439,7 @@ def load_wayfinder_map(path: Path) -> WayfinderMap:
     payload = _load_object(path, "wayfinder_map")
     _exact_keys(
         payload,
-        {
-            "destination",
-            "notes",
-            "decisions",
-            "not_yet_specified",
-            "out_of_scope",
-        },
+        set(WAYFINDER_MAP_KEYS),
         "wayfinder_map",
     )
     rows = _object_list(payload, "decisions", 100, "wayfinder_map")
@@ -419,7 +448,7 @@ def load_wayfinder_map(path: Path) -> WayfinderMap:
     for row in rows:
         _exact_keys(
             row,
-            {"id", "title", "question", "kind", "blocked_by", "resolution"},
+            set(DECISION_TICKET_KEYS),
             "wayfinder_decision",
         )
         ticket_id = _identifier(row, "id", TICKET_ID, "wayfinder_decision")
@@ -476,19 +505,7 @@ def load_delivery_plan(path: Path) -> DeliveryPlan:
     payload = _load_object(path, "delivery_plan")
     _exact_keys(
         payload,
-        {
-            "slug",
-            "title",
-            "problem_statement",
-            "solution",
-            "user_stories",
-            "implementation_decisions",
-            "testing_decisions",
-            "out_of_scope",
-            "further_notes",
-            "seams",
-            "tickets",
-        },
+        set(DELIVERY_PLAN_KEYS),
         "delivery_plan",
     )
     slug = _identifier(payload, "slug", SLUG, "delivery_plan")
@@ -500,7 +517,7 @@ def load_delivery_plan(path: Path) -> DeliveryPlan:
     for row in rows:
         _exact_keys(
             row,
-            {"id", "title", "what_to_build", "blocked_by", "acceptance_criteria"},
+            set(DELIVERY_TICKET_KEYS),
             "delivery_ticket",
         )
         ticket_id = _identifier(row, "id", TICKET_ID, "delivery_ticket")
@@ -564,13 +581,7 @@ def load_wayfinder_resolution(
     payload = _load_object(path, "wayfinder_resolution")
     _exact_keys(
         payload,
-        {
-            "ticket_id",
-            "resolution",
-            "new_decisions",
-            "not_yet_specified",
-            "out_of_scope",
-        },
+        set(WAYFINDER_RESOLUTION_KEYS),
         "wayfinder_resolution",
     )
     ticket_id = _identifier(
@@ -587,7 +598,7 @@ def load_wayfinder_resolution(
     for row in rows:
         _exact_keys(
             row,
-            {"id", "title", "question", "kind", "blocked_by", "resolution"},
+            set(DECISION_TICKET_KEYS),
             "wayfinder_decision",
         )
         decision = DecisionTicket(
@@ -644,7 +655,7 @@ def load_ticket_receipt(path: Path, ticket: DeliveryTicket) -> TicketReceipt:
     payload = _load_object(path, "ticket_receipt")
     _exact_keys(
         payload,
-        {"ticket_id", "commit", "acceptance", "checks", "summary"},
+        set(TICKET_RECEIPT_KEYS),
         "ticket_receipt",
     )
     ticket_id = _identifier(payload, "ticket_id", TICKET_ID, "ticket_receipt")
@@ -654,7 +665,7 @@ def load_ticket_receipt(path: Path, ticket: DeliveryTicket) -> TicketReceipt:
     rows = _object_list(payload, "acceptance", 100, "ticket_receipt")
     acceptance: list[AcceptanceResult] = []
     for row in rows:
-        _exact_keys(row, {"criterion", "passed", "evidence"}, "acceptance_result")
+        _exact_keys(row, set(ACCEPTANCE_RESULT_KEYS), "acceptance_result")
         passed = row["passed"]
         if not isinstance(passed, bool):
             raise DeliveryArtifactError("acceptance_result_passed_invalid")
@@ -687,7 +698,7 @@ def load_repair_receipt(
     payload = _load_object(path, "repair_receipt")
     _exact_keys(
         payload,
-        {"round", "before_commit", "commit"},
+        set(REPAIR_RECEIPT_KEYS),
         "repair_receipt",
     )
     recorded_round = payload["round"]
@@ -708,7 +719,7 @@ def load_repair_receipt(
 
 def load_review_report(path: Path) -> ReviewReport:
     payload = _load_object(path, "review_report")
-    _exact_keys(payload, {"standards", "spec"}, "review_report")
+    _exact_keys(payload, set(REVIEW_REPORT_KEYS), "review_report")
     return ReviewReport(
         standards=_review_findings(payload, "standards"),
         spec=_review_findings(payload, "spec"),
@@ -729,7 +740,7 @@ def load_review_verdict(
     candidates: tuple[str, ...],
 ) -> ReviewVerdict:
     payload = _load_object(path, "review_verdict")
-    _exact_keys(payload, {"accepted", "dismissed", "rationale"}, "review_verdict")
+    _exact_keys(payload, set(REVIEW_VERDICT_KEYS), "review_verdict")
     accepted = _string_list(payload, "accepted", 200, 40, "review_verdict")
     dismissed = _string_list(payload, "dismissed", 200, 40, "review_verdict")
     if len(set(accepted)) != len(accepted) or len(set(dismissed)) != len(dismissed):
@@ -749,7 +760,7 @@ def load_proxy_decision(path: Path) -> ProxyDecision:
     payload = _load_object(path, "proxy_decision")
     _exact_keys(
         payload,
-        {"action", "category", "response", "rationale"},
+        set(PROXY_DECISION_KEYS),
         "proxy_decision",
     )
     try:
@@ -777,7 +788,7 @@ def _review_findings(payload: dict[str, Any], key: str) -> tuple[ReviewFinding, 
     rows = _object_list(payload, key, 100, "review_report")
     findings: list[ReviewFinding] = []
     for row in rows:
-        _exact_keys(row, {"severity", "summary", "evidence", "source"}, "review_finding")
+        _exact_keys(row, set(REVIEW_FINDING_KEYS), "review_finding")
         try:
             severity = FindingSeverity(_text(row, "severity", 20, "review_finding"))
         except ValueError as exc:

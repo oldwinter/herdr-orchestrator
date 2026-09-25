@@ -254,6 +254,11 @@ manager 只对当前 Herdr session 可见。
 - workflow 的 `[[workers]]` 决定本次可被选择的 harness 子集；
 - `[planner].worker_harnesses` 或 CLI override 可以进一步收窄候选池；
 - planner prompt 和输出 schema 只暴露该子集，且只注入 compact catalog，不注入完整 Markdown；
+- 模型可见 JSON 的字段名集合有单一真源：planner/router 的 `PLANNER_TASK_KEYS`、
+  `PLANNER_OUTPUT_KEYS`、`WORKER_SELECTION_KEYS`（`planner.py`），topology 的
+  `PLACEMENT_KEYS`（`topology.py`），delivery artifact 的 `*_KEYS`
+  （`delivery_protocol.py`）；prompt 中的 schema 示例由这些 tuple 生成，loader 用同一
+  tuple 做 exact-key 校验，字段长度、枚举与 DAG 规则仍只属于 loader；
 - planner 为每个子任务输出 `harness`；
 - job 被 claim 后，coordinator 才读取该 harness 的 `.md` profile；
 - 完整 profile 与 task packet 一起注入 worker，未选中的 profile 不进入该 turn；
