@@ -62,13 +62,32 @@ from herdr_orchestrator.tracker import TrackerError
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Durable multi-harness orchestration over Herdr.")
+    parser = argparse.ArgumentParser(
+        description="Durable multi-harness orchestration over Herdr.",
+        epilog=(
+            "The justfile is the stable entry point: prefer just seed, "
+            "just status, just dashboard and friends. Run just --list for "
+            "every recipe."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("seed", "status"):
-        command = subparsers.add_parser(name)
-        command.add_argument("--workflow", required=True)
 
-    doctor_parser = subparsers.add_parser("doctor")
+    seed_parser = subparsers.add_parser(
+        "seed",
+        description="Prefer just seed; it supplies --workflow.",
+    )
+    seed_parser.add_argument("--workflow", required=True)
+
+    status_parser = subparsers.add_parser(
+        "status",
+        description="Prefer just status; it supplies --workflow.",
+    )
+    status_parser.add_argument("--workflow", required=True)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        description="Prefer just doctor; it supplies --workflow.",
+    )
     doctor_parser.add_argument("--workflow", required=True)
     doctor_parser.add_argument("--probe-timeout-seconds", type=int, default=30)
     doctor_parser.add_argument(
@@ -88,9 +107,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Limit evidence to one enabled harness; repeat for more than one.",
     )
 
-    retry_parser = subparsers.add_parser("retry")
+    retry_parser = subparsers.add_parser(
+        "retry",
+        description="Prefer just retry JOB_ID; it supplies --workflow.",
+    )
     retry_parser.add_argument("--workflow", required=True)
-    retry_parser.add_argument("--job-id", type=int, required=True)
+    retry_parser.add_argument(
+        "--job-id",
+        type=int,
+        required=True,
+        help="Failed job id; list job ids with just status.",
+    )
     retry_parser.add_argument("--extra-attempts", type=int, choices=range(1, 11), default=1)
 
     migrate_parser = subparsers.add_parser(
@@ -99,10 +126,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate_parser.add_argument("--workflow", required=True)
 
-    resume_parser = subparsers.add_parser("resume")
+    resume_parser = subparsers.add_parser(
+        "resume",
+        description=(
+            "Prefer just resume JOB_ID FILE; it supplies --workflow. "
+            "JOB_ID is the blocked job id from just status and FILE is the "
+            "response file answered by the operator."
+        ),
+    )
     resume_parser.add_argument("--workflow", required=True)
-    resume_parser.add_argument("--job-id", type=int, required=True)
-    resume_parser.add_argument("--response-file", required=True)
+    resume_parser.add_argument(
+        "--job-id",
+        type=int,
+        required=True,
+        help="Blocked job id; list job ids with just status.",
+    )
+    resume_parser.add_argument(
+        "--response-file",
+        required=True,
+        help="Operator answer file that unblocks the job.",
+    )
 
     gc_parser = subparsers.add_parser(
         "gc",
@@ -153,20 +196,37 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.add_argument("--poll-seconds", type=float, default=2.0)
 
-    run = subparsers.add_parser("run")
+    run = subparsers.add_parser(
+        "run",
+        description=(
+            "Prefer just run, just run-once or just run-until-idle; " "they supply --workflow."
+        ),
+    )
     run.add_argument("--workflow", required=True)
     run_mode = run.add_mutually_exclusive_group()
-    run_mode.add_argument("--once", action="store_true")
+    run_mode.add_argument(
+        "--once",
+        action="store_true",
+        help="Dispatch a single cycle; same as just run-once.",
+    )
     run_mode.add_argument(
         "--until-idle",
         "--drain",
         dest="until_idle",
         action="store_true",
+        help="Drain the queue until idle; same as just run-until-idle.",
     )
     run.add_argument("--drain-timeout-seconds", type=int, default=86400)
     _add_selection_arguments(run)
 
-    enqueue = subparsers.add_parser("enqueue")
+    enqueue = subparsers.add_parser(
+        "enqueue",
+        description=(
+            "Prefer just enqueue HARNESS TITLE PROMPT_FILE DEDUPE_KEY "
+            "(or just enqueue-auto TITLE PROMPT_FILE DEDUPE_KEY); they "
+            "supply --workflow."
+        ),
+    )
     enqueue.add_argument("--workflow", required=True)
     enqueue.add_argument(
         "--harness",
