@@ -74,7 +74,7 @@ grid = {
 const animationSource = sourceBetween("function motionAllowed()", "function setMetric(");
 const orderSource = sourceBetween(
   "function captureMainGridContinuity(",
-  "function currentTopologyTouchMode(",
+  "function attentionVisualId(",
 );
 const createRuntime = new Function(
   "board",
