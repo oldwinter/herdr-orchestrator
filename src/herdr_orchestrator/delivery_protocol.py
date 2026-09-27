@@ -99,7 +99,7 @@ def _reject_symlink_chain(path: Path) -> None:
 def read_artifact_text(path: Path, artifact: str, *, root: Path | None = None) -> str:
     try:
         candidate = validate_artifact_path(path, root=root)
-        descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError as exc:
         raise DeliveryArtifactError(f"{artifact}_missing") from exc
     except DeliveryArtifactError as exc:
@@ -178,7 +178,7 @@ def append_artifact_text(
         validate_artifact_path(candidate, root=root)
         descriptor = os.open(
             candidate,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):

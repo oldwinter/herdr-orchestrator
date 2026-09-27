@@ -321,7 +321,7 @@ def receipt_file_path(receipt: TaskReceipt, execution_workspace: Path) -> Path:
 
 
 def file_receipt_snapshot(candidate: Path) -> FileReceiptSnapshot:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(candidate, flags)
     except FileNotFoundError:
