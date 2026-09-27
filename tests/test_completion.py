@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -215,6 +218,28 @@ class CompletionProtocolTests(unittest.TestCase):
 
 
 class FileReceiptSnapshotTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_fifo_without_writer_is_absent_without_blocking(self) -> None:
+        script = (
+            "import sys; from pathlib import Path; "
+            "from herdr_orchestrator.completion import "
+            "FileReceiptSnapshot, file_receipt_snapshot; "
+            "assert file_receipt_snapshot(Path(sys.argv[1])) == "
+            "FileReceiptSnapshot(False, None, None)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "receipt.fifo"
+            os.mkfifo(path)
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_missing_file_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             snapshot = file_receipt_snapshot(Path(temporary) / "missing.txt")
