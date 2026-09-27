@@ -319,7 +319,7 @@ class DashboardTests(unittest.TestCase):
     def test_topology_inspector_exit_preserves_visual_continuity(self) -> None:
         static = REPO_ROOT / "src/herdr_orchestrator/dashboard/static"
         index = (static / "index.html").read_text()
-        dashboard_script = (static / "dashboard.js").read_text()
+        topology_script = (static / "dashboard-topology.js").read_text()
         dashboard_css = (static / "dashboard.css").read_text()
 
         inspector_start = index.index('id="topology-inspector"')
@@ -347,8 +347,8 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("@starting-style", dashboard_css)
         self.assertNotIn("@keyframes inspector-enter", dashboard_css)
 
-        render_inspector = dashboard_script[
-            dashboard_script.index("function renderTopologyInspector") : dashboard_script.index(
+        render_inspector = topology_script[
+            topology_script.index("function renderTopologyInspector") : topology_script.index(
                 "function clearTopologySelection"
             )
         ]
@@ -357,8 +357,8 @@ class DashboardTests(unittest.TestCase):
             render_inspector.index('inspector.classList.remove("is-hidden")'),
         )
 
-        clear_inspector = dashboard_script[
-            dashboard_script.index("function clearTopologySelection") : dashboard_script.index(
+        clear_inspector = topology_script[
+            topology_script.index("function clearTopologySelection") : topology_script.index(
                 "function handleTopologyResize"
             )
         ]
@@ -545,6 +545,7 @@ class DashboardTests(unittest.TestCase):
         static = REPO_ROOT / "src/herdr_orchestrator/dashboard/static"
         index = (static / "index.html").read_text()
         dashboard_script = (static / "dashboard.js").read_text()
+        topology_script = (static / "dashboard-topology.js").read_text()
 
         fit_start = index.index('id="topology-fit"')
         fit_button = index[fit_start : index.index("</button>", fit_start)]
@@ -561,18 +562,18 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("m3 11 9-8 9 8", fit_button)
         self.assertNotIn("M9 20v-6h6v6", fit_button)
 
-        content_reader = dashboard_script[
-            dashboard_script.index("function readTopologyContentState()") : dashboard_script.index(
+        content_reader = topology_script[
+            topology_script.index("function readTopologyContentState()") : topology_script.index(
                 "function readTopologyZoomState()"
             )
         ]
         self.assertIn("topologyCanvas.elements()", content_reader)
         self.assertIn('kind: "unavailable"', content_reader)
         self.assertIn('kind: "ready"', content_reader)
-        self.assertNotIn("hasTopology", dashboard_script)
+        self.assertNotIn("hasTopology", topology_script)
 
-        fit_projector = dashboard_script[
-            dashboard_script.index("function syncTopologyFitControl()") : dashboard_script.index(
+        fit_projector = topology_script[
+            topology_script.index("function syncTopologyFitControl()") : topology_script.index(
                 "function syncTopologyZoomControls()"
             )
         ]
@@ -580,14 +581,14 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("readTopologyContentState()", fit_projector)
         self.assertIn("fitUnavailable", fit_projector)
 
-        fit_writer = dashboard_script[
-            dashboard_script.index("function fitTopology") : dashboard_script.index(
+        fit_writer = topology_script[
+            topology_script.index("function fitTopology") : topology_script.index(
                 "function zoomTopology"
             )
         ]
         self.assertIn('origin = "programmatic"', fit_writer)
         self.assertIn('origin === "canvas-keyboard"', fit_writer)
-        self.assertIn('"No topology to fit."', dashboard_script)
+        self.assertIn('"No topology to fit."', topology_script)
         for camera_operation in (
             "recordTopologyViewportSize()",
             "getFitViewport",
@@ -599,14 +600,14 @@ class DashboardTests(unittest.TestCase):
                 fit_writer.index(camera_operation),
             )
 
-        empty_render = dashboard_script[
-            dashboard_script.index("if (!graph.elements.length)") : dashboard_script.index(
+        empty_render = topology_script[
+            topology_script.index("if (!graph.elements.length)") : topology_script.index(
                 "const canvas = ensureTopologyCanvas()"
             )
         ]
         self.assertIn("syncTopologyFitControl();", empty_render)
-        populated_render = dashboard_script[
-            dashboard_script.index("canvas.batch(() =>") : dashboard_script.index(
+        populated_render = topology_script[
+            topology_script.index("canvas.batch(() =>") : topology_script.index(
                 "topologyContentSignature = graph.contentSignature"
             )
         ]
@@ -622,7 +623,7 @@ class DashboardTests(unittest.TestCase):
     def test_zoom_boundary_controls_follow_camera_intent(self) -> None:
         static = REPO_ROOT / "src/herdr_orchestrator/dashboard/static"
         index = (static / "index.html").read_text()
-        dashboard_script = (static / "dashboard.js").read_text()
+        topology_script = (static / "dashboard-topology.js").read_text()
         dashboard_css = (static / "dashboard.css").read_text()
 
         for button_id in ("topology-zoom-out", "topology-zoom-in"):
@@ -630,8 +631,8 @@ class DashboardTests(unittest.TestCase):
             button = index[button_start : index.index("</button>", button_start)]
             self.assertIn("disabled", button)
 
-        zoom_state = dashboard_script[
-            dashboard_script.index("function readTopologyZoomState()") : dashboard_script.index(
+        zoom_state = topology_script[
+            topology_script.index("function readTopologyZoomState()") : topology_script.index(
                 "function syncTopologyZoomControls()"
             )
         ]
@@ -642,8 +643,8 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("atMin", zoom_state)
         self.assertNotIn("atMax", zoom_state)
 
-        viewport_listener = dashboard_script[
-            dashboard_script.index('topologyCanvas.on("viewport"') : dashboard_script.index(
+        viewport_listener = topology_script[
+            topology_script.index('topologyCanvas.on("viewport"') : topology_script.index(
                 '["dragpan", "scrollzoom", "pinchzoom"]'
             )
         ]
@@ -652,8 +653,8 @@ class DashboardTests(unittest.TestCase):
             viewport_listener.index("topologyViewportState.programmaticWriteDepth"),
         )
 
-        viewport_writer = dashboard_script[
-            dashboard_script.index("function setTopologyViewport") : dashboard_script.index(
+        viewport_writer = topology_script[
+            topology_script.index("function setTopologyViewport") : topology_script.index(
                 "function claimTopologyViewport"
             )
         ]
@@ -670,16 +671,16 @@ class DashboardTests(unittest.TestCase):
             viewport_writer,
         )
 
-        zoom_writer = dashboard_script[
-            dashboard_script.index("function zoomTopology") : dashboard_script.index(
+        zoom_writer = topology_script[
+            topology_script.index("function zoomTopology") : topology_script.index(
                 "function panTopology"
             )
         ]
         self.assertIn('origin = "toolbar"', zoom_writer)
         self.assertIn('origin === "canvas-keyboard"', zoom_writer)
-        self.assertIn('"Maximum zoom reached."', dashboard_script)
-        self.assertIn('"Minimum zoom reached."', dashboard_script)
-        self.assertIn("replaceChildren(document.createTextNode(message))", dashboard_script)
+        self.assertIn('"Maximum zoom reached."', topology_script)
+        self.assertIn('"Minimum zoom reached."', topology_script)
+        self.assertIn("replaceChildren(document.createTextNode(message))", topology_script)
         self.assertLess(
             zoom_writer.index("getZoomedViewport"),
             zoom_writer.index("claimTopologyViewport()"),
@@ -1507,6 +1508,9 @@ class DashboardTests(unittest.TestCase):
                 with urlopen(f"{base_url}/assets/timeline-continuity.js", timeout=2) as response:
                     timeline_continuity_content_type = response.headers["Content-Type"]
                     timeline_continuity_script = response.read().decode()
+                with urlopen(f"{base_url}/assets/dashboard-topology.js", timeout=2) as response:
+                    dashboard_topology_content_type = response.headers["Content-Type"]
+                    dashboard_topology_script = response.read().decode()
                 with urlopen(f"{base_url}/assets/dashboard-utils.js", timeout=2) as response:
                     dashboard_utils_content_type = response.headers["Content-Type"]
                     dashboard_utils_script = response.read().decode()
@@ -1535,6 +1539,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("/assets/topology-style.js", index)
         self.assertIn("/assets/source-warning.js", index)
         self.assertIn("/assets/timeline-continuity.js", index)
+        self.assertIn("/assets/dashboard-topology.js", index)
         self.assertIn("/assets/dashboard-utils.js", index)
         self.assertLess(
             index.index("/assets/topology.js"), index.index("/assets/topology-style.js")
@@ -1547,7 +1552,10 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertLess(
             index.index("/assets/timeline-continuity.js"),
-            index.index("/assets/dashboard.js"),
+            index.index("/assets/dashboard-topology.js"),
+        )
+        self.assertLess(
+            index.index("/assets/dashboard-topology.js"), index.index("/assets/dashboard.js")
         )
         self.assertLess(
             index.index("/assets/dashboard-utils.js"), index.index("/assets/source-warning.js")
@@ -1555,10 +1563,12 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(topology_style_content_type, "text/javascript; charset=utf-8")
         self.assertEqual(source_warning_content_type, "text/javascript; charset=utf-8")
         self.assertEqual(timeline_continuity_content_type, "text/javascript; charset=utf-8")
+        self.assertEqual(dashboard_topology_content_type, "text/javascript; charset=utf-8")
         self.assertEqual(dashboard_utils_content_type, "text/javascript; charset=utf-8")
         self.assertIn("function topologyStyles", topology_style_script)
         self.assertIn("function setSourceWarning", source_warning_script)
         self.assertIn("function captureTimelineContinuity", timeline_continuity_script)
+        self.assertIn("function renderTopology", dashboard_topology_script)
         self.assertIn("function finiteNumber", dashboard_utils_script)
         self.assertIn('id="topology-touch-owner"', index)
         self.assertIn('class="icon-button topology-touch-toggle"', index)
@@ -1578,10 +1588,10 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("topologyFocusViewport", topology_script)
         self.assertIn("topologyRebaseViewportCapture", topology_script)
         self.assertIn("topologyViewportMotionDuration", topology_script)
-        focus_adapter = dashboard_script[
-            dashboard_script.index("function readTopologyFocusInput") : dashboard_script.index(
-                "function setTopologyViewport"
-            )
+        focus_adapter = dashboard_topology_script[
+            dashboard_topology_script.index(
+                "function readTopologyFocusInput"
+            ) : dashboard_topology_script.index("function setTopologyViewport")
         ]
         self.assertIn("node.isParent()", focus_adapter)
         self.assertIn(
@@ -1602,10 +1612,10 @@ class DashboardTests(unittest.TestCase):
             "    });",
             focus_adapter,
         )
-        viewport_writer = dashboard_script[
-            dashboard_script.index("function setTopologyViewport") : dashboard_script.index(
-                "function stopTopologyViewportMotion"
-            )
+        viewport_writer = dashboard_topology_script[
+            dashboard_topology_script.index(
+                "function setTopologyViewport"
+            ) : dashboard_topology_script.index("function stopTopologyViewportMotion")
         ]
         self.assertIn("topologyViewportMotionDuration", viewport_writer)
         self.assertIn('easing: "ease-out-cubic"', viewport_writer)
@@ -1615,10 +1625,10 @@ class DashboardTests(unittest.TestCase):
             viewport_writer.index("topologyViewportMotionDuration"),
         )
         self.assertIn("target: next", viewport_writer)
-        zoom_writer = dashboard_script[
-            dashboard_script.index("function zoomTopology") : dashboard_script.index(
-                "function panTopology"
-            )
+        zoom_writer = dashboard_topology_script[
+            dashboard_topology_script.index(
+                "function zoomTopology"
+            ) : dashboard_topology_script.index("function panTopology")
         ]
         self.assertIn("getZoomedViewport", zoom_writer)
         self.assertIn("readTopologyZoomState", zoom_writer)
@@ -1627,10 +1637,10 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('purpose: "zoom"', zoom_writer)
         self.assertIn("if (!target) return false", zoom_writer)
         self.assertNotIn("topologyCanvas.zoom(", zoom_writer)
-        fit_writer = dashboard_script[
-            dashboard_script.index("function fitTopology") : dashboard_script.index(
-                "function zoomTopology"
-            )
+        fit_writer = dashboard_topology_script[
+            dashboard_topology_script.index(
+                "function fitTopology"
+            ) : dashboard_topology_script.index("function zoomTopology")
         ]
         self.assertIn("getFitViewport", fit_writer)
         self.assertIn("captureTopologyViewport", fit_writer)
@@ -1638,10 +1648,10 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('purpose: "fit"', fit_writer)
         self.assertNotIn("topologyCanvas.fit(", fit_writer)
         self.assertNotIn("topologyCanvas.zoom(", fit_writer)
-        pan_writer = dashboard_script[
-            dashboard_script.index("function panTopology") : dashboard_script.index(
-                "function topologyA11yId"
-            )
+        pan_writer = dashboard_topology_script[
+            dashboard_topology_script.index(
+                "function panTopology"
+            ) : dashboard_topology_script.index("function topologyA11yId")
         ]
         self.assertIn('purpose === "pan"', pan_writer)
         self.assertIn("active.target", pan_writer)
@@ -1649,7 +1659,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("setTopologyViewport", pan_writer)
         self.assertIn('purpose: "pan"', pan_writer)
         self.assertNotIn("topologyCanvas.pan(", pan_writer)
-        self.assertNotIn("minimumReadable", dashboard_script)
+        self.assertNotIn("minimumReadable", dashboard_topology_script)
         self.assertEqual(
             dashboard_script.count("fitTopology({ user: true, animate: true"),
             2,
@@ -1756,7 +1766,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('behavior: motionAllowed() ? "smooth" : "auto"', dashboard_script)
         self.assertIn('behavior: "auto"', dashboard_script)
         self.assertNotIn("clientWidth * 0.72", dashboard_script)
-        semantic_assets = index + dashboard_script
+        semantic_assets = index + dashboard_script + dashboard_topology_script
         self.assertNotIn('role="tablist"', semantic_assets)
         self.assertNotIn('role="tab"', semantic_assets)
         self.assertNotIn("aria-selected", semantic_assets)
@@ -1791,42 +1801,42 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("jobVisualSignature", dashboard_script)
         self.assertIn(
             'function fitTopology({ user = false, animate = false, origin = "programmatic" } = {})',
-            dashboard_script,
+            dashboard_topology_script,
         )
-        self.assertIn("fitPadding", dashboard_script)
+        self.assertIn("fitPadding", dashboard_topology_script)
         self.assertIn("compact ? 12 : 11", topology_style_script)
         self.assertIn("compact ? 14 : 13", topology_style_script)
         self.assertIn('"text-background-color": "#0d1114"', topology_style_script)
         self.assertIn('"text-background-padding": 5', topology_style_script)
         self.assertIn('"text-overflow-wrap": "anywhere"', topology_style_script)
         self.assertIn('"text-max-width": compact ? 130 : 170', topology_style_script)
-        self.assertIn("animationDuration: 360", dashboard_script)
-        self.assertIn("topologyLayoutGeneration", dashboard_script)
-        self.assertIn("is-reflowing", dashboard_script)
+        self.assertIn("animationDuration: 360", dashboard_topology_script)
+        self.assertIn("topologyLayoutGeneration", dashboard_topology_script)
+        self.assertIn("is-reflowing", dashboard_topology_script)
         self.assertIn("jobCardSignature", dashboard_script)
         self.assertIn("timelineVisualSignature", dashboard_script)
         self.assertIn("attentionVisualSignature", dashboard_script)
         self.assertIn("refreshJobAges", dashboard_script)
-        self.assertIn("panTopology", dashboard_script)
-        self.assertIn("topologyNavigationOrder", dashboard_script)
+        self.assertIn("panTopology", dashboard_topology_script)
+        self.assertIn("topologyNavigationOrder", dashboard_topology_script)
         self.assertIn("topologySelectionDirection", dashboard_script)
         self.assertIn("cycleTopologySelection", dashboard_script)
-        self.assertIn("selectTopologyNode", dashboard_script)
-        self.assertIn("revealTopologyNode", dashboard_script)
-        self.assertIn("aria-activedescendant", dashboard_script)
+        self.assertIn("selectTopologyNode", dashboard_topology_script)
+        self.assertIn("revealTopologyNode", dashboard_topology_script)
+        self.assertIn("aria-activedescendant", dashboard_topology_script)
         self.assertIn("topology-selection-status", index)
         self.assertIn("topology-selection-help", index)
         self.assertIn("topology-active-descendant", index)
         self.assertIn("aria-current", dashboard_script)
-        self.assertIn("reconcileTopologyNavigation", dashboard_script)
-        self.assertIn("topologyViewportState", dashboard_script)
-        self.assertIn("programmaticWriteDepth", dashboard_script)
-        self.assertIn("motionGeneration", dashboard_script)
-        self.assertIn("handleTopologyResize", dashboard_script)
-        resize_handler = dashboard_script[
-            dashboard_script.index("function handleTopologyResize()") : dashboard_script.index(
-                "function renderTopologyTree"
-            )
+        self.assertIn("reconcileTopologyNavigation", dashboard_topology_script)
+        self.assertIn("topologyViewportState", dashboard_topology_script)
+        self.assertIn("programmaticWriteDepth", dashboard_topology_script)
+        self.assertIn("motionGeneration", dashboard_topology_script)
+        self.assertIn("handleTopologyResize", dashboard_topology_script)
+        resize_handler = dashboard_topology_script[
+            dashboard_topology_script.index(
+                "function handleTopologyResize()"
+            ) : dashboard_topology_script.index("function renderTopologyTree")
         ]
         focused_resize = resize_handler[
             resize_handler.index(
@@ -1877,13 +1887,13 @@ class DashboardTests(unittest.TestCase):
             compact_entry_resize.index(compact_fit),
             compact_entry_resize.index(compact_capture),
         )
-        self.assertNotIn("topologyViewportTouched", dashboard_script)
-        self.assertNotIn("topologyViewportUpdate", dashboard_script)
+        self.assertNotIn("topologyViewportTouched", dashboard_topology_script)
+        self.assertNotIn("topologyViewportUpdate", dashboard_topology_script)
         self.assertIn("Control+ArrowRight", index)
         self.assertIn("Escape", dashboard_script)
-        self.assertIn('topologyCanvas.on("mouseover", "node"', dashboard_script)
-        self.assertIn('topologyCanvas.on("mouseout", "node"', dashboard_script)
-        self.assertIn("is-hovered", dashboard_script)
+        self.assertIn('topologyCanvas.on("mouseover", "node"', dashboard_topology_script)
+        self.assertIn('topologyCanvas.on("mouseout", "node"', dashboard_topology_script)
+        self.assertIn("is-hovered", dashboard_topology_script)
         self.assertIn(
             "node[kind = 'project']:selected, node[kind = 'worktree']:selected, "
             "node[kind = 'tab']:selected",
@@ -1923,12 +1933,14 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('matchMedia?.("(pointer: coarse)")', dashboard_script)
         self.assertIn("topologyTouchOwnershipState", dashboard_script)
         self.assertIn("coarseOwner", dashboard_script)
-        self.assertIn("function currentTopologyTouchMode()", dashboard_script)
-        self.assertIn("function setTopologyTouchOwner(owner)", dashboard_script)
-        self.assertIn("function syncTopologyTouchOwnership()", dashboard_script)
-        self.assertEqual(dashboard_script.count("function syncTopologyTouchOwnership()"), 1)
-        self.assertIn("userPanningEnabled", dashboard_script)
-        self.assertIn("userZoomingEnabled", dashboard_script)
+        self.assertIn("function currentTopologyTouchMode()", dashboard_topology_script)
+        self.assertIn("function setTopologyTouchOwner(owner)", dashboard_topology_script)
+        self.assertIn("function syncTopologyTouchOwnership()", dashboard_topology_script)
+        self.assertEqual(
+            dashboard_topology_script.count("function syncTopologyTouchOwnership()"), 1
+        )
+        self.assertIn("userPanningEnabled", dashboard_topology_script)
+        self.assertIn("userZoomingEnabled", dashboard_topology_script)
         self.assertIn('addEventListener("change"', dashboard_script)
         self.assertIn("addListener", dashboard_script)
         self.assertEqual(rejected_host, 421)
