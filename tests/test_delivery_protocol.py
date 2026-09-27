@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,11 +13,74 @@ from herdr_orchestrator.delivery_protocol import (
     DeliveryArtifactError,
     DeliveryTicket,
     ProxyAction,
+    append_artifact_text,
     load_delivery_plan,
     load_proxy_decision,
     load_review_verdict,
     load_ticket_receipt,
+    read_artifact_text,
 )
+
+
+class ArtifactTextTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_fifo_without_peer_is_rejected_without_blocking(self) -> None:
+        script = """
+import sys
+from pathlib import Path
+from herdr_orchestrator.delivery_protocol import (
+    DeliveryArtifactError, append_artifact_text, read_artifact_text,
+)
+try:
+    if sys.argv[2] == "read":
+        read_artifact_text(Path(sys.argv[1]), "receipt")
+    else:
+        append_artifact_text(Path(sys.argv[1]), "content")
+except DeliveryArtifactError as error:
+    print(error)
+else:
+    raise AssertionError("FIFO was accepted")
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "artifact.fifo"
+            os.mkfifo(path)
+            for operation, error in (
+                ("read", "receipt_unreadable"),
+                ("append", "delivery_artifact_write_failed"),
+            ):
+                with self.subTest(operation=operation):
+                    result = subprocess.run(
+                        [sys.executable, "-c", script, str(path), operation],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), error)
+
+    def test_creates_appends_and_reads_a_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "artifact.txt"
+            append_artifact_text(path, "first\n")
+            append_artifact_text(path, "second\n")
+
+            self.assertEqual(read_artifact_text(path, "receipt"), "first\nsecond\n")
+
+    def test_rejects_symlinks_without_changing_the_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target = root / "target.txt"
+            target.write_text("original\n", encoding="utf-8")
+            path = root / "artifact.txt"
+            path.symlink_to(target.name)
+
+            with self.assertRaisesRegex(DeliveryArtifactError, "^receipt_path_invalid$"):
+                read_artifact_text(path, "receipt")
+            with self.assertRaisesRegex(DeliveryArtifactError, "^delivery_artifact_path_invalid$"):
+                append_artifact_text(path, "content")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
 
 
 class DeliveryProtocolTests(unittest.TestCase):
