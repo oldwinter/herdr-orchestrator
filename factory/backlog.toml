@@ -103,3 +103,15 @@ requires = ["factory-evidence-gc-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "requires"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-status-truth-v1"
+title = "Surface backlog errors in status; pin concurrent intake idempotence"
+harness = "codex"
+prompt_file = "prompts/factory-status-truth-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-status-truth-v1.json"
+requires = ["factory-requires-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "backlog_error or concurrent_intake"]
+timeout_seconds = 600

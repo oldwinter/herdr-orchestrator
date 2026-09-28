@@ -756,8 +756,8 @@ def _command_status(args: argparse.Namespace) -> int:
             },
             "unqueued": sorted(key for key in items if key not in queued),
         }
-    except FactoryError:
-        backlog = {"items": 0, "unqueued": []}
+    except FactoryError as exc:
+        backlog = {"error": str(exc), "items": 0, "unqueued": []}
     print(
         json.dumps(
             {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import importlib.util
 import io
 import json
@@ -594,6 +595,29 @@ class FactoryCliTests(BacklogFixture):
         job = json.loads(status.stdout)["jobs"][0]
         self.assertEqual(job["error_code"], "factory_check_failed")
         self.assertIn("exit=3", job["error_summary"])
+
+    def test_cli_status_surfaces_backlog_error_not_silence(self) -> None:
+        self.write_workflow()
+        self.backlog.write_text("schema_version = 2\nitems = []\n", encoding="utf-8")
+
+        status = self.run_cli("status")
+
+        self.assertEqual(status.returncode, 0, status.stderr)
+        payload = json.loads(status.stdout)
+        self.assertIn("factory_backlog_schema_version", payload["backlog"]["error"])
+
+    def test_cli_concurrent_intake_is_idempotent(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", json.dumps([sys.executable, "-c", "pass"])))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.run_cli("intake"), range(2)))
+
+        self.assertTrue(all(result.returncode == 0 for result in results))
+        added = sum(json.loads(result.stdout)["added"] for result in results)
+        self.assertEqual(added, 1)
+        self.assertEqual(len(self.jobs()), 1)
 
     def test_cli_rejects_invalid_backlog_and_missing_workflow(self) -> None:
         self.write_workflow()
