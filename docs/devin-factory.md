@@ -36,7 +36,9 @@ and a non-empty `[[items.checks]]` list of bounded argv+timeout commands
 executed without a shell. An item only enters the queue at intake once every
 `requires` entry names a backlog item whose job is already `succeeded`;
 until then intake reports it under `waiting` (unknown references, duplicates
-and cycles are rejected as `factory_requires_*` errors). Check exit codes and
+and cycles are rejected as `factory_requires_*` errors). Re-run
+`just factory-intake` after a requirement lands — `factory-run` only drains
+jobs already enqueued. Check exit codes and
 stdout/stderr are recorded in per-attempt evidence under
 `.orchestrator/factory/evidence/<dedupe_key>/` (ignored by Git along with
 everything under `.orchestrator/`).
@@ -44,9 +46,10 @@ everything under `.orchestrator/`).
 ## Inspect
 
 - `just factory-status` — durable queue state for the `devin-factory`
-  workflow, including `task_verified` and `verification_class`.
-- `just factory-report` — operator report with one row per job and a link to
-  its latest evidence file.
+  workflow, including `task_verified` and `verification_class`; the backlog
+  section lists `unqueued` items and `waiting` items with unmet `requires`.
+- `just factory-report` — operator report with one row per job, a link to
+  its latest evidence file, and a backlog coverage section.
 - Raw inspection works with the standard CLI against the same DB:
   `PYTHONPATH=src uv run python -m herdr_orchestrator status --workflow
   workflows/devin-factory.toml`.
@@ -66,16 +69,18 @@ uv run pytest tests/test_devin_factory.py -q
   with the attempt `outcome_committed`.
 - `just factory-run` again to drain released retries.
 - `just factory-retry JOB_ID` re-queues a terminal failure with extra
-  attempts after a fix; `just factory-gc` collects terminal job artifacts
-  (dry-run unless confirmed; see `just gc-failed` for the main queue).
+  attempts after a fix; `just factory-gc` runs the canonical agent
+  collector against the factory queue (dry-run unless `--apply`; the local
+  lane creates no Herdr agents, so it normally reports no candidates).
 - `blocked` remains a manual state per repository rules and requires an
   explicit resume; the factory lane does not write it.
 
 ## Stop
 
-- `factory-run` is a bounded batch: it exits when the queue is idle or
-  `--max-waves` is hit. Send SIGINT to stop mid-run; claimed attempts expire
-  on their lease and become resumable on the next run.
+- `factory-run` is a bounded batch: it exits when the queue is idle or the
+  `--drain-timeout-seconds` budget is hit. Send SIGINT to stop mid-run;
+  claimed attempts expire on their lease and become resumable on the next
+  run.
 - Intake/status/report are single-shot and need no shutdown.
 
 ## Approval boundaries
