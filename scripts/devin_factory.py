@@ -788,13 +788,31 @@ def _command_intake(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_jobs_summary(coordinator: Coordinator) -> list[dict[str, object]]:
+    workspace = str(coordinator.config.workspace.resolve())
+    return [
+        {
+            "dedupe_key": job["dedupe_key"],
+            "error_code": job["error_code"],
+            "job_id": job["id"],
+            "state": job["state"],
+            "task_verified": job["task_verified"],
+        }
+        for job in coordinator.store.jobs(
+            coordinator.config.name, workspace=workspace, include_legacy=True
+        )
+    ]
+
+
 def _command_run(args: argparse.Namespace) -> int:
     coordinator, _ = _build_coordinator(args.workflow, args.backlog)
     if args.once:
         report = coordinator.run_once()
+        report["jobs"] = _run_jobs_summary(coordinator)
         print(json.dumps(report, sort_keys=True))
         return 1 if report.get("failed") or report.get("blocked") else 0
     result = coordinator.run_until_idle(timeout_seconds=args.drain_timeout_seconds)
+    result["jobs"] = _run_jobs_summary(coordinator)
     print(json.dumps(result, sort_keys=True))
     queue = result.get("queue", {})
     terminal = int(queue.get("failed", 0)) + int(queue.get("blocked", 0))

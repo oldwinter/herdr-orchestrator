@@ -255,3 +255,14 @@ requires = ["factory-corrupt-db-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "deadline or within_budget or evidence or receipt"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-run-jobs-v1"
+title = "Run output names per-job outcomes, not just counts"
+harness = "codex"
+prompt_file = "prompts/factory-run-jobs-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-run-jobs-v1.json"
+requires = ["factory-evidence-budget-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli or run_once"]
+timeout_seconds = 180

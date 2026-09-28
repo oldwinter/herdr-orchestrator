@@ -720,7 +720,20 @@ class FactoryCliTests(BacklogFixture):
 
         run = self.run_cli("run")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(json.loads(run.stdout)["queue"]["succeeded"], 1)
+        run_payload = json.loads(run.stdout)
+        self.assertEqual(run_payload["queue"]["succeeded"], 1)
+        self.assertEqual(
+            run_payload["jobs"],
+            [
+                {
+                    "dedupe_key": "alpha",
+                    "error_code": None,
+                    "job_id": 1,
+                    "state": "succeeded",
+                    "task_verified": True,
+                }
+            ],
+        )
 
         status = self.run_cli("status")
         self.assertEqual(status.returncode, 0, status.stderr)
