@@ -929,6 +929,27 @@ class FactoryValidateTests(BacklogFixture):
         self.assertTrue(by_key["alpha"]["harness_supported"])
         self.assertEqual(by_key["alpha"]["checks"], [["python3", "-c", "pass"]])
 
+    def test_validate_warns_when_check_timeout_exceeds_agent_budget(self) -> None:
+        self.write_workflow(agent_timeout=30)
+        self.write_prompt("alpha")
+        self.write_backlog(
+            self.item_header("alpha")
+            + "[[items.checks]]\n"
+            + 'argv = ["python3", "-c", "pass"]\n'
+            + "timeout_seconds = 60\n"
+        )
+
+        payload = self.capture()
+
+        self.assertTrue(payload["valid"])
+        self.assertEqual(
+            payload["warnings"],
+            [
+                "alpha: check[0] timeout_seconds=60 exceeds "
+                "agent_timeout_seconds=30; the dispatch deadline will truncate it"
+            ],
+        )
+
     def test_validate_fails_closed_on_unsupported_harness(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")

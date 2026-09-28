@@ -705,6 +705,14 @@ def _command_validate(args: argparse.Namespace) -> int:
     unsupported = sorted(
         item.dedupe_key for item in items.values() if item.harness not in worker_harnesses
     )
+    agent_budget = int(config.coordinator.agent_timeout_seconds)
+    warnings = [
+        f"{item.dedupe_key}: check[{index}] timeout_seconds={check.timeout_seconds}"
+        f" exceeds agent_timeout_seconds={agent_budget}; the dispatch deadline will truncate it"
+        for item in items.values()
+        for index, check in enumerate(item.checks)
+        if check.timeout_seconds > agent_budget
+    ]
     print(
         json.dumps(
             {
@@ -726,6 +734,7 @@ def _command_validate(args: argparse.Namespace) -> int:
                 "state_db_error": state_db_error,
                 "unsupported_harnesses": unsupported,
                 "valid": not unsupported,
+                "warnings": warnings,
             },
             indent=2,
             sort_keys=True,

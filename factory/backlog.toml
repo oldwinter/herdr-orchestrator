@@ -281,3 +281,14 @@ timeout_seconds = 60
 [[items.checks]]
 argv = ["python3", "-c", "import pathlib,sys; t=pathlib.Path('docs/devin-factory.md').read_text(); sys.exit(0 if 'jobs' in t and 'dispatch_deadline' in t else 1)"]
 timeout_seconds = 30
+[[items]]
+dedupe_key = "factory-validate-warnings-v1"
+title = "Validate warns when a check timeout exceeds the agent budget"
+harness = "codex"
+prompt_file = "prompts/factory-validate-warnings-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-validate-warnings-v1.json"
+requires = ["factory-docs-run-jobs-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "ValidateTests"]
+timeout_seconds = 180
