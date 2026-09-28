@@ -1017,6 +1017,27 @@ class FactoryCliTests(BacklogFixture):
         self.assertEqual(job["error_code"], "factory_check_failed")
         self.assertIn("exit=3", job["error_summary"])
 
+    def test_cli_status_marks_expired_lease_as_reclaimable(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", '["python3", "-c", "pass"]'))
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        status = self.run_cli("status")
+        self.assertFalse(json.loads(status.stdout)["jobs"][0]["lease_expired"])
+
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            connection.execute(
+                "UPDATE jobs SET state = 'running', lease_until = ? WHERE id = 1",
+                (time.time() - 60,),
+            )
+            connection.commit()
+
+        status = self.run_cli("status")
+        job = json.loads(status.stdout)["jobs"][0]
+        self.assertEqual(job["state"], "running")
+        self.assertTrue(job["lease_expired"])
+
     def test_cli_status_surfaces_backlog_error_not_silence(self) -> None:
         self.write_workflow()
         self.backlog.write_text("schema_version = 2\nitems = []\n", encoding="utf-8")

@@ -468,3 +468,14 @@ requires = ["factory-once-exit-pin-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "concurrent"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-lease-expired-v1"
+title = "Status flags jobs whose lease has expired"
+harness = "codex"
+prompt_file = "prompts/factory-lease-expired-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-lease-expired-v1.json"
+requires = ["factory-concurrent-run-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "lease or status"]
+timeout_seconds = 180

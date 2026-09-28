@@ -902,6 +902,10 @@ def _command_status(args: argparse.Namespace) -> int:
                         "error_summary": job["error_summary"],
                         "harness": job["harness"],
                         "id": job["id"],
+                        "lease_expired": (
+                            job["lease_until"] is not None
+                            and float(job["lease_until"]) <= time.time()
+                        ),
                         "max_attempts": job["max_attempts"],
                         "receipt_kind": job["receipt_kind"],
                         "receipt_value": job["receipt_value"],
