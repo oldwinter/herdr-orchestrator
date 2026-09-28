@@ -948,6 +948,22 @@ class FactoryCliTests(BacklogFixture):
         job = self.jobs()[0]
         self.assertEqual(job["state"], JobState.FAILED.value)
 
+    def test_cli_run_once_exit_code_reflects_failed_batch(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        self.write_backlog(
+            self.item_toml("alpha", json.dumps([sys.executable, "-c", "raise SystemExit(3)"]))
+        )
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        run = self.run_cli("run", "--once")
+
+        self.assertEqual(run.returncode, 1)
+        payload = json.loads(run.stdout)
+        self.assertEqual(payload["failed"], 1)
+        self.assertEqual(payload["jobs"][0]["state"], "failed")
+        self.assertEqual(payload["jobs"][0]["error_code"], "factory_check_failed")
+
     def test_cli_status_on_corrupt_state_db_exits_2_with_stable_code(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")

@@ -446,3 +446,14 @@ requires = ["factory-validate-attempts-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "sigint or executable or deadline"]
 timeout_seconds = 300
+[[items]]
+dedupe_key = "factory-once-exit-pin-v1"
+title = "Pin run --once exit code on a failed batch"
+harness = "codex"
+prompt_file = "prompts/factory-once-exit-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-once-exit-pin-v1.json"
+requires = ["factory-sigint-kill-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "once"]
+timeout_seconds = 180
