@@ -18,7 +18,7 @@
 | Manual manager | `just manager [harness]` | 当前 Herdr session 内的专用交互管理会话，策略见 `manager/AGENTS.md` |
 | Read-only dashboard | `just dashboard` | 查看 queue、attention、拓扑与 receipt 时间线，见 `docs/dashboard.md` |
 | Standardized delivery | 仅 `just deliver` 或显式 Skill | 用户明确触发时才用；入口 `.agents/skills/standardized-delivery/SKILL.md`，细节 `docs/standardized-delivery.md` |
-| Devin factory lane | `just factory-validate` / `factory-intake` / `factory-run` / `factory-status` / `factory-report` / `factory-retry` / `factory-gc` | 本地有界 work-item 流水线：复用 durable queue，本地执行 backlog 声明的验收检查而不是 Herdr transport，见 `docs/devin-factory.md` |
+| Devin factory lane | `just factory-validate` / `factory-intake` / `factory-run` / `factory-status` / `factory-report` / `factory-retry` / `factory-gc` | 本地有界 work-item 流水线：workflow `workflows/devin-factory.toml`，复用 durable queue，本地执行 backlog 声明的验收检查而不是 Herdr transport，见 `docs/devin-factory.md` |
 
 ## 真源
 
