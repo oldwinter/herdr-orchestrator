@@ -424,3 +424,14 @@ requires = ["factory-output-bound-pin-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "updated or enqueue_is_idempotent or Cli"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-validate-attempts-v1"
+title = "Validate shows declared max_attempts per item"
+harness = "codex"
+prompt_file = "prompts/factory-validate-attempts-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-validate-attempts-v1.json"
+requires = ["factory-job-updated-at-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
+timeout_seconds = 180

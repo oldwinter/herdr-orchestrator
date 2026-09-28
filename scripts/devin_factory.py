@@ -729,6 +729,7 @@ def _command_validate(args: argparse.Namespace) -> int:
                         "dedupe_key": item.dedupe_key,
                         "harness": item.harness.value,
                         "harness_supported": item.harness in worker_harnesses,
+                        "max_attempts": item.max_attempts,
                         "prompt_file": item.prompt_file.name,
                         "queued": item.dedupe_key in queued,
                         "receipt": item.receipt,
