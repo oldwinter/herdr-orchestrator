@@ -713,6 +713,13 @@ def _command_validate(args: argparse.Namespace) -> int:
         for index, check in enumerate(item.checks)
         if check.timeout_seconds > agent_budget
     ]
+    warnings += [
+        f"{item.dedupe_key}: check[{index}] argv[0]={check.argv[0]!r} does not"
+        " resolve on PATH; the check will fail with exit_code=127"
+        for item in items.values()
+        for index, check in enumerate(item.checks)
+        if not Path(check.argv[0]).is_absolute() and shutil.which(check.argv[0]) is None
+    ]
     print(
         json.dumps(
             {

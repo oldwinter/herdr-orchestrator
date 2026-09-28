@@ -1083,6 +1083,27 @@ class FactoryValidateTests(BacklogFixture):
             ],
         )
 
+    def test_validate_warns_when_check_executable_will_not_resolve(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(
+            self.item_header("alpha")
+            + "[[items.checks]]\n"
+            + 'argv = ["no-such-binary-xyz", "run"]\n'
+            + "timeout_seconds = 30\n"
+        )
+
+        payload = self.capture()
+
+        self.assertTrue(payload["valid"])
+        self.assertEqual(
+            payload["warnings"],
+            [
+                "alpha: check[0] argv[0]='no-such-binary-xyz' does not "
+                "resolve on PATH; the check will fail with exit_code=127"
+            ],
+        )
+
     def test_validate_fails_closed_on_unsupported_harness(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")
