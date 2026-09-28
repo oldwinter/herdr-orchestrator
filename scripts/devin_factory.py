@@ -70,6 +70,7 @@ ITEM_KEYS = frozenset(
         "receipt",
         "checks",
         "check_timeout_seconds",
+        "max_attempts",
         "requires",
     }
 )
@@ -97,6 +98,7 @@ class FactoryItem:
     receipt: str
     checks: tuple[FactoryCheck, ...]
     requires: tuple[str, ...]
+    max_attempts: int | None
 
 
 def _require(condition: bool, code: str) -> None:
@@ -156,6 +158,11 @@ def load_backlog(path: Path) -> dict[str, FactoryItem]:
         _require(receipt not in receipt_paths, f"factory_receipt_duplicate: {receipt}")
         receipt_paths.add(receipt)
         requires = _load_requires(row.get("requires"), dedupe_key)
+        max_attempts = row.get("max_attempts")
+        _require(
+            max_attempts is None or (isinstance(max_attempts, int) and 1 <= max_attempts <= 8),
+            f"factory_max_attempts_invalid: {dedupe_key}",
+        )
         items[dedupe_key] = FactoryItem(
             dedupe_key=dedupe_key,
             title=title.strip(),
@@ -164,6 +171,7 @@ def load_backlog(path: Path) -> dict[str, FactoryItem]:
             receipt=receipt,
             checks=_load_checks(row, dedupe_key),
             requires=requires,
+            max_attempts=max_attempts,
         )
     _check_requires(items)
     return items
@@ -706,6 +714,7 @@ def _command_intake(args: argparse.Namespace) -> int:
             dedupe_key=item.dedupe_key,
             placement=PlacementTarget.PANE,
             receipt=TaskReceipt(ReceiptKind.FILE, item.receipt),
+            max_attempts=item.max_attempts,
         )
         added += int(created)
         jobs.append(

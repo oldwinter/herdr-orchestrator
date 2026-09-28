@@ -28,8 +28,10 @@ just factory-report      # write .orchestrator/factory/report.md
 `just factory-run --once`.
 
 Backlog items live in `factory/backlog.toml` (`schema_version = 1`). Each
-item declares `dedupe_key`, `title`, `prompt_file`, `receipt`, optional
-`placement`/`max_attempts`, an optional `requires = [dedupe_key, ...]` list,
+item declares `dedupe_key`, `title`, `harness`, `prompt_file`, `receipt`,
+optional `max_attempts` (1–8, overriding the workflow default for this job
+only; existing jobs keep the budget they were enqueued with), an optional
+`requires = [dedupe_key, ...]` list,
 and a non-empty `[[items.checks]]` list of bounded argv+timeout commands
 executed without a shell. An item only enters the queue at intake once every
 `requires` entry names a backlog item whose job is already `succeeded`;

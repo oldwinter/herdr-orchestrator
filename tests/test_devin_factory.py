@@ -101,6 +101,7 @@ class BacklogFixture(unittest.TestCase):
         *,
         receipt: str | None = None,
         requires: list[str] | None = None,
+        max_attempts: int | None = None,
     ) -> str:
         receipt_line = (
             f'receipt = "{receipt}"\n'
@@ -108,6 +109,7 @@ class BacklogFixture(unittest.TestCase):
             else f'receipt = ".orchestrator/factory/receipts/{dedupe_key}.json"\n'
         )
         requires_line = f"requires = {json.dumps(requires)}\n" if requires is not None else ""
+        attempts_line = f"max_attempts = {max_attempts}\n" if max_attempts is not None else ""
         return (
             "[[items]]\n"
             f'dedupe_key = "{dedupe_key}"\n'
@@ -116,6 +118,7 @@ class BacklogFixture(unittest.TestCase):
             f'prompt_file = "prompts/{dedupe_key}.md"\n'
             f"{receipt_line}"
             f"{requires_line}"
+            f"{attempts_line}"
         )
 
     def item_toml(
@@ -126,9 +129,15 @@ class BacklogFixture(unittest.TestCase):
         timeout: int = 60,
         receipt: str | None = None,
         requires: list[str] | None = None,
+        max_attempts: int | None = None,
     ) -> str:
         return (
-            self.item_header(dedupe_key, receipt=receipt, requires=requires)
+            self.item_header(
+                dedupe_key,
+                receipt=receipt,
+                requires=requires,
+                max_attempts=max_attempts,
+            )
             + "[[items.checks]]\n"
             + f"argv = {argv}\n"
             + f"timeout_seconds = {timeout}\n"
@@ -212,6 +221,7 @@ class FactoryLifecycleTests(BacklogFixture):
                 dedupe_key=item.dedupe_key,
                 placement=PlacementTarget.PANE,
                 receipt=TaskReceipt(ReceiptKind.FILE, item.receipt),
+                max_attempts=item.max_attempts,
             )
             created.append(was_created)
         return created
@@ -498,6 +508,40 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertEqual(job["state"], JobState.FAILED.value)
         self.assertEqual(job["error_code"], "factory_receipt_write_failed")
         self.assertFalse(job["task_verified"])
+
+    def test_item_max_attempts_overrides_workflow_default(self) -> None:
+        self.write_workflow(max_attempts=3)
+        self.write_prompt("alpha")
+        self.write_backlog(
+            self.item_toml(
+                "alpha",
+                json.dumps([sys.executable, "-c", "raise SystemExit(3)"]),
+                max_attempts=1,
+            )
+        )
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["max_attempts"], 1)
+        self.assertEqual(job["attempts"], 1)
+
+    def test_item_max_attempts_invalid_is_rejected(self) -> None:
+        self.write_prompt("alpha")
+        for bad in ("0", "9", '"one"'):
+            with self.subTest(max_attempts=bad):
+                self.write_backlog(
+                    self.item_header("alpha")
+                    + f"max_attempts = {bad}\n"
+                    + '[[items.checks]]\nargv = ["python3", "-c", "pass"]\n'
+                )
+                with self.assertRaisesRegex(
+                    devin_factory.FactoryError, "factory_max_attempts_invalid"
+                ):
+                    devin_factory.load_backlog(self.backlog)
 
     def test_run_once_reports_batch_counts(self) -> None:
         self.write_workflow()

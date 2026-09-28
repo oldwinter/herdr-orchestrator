@@ -127,3 +127,15 @@ requires = ["factory-status-truth-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "receipt_write_failed or unwritable"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-max-attempts-v1"
+title = "Per-item retry budget via backlog max_attempts"
+harness = "codex"
+prompt_file = "prompts/factory-max-attempts-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-max-attempts-v1.json"
+requires = ["factory-receipt-write-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_runner.py", "-q"]
+timeout_seconds = 600

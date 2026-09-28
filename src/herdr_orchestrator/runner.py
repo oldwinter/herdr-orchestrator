@@ -176,6 +176,7 @@ class Coordinator:
         placement: PlacementTarget | None = None,
         receipt: TaskReceipt | None = None,
         completion_policy: CompletionPolicy | None = None,
+        max_attempts: int | None = None,
     ) -> tuple[int, bool, Harness]:
         self.initialize()
         if not prompt_file.is_file():
@@ -215,7 +216,7 @@ class Coordinator:
                 harness=selected,
                 prompt=prompt,
                 dedupe_key=dedupe_key,
-                max_attempts=self.config.coordinator.max_attempts,
+                max_attempts=max_attempts or self.config.coordinator.max_attempts,
                 placement=self._static_placement(
                     title,
                     prompt,
