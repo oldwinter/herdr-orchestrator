@@ -792,6 +792,18 @@ class FactoryCliTests(BacklogFixture):
         job = self.jobs()[0]
         self.assertEqual(job["state"], JobState.FAILED.value)
 
+    def test_cli_status_on_corrupt_state_db_exits_2_with_stable_code(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", '["python3", "-c", "pass"]'))
+        (self.root / "state.db").write_bytes(b"not a database")
+
+        result = self.run_cli("status")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("factory_state_db_unreadable", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_cli_run_on_empty_queue_is_idle_success(self) -> None:
         self.write_workflow()
         self.backlog.write_text("schema_version = 1\nitems = []\n", encoding="utf-8")

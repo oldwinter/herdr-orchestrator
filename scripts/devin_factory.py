@@ -992,6 +992,9 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         return handlers[args.factory_command](args)
+    except sqlite3.DatabaseError as exc:
+        print(f"factory_state_db_unreadable: {exc}", file=sys.stderr)
+        return 2
     except (ConfigError, FactoryError, StoreError, TransportError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

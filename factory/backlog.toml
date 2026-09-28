@@ -233,3 +233,14 @@ requires = ["factory-validate-harness-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "atomic or partial_artifacts or receipt_write or evidence_write"]
 timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-corrupt-db-v1"
+title = "Stable factory_state_db_unreadable exit-2 on corrupt state DB"
+harness = "codex"
+prompt_file = "prompts/factory-corrupt-db-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-corrupt-db-v1.json"
+requires = ["factory-atomic-writes-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli or corrupt"]
+timeout_seconds = 180
