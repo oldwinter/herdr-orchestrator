@@ -222,3 +222,14 @@ requires = ["factory-status-waiting-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
 timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-atomic-writes-v1"
+title = "Atomic writes for receipts, evidence, and the operator report"
+harness = "codex"
+prompt_file = "prompts/factory-atomic-writes-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-atomic-writes-v1.json"
+requires = ["factory-validate-harness-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "atomic or partial_artifacts or receipt_write or evidence_write"]
+timeout_seconds = 120

@@ -282,6 +282,22 @@ def _load_checks(row: dict[str, Any], dedupe_key: str) -> tuple[FactoryCheck, ..
     return tuple(checks)
 
 
+def _write_text_atomic(target: Path, text: str) -> None:
+    """Write via a sibling temp file + rename so concurrent readers never see
+    a partially written artifact."""
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _write_json_atomic(target: Path, payload: dict[str, Any]) -> None:
+    _write_text_atomic(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
 def _bounded_tail(text: str | None) -> str:
     return text[-MAX_CHECK_OUTPUT_CHARS:] if text else ""
 
@@ -482,28 +498,23 @@ class LocalDispatcher:
                 target = receipt_file_path(receipt, self._workspace)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    target.write_text(
-                        json.dumps(
-                            {
-                                "checks": [
-                                    {
-                                        "argv": result["argv"],
-                                        "exit_code": result["exit_code"],
-                                    }
-                                    for result in evidence.get("checks", [])
-                                ],
-                                "correlation_id": evidence["correlation_id"],
-                                "dedupe_key": item.dedupe_key,
-                                "git_head": evidence["git_head"],
-                                "schema_version": 1,
-                                "task": item.title,
-                                "verified_at": _utc_now(),
-                            },
-                            indent=2,
-                            sort_keys=True,
-                        )
-                        + "\n",
-                        encoding="utf-8",
+                    _write_json_atomic(
+                        target,
+                        {
+                            "checks": [
+                                {
+                                    "argv": result["argv"],
+                                    "exit_code": result["exit_code"],
+                                }
+                                for result in evidence.get("checks", [])
+                            ],
+                            "correlation_id": evidence["correlation_id"],
+                            "dedupe_key": item.dedupe_key,
+                            "git_head": evidence["git_head"],
+                            "schema_version": 1,
+                            "task": item.title,
+                            "verified_at": _utc_now(),
+                        },
                     )
                 except OSError:
                     return failed_completion(self._policy(context), "factory_receipt_write_failed")
@@ -632,13 +643,12 @@ class LocalDispatcher:
             stamp = _utc_now().replace(":", "-").replace("+", "Z")
             correlation = str(evidence.get("correlation_id") or "no-correlation")[:8]
             target = directory / f"{stamp}-{correlation}.json"
-            target.write_text(
-                json.dumps(evidence, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            _write_json_atomic(target, evidence)
             stale = sorted(directory.glob("*.json"))[:-EVIDENCE_KEEP_PER_ITEM]
             for old in stale:
                 old.unlink(missing_ok=True)
+            for orphan in directory.glob(".*.tmp"):
+                orphan.unlink(missing_ok=True)
         except OSError:
             return "factory_evidence_write_failed"
         return None
@@ -918,9 +928,12 @@ def _command_report(args: argparse.Namespace) -> int:
     except FactoryError as exc:
         lines += ["", "## Backlog coverage", "", f"- error: `{exc}`"]
     report_root = config.workspace / ".orchestrator" / "factory"
-    report_root.mkdir(parents=True, exist_ok=True)
-    target = report_root / "report.md"
-    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        report_root.mkdir(parents=True, exist_ok=True)
+        target = report_root / "report.md"
+        _write_text_atomic(target, "\n".join(lines) + "\n")
+    except OSError as exc:
+        raise FactoryError(f"factory_report_write_failed: {exc}") from exc
     print(
         json.dumps(
             {

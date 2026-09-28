@@ -410,6 +410,31 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertTrue(job["task_verified"])
         self.assertLess(elapsed, 5.0)
 
+    def test_receipt_and_evidence_writes_leave_no_partial_artifacts(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "pass"])
+        self.write_backlog(self.item_toml("alpha", argv))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        evidence_dir = self.root / ".orchestrator/factory/evidence/alpha"
+        leftovers = list(evidence_dir.glob("*.tmp")) + list(evidence_dir.glob(".*.tmp"))
+        self.assertEqual(leftovers, [])
+        receipt = self.root / ".orchestrator/factory/receipts/alpha.json"
+        json.loads(receipt.read_text(encoding="utf-8"))
+        for evidence_file in evidence_dir.glob("*.json"):
+            json.loads(evidence_file.read_text(encoding="utf-8"))
+
+    def test_atomic_write_cleans_up_tmp_on_failure(self) -> None:
+        target = self.root / "nowhere" / "report.md"
+        with self.assertRaises(OSError):
+            devin_factory._write_text_atomic(target, "x")
+        self.assertEqual(list(self.root.glob("**/*.tmp")), [])
+        self.assertEqual(list(self.root.glob("**/.*.tmp")), [])
+
     def test_evidence_write_failure_fails_success_with_stable_code(self) -> None:
         self.write_workflow(max_attempts=1)
         self.write_prompt("alpha")
