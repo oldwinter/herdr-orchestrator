@@ -189,3 +189,14 @@ requires = ["factory-deadline-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "evidence_write"]
 timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-report-coverage-v1"
+title = "Include backlog coverage and waiting items in the operator report"
+harness = "codex"
+prompt_file = "prompts/factory-report-coverage-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-report-coverage-v1.json"
+requires = ["factory-evidence-write-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report"]
+timeout_seconds = 120

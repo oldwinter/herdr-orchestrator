@@ -879,6 +879,26 @@ def _command_report(args: argparse.Namespace) -> int:
                 evidence=evidence_note,
             )
         )
+    queued = {str(job["dedupe_key"]) for job in jobs}
+    try:
+        backlog_items = load_backlog(args.backlog)
+        unqueued = sorted(key for key in backlog_items if key not in queued)
+        waiting = [
+            f"{item.dedupe_key} (requires: {', '.join(item.requires)})"
+            for item in backlog_items.values()
+            if item.dedupe_key in unqueued and item.requires
+        ]
+        lines += [
+            "",
+            "## Backlog coverage",
+            "",
+            f"- items: {len(backlog_items)}",
+            f"- queued: {len(backlog_items) - len(unqueued)}",
+            f"- unqueued: {', '.join(unqueued) if unqueued else 'none'}",
+            f"- waiting on requires: {', '.join(waiting) if waiting else 'none'}",
+        ]
+    except FactoryError as exc:
+        lines += ["", "## Backlog coverage", "", f"- error: `{exc}`"]
     report_root = config.workspace / ".orchestrator" / "factory"
     report_root.mkdir(parents=True, exist_ok=True)
     target = report_root / "report.md"

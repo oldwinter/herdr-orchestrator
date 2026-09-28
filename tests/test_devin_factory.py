@@ -706,6 +706,29 @@ class FactoryCliTests(BacklogFixture):
         rendered = (self.root / ".orchestrator/factory/report.md").read_text(encoding="utf-8")
         self.assertIn("alpha", rendered)
         self.assertIn("succeeded", rendered)
+        self.assertIn("Backlog coverage", rendered)
+
+    def test_report_lists_backlog_coverage_and_waiting_items(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_prompt("beta")
+        argv = json.dumps([sys.executable, "-c", "pass"])
+        self.write_backlog(
+            self.item_toml("alpha", argv)
+            + self.item_header("beta", requires=["alpha"])
+            + "[[items.checks]]\n"
+            + f"argv = {argv}\n"
+            + "timeout_seconds = 60\n"
+        )
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        report = self.run_cli("report")
+
+        self.assertEqual(report.returncode, 0, report.stderr)
+        rendered = (self.root / ".orchestrator/factory/report.md").read_text(encoding="utf-8")
+        self.assertIn("items: 2", rendered)
+        self.assertIn("unqueued: beta", rendered)
+        self.assertIn("beta (requires: alpha)", rendered)
 
     def test_cli_run_exit_code_reflects_queue_failure(self) -> None:
         self.write_workflow(max_attempts=1)
