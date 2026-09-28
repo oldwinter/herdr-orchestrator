@@ -77,6 +77,10 @@ uv run pytest tests/test_devin_factory.py -q
   `max_attempts` (default 2) is exhausted, after which the job is `failed`
   with the attempt `outcome_committed`.
 - `just factory-run` again to drain released retries.
+- When a required item fails terminally, dependents stay `waiting`
+  forever (status/report show `key=failed`). After `factory-retry` lands
+  the blocker at `succeeded`, re-run `just factory-intake` to release
+  the dependents — intake is the only place the gate is evaluated.
 - `just factory-retry JOB_ID` re-queues a terminal failure with extra
   attempts after a fix; `just factory-gc` runs the canonical agent
   collector against the factory queue (dry-run unless `--apply`; the local
