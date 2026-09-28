@@ -336,3 +336,14 @@ requires = ["factory-report-write-pin-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q"]
 timeout_seconds = 300
+[[items]]
+dedupe_key = "factory-intake-blocker-state-v1"
+title = "Intake waiting list exposes blocker states"
+harness = "codex"
+prompt_file = "prompts/factory-intake-blocker-state-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-intake-blocker-state-v1.json"
+requires = ["factory-evidence-stamp-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "intake or waiting or requires"]
+timeout_seconds = 180

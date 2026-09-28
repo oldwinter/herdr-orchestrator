@@ -568,7 +568,15 @@ class FactoryLifecycleTests(BacklogFixture):
             self.assertEqual(devin_factory._command_intake(args), 0)
         first = json.loads(buffer.getvalue())
         self.assertEqual(first["added"], 1)
-        self.assertEqual(first["waiting"], [{"dedupe_key": "beta", "requires": ["alpha"]}])
+        self.assertEqual(
+            first["waiting"],
+            [
+                {
+                    "dedupe_key": "beta",
+                    "waiting_on": [{"dedupe_key": "alpha", "state": "pending"}],
+                }
+            ],
+        )
         self.assertEqual(len(self.jobs()), 1)
 
         coordinator.run_until_idle(timeout_seconds=30)

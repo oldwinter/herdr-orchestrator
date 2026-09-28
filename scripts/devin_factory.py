@@ -758,12 +758,15 @@ def _command_intake(args: argparse.Namespace) -> int:
     waiting: list[dict[str, object]] = []
     for item in items.values():
         blockers = [
-            required
+            {
+                "dedupe_key": required,
+                "state": state_by_key.get(required, "unqueued"),
+            }
             for required in item.requires
             if state_by_key.get(required) != JobState.SUCCEEDED.value
         ]
         if blockers:
-            waiting.append({"dedupe_key": item.dedupe_key, "requires": blockers})
+            waiting.append({"dedupe_key": item.dedupe_key, "waiting_on": blockers})
             continue
         job_id, created, selected = coordinator.enqueue_prompt_file(
             harness=item.harness,
@@ -775,6 +778,8 @@ def _command_intake(args: argparse.Namespace) -> int:
             max_attempts=item.max_attempts,
         )
         added += int(created)
+        if created:
+            state_by_key[item.dedupe_key] = JobState.PENDING.value
         jobs.append(
             {
                 "created": created,
