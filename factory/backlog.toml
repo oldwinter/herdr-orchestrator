@@ -65,3 +65,18 @@ receipt = ".orchestrator/factory/receipts/factory-hardening-v1.json"
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "unreadable or empty_queue or error_summary"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-docs-pin-v1"
+title = "Pin jobs() dedupe_key at store layer; document the factory lane"
+harness = "codex"
+prompt_file = "prompts/factory-docs-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-docs-pin-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_store.py", "-q", "-k", "idempotent"]
+timeout_seconds = 600
+
+[[items.checks]]
+argv = ["python3", "scripts/check_docs.py"]
+timeout_seconds = 120

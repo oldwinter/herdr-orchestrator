@@ -48,6 +48,7 @@ class StoreTests(unittest.TestCase):
             self.store.existing_job("example", "same"),
             (first_id, Harness.CODEX),
         )
+        self.assertEqual(self.store.jobs("example")[0]["dedupe_key"], "same")
 
     def test_enqueue_rejects_changed_dedupe_contract(self) -> None:
         job = _job("contract")
