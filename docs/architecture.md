@@ -386,7 +386,10 @@ dedupe/retry/receipt 全部语义，只把 Herdr transport 换成在 workflow wo
 check 各自受 `timeout_seconds` 上限，同时不能超过剩余预算——deadline 之后
 不再调度新 check，记录 `factory_check_timeout` 而不是成功。运行状态与证据留在
 `.orchestrator/factory/`（不进 Git），入口是 justfile 的 `factory-*`
-recipes，细节见 `docs/devin-factory.md`。本地 lane 不会写 `blocked`，也不会 merge、
+recipes，细节见 `docs/devin-factory.md`。过期 lease 的 reclaim 在同一 attempt
+上重跑声明的 checks（`recover` = re-dispatch，无交互 session 可接管）；仅当
+reclaim 的 dispatch 仍 ambiguously 收尾时才落到 `blocked`，由
+`just factory-retry`（`--allow-blocked`）重新驱动。本地 lane 不会 merge、
 push、发布或改动权限。
 
 ## 24/7 边界

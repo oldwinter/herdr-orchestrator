@@ -17,7 +17,9 @@ verified file receipt at the item's declared path.
 
 ```sh
 just factory-validate    # dry-run: parse backlog, print items, touch nothing
-                         # (warns when a check timeout exceeds the agent budget)
+                         # (warns on unhonorable check timeouts, check
+                         # executables absent from PATH, and durable-contract
+                         # drift on already-queued items)
 just factory-intake      # enqueue backlog items (idempotent)
 just factory-run         # drain pending items through their checks
 just factory-status      # queue counts, job states, unqueued items
@@ -116,9 +118,10 @@ uv run pytest tests/test_devin_factory.py -q
 ## Stop
 
 - `factory-run` is a bounded batch: it exits when the queue is idle or the
-  `--drain-timeout-seconds` budget is hit. Send SIGINT to stop mid-run;
-  claimed attempts expire on their lease and become resumable on the next
-  run.
+  `--drain-timeout-seconds` budget is hit. Send SIGINT to stop mid-run: the
+  runner exits 130, kills the in-flight check it was waiting on, and the
+  claimed attempt's lease lapses so the job is reclaimed and re-dispatched
+  on the next run.
 - Intake/status/report are single-shot and need no shutdown.
 
 ## Approval boundaries
