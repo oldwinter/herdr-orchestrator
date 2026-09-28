@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1009,6 +1010,40 @@ class FactoryCliTests(BacklogFixture):
         self.assertEqual(status.returncode, 0, status.stderr)
         payload = json.loads(status.stdout)
         self.assertIn("factory_backlog_schema_version", payload["backlog"]["error"])
+
+    def test_cli_run_sigint_exits_130_without_traceback(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        sleep = json.dumps([sys.executable, "-c", "import time;time.sleep(60)"])
+        self.write_backlog(self.item_toml("alpha", sleep))
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        environment = dict(os.environ)
+        source = str(REPO_ROOT / "src")
+        environment["PYTHONPATH"] = source
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--workflow",
+                str(self.workflow),
+                "--backlog",
+                str(self.backlog),
+                "run",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=self.root,
+            env=environment,
+        )
+        time.sleep(2)
+        process.send_signal(signal.SIGINT)
+        _, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 130)
+        self.assertIn("interrupted", stderr)
+        self.assertNotIn("Traceback", stderr)
 
     def test_cli_concurrent_intake_is_idempotent(self) -> None:
         self.write_workflow()

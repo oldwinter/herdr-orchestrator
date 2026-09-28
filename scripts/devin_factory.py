@@ -568,26 +568,14 @@ class LocalDispatcher:
         env["PYTHONPATH"] = source if not existing else source + os.pathsep + existing
         started = time.monotonic()
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [executable, *check.argv[1:]],
                 cwd=self._workspace,
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=remaining,
-                check=False,
             )
-        except subprocess.TimeoutExpired:
-            result.update(
-                {
-                    "duration_ms": int((time.monotonic() - started) * 1000),
-                    "exit_code": 124,
-                    "stderr_tail": "",
-                    "stdout_tail": "",
-                    "timed_out": True,
-                }
-            )
-            return result
         except OSError as exc:
             result.update(
                 {
@@ -598,12 +586,31 @@ class LocalDispatcher:
                 }
             )
             return result
+        try:
+            stdout, stderr = process.communicate(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            result.update(
+                {
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "exit_code": 124,
+                    "stderr_tail": "",
+                    "stdout_tail": "",
+                    "timed_out": True,
+                }
+            )
+            return result
+        except KeyboardInterrupt:
+            process.kill()
+            process.wait()
+            raise
         result.update(
             {
                 "duration_ms": int((time.monotonic() - started) * 1000),
-                "exit_code": completed.returncode,
-                "stderr_tail": _bounded_tail(completed.stderr),
-                "stdout_tail": _bounded_tail(completed.stdout),
+                "exit_code": process.returncode,
+                "stderr_tail": _bounded_tail(stderr),
+                "stdout_tail": _bounded_tail(stdout),
             }
         )
         return result
@@ -1050,6 +1057,9 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         return handlers[args.factory_command](args)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
     except sqlite3.DatabaseError as exc:
         print(f"factory_state_db_unreadable: {exc}", file=sys.stderr)
         return 2

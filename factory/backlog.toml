@@ -435,3 +435,14 @@ requires = ["factory-job-updated-at-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-sigint-kill-v1"
+title = "SIGINT exits 130 and kills the in-flight check"
+harness = "codex"
+prompt_file = "prompts/factory-sigint-kill-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-sigint-kill-v1.json"
+requires = ["factory-validate-attempts-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "sigint or executable or deadline"]
+timeout_seconds = 300
