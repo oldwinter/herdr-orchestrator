@@ -815,6 +815,7 @@ def _run_jobs_summary(coordinator: Coordinator) -> list[dict[str, object]]:
         {
             "dedupe_key": job["dedupe_key"],
             "error_code": job["error_code"],
+            "harness": job["harness"],
             "job_id": job["id"],
             "state": job["state"],
             "task_verified": job["task_verified"],
@@ -891,6 +892,7 @@ def _command_status(args: argparse.Namespace) -> int:
                         "dedupe_key": job["dedupe_key"],
                         "error_code": job["error_code"],
                         "error_summary": job["error_summary"],
+                        "harness": job["harness"],
                         "id": job["id"],
                         "max_attempts": job["max_attempts"],
                         "receipt_kind": job["receipt_kind"],

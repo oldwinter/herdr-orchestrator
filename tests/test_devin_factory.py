@@ -821,6 +821,7 @@ class FactoryCliTests(BacklogFixture):
                 {
                     "dedupe_key": "alpha",
                     "error_code": None,
+                    "harness": "codex",
                     "job_id": 1,
                     "state": "succeeded",
                     "task_verified": True,

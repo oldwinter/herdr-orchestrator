@@ -380,3 +380,14 @@ requires = ["factory-exec-failure-codes-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-status-harness-v1"
+title = "Job summaries name the harness that ran"
+harness = "codex"
+prompt_file = "prompts/factory-status-harness-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-status-harness-v1.json"
+requires = ["factory-validate-path-warning-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q"]
+timeout_seconds = 300
