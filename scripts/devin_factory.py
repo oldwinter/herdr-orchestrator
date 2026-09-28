@@ -793,15 +793,29 @@ def _command_status(args: argparse.Namespace) -> int:
     try:
         items = load_backlog(args.backlog)
         queued = {str(job["dedupe_key"]) for job in jobs}
+        state_by_key = {str(job["dedupe_key"]): str(job["state"]) for job in jobs}
         backlog: dict[str, object] = {
             "items": len(items),
             "requires": {
                 item.dedupe_key: list(item.requires) for item in items.values() if item.requires
             },
             "unqueued": sorted(key for key in items if key not in queued),
+            "waiting": {
+                item.dedupe_key: unmet
+                for item in items.values()
+                if item.dedupe_key not in queued
+                and item.requires
+                and (
+                    unmet := [
+                        required
+                        for required in item.requires
+                        if state_by_key.get(required) != JobState.SUCCEEDED.value
+                    ]
+                )
+            },
         }
     except FactoryError as exc:
-        backlog = {"error": str(exc), "items": 0, "unqueued": []}
+        backlog = {"error": str(exc), "items": 0, "unqueued": [], "waiting": {}}
     print(
         json.dumps(
             {

@@ -708,6 +708,29 @@ class FactoryCliTests(BacklogFixture):
         self.assertIn("succeeded", rendered)
         self.assertIn("Backlog coverage", rendered)
 
+    def test_status_distinguishes_requires_waiting_from_unqueued(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_prompt("beta")
+        self.write_prompt("gamma")
+        argv = json.dumps([sys.executable, "-c", "pass"])
+        self.write_backlog(
+            self.item_toml("alpha", argv)
+            + self.item_header("beta", requires=["alpha"])
+            + "[[items.checks]]\n"
+            + f"argv = {argv}\n"
+            + "timeout_seconds = 60\n"
+            + self.item_toml("gamma", argv)
+        )
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        status = self.run_cli("status")
+
+        self.assertEqual(status.returncode, 0, status.stderr)
+        backlog = json.loads(status.stdout)["backlog"]
+        self.assertEqual(sorted(backlog["unqueued"]), ["beta"])
+        self.assertEqual(backlog["waiting"], {"beta": ["alpha"]})
+
     def test_report_lists_backlog_coverage_and_waiting_items(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")

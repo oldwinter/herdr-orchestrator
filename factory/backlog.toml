@@ -200,3 +200,14 @@ requires = ["factory-evidence-write-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report"]
 timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-status-waiting-v1"
+title = "Status distinguishes requires-blocked waiting items from plain unqueued"
+harness = "codex"
+prompt_file = "prompts/factory-status-waiting-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-status-waiting-v1.json"
+requires = ["factory-report-coverage-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "status or report"]
+timeout_seconds = 120
