@@ -314,3 +314,14 @@ requires = ["factory-waiting-blocker-state-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report or waiting"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-report-write-pin-v1"
+title = "Pin factory_report_write_failed stable CLI error"
+harness = "codex"
+prompt_file = "prompts/factory-report-write-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-report-write-pin-v1.json"
+requires = ["factory-report-blocker-state-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report"]
+timeout_seconds = 180

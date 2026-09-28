@@ -845,6 +845,20 @@ class FactoryCliTests(BacklogFixture):
         self.assertIn("factory_state_db_unreadable", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_cli_report_write_failure_is_stable_error(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", '["python3", "-c", "pass"]'))
+        blocker = self.root / ".orchestrator" / "factory"
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_text("not a directory", encoding="utf-8")
+
+        result = self.run_cli("report")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("factory_report_write_failed", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_cli_run_on_empty_queue_is_idle_success(self) -> None:
         self.write_workflow()
         self.backlog.write_text("schema_version = 1\nitems = []\n", encoding="utf-8")
