@@ -369,6 +369,23 @@ class FactoryLifecycleTests(BacklogFixture):
         record = json.loads(evidence[0].read_text(encoding="utf-8"))
         self.assertEqual(record["checks"][0]["exit_code"], 126)
 
+    def test_check_output_is_bounded_in_evidence(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        flood = "import sys;sys.stdout.write('x' * 20000)"
+        self.write_backlog(self.item_toml("alpha", json.dumps([sys.executable, "-c", flood])))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        evidence = list((self.root / ".orchestrator/factory/evidence/alpha").glob("*.json"))
+        record = json.loads(evidence[0].read_text(encoding="utf-8"))
+        self.assertLessEqual(
+            len(record["checks"][0]["stdout_tail"]),
+            devin_factory.MAX_CHECK_OUTPUT_CHARS,
+        )
+
     def test_retry_after_fix_turns_failure_into_verified_success(self) -> None:
         self.write_workflow(max_attempts=1)
         self.write_prompt("alpha")
@@ -1036,9 +1053,7 @@ class FactoryValidateTests(BacklogFixture):
         self.assertEqual(payload["unsupported_harnesses"], [])
         self.assertGreater(len(payload["items"]), 0)
         self.assertEqual(payload["warnings"], [])
-        self.assertTrue(
-            all(item["harness_supported"] for item in payload["items"])
-        )
+        self.assertTrue(all(item["harness_supported"] for item in payload["items"]))
 
     def parse(self, *extra: str):
         return devin_factory.build_parser().parse_args(
