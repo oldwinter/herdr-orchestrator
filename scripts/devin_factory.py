@@ -28,7 +28,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from herdr_orchestrator.completion import (
     CompletionPolicy,
@@ -117,34 +117,37 @@ def load_backlog(path: Path) -> dict[str, FactoryItem]:
         raise FactoryError(f"factory_backlog_invalid: {exc}") from exc
     _require(isinstance(raw, dict), "factory_backlog_invalid")
     _require(raw.get("schema_version") == 1, "factory_backlog_schema_version")
-    rows = raw.get("items")
-    _require(isinstance(rows, list), "factory_backlog_items_missing")
+    rows_raw = raw.get("items")
+    if not isinstance(rows_raw, list):
+        raise FactoryError("factory_backlog_items_missing")
+    rows: list[object] = rows_raw
     items: dict[str, FactoryItem] = {}
     receipt_paths: set[str] = set()
-    for index, row in enumerate(rows):
-        _require(isinstance(row, dict), f"factory_item_invalid: row {index}")
+    for index, row_raw in enumerate(rows):
+        if not isinstance(row_raw, dict):
+            raise FactoryError(f"factory_item_invalid: row {index}")
+        row: dict[str, Any] = row_raw
         unknown = set(row) - ITEM_KEYS
         _require(not unknown, f"factory_item_unknown_keys: {sorted(unknown)}")
-        dedupe_key = row.get("dedupe_key")
-        _require(
-            isinstance(dedupe_key, str) and DEDUPE_KEY.fullmatch(dedupe_key) is not None,
-            "factory_dedupe_key_invalid",
-        )
+        dedupe_key_raw = row.get("dedupe_key")
+        if not (
+            isinstance(dedupe_key_raw, str) and DEDUPE_KEY.fullmatch(dedupe_key_raw) is not None
+        ):
+            raise FactoryError("factory_dedupe_key_invalid")
+        dedupe_key = dedupe_key_raw
         _require(dedupe_key not in items, f"factory_dedupe_key_duplicate: {dedupe_key}")
-        title = row.get("title")
-        _require(
-            isinstance(title, str) and title.strip() != "" and len(title) <= 200,
-            "factory_title_invalid",
-        )
+        title_raw = row.get("title")
+        if not (isinstance(title_raw, str) and title_raw.strip() != "" and len(title_raw) <= 200):
+            raise FactoryError("factory_title_invalid")
+        title = title_raw
         try:
             harness = Harness(str(row.get("harness")))
         except ValueError as exc:
             raise FactoryError(f"factory_harness_invalid: {row.get('harness')}") from exc
-        prompt_value = row.get("prompt_file")
-        _require(
-            isinstance(prompt_value, str) and prompt_value != "",
-            "factory_prompt_invalid",
-        )
+        prompt_raw = row.get("prompt_file")
+        if not (isinstance(prompt_raw, str) and prompt_raw != ""):
+            raise FactoryError("factory_prompt_invalid")
+        prompt_value = prompt_raw
         prompt_file = (path.parent / prompt_value).resolve()
         _require(
             prompt_file.is_file() and prompt_file.is_relative_to(path.parent),
@@ -180,18 +183,17 @@ def load_backlog(path: Path) -> dict[str, FactoryItem]:
 def _load_requires(value: object, dedupe_key: str) -> tuple[str, ...]:
     if value is None:
         return ()
-    _require(
+    if not (
         isinstance(value, list)
         and all(
             isinstance(entry, str) and DEDUPE_KEY.fullmatch(entry) is not None for entry in value
-        ),
-        f"factory_requires_invalid: {dedupe_key}",
-    )
-    _require(
-        len(set(value)) == len(value),
-        f"factory_requires_duplicate: {dedupe_key}",
-    )
-    return tuple(value)
+        )
+    ):
+        raise FactoryError(f"factory_requires_invalid: {dedupe_key}")
+    entries = cast(list[str], value)
+    if len(set(entries)) != len(entries):
+        raise FactoryError(f"factory_requires_duplicate: {dedupe_key}")
+    return tuple(entries)
 
 
 def _check_requires(items: dict[str, FactoryItem]) -> None:
@@ -228,7 +230,8 @@ def _check_requires(items: dict[str, FactoryItem]) -> None:
 def _load_receipt(value: object, dedupe_key: str) -> str:
     if value is None:
         value = f".orchestrator/factory/receipts/{dedupe_key}.json"
-    _require(isinstance(value, str) and value != "", "factory_receipt_invalid")
+    if not (isinstance(value, str) and value != ""):
+        raise FactoryError("factory_receipt_invalid")
     relative = Path(value)
     _require(
         not relative.is_absolute()
@@ -241,28 +244,30 @@ def _load_receipt(value: object, dedupe_key: str) -> str:
 
 
 def _load_checks(row: dict[str, Any], dedupe_key: str) -> tuple[FactoryCheck, ...]:
-    raw_checks = row.get("checks")
-    _require(
-        isinstance(raw_checks, list) and 1 <= len(raw_checks) <= 16,
-        f"factory_checks_missing: {dedupe_key}",
-    )
+    raw_checks_raw = row.get("checks")
+    if not (isinstance(raw_checks_raw, list) and 1 <= len(raw_checks_raw) <= 16):
+        raise FactoryError(f"factory_checks_missing: {dedupe_key}")
+    raw_checks: list[object] = raw_checks_raw
     default_timeout = row.get("check_timeout_seconds", 600)
     _require(
         isinstance(default_timeout, int) and 1 <= default_timeout <= 3600,
         "factory_check_timeout_invalid",
     )
     checks: list[FactoryCheck] = []
-    for index, entry in enumerate(raw_checks):
-        _require(isinstance(entry, dict), f"factory_check_invalid: {dedupe_key}[{index}]")
+    for index, entry_raw in enumerate(raw_checks):
+        if not isinstance(entry_raw, dict):
+            raise FactoryError(f"factory_check_invalid: {dedupe_key}[{index}]")
+        entry: dict[str, Any] = entry_raw
         unknown = set(entry) - CHECK_KEYS
         _require(not unknown, f"factory_check_unknown_keys: {sorted(unknown)}")
-        argv = entry.get("argv")
-        _require(
-            isinstance(argv, list)
-            and 1 <= len(argv) <= 16
-            and all(isinstance(arg, str) and 0 < len(arg) <= 512 for arg in argv),
-            f"factory_check_argv_invalid: {dedupe_key}[{index}]",
-        )
+        argv_raw = entry.get("argv")
+        if not (
+            isinstance(argv_raw, list)
+            and 1 <= len(argv_raw) <= 16
+            and all(isinstance(arg, str) and 0 < len(arg) <= 512 for arg in argv_raw)
+        ):
+            raise FactoryError(f"factory_check_argv_invalid: {dedupe_key}[{index}]")
+        argv = cast(list[str], argv_raw)
         executable = Path(argv[0])
         _require(
             ".." not in executable.parts and (not executable.is_absolute() or executable.is_file()),
@@ -504,11 +509,23 @@ class LocalDispatcher:
             return failed_completion(self._policy(context), exc.code)
 
     def _run_check(self, check: FactoryCheck, deadline: float) -> dict[str, Any]:
-        remaining = max(1.0, min(check.timeout_seconds, deadline - time.monotonic()))
+        remaining = min(check.timeout_seconds, deadline - time.monotonic())
         result: dict[str, Any] = {
             "argv": list(check.argv),
             "timeout_seconds": check.timeout_seconds,
         }
+        if remaining <= 0:
+            result.update(
+                {
+                    "deadline_exceeded": True,
+                    "duration_ms": 0,
+                    "exit_code": 124,
+                    "stderr_tail": "",
+                    "stdout_tail": "",
+                    "timed_out": True,
+                }
+            )
+            return result
         executable = shutil.which(check.argv[0])
         if executable is None:
             result.update(

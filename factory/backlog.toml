@@ -163,3 +163,18 @@ timeout_seconds = 30
 [[items.checks]]
 argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/capture-dashboard.sh"]
 timeout_seconds = 30
+[[items]]
+dedupe_key = "factory-deadline-v1"
+title = "Enforce global check deadline inside dispatch budget"
+harness = "codex"
+prompt_file = "prompts/factory-deadline-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-deadline-v1.json"
+requires = ["verify-helpers-darwin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "deadline_overrun or within_budget or check_timeout"]
+timeout_seconds = 300
+
+[[items.checks]]
+argv = ["python3", "-c", "import ast; ast.parse(open('scripts/devin_factory.py').read()); assert 'deadline_exceeded' in open('scripts/devin_factory.py').read()"]
+timeout_seconds = 30

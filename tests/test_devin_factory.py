@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -54,7 +55,7 @@ class BacklogFixture(unittest.TestCase):
         self.store = Store(self.root / "state.db")
         self.store.initialize()
 
-    def write_workflow(self, max_attempts: int = 2) -> None:
+    def write_workflow(self, max_attempts: int = 2, agent_timeout: int = 30) -> None:
         profiles = (REPO_ROOT / "profiles" / "harnesses").as_posix()
         self.workflow.write_text(
             "\n".join(
@@ -69,7 +70,7 @@ class BacklogFixture(unittest.TestCase):
                     "max_parallel = 1",
                     "lease_seconds = 120",
                     f"max_attempts = {max_attempts}",
-                    "agent_timeout_seconds = 30",
+                    f"agent_timeout_seconds = {agent_timeout}",
                     "[placement]",
                     'mode = "pane"',
                     "[planner]",
@@ -357,6 +358,57 @@ class FactoryLifecycleTests(BacklogFixture):
         job = self.jobs()[0]
         self.assertEqual(job["state"], JobState.SUCCEEDED.value)
         self.assertTrue(job["task_verified"])
+
+    def test_check_deadline_overrun_fails_instead_of_succeeding(self) -> None:
+        self.write_workflow(max_attempts=1, agent_timeout=10)
+        self.write_prompt("alpha")
+        sleep_check = (
+            "[[items.checks]]\n"
+            + f"argv = {json.dumps([sys.executable, '-c', 'import time; time.sleep(0.75)'])}\n"
+            + "timeout_seconds = 30\n"
+        )
+        self.write_backlog(self.item_header("alpha") + sleep_check * 16)
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        started = time.monotonic()
+        result = coordinator.run_until_idle(timeout_seconds=60)
+        elapsed = time.monotonic() - started
+
+        job = self.jobs()[0]
+        self.assertTrue(result["idle"])
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_check_timeout")
+        self.assertFalse(job["task_verified"])
+        self.assertLess(elapsed, 13.0)
+        evidence_files = list((self.root / ".orchestrator/factory/evidence/alpha").glob("*.json"))
+        record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertFalse(record["verified"])
+        self.assertTrue(
+            any(
+                check.get("timed_out") or check.get("deadline_exceeded")
+                for check in record["checks"]
+            )
+        )
+        self.assertFalse((self.root / ".orchestrator/factory/receipts/alpha.json").exists())
+
+    def test_within_budget_control_still_succeeds(self) -> None:
+        self.write_workflow(max_attempts=1, agent_timeout=10)
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "import time; time.sleep(0.05)"])
+        self.write_backlog(self.item_toml("alpha", argv))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        started = time.monotonic()
+        result = coordinator.run_until_idle(timeout_seconds=60)
+        elapsed = time.monotonic() - started
+
+        job = self.jobs()[0]
+        self.assertTrue(result["idle"])
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+        self.assertTrue(job["task_verified"])
+        self.assertLess(elapsed, 5.0)
 
     def test_check_timeout_is_a_distinct_stable_error(self) -> None:
         self.write_workflow(max_attempts=1)
