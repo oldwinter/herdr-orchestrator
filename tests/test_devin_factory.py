@@ -381,6 +381,31 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertEqual(len(record["checks"]), 1)
         self.assertEqual(record["checks_skipped"], 1)
 
+    def test_evidence_is_bounded_per_item(self) -> None:
+        self.write_workflow()
+        dispatcher = devin_factory.LocalDispatcher(
+            workspace=self.root,
+            items={},
+            evidence_root=self.root / ".orchestrator/factory/evidence",
+        )
+        directory = self.root / ".orchestrator/factory/evidence/alpha"
+        directory.mkdir(parents=True)
+        for index in range(30):
+            (directory / f"2020-01-01T00-00-{index:06d}Z-0000000{index % 10}.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+        dispatcher._write_evidence(
+            None,
+            {"dedupe_key": "alpha", "correlation_id": "newest"},
+            verified=False,
+        )
+
+        remaining = sorted(directory.glob("*.json"))
+        self.assertEqual(len(remaining), devin_factory.EVIDENCE_KEEP_PER_ITEM)
+        self.assertTrue(remaining[-1].name.endswith("-newest.json"))
+        self.assertFalse((directory / "2020-01-01T00-00-000000Z-00000000.json").exists())
+
     def test_run_once_reports_batch_counts(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")

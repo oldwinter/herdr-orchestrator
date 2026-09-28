@@ -73,6 +73,7 @@ ITEM_KEYS = frozenset(
 )
 CHECK_KEYS = frozenset({"argv", "timeout_seconds"})
 MAX_CHECK_OUTPUT_CHARS = 4000
+EVIDENCE_KEEP_PER_ITEM = 25
 
 
 class FactoryError(ValueError):
@@ -541,6 +542,9 @@ class LocalDispatcher:
             json.dumps(evidence, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        stale = sorted(directory.glob("*.json"))[:-EVIDENCE_KEEP_PER_ITEM]
+        for old in stale:
+            old.unlink(missing_ok=True)
 
 
 def _build_coordinator(

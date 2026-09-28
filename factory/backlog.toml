@@ -80,3 +80,14 @@ timeout_seconds = 600
 [[items.checks]]
 argv = ["python3", "scripts/check_docs.py"]
 timeout_seconds = 120
+
+[[items]]
+dedupe_key = "factory-evidence-gc-v1"
+title = "Bound per-item evidence files to the newest 25"
+harness = "codex"
+prompt_file = "prompts/factory-evidence-gc-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-evidence-gc-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "evidence_is_bounded"]
+timeout_seconds = 120
