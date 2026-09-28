@@ -357,13 +357,15 @@ class LocalDispatcher:
         task_key = context.task_key if context is not None else ""
         item = self._items.get(task_key)
         evidence: dict[str, Any] = {
+            "budget_seconds": timeout_seconds,
             "correlation_id": context.correlation_id if context is not None else "",
             "dedupe_key": task_key,
             "git_head": _git_head(self._workspace),
             "started_at": _utc_now(),
             "title": item.title if item is not None else None,
         }
-        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        started_mono = time.monotonic()
+        deadline = started_mono + max(1.0, timeout_seconds)
         self._progress(context, AttemptPhase.RUNTIME_ACQUIRED, AgentState.WORKING)
         file_before = (
             snapshot_file_receipt(context.receipt, self._workspace) if context is not None else None
@@ -386,6 +388,7 @@ class LocalDispatcher:
         evidence["checks"] = results
         evidence["checks_skipped"] = len(item.checks) - len(results)
         evidence["finished_at"] = _utc_now()
+        evidence["elapsed_seconds"] = round(time.monotonic() - started_mono, 3)
         self._progress(context, AttemptPhase.SETTLED, AgentState.DONE)
         failed = next((result for result in results if result["exit_code"] != 0), None)
         if failed is not None:

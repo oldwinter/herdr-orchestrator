@@ -244,3 +244,14 @@ requires = ["factory-atomic-writes-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli or corrupt"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-evidence-budget-v1"
+title = "Evidence records the dispatch budget and elapsed wall time"
+harness = "codex"
+prompt_file = "prompts/factory-evidence-budget-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-evidence-budget-v1.json"
+requires = ["factory-corrupt-db-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "deadline or within_budget or evidence or receipt"]
+timeout_seconds = 180

@@ -384,6 +384,8 @@ class FactoryLifecycleTests(BacklogFixture):
         evidence_files = list((self.root / ".orchestrator/factory/evidence/alpha").glob("*.json"))
         record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
         self.assertFalse(record["verified"])
+        self.assertEqual(record["budget_seconds"], 10)
+        self.assertLessEqual(record["elapsed_seconds"], 13.0)
         self.assertTrue(
             any(
                 check.get("timed_out") or check.get("deadline_exceeded")
