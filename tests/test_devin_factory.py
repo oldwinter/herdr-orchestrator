@@ -350,6 +350,35 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertEqual(job["state"], JobState.FAILED.value)
         self.assertEqual(job["error_code"], "factory_check_timeout")
 
+    def test_checks_short_circuit_after_first_failure(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        marker = self.root / "marker"
+        first = json.dumps([sys.executable, "-c", "raise SystemExit(3)"])
+        second = json.dumps([sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ran')"])
+        self.write_backlog(
+            self.item_header("alpha")
+            + "[[items.checks]]\n"
+            + f"argv = {first}\n"
+            + "timeout_seconds = 60\n"
+            + "[[items.checks]]\n"
+            + f"argv = {second}\n"
+            + "timeout_seconds = 60\n"
+        )
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_check_failed")
+        self.assertFalse(marker.exists())
+        evidence = sorted((self.root / ".orchestrator/factory/evidence/alpha").glob("*.json"))
+        record = json.loads(evidence[-1].read_text(encoding="utf-8"))
+        self.assertEqual(len(record["checks"]), 1)
+        self.assertEqual(record["checks_skipped"], 1)
+
     def test_run_once_reports_batch_counts(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")

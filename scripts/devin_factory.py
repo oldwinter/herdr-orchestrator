@@ -294,8 +294,13 @@ class LocalDispatcher:
                 settled=False,
             )
         self._progress(context, AttemptPhase.PROMPT_ACCEPTED, AgentState.WORKING)
-        results = [self._run_check(check, deadline) for check in item.checks]
+        results = []
+        for check in item.checks:
+            results.append(self._run_check(check, deadline))
+            if results[-1]["exit_code"] != 0:
+                break
         evidence["checks"] = results
+        evidence["checks_skipped"] = len(item.checks) - len(results)
         evidence["finished_at"] = _utc_now()
         self._progress(context, AttemptPhase.SETTLED, AgentState.DONE)
         failed = next((result for result in results if result["exit_code"] != 0), None)

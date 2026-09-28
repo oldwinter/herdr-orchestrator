@@ -59,10 +59,9 @@ uv run pytest tests/test_devin_factory.py -q
   `max_attempts` (default 2) is exhausted, after which the job is `failed`
   with the attempt `outcome_committed`.
 - `just factory-run` again to drain released retries.
-- `PYTHONPATH=src uv run python -m herdr_orchestrator retry-failed
-  --workflow workflows/devin-factory.toml` re-queues terminal failures after
-  a fix; `... stuck` and `... gc` operate on the same state DB the standard
-  way.
+- `just factory-retry JOB_ID` re-queues a terminal failure with extra
+  attempts after a fix; `just factory-gc` collects terminal job artifacts
+  (dry-run unless confirmed; see `just gc-failed` for the main queue).
 - `blocked` remains a manual state per repository rules and requires an
   explicit resume; the factory lane does not write it.
 

@@ -32,3 +32,14 @@ timeout_seconds = 60
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-failfast-v1"
+title = "Fail fast on first check failure; add recovery recipes"
+harness = "codex"
+prompt_file = "prompts/factory-failfast-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-failfast-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "short_circuit"]
+timeout_seconds = 600

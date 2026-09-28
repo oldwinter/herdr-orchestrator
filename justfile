@@ -173,6 +173,16 @@ factory-status *args:
 factory-report *args:
     @PYTHONPATH=src {{python}} scripts/devin_factory.py --workflow {{quote(factory_workflow)}} --backlog {{quote(factory_backlog)}} report "$@"
 
+# Re-queue a failed factory job with extra attempts (recovery).
+[positional-arguments]
+factory-retry job_id *args:
+    @shift 1; PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{quote(factory_workflow)}} --job-id {{quote(job_id)}} "$@"
+
+# Collect terminal factory job artifacts (dry-run by default).
+[positional-arguments]
+factory-gc *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{quote(factory_workflow)}} --failed-agents "$@"
+
 # Run the factory lane regression suite.
 test-devin-factory:
     @PYTHONPATH=src uv run python -m pytest tests/test_devin_factory.py -q
