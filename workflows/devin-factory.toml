@@ -1,0 +1,35 @@
+schema_version = 1
+name = "devin-factory"
+workspace = ".."
+state_db = "../.orchestrator/factory/state.db"
+profiles_dir = "../profiles/harnesses"
+
+# The local factory lane. Queue semantics (lease, attempts, fencing,
+# receipts) are identical to the durable queue; scripts/devin_factory.py
+# only replaces the Herdr transport with bounded local check execution.
+[coordinator]
+poll_seconds = 2
+max_parallel = 1
+lease_seconds = 1890
+max_attempts = 2
+agent_timeout_seconds = 1800
+
+[placement]
+mode = "pane"
+
+[planner]
+enabled = false
+harness = "auto"
+worker_harnesses = ["codex", "claude"]
+interval_seconds = 3600
+prompt_file = "prompts/planner.md"
+output_file = "../.orchestrator/factory/plans/devin-factory.json"
+max_tasks = 10
+
+[[workers]]
+name = "implementation"
+harness = "codex"
+
+[[workers]]
+name = "review"
+harness = "claude"

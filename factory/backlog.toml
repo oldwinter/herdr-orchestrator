@@ -1,0 +1,19 @@
+schema_version = 1
+
+# Factory backlog: operator-authored work items with declared acceptance
+# checks. `just factory-intake` enqueues them into the durable devin-factory
+# queue (dedupe_key is the idempotence contract; bump the -vN suffix when a
+# completed item's contract changes). `just factory-run` claims each pending
+# item and executes `checks` locally; a nonzero check exits the item through
+# the normal failed-validation path — no success is recorded.
+
+[[items]]
+dedupe_key = "factory-scaffold-v1"
+title = "Stand up the local factory lane over the durable queue"
+harness = "codex"
+prompt_file = "prompts/factory-scaffold-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-scaffold-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q"]
+timeout_seconds = 600

@@ -20,5 +20,6 @@ build/
 dist/
 .orchestrator/
 .scratch/
+.codex/
 .coverage
 coverage.xml

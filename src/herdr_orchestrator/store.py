@@ -1317,7 +1317,7 @@ class Store:
     ) -> list[dict[str, object]]:
         query = """
                 SELECT jobs.id, jobs.workspace, jobs.title, jobs.harness, jobs.placement,
-                       jobs.state,
+                       jobs.state, jobs.dedupe_key,
                        jobs.attempts, jobs.max_attempts, jobs.agent_name,
                        jobs.error_code, jobs.execution_path, jobs.herdr_workspace_id,
                        jobs.receipt_kind, jobs.receipt_value, jobs.agent_settled,
