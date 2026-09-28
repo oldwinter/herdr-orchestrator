@@ -1326,6 +1326,7 @@ class Store:
                        jobs.completion_status, jobs.completion_evidence_summary,
                        jobs.completion_error_code, jobs.current_attempt_id,
                        jobs.created_at, jobs.updated_at, jobs.lease_until,
+                       jobs.available_at,
                        job_attempts.phase AS attempt_phase
                 FROM jobs AS jobs
                 LEFT JOIN job_attempts ON job_attempts.id = jobs.current_attempt_id

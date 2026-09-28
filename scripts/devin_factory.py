@@ -909,6 +909,11 @@ def _command_status(args: argparse.Namespace) -> int:
                         "max_attempts": job["max_attempts"],
                         "receipt_kind": job["receipt_kind"],
                         "receipt_value": job["receipt_value"],
+                        "retry_backoff_seconds": (
+                            max(0, round(float(job["available_at"]) - time.time()))
+                            if job["state"] == "pending"
+                            else None
+                        ),
                         "state": job["state"],
                         "task_verified": job["task_verified"],
                         "title": job["title"],

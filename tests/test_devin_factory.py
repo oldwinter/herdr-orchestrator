@@ -1038,6 +1038,26 @@ class FactoryCliTests(BacklogFixture):
         self.assertEqual(job["state"], "running")
         self.assertTrue(job["lease_expired"])
 
+    def test_cli_status_shows_retry_backoff_for_deferred_pending(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", '["python3", "-c", "pass"]'))
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        status = self.run_cli("status")
+        self.assertEqual(json.loads(status.stdout)["jobs"][0]["retry_backoff_seconds"], 0)
+
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            connection.execute(
+                "UPDATE jobs SET available_at = ? WHERE id = 1",
+                (time.time() + 300,),
+            )
+            connection.commit()
+
+        status = self.run_cli("status")
+        job = json.loads(status.stdout)["jobs"][0]
+        self.assertGreaterEqual(job["retry_backoff_seconds"], 290)
+
     def test_cli_status_surfaces_backlog_error_not_silence(self) -> None:
         self.write_workflow()
         self.backlog.write_text("schema_version = 2\nitems = []\n", encoding="utf-8")

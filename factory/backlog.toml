@@ -479,3 +479,14 @@ requires = ["factory-concurrent-run-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "lease or status"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-retry-backoff-v1"
+title = "Status shows retry backoff for deferred pending jobs"
+harness = "codex"
+prompt_file = "prompts/factory-retry-backoff-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-retry-backoff-v1.json"
+requires = ["factory-lease-expired-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "backoff or lease or status"]
+timeout_seconds = 180
