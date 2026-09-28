@@ -17,6 +17,7 @@ verified file receipt at the item's declared path.
 
 ```sh
 just factory-validate    # dry-run: parse backlog, print items, touch nothing
+                         # (warns when a check timeout exceeds the agent budget)
 just factory-intake      # enqueue backlog items (idempotent)
 just factory-run         # drain pending items through their checks
 just factory-status      # queue counts, job states, unqueued items
@@ -53,7 +54,9 @@ everything under `.orchestrator/`).
 
 - `just factory-status` — durable queue state for the `devin-factory`
   workflow, including `task_verified` and `verification_class`; the backlog
-  section lists `unqueued` items and `waiting` items with unmet `requires`.
+  section lists `unqueued` items and `waiting` items with each unmet
+  requirement's current queue state (a `failed` blocker will never
+  release its dependents without operator intervention).
 - `just factory-report` — operator report with one row per job, a link to
   its latest evidence file, and a backlog coverage section.
 - Raw inspection works with the standard CLI against the same DB:
