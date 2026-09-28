@@ -851,7 +851,10 @@ def _command_status(args: argparse.Namespace) -> int:
                 and item.requires
                 and (
                     unmet := [
-                        required
+                        {
+                            "dedupe_key": required,
+                            "state": state_by_key.get(required, "unqueued"),
+                        }
                         for required in item.requires
                         if state_by_key.get(required) != JobState.SUCCEEDED.value
                     ]

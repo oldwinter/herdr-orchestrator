@@ -292,3 +292,14 @@ requires = ["factory-docs-run-jobs-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "ValidateTests"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-waiting-blocker-state-v1"
+title = "Status waiting list exposes blocker states"
+harness = "codex"
+prompt_file = "prompts/factory-waiting-blocker-state-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-waiting-blocker-state-v1.json"
+requires = ["factory-validate-warnings-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "waiting or status"]
+timeout_seconds = 180

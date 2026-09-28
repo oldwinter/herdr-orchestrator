@@ -769,7 +769,33 @@ class FactoryCliTests(BacklogFixture):
         self.assertEqual(status.returncode, 0, status.stderr)
         backlog = json.loads(status.stdout)["backlog"]
         self.assertEqual(sorted(backlog["unqueued"]), ["beta"])
-        self.assertEqual(backlog["waiting"], {"beta": ["alpha"]})
+        self.assertEqual(
+            backlog["waiting"],
+            {"beta": [{"dedupe_key": "alpha", "state": "pending"}]},
+        )
+
+    def test_status_waiting_exposes_terminally_failed_blocker(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        self.write_prompt("beta")
+        fail = json.dumps([sys.executable, "-c", "raise SystemExit(3)"])
+        self.write_backlog(
+            self.item_toml("alpha", fail)
+            + self.item_header("beta", requires=["alpha"])
+            + "[[items.checks]]\n"
+            + f'argv = {json.dumps([sys.executable, "-c", "pass"])}\n'
+            + "timeout_seconds = 60\n"
+        )
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+        self.assertEqual(self.run_cli("run").returncode, 1)
+
+        status = self.run_cli("status")
+
+        backlog = json.loads(status.stdout)["backlog"]
+        self.assertEqual(
+            backlog["waiting"],
+            {"beta": [{"dedupe_key": "alpha", "state": "failed"}]},
+        )
 
     def test_report_lists_backlog_coverage_and_waiting_items(self) -> None:
         self.write_workflow()
