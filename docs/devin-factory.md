@@ -59,7 +59,10 @@ everything under `.orchestrator/`).
   workflow, including `task_verified` and `verification_class`; the backlog
   section lists `unqueued` items and `waiting` items with each unmet
   requirement's current queue state (a `failed` blocker will never
-  release its dependents without operator intervention).
+  release its dependents without operator intervention). Job rows carry
+  `retry_backoff_seconds` for backoff-deferred pending work and
+  `lease_expired` for claims whose lease lapsed (reclaimable on the next
+  drain).
 - `just factory-report` — operator report with one row per job, a link to
   its latest evidence file, and a backlog coverage section.
 - Raw inspection works with the standard CLI against the same DB:
