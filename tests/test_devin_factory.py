@@ -1017,6 +1017,29 @@ class FactoryCliTests(BacklogFixture):
 
 
 class FactoryValidateTests(BacklogFixture):
+    def test_repository_backlog_and_workflow_validate(self) -> None:
+        args = devin_factory.build_parser().parse_args(
+            [
+                "--workflow",
+                str(REPO_ROOT / "workflows/devin-factory.toml"),
+                "--backlog",
+                str(REPO_ROOT / "factory/backlog.toml"),
+                "validate",
+            ]
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = devin_factory._command_validate(args)
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertTrue(payload["valid"])
+        self.assertEqual(payload["unsupported_harnesses"], [])
+        self.assertGreater(len(payload["items"]), 0)
+        self.assertEqual(payload["warnings"], [])
+        self.assertTrue(
+            all(item["harness_supported"] for item in payload["items"])
+        )
+
     def parse(self, *extra: str):
         return devin_factory.build_parser().parse_args(
             [
