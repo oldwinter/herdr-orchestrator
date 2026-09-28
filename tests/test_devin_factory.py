@@ -392,7 +392,7 @@ class FactoryLifecycleTests(BacklogFixture):
         self.write_workflow(max_attempts=1)
         self.write_prompt("alpha")
         gate = self.root / "flag"
-        probe = "import os,sys;" f"sys.exit(0 if os.path.exists({str(gate)!r}) else 5)"
+        probe = f"import os,sys;sys.exit(0 if os.path.exists({str(gate)!r}) else 5)"
         argv = json.dumps([sys.executable, "-c", probe])
         self.write_backlog(self.item_toml("alpha", argv))
         coordinator, items = self.coordinator()
@@ -413,6 +413,47 @@ class FactoryLifecycleTests(BacklogFixture):
         job = self.jobs()[0]
         self.assertEqual(job["state"], JobState.SUCCEEDED.value)
         self.assertTrue(job["task_verified"])
+
+    def test_expired_lease_reclaim_redispatches_instead_of_blocking(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "print('ok')"])
+        self.write_backlog(self.item_toml("alpha", argv))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        claimed = coordinator.store.claim(
+            "factory-test",
+            limit=1,
+            lease_seconds=120,
+            slot_names=coordinator._slot_names(),
+            slot_limits={
+                worker.harness.value: worker.replicas for worker in coordinator.config.workers
+            },
+            allowed_harnesses={worker.harness for worker in coordinator.config.workers},
+            workspace=str(self.root),
+            include_legacy=True,
+        )
+        self.assertEqual(len(claimed), 1)
+        expired = time.time() - 60
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            connection.execute(
+                "UPDATE jobs SET lease_until = ? WHERE id = ?",
+                (expired, claimed[0].job_id),
+            )
+            connection.execute(
+                "UPDATE job_attempts SET lease_until = ? WHERE job_id = ?",
+                (expired, claimed[0].job_id),
+            )
+            connection.commit()
+
+        result = coordinator.run_until_idle(timeout_seconds=30)
+
+        self.assertTrue(result["idle"])
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+        self.assertTrue(job["task_verified"])
+        self.assertEqual(job["attempts"], 1)
 
     def test_check_deadline_overrun_fails_instead_of_succeeding(self) -> None:
         self.write_workflow(max_attempts=1, agent_timeout=10)
@@ -898,7 +939,7 @@ class FactoryCliTests(BacklogFixture):
             self.item_toml("alpha", fail)
             + self.item_header("beta", requires=["alpha"])
             + "[[items.checks]]\n"
-            + f'argv = {json.dumps([sys.executable, "-c", "pass"])}\n'
+            + f"argv = {json.dumps([sys.executable, '-c', 'pass'])}\n"
             + "timeout_seconds = 60\n"
         )
         self.assertEqual(self.run_cli("intake").returncode, 0)

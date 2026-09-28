@@ -91,6 +91,12 @@ uv run pytest tests/test_devin_factory.py -q
   attempts after a fix; `just factory-gc` runs the canonical agent
   collector against the factory queue (dry-run unless `--apply`; the local
   lane creates no Herdr agents, so it normally reports no candidates).
+- A `running` job whose lease lapses mid-dispatch (crash, SIGINT) is
+  reclaimed on the next drain; the local lane re-executes the declared
+  checks on the same attempt (`recover` = re-dispatch — there is no
+  interactive session to adopt), so the retry budget is not consumed.
+  `just factory-status` flags such jobs with `lease_expired` while they
+  wait for the lease to lapse.
 - `blocked` remains a manual state per repository rules and requires an
   explicit resume; the factory lane does not write it.
 

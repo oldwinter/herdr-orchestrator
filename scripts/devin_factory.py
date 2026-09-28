@@ -46,6 +46,7 @@ from herdr_orchestrator.model import (
     AgentState,
     AttemptPhase,
     AttemptProgress,
+    AttemptRuntime,
     DispatchContext,
     DispatchOutcome,
     Harness,
@@ -399,7 +400,7 @@ class LocalDispatcher:
                 error_code=(
                     "factory_check_timeout" if failed.get("timed_out") else "factory_check_failed"
                 ),
-                error_summary=f"check {' '.join(failed['argv'])} " f"exit={failed['exit_code']}",
+                error_summary=f"check {' '.join(failed['argv'])} exit={failed['exit_code']}",
                 settled=True,
             )
         completion = self._write_receipt_and_verify(
@@ -438,6 +439,25 @@ class LocalDispatcher:
             task_verified=task_verified,
             completion=completion,
             correlation_id=context.correlation_id if context is not None else "",
+        )
+
+    def recover(
+        self,
+        harness: Harness,
+        prompt: str,
+        *,
+        timeout_seconds: float,
+        agent_name: str,
+        context: DispatchContext,
+        runtime: AttemptRuntime,
+    ) -> DispatchOutcome:
+        del runtime
+        return self.dispatch(
+            harness,
+            prompt,
+            timeout_seconds=timeout_seconds,
+            agent_name=agent_name,
+            context=context,
         )
 
     def _failure(

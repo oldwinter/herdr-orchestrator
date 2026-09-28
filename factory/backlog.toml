@@ -490,3 +490,14 @@ requires = ["factory-lease-expired-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "backoff or lease or status"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-lease-reclaim-v1"
+title = "Expired-lease factory jobs reclaim and re-dispatch checks"
+harness = "codex"
+prompt_file = "prompts/factory-lease-reclaim-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-lease-reclaim-v1.json"
+requires = ["factory-retry-backoff-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "reclaim"]
+timeout_seconds = 180
