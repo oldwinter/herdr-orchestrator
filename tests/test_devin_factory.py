@@ -1074,6 +1074,23 @@ class FactoryCliTests(BacklogFixture):
         self.assertEqual(added, 1)
         self.assertEqual(len(self.jobs()), 1)
 
+    def test_cli_concurrent_runs_do_not_double_claim(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        slow = json.dumps([sys.executable, "-c", "import time;time.sleep(2)"])
+        self.write_backlog(self.item_toml("alpha", slow))
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.run_cli("run"), range(2)))
+
+        jobs = self.jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["state"], JobState.SUCCEEDED.value)
+        self.assertEqual(jobs[0]["attempts"], 1)
+        self.assertTrue(all(result.returncode == 0 for result in results))
+        self.assertEqual(sum(json.loads(result.stdout)["claimed"] for result in results), 1)
+
     def test_cli_rejects_invalid_backlog_and_missing_workflow(self) -> None:
         self.write_workflow()
         self.backlog.write_text("not toml [", encoding="utf-8")

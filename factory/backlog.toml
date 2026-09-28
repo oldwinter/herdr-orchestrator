@@ -457,3 +457,14 @@ requires = ["factory-sigint-kill-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "once"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-concurrent-run-v1"
+title = "Concurrent factory-run drains do not double-claim"
+harness = "codex"
+prompt_file = "prompts/factory-concurrent-run-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-concurrent-run-v1.json"
+requires = ["factory-once-exit-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "concurrent"]
+timeout_seconds = 180
