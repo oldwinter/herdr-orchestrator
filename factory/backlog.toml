@@ -512,3 +512,14 @@ requires = ["factory-lease-reclaim-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "tests/test_cli.py", "-q", "-k", "blocked or reclaim"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-drift-warning-v1"
+title = "Validate warns when a queued item's contract drifted"
+harness = "codex"
+prompt_file = "prompts/factory-drift-warning-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-drift-warning-v1.json"
+requires = ["factory-retry-blocked-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "validate"]
+timeout_seconds = 180

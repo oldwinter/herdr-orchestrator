@@ -53,6 +53,14 @@ stdout/stderr are recorded in per-attempt evidence under
 `.orchestrator/factory/evidence/<dedupe_key>/` (ignored by Git along with
 everything under `.orchestrator/`).
 
+Editing a queued item: the durable contract covers `title`, `harness`,
+`prompt_file` content and `receipt` — changing any of them makes the next
+intake fail with `dedupe_contract_conflict` (retire the item by assigning a
+new `dedupe_key` instead; `factory-validate` warns about the drift before
+that). `checks`/`check_timeout_seconds` are not part of the contract and
+apply live to the next attempt, `requires` only gates items not yet
+queued, and `max_attempts` pins at enqueue.
+
 ## Inspect
 
 - `just factory-status` — durable queue state for the `devin-factory`
@@ -60,9 +68,9 @@ everything under `.orchestrator/`).
   section lists `unqueued` items and `waiting` items with each unmet
   requirement's current queue state (a `failed` blocker will never
   release its dependents without operator intervention). Job rows carry
-  `retry_backoff_seconds` for backoff-deferred pending work and
+  `retry_backoff_seconds` for backoff-deferred pending work,
   `lease_expired` for claims whose lease lapsed (reclaimable on the next
-  drain).
+  drain), and `updated_at_utc` as the row's last state-change timestamp.
 - `just factory-report` — operator report with one row per job, a link to
   its latest evidence file, and a backlog coverage section.
 - Raw inspection works with the standard CLI against the same DB:

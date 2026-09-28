@@ -722,6 +722,7 @@ def _command_validate(args: argparse.Namespace) -> int:
     items = load_backlog(args.backlog)
     worker_harnesses = {worker.harness for worker in config.workers}
     queued: list[str] = []
+    queued_rows: dict[str, dict[str, object]] = {}
     state_db_error: str | None = None
     state_db = Path(config.state_db)
     if state_db.is_file():
@@ -732,13 +733,17 @@ def _command_validate(args: argparse.Namespace) -> int:
                     uri=True,
                 )
             ) as connection:
-                queued = [
-                    str(row[0])
-                    for row in connection.execute(
-                        "SELECT dedupe_key FROM jobs WHERE workflow = ?",
-                        (config.name,),
-                    )
-                ]
+                connection.row_factory = sqlite3.Row
+                for row in connection.execute(
+                    """
+                    SELECT dedupe_key, title, harness, prompt, receipt_value
+                    FROM jobs WHERE workflow = ?
+                    """,
+                    (config.name,),
+                ):
+                    key = str(row["dedupe_key"])
+                    queued.append(key)
+                    queued_rows[key] = dict(row)
         except sqlite3.DatabaseError as exc:
             state_db_error = str(exc)[:200]
     unsupported = sorted(
@@ -759,6 +764,27 @@ def _command_validate(args: argparse.Namespace) -> int:
         for index, check in enumerate(item.checks)
         if not Path(check.argv[0]).is_absolute() and shutil.which(check.argv[0]) is None
     ]
+    for item in items.values():
+        row = queued_rows.get(item.dedupe_key)
+        if row is None:
+            continue
+        try:
+            prompt: str | None = item.prompt_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            prompt = None
+        fields = [
+            ("title", item.title, row["title"]),
+            ("harness", item.harness.value, row["harness"]),
+            ("receipt", item.receipt, row["receipt_value"]),
+        ]
+        if prompt is not None:
+            fields.append(("prompt", prompt, row["prompt"]))
+        drifted = [field for field, current, durable in fields if str(current) != str(durable)]
+        if drifted:
+            warnings.append(
+                f"{item.dedupe_key}: {', '.join(drifted)} changed after the job was"
+                " queued; the next intake will fail with dedupe_contract_conflict"
+            )
     print(
         json.dumps(
             {

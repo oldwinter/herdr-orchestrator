@@ -1312,6 +1312,39 @@ class FactoryValidateTests(BacklogFixture):
         self.assertTrue(by_key["alpha"]["harness_supported"])
         self.assertEqual(by_key["alpha"]["checks"], [["python3", "-c", "pass"]])
 
+    def test_validate_warns_on_contract_drift_for_queued_item(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        check = '["python3", "-c", "pass"]'
+        self.write_backlog(self.item_toml("alpha", check, timeout=30))
+        coordinator, items = devin_factory._build_coordinator(self.workflow, self.backlog)
+        coordinator.initialize()
+        coordinator.enqueue_prompt_file(
+            harness=items["alpha"].harness,
+            title=items["alpha"].title,
+            prompt_file=items["alpha"].prompt_file,
+            dedupe_key="alpha",
+            placement=PlacementTarget.PANE,
+            receipt=TaskReceipt(ReceiptKind.FILE, items["alpha"].receipt),
+        )
+        self.write_prompt("alpha", "changed contract")
+        self.write_backlog(
+            self.item_toml("alpha", check, timeout=30).replace(
+                'title = "item alpha"', 'title = "renamed item"'
+            )
+        )
+
+        payload = self.capture()
+
+        self.assertTrue(payload["valid"])
+        self.assertEqual(
+            payload["warnings"],
+            [
+                "alpha: title, prompt changed after the job was queued;"
+                " the next intake will fail with dedupe_contract_conflict"
+            ],
+        )
+
     def test_validate_warns_when_check_timeout_exceeds_agent_budget(self) -> None:
         self.write_workflow(agent_timeout=30)
         self.write_prompt("alpha")
