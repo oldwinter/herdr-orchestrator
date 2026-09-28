@@ -94,12 +94,19 @@ class BacklogFixture(unittest.TestCase):
     def write_backlog(self, body: str) -> None:
         self.backlog.write_text("schema_version = 1\n\n" + body, encoding="utf-8")
 
-    def item_header(self, dedupe_key: str, *, receipt: str | None = None) -> str:
+    def item_header(
+        self,
+        dedupe_key: str,
+        *,
+        receipt: str | None = None,
+        requires: list[str] | None = None,
+    ) -> str:
         receipt_line = (
             f'receipt = "{receipt}"\n'
             if receipt is not None
             else f'receipt = ".orchestrator/factory/receipts/{dedupe_key}.json"\n'
         )
+        requires_line = f"requires = {json.dumps(requires)}\n" if requires is not None else ""
         return (
             "[[items]]\n"
             f'dedupe_key = "{dedupe_key}"\n'
@@ -107,6 +114,7 @@ class BacklogFixture(unittest.TestCase):
             'harness = "codex"\n'
             f'prompt_file = "prompts/{dedupe_key}.md"\n'
             f"{receipt_line}"
+            f"{requires_line}"
         )
 
     def item_toml(
@@ -116,9 +124,10 @@ class BacklogFixture(unittest.TestCase):
         *,
         timeout: int = 60,
         receipt: str | None = None,
+        requires: list[str] | None = None,
     ) -> str:
         return (
-            self.item_header(dedupe_key, receipt=receipt)
+            self.item_header(dedupe_key, receipt=receipt, requires=requires)
             + "[[items.checks]]\n"
             + f"argv = {argv}\n"
             + f"timeout_seconds = {timeout}\n"
@@ -405,6 +414,71 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertEqual(len(remaining), devin_factory.EVIDENCE_KEEP_PER_ITEM)
         self.assertTrue(remaining[-1].name.endswith("-newest.json"))
         self.assertFalse((directory / "2020-01-01T00-00-000000Z-00000000.json").exists())
+
+    def test_requires_gates_intake_until_dependency_succeeds(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_prompt("beta")
+        check = json.dumps([sys.executable, "-c", "pass"])
+        self.write_backlog(
+            self.item_toml("alpha", check) + self.item_toml("beta", check, requires=["alpha"])
+        )
+        coordinator, items = self.coordinator()
+        coordinator.initialize()
+        args = devin_factory.build_parser().parse_args(
+            [
+                "--workflow",
+                str(self.workflow),
+                "--backlog",
+                str(self.backlog),
+                "intake",
+            ]
+        )
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(devin_factory._command_intake(args), 0)
+        first = json.loads(buffer.getvalue())
+        self.assertEqual(first["added"], 1)
+        self.assertEqual(first["waiting"], [{"dedupe_key": "beta", "requires": ["alpha"]}])
+        self.assertEqual(len(self.jobs()), 1)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(devin_factory._command_intake(args), 0)
+        second = json.loads(buffer.getvalue())
+        self.assertEqual(second["added"], 1)
+        self.assertEqual(second["waiting"], [])
+
+        coordinator.run_until_idle(timeout_seconds=30)
+        states = {job["dedupe_key"]: job["state"] for job in self.jobs()}
+        self.assertEqual(states, {"alpha": "succeeded", "beta": "succeeded"})
+
+    def test_load_backlog_rejects_requires_unknown_cycle_and_duplicate(self) -> None:
+        check = '["python3", "-c", "pass"]'
+        cases = {
+            "unknown": self.item_toml("alpha", check, requires=["ghost"]),
+            "self": self.item_toml("alpha", check, requires=["alpha"]),
+            "cycle": (
+                self.item_toml("alpha", check, requires=["beta"])
+                + self.item_toml("beta", check, requires=["alpha"])
+            ),
+            "duplicate": self.item_toml("alpha", check, requires=["beta", "beta"]),
+        }
+        codes = {
+            "unknown": "factory_requires_unknown",
+            "self": "factory_requires_cycle",
+            "cycle": "factory_requires_cycle",
+            "duplicate": "factory_requires_duplicate",
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                self.write_prompt("alpha")
+                self.write_prompt("beta")
+                self.write_backlog(body)
+                with self.assertRaisesRegex(devin_factory.FactoryError, codes[name]):
+                    devin_factory.load_backlog(self.backlog)
 
     def test_run_once_reports_batch_counts(self) -> None:
         self.write_workflow()

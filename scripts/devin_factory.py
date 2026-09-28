@@ -49,6 +49,7 @@ from herdr_orchestrator.model import (
     DispatchContext,
     DispatchOutcome,
     Harness,
+    JobState,
     PlacementTarget,
 )
 from herdr_orchestrator.protocol import TransportError
@@ -69,6 +70,7 @@ ITEM_KEYS = frozenset(
         "receipt",
         "checks",
         "check_timeout_seconds",
+        "requires",
     }
 )
 CHECK_KEYS = frozenset({"argv", "timeout_seconds"})
@@ -94,6 +96,7 @@ class FactoryItem:
     prompt_file: Path
     receipt: str
     checks: tuple[FactoryCheck, ...]
+    requires: tuple[str, ...]
 
 
 def _require(condition: bool, code: str) -> None:
@@ -152,6 +155,7 @@ def load_backlog(path: Path) -> dict[str, FactoryItem]:
         receipt = _load_receipt(row.get("receipt"), dedupe_key)
         _require(receipt not in receipt_paths, f"factory_receipt_duplicate: {receipt}")
         receipt_paths.add(receipt)
+        requires = _load_requires(row.get("requires"), dedupe_key)
         items[dedupe_key] = FactoryItem(
             dedupe_key=dedupe_key,
             title=title.strip(),
@@ -159,8 +163,58 @@ def load_backlog(path: Path) -> dict[str, FactoryItem]:
             prompt_file=prompt_file,
             receipt=receipt,
             checks=_load_checks(row, dedupe_key),
+            requires=requires,
         )
+    _check_requires(items)
     return items
+
+
+def _load_requires(value: object, dedupe_key: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    _require(
+        isinstance(value, list)
+        and all(
+            isinstance(entry, str) and DEDUPE_KEY.fullmatch(entry) is not None for entry in value
+        ),
+        f"factory_requires_invalid: {dedupe_key}",
+    )
+    _require(
+        len(set(value)) == len(value),
+        f"factory_requires_duplicate: {dedupe_key}",
+    )
+    return tuple(value)
+
+
+def _check_requires(items: dict[str, FactoryItem]) -> None:
+    for item in items.values():
+        for required in item.requires:
+            _require(
+                required in items,
+                f"factory_requires_unknown: {item.dedupe_key} -> {required}",
+            )
+            _require(
+                required != item.dedupe_key,
+                f"factory_requires_cycle: {item.dedupe_key}",
+            )
+    visiting: set[str] = set()
+    done: set[str] = set()
+
+    def walk(key: str, trail: tuple[str, ...]) -> None:
+        if key in done:
+            return
+        _require(
+            key not in visiting,
+            f"factory_requires_cycle: {' -> '.join((*trail, key))}",
+        )
+        visiting.add(key)
+        for required in items[key].requires:
+            walk(required, (*trail, key))
+        visiting.discard(key)
+        done.add(key)
+
+    for key in items:
+        walk(key, ())
 
 
 def _load_receipt(value: object, dedupe_key: str) -> str:
@@ -604,6 +658,7 @@ def _command_validate(args: argparse.Namespace) -> int:
                         "prompt_file": item.prompt_file.name,
                         "queued": item.dedupe_key in queued,
                         "receipt": item.receipt,
+                        "requires": list(item.requires),
                         "title": item.title,
                     }
                     for item in items.values()
@@ -622,9 +677,25 @@ def _command_validate(args: argparse.Namespace) -> int:
 def _command_intake(args: argparse.Namespace) -> int:
     coordinator, items = _build_coordinator(args.workflow, args.backlog)
     coordinator.initialize()
+    workspace = str(coordinator.config.workspace.resolve())
+    state_by_key = {
+        str(job["dedupe_key"]): str(job["state"])
+        for job in coordinator.store.jobs(
+            coordinator.config.name, workspace=workspace, include_legacy=True
+        )
+    }
     added = 0
     jobs: list[dict[str, object]] = []
+    waiting: list[dict[str, object]] = []
     for item in items.values():
+        blockers = [
+            required
+            for required in item.requires
+            if state_by_key.get(required) != JobState.SUCCEEDED.value
+        ]
+        if blockers:
+            waiting.append({"dedupe_key": item.dedupe_key, "requires": blockers})
+            continue
         job_id, created, selected = coordinator.enqueue_prompt_file(
             harness=item.harness,
             title=item.title,
@@ -648,6 +719,7 @@ def _command_intake(args: argparse.Namespace) -> int:
                 "added": added,
                 "existing": len(jobs) - added,
                 "jobs": jobs,
+                "waiting": waiting,
             },
             sort_keys=True,
         )
@@ -679,6 +751,9 @@ def _command_status(args: argparse.Namespace) -> int:
         queued = {str(job["dedupe_key"]) for job in jobs}
         backlog: dict[str, object] = {
             "items": len(items),
+            "requires": {
+                item.dedupe_key: list(item.requires) for item in items.values() if item.requires
+            },
             "unqueued": sorted(key for key in items if key not in queued),
         }
     except FactoryError:

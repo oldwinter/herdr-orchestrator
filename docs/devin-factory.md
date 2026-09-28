@@ -29,8 +29,12 @@ just factory-report      # write .orchestrator/factory/report.md
 
 Backlog items live in `factory/backlog.toml` (`schema_version = 1`). Each
 item declares `dedupe_key`, `title`, `prompt_file`, `receipt`, optional
-`placement`/`max_attempts`, and a non-empty `[[items.checks]]` list of
-bounded argv+timeout commands executed without a shell. Check exit codes and
+`placement`/`max_attempts`, an optional `requires = [dedupe_key, ...]` list,
+and a non-empty `[[items.checks]]` list of bounded argv+timeout commands
+executed without a shell. An item only enters the queue at intake once every
+`requires` entry names a backlog item whose job is already `succeeded`;
+until then intake reports it under `waiting` (unknown references, duplicates
+and cycles are rejected as `factory_requires_*` errors). Check exit codes and
 stdout/stderr are recorded in per-attempt evidence under
 `.orchestrator/factory/evidence/<dedupe_key>/` (ignored by Git along with
 everything under `.orchestrator/`).

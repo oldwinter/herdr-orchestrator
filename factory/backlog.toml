@@ -91,3 +91,15 @@ receipt = ".orchestrator/factory/receipts/factory-evidence-gc-v1.json"
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "evidence_is_bounded"]
 timeout_seconds = 120
+
+[[items]]
+dedupe_key = "factory-requires-v1"
+title = "Ordered factory states via item requires gating"
+harness = "codex"
+prompt_file = "prompts/factory-requires-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-requires-v1.json"
+requires = ["factory-evidence-gc-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "requires"]
+timeout_seconds = 600
