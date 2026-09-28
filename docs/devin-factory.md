@@ -97,9 +97,13 @@ uv run pytest tests/test_devin_factory.py -q
   interactive session to adopt), so the retry budget is not consumed.
   `just factory-status` flags such jobs with `lease_expired` while they
   wait for the lease to lapse.
-- `blocked` remains a manual state per repository rules and requires an
-  explicit resume; the factory lane only writes it when a reclaimed
-  dispatch settles ambiguously (the canonical `attention` path).
+- `blocked` remains an operator-attention state per repository rules; the
+  factory lane only writes it when a reclaimed dispatch settles
+  ambiguously (the canonical `attention` path). Local jobs have no pane
+  to resume, so `just factory-retry JOB_ID` opts into
+  `retry --allow-blocked` and re-drives the item on a fresh attempt. The
+  canonical `just retry` keeps `failed`-only semantics for lanes whose
+  blocked jobs may still own a live session.
 
 ## Stop
 

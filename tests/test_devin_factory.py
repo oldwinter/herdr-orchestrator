@@ -458,6 +458,44 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertTrue(job["task_verified"])
         self.assertEqual(job["attempts"], 1)
 
+    def test_blocked_job_is_retryable_only_with_allow_blocked(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "print('ok')"])
+        self.write_backlog(self.item_toml("alpha", argv))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        job_id = self._claim_and_expire(coordinator)
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            connection.execute(
+                "UPDATE jobs SET state = 'blocked', lease_until = NULL WHERE id = ?",
+                (job_id,),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(StoreError, "job_not_retryable"):
+            self.store.retry_failed(
+                "factory-test", job_id, extra_attempts=1, workspace=str(self.root)
+            )
+
+        retried = self.store.retry_failed(
+            "factory-test",
+            job_id,
+            extra_attempts=1,
+            workspace=str(self.root),
+            allow_blocked=True,
+        )
+        self.assertEqual(retried["state"], "pending")
+
+        result = coordinator.run_until_idle(timeout_seconds=30)
+
+        self.assertTrue(result["idle"])
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+        self.assertTrue(job["task_verified"])
+        self.assertEqual(job["attempts"], 2)
+
     def test_expired_lease_reclaim_after_settled_phase_still_completes(self) -> None:
         self.write_workflow(max_attempts=1)
         self.write_prompt("alpha")

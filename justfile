@@ -173,10 +173,10 @@ factory-status *args:
 factory-report *args:
     @PYTHONPATH=src {{python}} scripts/devin_factory.py --workflow {{quote(factory_workflow)}} --backlog {{quote(factory_backlog)}} report "$@"
 
-# Re-queue a failed factory job with extra attempts (recovery).
+# Re-queue a failed or blocked factory job with extra attempts (recovery).
 [positional-arguments]
 factory-retry job_id *args:
-    @shift 1; PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{quote(factory_workflow)}} --job-id {{quote(job_id)}} "$@"
+    @shift 1; PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{quote(factory_workflow)}} --job-id {{quote(job_id)}} --allow-blocked "$@"
 
 # Collect terminal factory job artifacts (dry-run by default).
 [positional-arguments]
