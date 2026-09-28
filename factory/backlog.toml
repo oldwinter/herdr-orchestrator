@@ -115,3 +115,15 @@ requires = ["factory-requires-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "backlog_error or concurrent_intake"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-receipt-write-v1"
+title = "Stable factory_receipt_write_failed code; architecture doc section"
+harness = "codex"
+prompt_file = "prompts/factory-receipt-write-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-receipt-write-v1.json"
+requires = ["factory-status-truth-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "receipt_write_failed or unwritable"]
+timeout_seconds = 600

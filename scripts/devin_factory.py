@@ -457,29 +457,32 @@ class LocalDispatcher:
             if receipt is not None and receipt.kind is ReceiptKind.FILE:
                 target = receipt_file_path(receipt, self._workspace)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(
-                    json.dumps(
-                        {
-                            "checks": [
-                                {
-                                    "argv": result["argv"],
-                                    "exit_code": result["exit_code"],
-                                }
-                                for result in evidence.get("checks", [])
-                            ],
-                            "correlation_id": evidence["correlation_id"],
-                            "dedupe_key": item.dedupe_key,
-                            "git_head": evidence["git_head"],
-                            "schema_version": 1,
-                            "task": item.title,
-                            "verified_at": _utc_now(),
-                        },
-                        indent=2,
-                        sort_keys=True,
+                try:
+                    target.write_text(
+                        json.dumps(
+                            {
+                                "checks": [
+                                    {
+                                        "argv": result["argv"],
+                                        "exit_code": result["exit_code"],
+                                    }
+                                    for result in evidence.get("checks", [])
+                                ],
+                                "correlation_id": evidence["correlation_id"],
+                                "dedupe_key": item.dedupe_key,
+                                "git_head": evidence["git_head"],
+                                "schema_version": 1,
+                                "task": item.title,
+                                "verified_at": _utc_now(),
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
                     )
-                    + "\n",
-                    encoding="utf-8",
-                )
+                except OSError:
+                    return failed_completion(self._policy(context), "factory_receipt_write_failed")
             return verify_completion(
                 receipt,
                 None,

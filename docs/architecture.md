@@ -373,6 +373,19 @@ schema 都要求 secret/production 升级。由于 Herdr 拒绝向已 blocked ag
 `.orchestrator/deliveries/<run-id>/`。最终产物是隔离 integration branch 与 commit，
 不会自动 push 或 merge 用户 branch。
 
+### Devin factory lane
+
+`scripts/devin_factory.py` 是本仓库的本地 software-factory lane：它把
+`LocalDispatcher` 注入现有 `Coordinator`，复用 claim/lease/attempt/fencing/
+dedupe/retry/receipt 全部语义，只把 Herdr transport 换成在 workflow workspace
+内本地执行 backlog 声明的 bounded 验收检查（无 shell）。工作项来自提交的
+`factory/backlog.toml`（`schema_version = 1`），每项声明 `dedupe_key`、
+`prompt_file`、file receipt、`[[items.checks]]` 与可选 `requires` 依赖门；
+intake 只在所有 `requires` 项已 `succeeded` 时入队。运行状态与证据留在
+`.orchestrator/factory/`（不进 Git），入口是 justfile 的 `factory-*`
+recipes，细节见 `docs/devin-factory.md`。本地 lane 不会写 `blocked`，也不会 merge、
+push、发布或改动权限。
+
 ## 24/7 边界
 
 Herdr detach 不终止 coordinator 与 agent 进程，因此适合长时间运行。以下情况不承诺无缝：

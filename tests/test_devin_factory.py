@@ -481,6 +481,24 @@ class FactoryLifecycleTests(BacklogFixture):
                 with self.assertRaisesRegex(devin_factory.FactoryError, codes[name]):
                     devin_factory.load_backlog(self.backlog)
 
+    def test_unwritable_receipt_path_fails_closed_with_stable_code(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", json.dumps([sys.executable, "-c", "pass"])))
+        receipt_dir = self.root / ".orchestrator/factory/receipts"
+        receipt_dir.mkdir(parents=True)
+        receipt_dir.chmod(0o555)
+        self.addCleanup(receipt_dir.chmod, 0o755)
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_receipt_write_failed")
+        self.assertFalse(job["task_verified"])
+
     def test_run_once_reports_batch_counts(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")
