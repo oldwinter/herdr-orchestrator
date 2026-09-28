@@ -469,6 +469,33 @@ class FactoryCliTests(BacklogFixture):
         job = self.jobs()[0]
         self.assertEqual(job["state"], JobState.FAILED.value)
 
+    def test_cli_run_on_empty_queue_is_idle_success(self) -> None:
+        self.write_workflow()
+        self.backlog.write_text("schema_version = 1\nitems = []\n", encoding="utf-8")
+
+        run = self.run_cli("run")
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertTrue(payload["idle"])
+        self.assertEqual(payload["claimed"], 0)
+
+    def test_cli_status_includes_error_summary(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        self.write_backlog(
+            self.item_toml("alpha", json.dumps([sys.executable, "-c", "raise SystemExit(3)"]))
+        )
+        self.run_cli("intake")
+        self.run_cli("run")
+
+        status = self.run_cli("status")
+
+        self.assertEqual(status.returncode, 0, status.stderr)
+        job = json.loads(status.stdout)["jobs"][0]
+        self.assertEqual(job["error_code"], "factory_check_failed")
+        self.assertIn("exit=3", job["error_summary"])
+
     def test_cli_rejects_invalid_backlog_and_missing_workflow(self) -> None:
         self.write_workflow()
         self.backlog.write_text("not toml [", encoding="utf-8")
@@ -541,6 +568,19 @@ class FactoryValidateTests(BacklogFixture):
         self.assertFalse(payload["state_db"])
         self.assertFalse(payload["items"][0]["queued"])
         self.assertFalse(state_db.exists())
+
+    def test_validate_tolerates_unreadable_state_db(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", '["python3", "-c", "pass"]'))
+        state_db = self.root / "state.db"
+        state_db.write_text("not a database", encoding="utf-8")
+
+        payload = self.capture()
+
+        self.assertTrue(payload["state_db"])
+        self.assertIsNotNone(payload["state_db_error"])
+        self.assertFalse(payload["items"][0]["queued"])
 
     def test_validate_rejects_invalid_backlog_via_main(self) -> None:
         self.write_workflow()

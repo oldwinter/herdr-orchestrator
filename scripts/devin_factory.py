@@ -569,21 +569,25 @@ def _command_validate(args: argparse.Namespace) -> int:
     items = load_backlog(args.backlog)
     worker_harnesses = {worker.harness for worker in config.workers}
     queued: list[str] = []
+    state_db_error: str | None = None
     state_db = Path(config.state_db)
     if state_db.is_file():
-        with closing(
-            sqlite3.connect(
-                f"file:{state_db}?mode=ro&immutable=1",
-                uri=True,
-            )
-        ) as connection:
-            queued = [
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT dedupe_key FROM jobs WHERE workflow = ?",
-                    (config.name,),
+        try:
+            with closing(
+                sqlite3.connect(
+                    f"file:{state_db}?mode=ro&immutable=1",
+                    uri=True,
                 )
-            ]
+            ) as connection:
+                queued = [
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT dedupe_key FROM jobs WHERE workflow = ?",
+                        (config.name,),
+                    )
+                ]
+        except sqlite3.DatabaseError as exc:
+            state_db_error = str(exc)[:200]
     print(
         json.dumps(
             {
@@ -601,6 +605,7 @@ def _command_validate(args: argparse.Namespace) -> int:
                     for item in items.values()
                 ],
                 "state_db": state_db.is_file(),
+                "state_db_error": state_db_error,
                 "valid": True,
             },
             indent=2,
@@ -689,6 +694,7 @@ def _command_status(args: argparse.Namespace) -> int:
                         "attempts": job["attempts"],
                         "dedupe_key": job["dedupe_key"],
                         "error_code": job["error_code"],
+                        "error_summary": job["error_summary"],
                         "id": job["id"],
                         "max_attempts": job["max_attempts"],
                         "receipt_kind": job["receipt_kind"],

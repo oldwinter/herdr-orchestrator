@@ -54,3 +54,14 @@ receipt = ".orchestrator/factory/receipts/factory-cli-v1.json"
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-hardening-v1"
+title = "Harden validate against corrupt state DB; surface error_summary"
+harness = "codex"
+prompt_file = "prompts/factory-hardening-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-hardening-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "unreadable or empty_queue or error_summary"]
+timeout_seconds = 600
