@@ -817,7 +817,7 @@ class FactoryCliTests(BacklogFixture):
         rendered = (self.root / ".orchestrator/factory/report.md").read_text(encoding="utf-8")
         self.assertIn("items: 2", rendered)
         self.assertIn("unqueued: beta", rendered)
-        self.assertIn("beta (requires: alpha)", rendered)
+        self.assertIn("beta (waiting on: alpha=pending)", rendered)
 
     def test_cli_run_exit_code_reflects_queue_failure(self) -> None:
         self.write_workflow(max_attempts=1)

@@ -303,3 +303,14 @@ requires = ["factory-validate-warnings-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "waiting or status"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-report-blocker-state-v1"
+title = "Report renders unmet requirement states"
+harness = "codex"
+prompt_file = "prompts/factory-report-blocker-state-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-report-blocker-state-v1.json"
+requires = ["factory-waiting-blocker-state-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report or waiting"]
+timeout_seconds = 180

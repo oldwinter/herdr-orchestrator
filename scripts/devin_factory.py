@@ -941,11 +941,18 @@ def _command_report(args: argparse.Namespace) -> int:
             )
         )
     queued = {str(job["dedupe_key"]) for job in jobs}
+    state_by_key = {str(job["dedupe_key"]): str(job["state"]) for job in jobs}
     try:
         backlog_items = load_backlog(args.backlog)
         unqueued = sorted(key for key in backlog_items if key not in queued)
         waiting = [
-            f"{item.dedupe_key} (requires: {', '.join(item.requires)})"
+            f"{item.dedupe_key} (waiting on: "
+            + ", ".join(
+                f"{required}={state_by_key.get(required, 'unqueued')}"
+                for required in item.requires
+                if state_by_key.get(required) != JobState.SUCCEEDED.value
+            )
+            + ")"
             for item in backlog_items.values()
             if item.dedupe_key in unqueued and item.requires
         ]
