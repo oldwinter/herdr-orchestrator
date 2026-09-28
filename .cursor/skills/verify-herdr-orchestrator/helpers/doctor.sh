@@ -37,7 +37,7 @@ if ! kill -0 "$PID" 2>/dev/null; then
   exit 1
 fi
 
-CMDLINE="$(tr '\0' ' ' <"/proc/$PID/cmdline" || true)"
+CMDLINE="$(pid_cmdline "$PID")"
 case "$CMDLINE" in
   *herdr_orchestrator*dashboard*) ;;
   *)

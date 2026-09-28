@@ -139,3 +139,27 @@ requires = ["factory-receipt-write-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_runner.py", "-q"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "verify-helpers-darwin-v1"
+title = "Port verify-herdr-orchestrator helpers to macOS"
+harness = "codex"
+prompt_file = "prompts/verify-helpers-darwin-v1.md"
+receipt = ".orchestrator/factory/receipts/verify-helpers-darwin-v1.json"
+requires = ["factory-max-attempts-v1"]
+
+[[items.checks]]
+argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/common.sh"]
+timeout_seconds = 30
+
+[[items.checks]]
+argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/doctor.sh"]
+timeout_seconds = 30
+
+[[items.checks]]
+argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/cleanup.sh"]
+timeout_seconds = 30
+
+[[items.checks]]
+argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/capture-dashboard.sh"]
+timeout_seconds = 30
