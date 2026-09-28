@@ -43,3 +43,14 @@ receipt = ".orchestrator/factory/receipts/factory-failfast-v1.json"
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "short_circuit"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-cli-v1"
+title = "Add CLI-level end-to-end coverage for the factory lane"
+harness = "codex"
+prompt_file = "prompts/factory-cli-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-cli-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli"]
+timeout_seconds = 600

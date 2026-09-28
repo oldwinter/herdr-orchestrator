@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -403,6 +405,81 @@ class FactoryLifecycleTests(BacklogFixture):
         )
         with self.assertRaisesRegex(devin_factory.FactoryError, "factory_harness_has_no_worker"):
             self.coordinator()
+
+
+class FactoryCliTests(BacklogFixture):
+    def run_cli(self, *argv: str) -> subprocess.CompletedProcess:
+        environment = dict(os.environ)
+        source = str(REPO_ROOT / "src")
+        existing = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = source if not existing else source + os.pathsep + existing
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--workflow",
+                str(self.workflow),
+                "--backlog",
+                str(self.backlog),
+                *argv,
+            ],
+            capture_output=True,
+            text=True,
+            cwd=self.root,
+            env=environment,
+            check=False,
+        )
+
+    def test_cli_intake_run_status_report_end_to_end(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", json.dumps([sys.executable, "-c", "pass"])))
+
+        intake = self.run_cli("intake")
+        self.assertEqual(intake.returncode, 0, intake.stderr)
+        self.assertEqual(json.loads(intake.stdout)["added"], 1)
+
+        run = self.run_cli("run")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["queue"]["succeeded"], 1)
+
+        status = self.run_cli("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        payload = json.loads(status.stdout)
+        self.assertEqual(payload["counts"]["succeeded"], 1)
+        self.assertEqual(payload["jobs"][0]["dedupe_key"], "alpha")
+
+        report = self.run_cli("report")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        rendered = (self.root / ".orchestrator/factory/report.md").read_text(encoding="utf-8")
+        self.assertIn("alpha", rendered)
+        self.assertIn("succeeded", rendered)
+
+    def test_cli_run_exit_code_reflects_queue_failure(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        self.write_backlog(
+            self.item_toml("alpha", json.dumps([sys.executable, "-c", "raise SystemExit(3)"]))
+        )
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        run = self.run_cli("run")
+
+        self.assertEqual(run.returncode, 1)
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+
+    def test_cli_rejects_invalid_backlog_and_missing_workflow(self) -> None:
+        self.write_workflow()
+        self.backlog.write_text("not toml [", encoding="utf-8")
+        result = self.run_cli("validate")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("factory_backlog_invalid", result.stderr)
+
+        self.write_backlog(self.item_toml("alpha", '["python3", "-c", "pass"]'))
+        self.workflow.unlink()
+        result = self.run_cli("validate")
+        self.assertEqual(result.returncode, 2)
 
 
 class FactoryValidateTests(BacklogFixture):
