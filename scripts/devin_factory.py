@@ -398,7 +398,16 @@ class LocalDispatcher:
             task_verified=task_verified,
             completion=completion,
         )
-        self._write_evidence(context, evidence, verified=task_verified is True)
+        write_error = self._write_evidence(context, evidence, verified=task_verified is True)
+        if write_error is not None:
+            return self._failure(
+                context,
+                name,
+                evidence,
+                error_code=write_error,
+                error_summary="evidence write failed after checks and receipt passed",
+                settled=True,
+            )
         return DispatchOutcome(
             agent_name=name,
             state=AgentState.DONE,
@@ -435,7 +444,9 @@ class LocalDispatcher:
                 task_verified=False,
                 completion=completion,
             )
-        self._write_evidence(context, evidence, verified=False)
+        write_error = self._write_evidence(context, evidence, verified=False)
+        if write_error is not None:
+            error_summary = f"{error_summary}; evidence_write_failed"[:500]
         return DispatchOutcome(
             agent_name=agent_name,
             state=AgentState.DONE,
@@ -613,20 +624,24 @@ class LocalDispatcher:
         evidence: dict[str, Any],
         *,
         verified: bool,
-    ) -> None:
+    ) -> str | None:
         evidence["verified"] = verified
-        directory = self._evidence_root / str(evidence.get("dedupe_key") or "unknown")
-        directory.mkdir(parents=True, exist_ok=True)
-        stamp = _utc_now().replace(":", "-").replace("+", "Z")
-        correlation = str(evidence.get("correlation_id") or "no-correlation")[:8]
-        target = directory / f"{stamp}-{correlation}.json"
-        target.write_text(
-            json.dumps(evidence, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        stale = sorted(directory.glob("*.json"))[:-EVIDENCE_KEEP_PER_ITEM]
-        for old in stale:
-            old.unlink(missing_ok=True)
+        try:
+            directory = self._evidence_root / str(evidence.get("dedupe_key") or "unknown")
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = _utc_now().replace(":", "-").replace("+", "Z")
+            correlation = str(evidence.get("correlation_id") or "no-correlation")[:8]
+            target = directory / f"{stamp}-{correlation}.json"
+            target.write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            stale = sorted(directory.glob("*.json"))[:-EVIDENCE_KEEP_PER_ITEM]
+            for old in stale:
+                old.unlink(missing_ok=True)
+        except OSError:
+            return "factory_evidence_write_failed"
+        return None
 
 
 def _build_coordinator(

@@ -410,6 +410,44 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertTrue(job["task_verified"])
         self.assertLess(elapsed, 5.0)
 
+    def test_evidence_write_failure_fails_success_with_stable_code(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "pass"])
+        self.write_backlog(self.item_toml("alpha", argv))
+        blocker = self.root / ".orchestrator/factory/evidence/alpha"
+        blocker.parent.mkdir(parents=True)
+        blocker.write_text("not a directory", encoding="utf-8")
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        result = coordinator.run_until_idle(timeout_seconds=30)
+
+        self.assertTrue(result["idle"])
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_evidence_write_failed")
+        self.assertFalse(job["task_verified"])
+
+    def test_evidence_write_failure_keeps_original_error_code(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "raise SystemExit(3)"])
+        self.write_backlog(self.item_toml("alpha", argv))
+        blocker = self.root / ".orchestrator/factory/evidence/alpha"
+        blocker.parent.mkdir(parents=True)
+        blocker.write_text("not a directory", encoding="utf-8")
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        result = coordinator.run_until_idle(timeout_seconds=30)
+
+        self.assertTrue(result["idle"])
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_check_failed")
+        self.assertIn("evidence_write_failed", str(job.get("error_summary") or ""))
+
     def test_check_timeout_is_a_distinct_stable_error(self) -> None:
         self.write_workflow(max_attempts=1)
         self.write_prompt("alpha")

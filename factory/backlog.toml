@@ -178,3 +178,14 @@ timeout_seconds = 300
 [[items.checks]]
 argv = ["python3", "-c", "import ast; ast.parse(open('scripts/devin_factory.py').read()); assert 'deadline_exceeded' in open('scripts/devin_factory.py').read()"]
 timeout_seconds = 30
+[[items]]
+dedupe_key = "factory-evidence-write-v1"
+title = "Stable factory_evidence_write_failed code; preserve original error on evidence-write failure"
+harness = "codex"
+prompt_file = "prompts/factory-evidence-write-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-evidence-write-v1.json"
+requires = ["factory-deadline-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "evidence_write"]
+timeout_seconds = 120
