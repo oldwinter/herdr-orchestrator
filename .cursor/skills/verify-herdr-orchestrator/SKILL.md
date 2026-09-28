@@ -48,7 +48,7 @@ feature map 在 `features/`。一次证明至少覆盖 map 里列出的全部入
 
 只回答「这个实例还能不敢开」。通过条件：
 
-- `run.json` 指向的 pid 仍在，且 `/proc/<pid>/cmdline` 含 `herdr_orchestrator` 和 `dashboard`。
+- `run.json` 指向的 pid 仍在，且其命令行（`pid_cmdline`：Linux 读 `/proc/<pid>/cmdline`，macOS 退回 `ps -o command=`）含 `herdr_orchestrator` 和 `dashboard`。
 - `state_db` / workflow 不是仓库默认那一对。
 - `GET <url>/api/health` → `ok: true`。
 - `GET <url>/api/snapshot` 的 `snapshot.workflow` 是 `verify-orchestrator`，`source_health.queue` 是 `ok`，两张 seed 卡都在且为 `pending`。
@@ -128,7 +128,7 @@ PYTHONPATH=src python3 -m herdr_orchestrator enqueue --workflow "$WORKFLOW" \
 .cursor/skills/verify-herdr-orchestrator/helpers/capture-dashboard.sh
 ```
 
-不要用 `chrome --dump-dom` / `--screenshot` 直接打开 Dashboard：页面会挂上 `EventSource /api/events`，headless 会一直等 network idle。`capture-dashboard.sh` 走 Node CDP（`helpers/capture-dashboard.mjs`），等 `.job-card[data-job-id]` 出现再截图。Chrome 用 `/usr/bin/google-chrome-stable` 或 `/opt/google/chrome/chrome`，**不要**用 `/usr/local/bin/google-chrome` 这类会劫持 profile / 9222 的包装器。每个 run 用自己的 `--user-data-dir`。需要 `--no-sandbox`。
+不要用 `chrome --dump-dom` / `--screenshot` 直接打开 Dashboard：页面会挂上 `EventSource /api/events`，headless 会一直等 network idle。`capture-dashboard.sh` 走 Node CDP（`helpers/capture-dashboard.mjs`），等 `.job-card[data-job-id]` 出现再截图。浏览器探测顺序覆盖 Linux（`/usr/bin/google-chrome-stable`、`/opt/google/chrome/chrome`、chromium）和 macOS（`/Applications/Google Chrome.app`、`Chromium.app`、`Microsoft Edge.app` 的 bundle 内二进制），**不要**用 `/usr/local/bin/google-chrome` 这类会劫持 profile / 9222 的包装器。每个 run 用自己的 `--user-data-dir`。需要 `--no-sandbox`。
 
 ## Evidence
 
