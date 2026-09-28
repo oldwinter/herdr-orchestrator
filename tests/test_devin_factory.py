@@ -877,6 +877,27 @@ class FactoryValidateTests(BacklogFixture):
         self.assertTrue(by_key["alpha"]["harness_supported"])
         self.assertEqual(by_key["alpha"]["checks"], [["python3", "-c", "pass"]])
 
+    def test_validate_fails_closed_on_unsupported_harness(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "pass"])
+        self.write_backlog(
+            self.item_header("alpha").replace('harness = "codex"', 'harness = "droid"')
+            + "[[items.checks]]\n"
+            + f"argv = {argv}\n"
+            + "timeout_seconds = 60\n"
+        )
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = devin_factory._command_validate(self.parse())
+
+        self.assertEqual(code, 2)
+        payload = json.loads(buffer.getvalue())
+        self.assertFalse(payload["valid"])
+        self.assertEqual(payload["unsupported_harnesses"], ["alpha"])
+        self.assertFalse(payload["items"][0]["harness_supported"])
+
     def test_validate_reports_absent_state_db_without_creating_it(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")

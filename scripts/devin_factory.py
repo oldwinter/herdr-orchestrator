@@ -689,6 +689,9 @@ def _command_validate(args: argparse.Namespace) -> int:
                 ]
         except sqlite3.DatabaseError as exc:
             state_db_error = str(exc)[:200]
+    unsupported = sorted(
+        item.dedupe_key for item in items.values() if item.harness not in worker_harnesses
+    )
     print(
         json.dumps(
             {
@@ -708,13 +711,14 @@ def _command_validate(args: argparse.Namespace) -> int:
                 ],
                 "state_db": state_db.is_file(),
                 "state_db_error": state_db_error,
-                "valid": True,
+                "unsupported_harnesses": unsupported,
+                "valid": not unsupported,
             },
             indent=2,
             sort_keys=True,
         )
     )
-    return 0
+    return 0 if not unsupported else 2
 
 
 def _command_intake(args: argparse.Namespace) -> int:
