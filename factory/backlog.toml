@@ -266,3 +266,18 @@ requires = ["factory-evidence-budget-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli or run_once"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-docs-run-jobs-v1"
+title = "Document run jobs list and drain-deadline semantics"
+harness = "codex"
+prompt_file = "prompts/factory-docs-run-jobs-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-docs-run-jobs-v1.json"
+requires = ["factory-run-jobs-v1"]
+
+[[items.checks]]
+argv = ["python3", "scripts/check_docs.py"]
+timeout_seconds = 60
+
+[[items.checks]]
+argv = ["python3", "-c", "import pathlib,sys; t=pathlib.Path('docs/devin-factory.md').read_text(); sys.exit(0 if 'jobs' in t and 'dispatch_deadline' in t else 1)"]
+timeout_seconds = 30

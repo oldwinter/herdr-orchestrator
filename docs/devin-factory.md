@@ -25,7 +25,13 @@ just factory-report      # write .orchestrator/factory/report.md
 
 `factory-run` accepts `--once` (single claim wave) and
 `--drain-timeout-seconds N` (default 3600), e.g.
-`just factory-run --once`.
+`just factory-run --once`. The drain deadline bounds new claims and
+truncates in-flight dispatches via the canonical `dispatch_deadline`.
+
+Both run modes emit JSON with a `jobs` list — one entry per queued job
+(`job_id`, `dedupe_key`, `state`, `task_verified`, `error_code`) — so a
+failed or retried item is identifiable from the run output itself without
+a follow-up `factory-status` call.
 
 Backlog items live in `factory/backlog.toml` (`schema_version = 1`). Each
 item declares `dedupe_key`, `title`, `harness`, `prompt_file`, `receipt`,
