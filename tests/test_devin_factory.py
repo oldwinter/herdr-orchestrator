@@ -591,6 +591,55 @@ class FactoryLifecycleTests(BacklogFixture):
         states = {job["dedupe_key"]: job["state"] for job in self.jobs()}
         self.assertEqual(states, {"alpha": "succeeded", "beta": "succeeded"})
 
+    def test_requires_chains_release_level_by_level(self) -> None:
+        self.write_workflow()
+        check = json.dumps([sys.executable, "-c", "pass"])
+        for name in ("alpha", "beta", "gamma"):
+            self.write_prompt(name)
+        self.write_backlog(
+            self.item_toml("alpha", check)
+            + self.item_toml("beta", check, requires=["alpha"])
+            + self.item_toml("gamma", check, requires=["beta"])
+        )
+        coordinator, _ = self.coordinator()
+        coordinator.initialize()
+        args = devin_factory.build_parser().parse_args(
+            [
+                "--workflow",
+                str(self.workflow),
+                "--backlog",
+                str(self.backlog),
+                "intake",
+            ]
+        )
+
+        def intake() -> dict[str, object]:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                self.assertEqual(devin_factory._command_intake(args), 0)
+            return json.loads(buffer.getvalue())
+
+        first = intake()
+        self.assertEqual(first["added"], 1)
+        self.assertEqual({entry["dedupe_key"] for entry in first["waiting"]}, {"beta", "gamma"})
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        second = intake()
+        self.assertEqual(second["added"], 1)
+        self.assertEqual([entry["dedupe_key"] for entry in second["waiting"]], ["gamma"])
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        third = intake()
+        self.assertEqual(third["added"], 1)
+        self.assertEqual(third["waiting"], [])
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        states = {job["dedupe_key"]: job["state"] for job in self.jobs()}
+        self.assertEqual(
+            states,
+            {"alpha": "succeeded", "beta": "succeeded", "gamma": "succeeded"},
+        )
+
     def test_load_backlog_rejects_requires_unknown_cycle_and_duplicate(self) -> None:
         check = '["python3", "-c", "pass"]'
         cases = {

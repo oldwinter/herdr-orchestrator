@@ -347,3 +347,14 @@ requires = ["factory-evidence-stamp-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "intake or waiting or requires"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-requires-chain-pin-v1"
+title = "Pin transitive requires release ordering"
+harness = "codex"
+prompt_file = "prompts/factory-requires-chain-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-requires-chain-pin-v1.json"
+requires = ["factory-intake-blocker-state-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "requires"]
+timeout_seconds = 180
