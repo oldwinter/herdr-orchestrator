@@ -900,6 +900,9 @@ def _command_status(args: argparse.Namespace) -> int:
                         "state": job["state"],
                         "task_verified": job["task_verified"],
                         "title": job["title"],
+                        "updated_at_utc": datetime.fromtimestamp(
+                            float(job["updated_at"]), UTC
+                        ).isoformat(),
                         "verification_class": job["verification_class"],
                     }
                     for job in jobs

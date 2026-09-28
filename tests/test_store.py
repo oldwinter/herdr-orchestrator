@@ -48,7 +48,10 @@ class StoreTests(unittest.TestCase):
             self.store.existing_job("example", "same"),
             (first_id, Harness.CODEX),
         )
-        self.assertEqual(self.store.jobs("example")[0]["dedupe_key"], "same")
+        projected = self.store.jobs("example")[0]
+        self.assertEqual(projected["dedupe_key"], "same")
+        self.assertGreater(float(projected["created_at"]), 0)
+        self.assertGreater(float(projected["updated_at"]), 0)
 
     def test_enqueue_rejects_changed_dedupe_contract(self) -> None:
         job = _job("contract")

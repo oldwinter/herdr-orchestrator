@@ -413,3 +413,14 @@ requires = ["factory-backlog-ci-pin-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "bounded"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-job-updated-at-v1"
+title = "Project job timestamps; status shows last-change ISO time"
+harness = "codex"
+prompt_file = "prompts/factory-job-updated-at-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-job-updated-at-v1.json"
+requires = ["factory-output-bound-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "updated or enqueue_is_idempotent or Cli"]
+timeout_seconds = 180

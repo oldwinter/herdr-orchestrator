@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 
 from herdr_orchestrator.completion import ReceiptKind, TaskReceipt
@@ -851,6 +852,8 @@ class FactoryCliTests(BacklogFixture):
         payload = json.loads(status.stdout)
         self.assertEqual(payload["counts"]["succeeded"], 1)
         self.assertEqual(payload["jobs"][0]["dedupe_key"], "alpha")
+        updated = datetime.fromisoformat(payload["jobs"][0]["updated_at_utc"])
+        self.assertEqual(updated.tzinfo, UTC)
 
         report = self.run_cli("report")
         self.assertEqual(report.returncode, 0, report.stderr)
