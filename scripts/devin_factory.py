@@ -643,7 +643,7 @@ class LocalDispatcher:
         try:
             directory = self._evidence_root / str(evidence.get("dedupe_key") or "unknown")
             directory.mkdir(parents=True, exist_ok=True)
-            stamp = _utc_now().replace(":", "-").replace("+", "Z")
+            stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S.%fZ")
             correlation = str(evidence.get("correlation_id") or "no-correlation")[:8]
             target = directory / f"{stamp}-{correlation}.json"
             _write_json_atomic(target, evidence)

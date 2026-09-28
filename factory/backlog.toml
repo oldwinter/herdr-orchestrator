@@ -325,3 +325,14 @@ requires = ["factory-report-blocker-state-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-evidence-stamp-v1"
+title = "Evidence filenames use clean UTC stamp"
+harness = "codex"
+prompt_file = "prompts/factory-evidence-stamp-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-evidence-stamp-v1.json"
+requires = ["factory-report-write-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q"]
+timeout_seconds = 300
