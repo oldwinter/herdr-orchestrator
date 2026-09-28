@@ -358,3 +358,14 @@ requires = ["factory-intake-blocker-state-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "requires"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-exec-failure-codes-v1"
+title = "Pin 127/126 exec-failure check codes"
+harness = "codex"
+prompt_file = "prompts/factory-exec-failure-codes-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-exec-failure-codes-v1.json"
+requires = ["factory-requires-chain-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "executable"]
+timeout_seconds = 180

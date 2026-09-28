@@ -333,6 +333,42 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertEqual(job["state"], JobState.FAILED.value)
         self.assertEqual(job["error_code"], "factory_item_unknown")
 
+    def test_missing_check_executable_fails_with_127(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", '["definitely-not-a-real-binary-xyz", "arg"]'))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_check_failed")
+        evidence = list((self.root / ".orchestrator/factory/evidence/alpha").glob("*.json"))
+        record = json.loads(evidence[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["checks"][0]["exit_code"], 127)
+        self.assertEqual(record["checks"][0]["error"], "executable_not_found")
+
+    def test_non_executable_check_binary_fails_with_126(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        fake = self.root / "bad-binary.sh"
+        fake.write_text("this is not a script\n", encoding="utf-8")
+        fake.chmod(0o755)
+        self.write_backlog(self.item_toml("alpha", json.dumps([str(fake)])))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_check_failed")
+        evidence = list((self.root / ".orchestrator/factory/evidence/alpha").glob("*.json"))
+        record = json.loads(evidence[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["checks"][0]["exit_code"], 126)
+
     def test_retry_after_fix_turns_failure_into_verified_success(self) -> None:
         self.write_workflow(max_attempts=1)
         self.write_prompt("alpha")
