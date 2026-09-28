@@ -414,14 +414,7 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertEqual(job["state"], JobState.SUCCEEDED.value)
         self.assertTrue(job["task_verified"])
 
-    def test_expired_lease_reclaim_redispatches_instead_of_blocking(self) -> None:
-        self.write_workflow(max_attempts=1)
-        self.write_prompt("alpha")
-        argv = json.dumps([sys.executable, "-c", "print('ok')"])
-        self.write_backlog(self.item_toml("alpha", argv))
-        coordinator, items = self.coordinator()
-        self.intake(coordinator, items)
-
+    def _claim_and_expire(self, coordinator, phase: str = "claimed") -> int:
         claimed = coordinator.store.claim(
             "factory-test",
             limit=1,
@@ -442,11 +435,38 @@ class FactoryLifecycleTests(BacklogFixture):
                 (expired, claimed[0].job_id),
             )
             connection.execute(
-                "UPDATE job_attempts SET lease_until = ? WHERE job_id = ?",
-                (expired, claimed[0].job_id),
+                "UPDATE job_attempts SET lease_until = ?, phase = ? WHERE job_id = ?",
+                (expired, phase, claimed[0].job_id),
             )
             connection.commit()
+        return claimed[0].job_id
 
+    def test_expired_lease_reclaim_redispatches_instead_of_blocking(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "print('ok')"])
+        self.write_backlog(self.item_toml("alpha", argv))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        self._claim_and_expire(coordinator)
+        result = coordinator.run_until_idle(timeout_seconds=30)
+
+        self.assertTrue(result["idle"])
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+        self.assertTrue(job["task_verified"])
+        self.assertEqual(job["attempts"], 1)
+
+    def test_expired_lease_reclaim_after_settled_phase_still_completes(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        argv = json.dumps([sys.executable, "-c", "print('ok')"])
+        self.write_backlog(self.item_toml("alpha", argv))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        self._claim_and_expire(coordinator, phase="settled")
         result = coordinator.run_until_idle(timeout_seconds=30)
 
         self.assertTrue(result["idle"])

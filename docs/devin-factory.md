@@ -98,7 +98,8 @@ uv run pytest tests/test_devin_factory.py -q
   `just factory-status` flags such jobs with `lease_expired` while they
   wait for the lease to lapse.
 - `blocked` remains a manual state per repository rules and requires an
-  explicit resume; the factory lane does not write it.
+  explicit resume; the factory lane only writes it when a reclaimed
+  dispatch settles ambiguously (the canonical `attention` path).
 
 ## Stop
 

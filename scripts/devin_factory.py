@@ -25,7 +25,7 @@ import sys
 import time
 import tomllib
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -452,6 +452,18 @@ class LocalDispatcher:
         runtime: AttemptRuntime,
     ) -> DispatchOutcome:
         del runtime
+        emit = context.attempt_progress if context is not None else None
+
+        def _tolerant(progress: AttemptProgress) -> None:
+            assert emit is not None
+            try:
+                emit(progress)
+            except StoreError as exc:
+                if str(exc) != "attempt_phase_invalid":
+                    raise
+
+        if context is not None and emit is not None:
+            context = replace(context, attempt_progress=_tolerant)
         return self.dispatch(
             harness,
             prompt,
