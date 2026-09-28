@@ -41,8 +41,10 @@ optional `max_attempts` (1–8, overriding the workflow default for this job
 only; existing jobs keep the budget they were enqueued with), an optional
 `requires = [dedupe_key, ...]` list,
 and a non-empty `[[items.checks]]` list of bounded argv+timeout commands
-executed without a shell. An item only enters the queue at intake once every
-`requires` entry names a backlog item whose job is already `succeeded`;
+executed without a shell. Per-check `timeout_seconds` (1–3600) defaults
+to the item-level `check_timeout_seconds` (default 600). An item only
+enters the queue at intake once every `requires` entry names a backlog
+item whose job is already `succeeded`;
 until then intake reports it under `waiting` (unknown references, duplicates
 and cycles are rejected as `factory_requires_*` errors). Re-run
 `just factory-intake` after a requirement lands — `factory-run` only drains
