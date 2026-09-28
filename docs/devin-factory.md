@@ -30,7 +30,8 @@ just factory-report      # write .orchestrator/factory/report.md
 truncates in-flight dispatches via the canonical `dispatch_deadline`.
 
 Both run modes emit JSON with a `jobs` list — one entry per queued job
-(`job_id`, `dedupe_key`, `state`, `task_verified`, `error_code`) — so a
+(`job_id`, `dedupe_key`, `harness`, `state`, `task_verified`,
+`error_code`) — so a
 failed or retried item is identifiable from the run output itself without
 a follow-up `factory-status` call.
 
