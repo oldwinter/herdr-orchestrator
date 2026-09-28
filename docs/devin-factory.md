@@ -8,21 +8,24 @@ only difference from a Herdr dispatch is transport: an injected
 workflow workspace instead of prompting an agent.
 
 Dedicated configuration: `workflows/devin-factory.toml` — its own state
-database (`.orchestrator/factory/state.db`), single `codex` worker, worker
-name `factory`, and `[workflow.receipts] kind = "file"` so every job outcome
-must be backed by a verified file receipt.
+database (`.orchestrator/factory/state.db`) and `codex`/`claude` workers.
+Receipts follow the enqueue contract: intake attaches a
+`TaskReceipt(kind=file)` to each job, so an outcome can only succeed with a
+verified file receipt at the item's declared path.
 
 ## Run
 
 ```sh
+just factory-validate    # dry-run: parse backlog, print items, touch nothing
 just factory-intake      # enqueue backlog items (idempotent)
 just factory-run         # drain pending items through their checks
 just factory-status      # queue counts, job states, unqueued items
 just factory-report      # write .orchestrator/factory/report.md
 ```
 
-`factory-run` accepts the standard coordinator flags as extra args, e.g.
-`just factory-run --max-waves 1 --poll-interval-seconds 0`.
+`factory-run` accepts `--once` (single claim wave) and
+`--drain-timeout-seconds N` (default 3600), e.g.
+`just factory-run --once`.
 
 Backlog items live in `factory/backlog.toml` (`schema_version = 1`). Each
 item declares `dedupe_key`, `title`, `prompt_file`, `receipt`, optional

@@ -148,6 +148,11 @@ gc *args:
 gc-failed *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{quote(workflow)}} --failed-agents "$@"
 
+# Dry-run the factory backlog: validate items and show queue coverage.
+[positional-arguments]
+factory-validate *args:
+    @PYTHONPATH=src {{python}} scripts/devin_factory.py --workflow {{quote(factory_workflow)}} --backlog {{quote(factory_backlog)}} validate "$@"
+
 # Enqueue factory backlog items into the durable factory queue (idempotent).
 [positional-arguments]
 factory-intake *args:

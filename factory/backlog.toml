@@ -17,3 +17,18 @@ receipt = ".orchestrator/factory/receipts/factory-scaffold-v1.json"
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q"]
 timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-validate-v1"
+title = "Add a dry-run validate verb to the factory lane"
+harness = "codex"
+prompt_file = "prompts/factory-validate-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-validate-v1.json"
+
+[[items.checks]]
+argv = ["python3", "scripts/devin_factory.py", "validate"]
+timeout_seconds = 60
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
+timeout_seconds = 600

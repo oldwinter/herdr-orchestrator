@@ -19,10 +19,12 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 import tomllib
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -556,6 +558,53 @@ def _build_coordinator(
     return Coordinator(config, dispatcher=dispatcher), items
 
 
+def _command_validate(args: argparse.Namespace) -> int:
+    """Dry-run the backlog: validate and summarize without queue writes."""
+    config = load_workflow(args.workflow)
+    items = load_backlog(args.backlog)
+    worker_harnesses = {worker.harness for worker in config.workers}
+    queued: list[str] = []
+    state_db = Path(config.state_db)
+    if state_db.is_file():
+        with closing(
+            sqlite3.connect(
+                f"file:{state_db}?mode=ro&immutable=1",
+                uri=True,
+            )
+        ) as connection:
+            queued = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT dedupe_key FROM jobs WHERE workflow = ?",
+                    (config.name,),
+                )
+            ]
+    print(
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "checks": [list(check.argv) for check in item.checks],
+                        "dedupe_key": item.dedupe_key,
+                        "harness": item.harness.value,
+                        "harness_supported": item.harness in worker_harnesses,
+                        "prompt_file": item.prompt_file.name,
+                        "queued": item.dedupe_key in queued,
+                        "receipt": item.receipt,
+                        "title": item.title,
+                    }
+                    for item in items.values()
+                ],
+                "state_db": state_db.is_file(),
+                "valid": True,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _command_intake(args: argparse.Namespace) -> int:
     coordinator, items = _build_coordinator(args.workflow, args.backlog)
     coordinator.initialize()
@@ -740,6 +789,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("status", help="Show queue counts, jobs and backlog.")
     subparsers.add_parser("report", help="Write .orchestrator/factory/report.md.")
+    subparsers.add_parser(
+        "validate",
+        help="Dry-run: parse and summarize the backlog without queue writes.",
+    )
     return parser
 
 
@@ -750,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
         "run": _command_run,
         "status": _command_status,
         "report": _command_report,
+        "validate": _command_validate,
     }
     try:
         return handlers[args.factory_command](args)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from herdr_orchestrator.completion import ReceiptKind, TaskReceipt
@@ -373,6 +374,84 @@ class FactoryLifecycleTests(BacklogFixture):
         )
         with self.assertRaisesRegex(devin_factory.FactoryError, "factory_harness_has_no_worker"):
             self.coordinator()
+
+
+class FactoryValidateTests(BacklogFixture):
+    def parse(self, *extra: str):
+        return devin_factory.build_parser().parse_args(
+            [
+                "--workflow",
+                str(self.workflow),
+                "--backlog",
+                str(self.backlog),
+                "validate",
+                *extra,
+            ]
+        )
+
+    def capture(self, *extra: str) -> dict[str, object]:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = devin_factory._command_validate(self.parse(*extra))
+        self.assertEqual(code, 0)
+        return json.loads(buffer.getvalue())
+
+    def test_validate_lists_items_and_queue_coverage(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_prompt("beta")
+        check = '["python3", "-c", "pass"]'
+        self.write_backlog(self.item_toml("alpha", check) + self.item_toml("beta", check))
+        coordinator, items = devin_factory._build_coordinator(self.workflow, self.backlog)
+        coordinator.initialize()
+        coordinator.enqueue_prompt_file(
+            harness=items["alpha"].harness,
+            title=items["alpha"].title,
+            prompt_file=items["alpha"].prompt_file,
+            dedupe_key="alpha",
+            placement=PlacementTarget.PANE,
+            receipt=TaskReceipt(ReceiptKind.FILE, items["alpha"].receipt),
+        )
+
+        payload = self.capture()
+
+        self.assertTrue(payload["valid"])
+        self.assertTrue(payload["state_db"])
+        by_key = {item["dedupe_key"]: item for item in payload["items"]}
+        self.assertTrue(by_key["alpha"]["queued"])
+        self.assertFalse(by_key["beta"]["queued"])
+        self.assertTrue(by_key["alpha"]["harness_supported"])
+        self.assertEqual(by_key["alpha"]["checks"], [["python3", "-c", "pass"]])
+
+    def test_validate_reports_absent_state_db_without_creating_it(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        self.write_backlog(self.item_toml("alpha", '["python3", "-c", "pass"]'))
+        state_db = self.root / "state.db"
+        state_db.unlink()
+
+        payload = self.capture()
+
+        self.assertFalse(payload["state_db"])
+        self.assertFalse(payload["items"][0]["queued"])
+        self.assertFalse(state_db.exists())
+
+    def test_validate_rejects_invalid_backlog_via_main(self) -> None:
+        self.write_workflow()
+        self.backlog.write_text("schema_version = 2\nitems = []\n", encoding="utf-8")
+
+        with redirect_stderr(io.StringIO()):
+            code = devin_factory.main(
+                [
+                    "--workflow",
+                    str(self.workflow),
+                    "--backlog",
+                    str(self.backlog),
+                    "validate",
+                ]
+            )
+
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":
