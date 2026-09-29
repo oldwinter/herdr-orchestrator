@@ -1287,6 +1287,57 @@ class FactoryCliTests(BacklogFixture):
         time.sleep(7)
         self.assertFalse(marker.exists())
 
+    def test_cli_run_sigterm_kills_check_process_group(self) -> None:
+        self.write_workflow()
+        self.write_prompt("alpha")
+        marker = self.root / "sigterm-descendant-marker"
+        child_code = (
+            "import time,pathlib;" f"time.sleep(5);pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        sleep = json.dumps(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+                "time.sleep(60)",
+            ]
+        )
+        self.write_backlog(self.item_toml("alpha", sleep))
+        self.assertEqual(self.run_cli("intake").returncode, 0)
+
+        environment = dict(os.environ)
+        source = str(REPO_ROOT / "src")
+        environment["PYTHONPATH"] = source
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--workflow",
+                str(self.workflow),
+                "--backlog",
+                str(self.backlog),
+                "run",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=self.root,
+            env=environment,
+        )
+        time.sleep(2)
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 143)
+        self.assertIn("terminated", stderr)
+        self.assertNotIn("Traceback", stderr)
+        time.sleep(7)
+        self.assertFalse(marker.exists())
+        jobs = self.jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["state"], "running")
+
     def test_cli_concurrent_intake_is_idempotent(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")

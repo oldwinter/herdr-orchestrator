@@ -932,40 +932,48 @@ def _run_jobs_summary(coordinator: Coordinator) -> list[dict[str, object]]:
     ]
 
 
-def _install_sigint_abort(dispatcher: object) -> Any:
-    """Point SIGINT at ``dispatcher.abort()`` so an interrupt kills in-flight
-    check process groups immediately instead of waiting out the check's
-    communicate timeout. Returns the previous handler (None when signals are
+def _install_signal_abort(dispatcher: object) -> dict[int, Any]:
+    """Point SIGINT and SIGTERM at ``dispatcher.abort()`` so either signal
+    kills in-flight check process groups immediately instead of waiting out
+    the check's communicate timeout. SIGINT exits 130, SIGTERM exits the
+    conventional 143; the claimed attempt's lease lapses and is reclaimed
+    later either way. Returns the previous handlers (empty when signals are
     unavailable, e.g. off the main thread)."""
 
     def _handler(_signum: int, _frame: Any) -> None:
         abort = getattr(dispatcher, "abort", None)
         if callable(abort):
             abort()
-        raise KeyboardInterrupt
+        if _signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        print("terminated", file=sys.stderr)
+        raise SystemExit(128 + _signum)
 
+    previous: dict[int, Any] = {}
     try:
-        previous = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, _handler)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, _handler)
     except ValueError:
-        return None
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        return {}
     return previous
 
 
-def _restore_sigint(previous: Any) -> None:
-    if previous is None:
-        return
-    with suppress(ValueError):
-        signal.signal(signal.SIGINT, previous)
+def _restore_signal_abort(previous: dict[int, Any]) -> None:
+    for signum, handler in previous.items():
+        with suppress(ValueError):
+            signal.signal(signum, handler)
 
 
 def _command_run(args: argparse.Namespace) -> int:
     coordinator, _ = _build_coordinator(args.workflow, args.backlog)
-    previous_handler = _install_sigint_abort(coordinator.dispatcher)
+    previous_handlers = _install_signal_abort(coordinator.dispatcher)
     try:
         return _command_run_inner(args, coordinator)
     finally:
-        _restore_sigint(previous_handler)
+        _restore_signal_abort(previous_handlers)
 
 
 def _command_run_inner(args: argparse.Namespace, coordinator: Coordinator) -> int:
