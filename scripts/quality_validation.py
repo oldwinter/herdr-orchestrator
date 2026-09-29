@@ -315,6 +315,7 @@ def validate_artifact_payload(
                 and _npm_counts_are_consistent(vulnerability_counts, payload["vulnerabilities"])
             )
     elif producer == "build" and key == "build":
+        packages = payload.get("packages")
         valid = (
             _nonempty_text(payload.get("command"))
             and (build_command is None or payload.get("command") == build_command)
@@ -328,7 +329,41 @@ def validate_artifact_payload(
                 _nonnegative_integer(payload.get(name))
                 for name in ("entry_count", "package_size_bytes", "unpacked_size_bytes")
             )
+            and isinstance(packages, dict)
+            and set(packages) == {"herdr-orchestrator", "herdr-manager"}
         )
+        if valid:
+            valid = all(
+                isinstance(package, dict)
+                and _nonempty_text(package.get("command"))
+                and package.get("status") in {"passed", "failed"}
+                and isinstance(package.get("exit_code"), int)
+                and not isinstance(package.get("exit_code"), bool)
+                and (package["status"] == "passed") == (package["exit_code"] == 0)
+                and (
+                    package["status"] == "failed"
+                    or all(
+                        _nonnegative_integer(package.get(name))
+                        for name in (
+                            "entry_count",
+                            "package_size_bytes",
+                            "unpacked_size_bytes",
+                        )
+                    )
+                )
+                for package in packages.values()
+            )
+        if valid and payload["status"] == "passed":
+            valid = all(package["status"] == "passed" for package in packages.values())
+        if valid and payload["status"] == "passed":
+            valid = all(
+                payload[total_name] == sum(package[total_name] for package in packages.values())
+                for total_name in (
+                    "entry_count",
+                    "package_size_bytes",
+                    "unpacked_size_bytes",
+                )
+            )
         if valid and expected_exit_code is not None:
             valid = payload["exit_code"] == expected_exit_code
         if valid:

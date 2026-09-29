@@ -206,6 +206,16 @@ class RepositoryCheckerTests(unittest.TestCase):
             ["sample.py: 1 lines leaves no headroom under 1"],
         )
 
+    def test_repository_checker_reports_invalid_utf8_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sample.py"
+            source.write_bytes(b"value = \xff\n")
+
+            failures = CHECK_REPOSITORY.repository_failures(root, (source,))
+
+        self.assertEqual(failures, ["sample.py: unable to read UTF-8 text"])
+
     def test_tracked_text_files_keep_one_line_below_the_repository_limit(self) -> None:
         files = CHECK_REPOSITORY.tracked_files()
         failures = []
@@ -261,6 +271,24 @@ class RepositoryCheckerTests(unittest.TestCase):
             failures = CHECK_DOCS.documentation_failures(root)
 
         self.assertEqual(failures, ["README.md: local link escapes repository ../outside.md"])
+
+    def test_docs_checker_parses_balanced_parentheses_in_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "justfile").write_text("check:\n\t@true\n", encoding="utf-8")
+            for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
+                (root / name).write_text("", encoding="utf-8")
+            target = root / "docs" / "name(with-parentheses).md"
+            target.parent.mkdir()
+            target.write_text("ok\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[target](docs/name(with-parentheses).md)\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK_DOCS.documentation_failures(root)
+
+        self.assertEqual(failures, [])
 
     def test_docs_checker_rejects_a_symlinked_key_document(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -319,6 +347,27 @@ class RepositoryCheckerTests(unittest.TestCase):
             "architecture.md: missing command path workflows/missing-architecture.toml",
             failures,
         )
+
+    def test_docs_checker_validates_every_copy_and_move_operand(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "justfile").write_text("check:\n\t@true\n", encoding="utf-8")
+            for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
+                (root / name).write_text("", encoding="utf-8")
+            (root / "existing").mkdir()
+            (root / "existing" / "source.txt").write_text("ok\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "```bash\n"
+                "cp existing/source.txt missing/copy.txt\n"
+                "mv existing/source.txt missing/move.txt\n"
+                "```\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK_DOCS.documentation_failures(root)
+
+        self.assertIn("README.md: missing command path missing/copy.txt", failures)
+        self.assertIn("README.md: missing command path missing/move.txt", failures)
 
     def test_documented_workflows_are_all_tracked_examples(self) -> None:
         result = subprocess.run(

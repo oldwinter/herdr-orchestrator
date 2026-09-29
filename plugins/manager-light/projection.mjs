@@ -1,4 +1,4 @@
-import { basename } from "node:path";
+import { basename, win32 } from "node:path";
 
 export const MANAGER_ROLE_TOKEN = "hml_role";
 export const METADATA_SOURCE = "herdr-manager-light";
@@ -22,9 +22,11 @@ const CLASSIFICATIONS = new Set([
 ]);
 
 function executableName(value) {
-  return typeof value === "string" && value.length > 0
-    ? basename(value).toLowerCase()
-    : "";
+  if (typeof value !== "string" || value.length === 0) {
+    return "";
+  }
+  const name = value.includes("\\") ? win32.basename(value) : basename(value);
+  return name.toLowerCase().replace(/\.exe$/u, "");
 }
 
 function isDirectManagerProcess(process) {
@@ -35,7 +37,7 @@ function isDirectManagerProcess(process) {
 
   const argv = Array.isArray(process?.argv) ? process.argv : [];
   return (
-    ["node", "node.exe"].includes(executableName(argv[0])) &&
+    executableName(argv[0]) === "node" &&
     executableName(argv[1]) === "herdr-manager"
   );
 }
@@ -49,7 +51,7 @@ function isOrchestratorManagerProcess(process) {
     return true;
   }
   if (
-    ["node", "node.exe"].includes(executable) &&
+    executable === "node" &&
     names.has(executableName(argv[1])) &&
     argv[2] === "manager"
   ) {

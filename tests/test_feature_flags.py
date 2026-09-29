@@ -167,6 +167,21 @@ def test_feature_flag_checker_rejects_undeclared_python_reference(tmp_path: Path
     assert "REMOVED: production reference has no declared flag" in checker.policy_failures(tmp_path)
 
 
+def test_feature_flag_checker_rejects_direct_environment_variable_reads(tmp_path: Path) -> None:
+    _write_policy_fixture(tmp_path)
+    consumer = tmp_path / "src" / "herdr_orchestrator" / "consumer.py"
+    consumer.write_text(
+        consumer.read_text(encoding="utf-8")
+        + "\nDIRECT = os.environ.get('HERDR_FEATURE_UNDECLARED')\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        "src/herdr_orchestrator/consumer.py: HERDR_FEATURE_UNDECLARED "
+        "bypasses typed feature flags"
+    ) in checker.policy_failures(tmp_path)
+
+
 def test_feature_flag_checker_rejects_retired_references(tmp_path: Path) -> None:
     _write_policy_fixture(tmp_path)
     tests = tmp_path / "tests" / "test_consumers.py"
@@ -233,5 +248,17 @@ def test_feature_flag_checker_requires_false_environment_defaults(tmp_path: Path
 
     assert (
         "sentry_export: HERDR_FEATURE_SENTRY_EXPORT must default to false"
+        in checker.policy_failures(tmp_path)
+    )
+
+
+def test_feature_flag_checker_rejects_duplicate_environment_assignments(tmp_path: Path) -> None:
+    _write_policy_fixture(tmp_path)
+    example = tmp_path / ".env.example"
+    with example.open("a", encoding="utf-8") as handle:
+        handle.write("HERDR_FEATURE_SENTRY_EXPORT=false\n")
+
+    assert (
+        "HERDR_FEATURE_SENTRY_EXPORT: duplicate .env.example assignments"
         in checker.policy_failures(tmp_path)
     )

@@ -8,6 +8,19 @@ from typing import Any
 
 from herdr_orchestrator.model import Harness, JobState, PlacementTarget
 
+_WORKSPACE_CLAUSE = """ AND (
+            {alias}.workspace = ?
+            OR (
+                {alias}.workspace IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM jobs AS scoped_jobs
+                    WHERE scoped_jobs.workflow = {alias}.workflow
+                      AND scoped_jobs.workspace IS NOT NULL
+                )
+            )
+        )
+        """
+
 
 def workspace_matches(
     value: object,
@@ -30,19 +43,9 @@ def workspace_clause(
     target = str(workspace)
     if not include_legacy:
         return f" AND {alias}.workspace = ?", (target,)
+    # The alias is a local SQL identifier and all values are bound.
     return (
-        f""" AND (
-            {alias}.workspace = ?
-            OR (
-                {alias}.workspace IS NULL
-                AND NOT EXISTS (
-                    SELECT 1 FROM jobs AS scoped_jobs
-                    WHERE scoped_jobs.workflow = {alias}.workflow
-                      AND scoped_jobs.workspace IS NOT NULL
-                )
-            )
-        )
-        """,  # nosec B608: alias is a local SQL identifier, values are bound
+        _WORKSPACE_CLAUSE.format(alias=alias),  # nosec B608
         (target,),
     )
 

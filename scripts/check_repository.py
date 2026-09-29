@@ -56,7 +56,11 @@ def repository_failures(root: Path, files: tuple[Path, ...]) -> list[str]:
             failures.append(f"{relative}: {size} bytes exceeds {MAX_BYTES}")
         if path.suffix not in TEXT_SUFFIXES or relative in EXEMPT_SIZE_PATHS:
             continue
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            failures.append(f"{relative}: unable to read UTF-8 text")
+            continue
         lines = len(text.splitlines())
         maximum = line_limit(path, root)
         if lines + LINE_HEADROOM > maximum and relative not in EXEMPT_LINE_PATHS:
