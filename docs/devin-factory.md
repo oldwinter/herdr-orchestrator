@@ -119,9 +119,11 @@ uv run pytest tests/test_devin_factory.py -q
 
 - `factory-run` is a bounded batch: it exits when the queue is idle or the
   `--drain-timeout-seconds` budget is hit. Send SIGINT to stop mid-run: the
-  runner exits 130, kills the in-flight check it was waiting on, and the
-  claimed attempt's lease lapses so the job is reclaimed and re-dispatched
-  on the next run.
+  runner exits 130 and kills the in-flight check's whole process group
+  immediately (checks run in their own session; descendant processes spawned
+  by a check cannot outlive it and write artifacts after cancellation or a
+  per-check timeout), and the claimed attempt's lease lapses so the job is
+  reclaimed and re-dispatched on the next run.
 - Intake/status/report are single-shot and need no shutdown.
 
 ## Approval boundaries

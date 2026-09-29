@@ -523,3 +523,14 @@ requires = ["factory-retry-blocked-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "validate"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-descendant-kill-v1"
+title = "Timeout and SIGINT kill a check's whole process group"
+harness = "codex"
+prompt_file = "prompts/factory-descendant-kill-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-descendant-kill-v1.json"
+requires = ["factory-drift-warning-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "descendant or term_trapping or sigint"]
+timeout_seconds = 180

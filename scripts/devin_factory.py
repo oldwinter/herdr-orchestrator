@@ -19,12 +19,14 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import tomllib
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -283,6 +285,19 @@ def _load_checks(row: dict[str, Any], dedupe_key: str) -> tuple[FactoryCheck, ..
     return tuple(checks)
 
 
+def _kill_process_group(process: subprocess.Popen[Any]) -> None:
+    """Kill the check's whole process group so spawned descendants cannot
+    outlive a timeout or interrupt and write artifacts after the fact."""
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        process.kill()
+        return
+    try:
+        killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        process.kill()
+
+
 def _write_text_atomic(target: Path, text: str) -> None:
     """Write via a sibling temp file + rename so concurrent readers never see
     a partially written artifact."""
@@ -343,6 +358,23 @@ class LocalDispatcher:
         self._items = items
         self._evidence_root = evidence_root
         self._environment = environment if environment is not None else os.environ
+        self._live: set[subprocess.Popen[Any]] = set()
+        self._live_lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def abort(self) -> None:
+        """Cancel in-flight checks promptly on operator interrupt.
+
+        Dispatches run on executor worker threads, so SIGINT is raised in the
+        main thread while a check's ``communicate`` keeps waiting; ``abort`` is
+        the cross-thread stop path: it kills every live check's process group
+        and prevents further checks from starting.
+        """
+        self._stop.set()
+        with self._live_lock:
+            live = list(self._live)
+        for process in live:
+            _kill_process_group(process)
 
     def dispatch(
         self,
@@ -383,6 +415,8 @@ class LocalDispatcher:
         self._progress(context, AttemptPhase.PROMPT_ACCEPTED, AgentState.WORKING)
         results = []
         for check in item.checks:
+            if self._stop.is_set():
+                raise KeyboardInterrupt
             results.append(self._run_check(check, deadline))
             if results[-1]["exit_code"] != 0:
                 break
@@ -607,6 +641,7 @@ class LocalDispatcher:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
         except OSError as exc:
             result.update(
@@ -618,10 +653,12 @@ class LocalDispatcher:
                 }
             )
             return result
+        with self._live_lock:
+            self._live.add(process)
         try:
             stdout, stderr = process.communicate(timeout=remaining)
         except subprocess.TimeoutExpired:
-            process.kill()
+            _kill_process_group(process)
             process.communicate()
             result.update(
                 {
@@ -634,9 +671,12 @@ class LocalDispatcher:
             )
             return result
         except KeyboardInterrupt:
-            process.kill()
+            _kill_process_group(process)
             process.wait()
             raise
+        finally:
+            with self._live_lock:
+                self._live.discard(process)
         result.update(
             {
                 "duration_ms": int((time.monotonic() - started) * 1000),
@@ -892,8 +932,43 @@ def _run_jobs_summary(coordinator: Coordinator) -> list[dict[str, object]]:
     ]
 
 
+def _install_sigint_abort(dispatcher: object) -> Any:
+    """Point SIGINT at ``dispatcher.abort()`` so an interrupt kills in-flight
+    check process groups immediately instead of waiting out the check's
+    communicate timeout. Returns the previous handler (None when signals are
+    unavailable, e.g. off the main thread)."""
+
+    def _handler(signum: int, frame: Any) -> None:
+        abort = getattr(dispatcher, "abort", None)
+        if callable(abort):
+            abort()
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, _handler)
+    except ValueError:
+        return None
+    return previous
+
+
+def _restore_sigint(previous: Any) -> None:
+    if previous is None:
+        return
+    with suppress(ValueError):
+        signal.signal(signal.SIGINT, previous)
+
+
 def _command_run(args: argparse.Namespace) -> int:
     coordinator, _ = _build_coordinator(args.workflow, args.backlog)
+    previous_handler = _install_sigint_abort(coordinator.dispatcher)
+    try:
+        return _command_run_inner(args, coordinator)
+    finally:
+        _restore_sigint(previous_handler)
+
+
+def _command_run_inner(args: argparse.Namespace, coordinator: Coordinator) -> int:
     if args.once:
         report = coordinator.run_once()
         report["jobs"] = _run_jobs_summary(coordinator)

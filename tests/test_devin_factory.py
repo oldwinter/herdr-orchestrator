@@ -643,6 +643,78 @@ class FactoryLifecycleTests(BacklogFixture):
         self.assertEqual(job["state"], JobState.FAILED.value)
         self.assertEqual(job["error_code"], "factory_check_timeout")
 
+    def test_check_timeout_kills_descendant_processes(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        marker = self.root / "descendant-marker"
+        child_code = (
+            "import time,pathlib;" f"time.sleep(1.5);pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        script = (
+            "import subprocess,sys,time;"
+            f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+            "print('STARTED',flush=True);time.sleep(60)"
+        )
+        argv = json.dumps([sys.executable, "-c", script])
+        self.write_backlog(self.item_toml("alpha", argv, timeout=1))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_check_timeout")
+        time.sleep(2.5)
+        self.assertFalse(marker.exists())
+
+    def test_descendant_writes_marker_when_check_succeeds(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        marker = self.root / "descendant-marker"
+        child_code = (
+            "import time,pathlib;" f"time.sleep(1);pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        script = (
+            "import subprocess,sys;"
+            f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+            "print('STARTED',flush=True)"
+        )
+        argv = json.dumps([sys.executable, "-c", script])
+        self.write_backlog(self.item_toml("alpha", argv, timeout=20))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.SUCCEEDED.value)
+        self.assertTrue(job["task_verified"])
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(marker.exists())
+
+    def test_term_trapping_check_cannot_convert_timeout_to_success(self) -> None:
+        self.write_workflow(max_attempts=1)
+        self.write_prompt("alpha")
+        script = (
+            "import signal,time;"
+            "signal.signal(signal.SIGTERM,lambda s,f:exit(0));"
+            "time.sleep(60)"
+        )
+        argv = json.dumps([sys.executable, "-c", script])
+        self.write_backlog(self.item_toml("alpha", argv, timeout=1))
+        coordinator, items = self.coordinator()
+        self.intake(coordinator, items)
+
+        coordinator.run_until_idle(timeout_seconds=30)
+
+        job = self.jobs()[0]
+        self.assertEqual(job["state"], JobState.FAILED.value)
+        self.assertEqual(job["error_code"], "factory_check_timeout")
+        self.assertFalse(job["task_verified"])
+
     def test_checks_short_circuit_after_first_failure(self) -> None:
         self.write_workflow(max_attempts=1)
         self.write_prompt("alpha")
@@ -1170,7 +1242,19 @@ class FactoryCliTests(BacklogFixture):
     def test_cli_run_sigint_exits_130_without_traceback(self) -> None:
         self.write_workflow()
         self.write_prompt("alpha")
-        sleep = json.dumps([sys.executable, "-c", "import time;time.sleep(60)"])
+        marker = self.root / "sigint-descendant-marker"
+        child_code = (
+            "import time,pathlib;" f"time.sleep(5);pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        sleep = json.dumps(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+                "time.sleep(60)",
+            ]
+        )
         self.write_backlog(self.item_toml("alpha", sleep))
         self.assertEqual(self.run_cli("intake").returncode, 0)
 
@@ -1200,6 +1284,8 @@ class FactoryCliTests(BacklogFixture):
         self.assertEqual(process.returncode, 130)
         self.assertIn("interrupted", stderr)
         self.assertNotIn("Traceback", stderr)
+        time.sleep(7)
+        self.assertFalse(marker.exists())
 
     def test_cli_concurrent_intake_is_idempotent(self) -> None:
         self.write_workflow()
