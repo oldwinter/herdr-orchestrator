@@ -24,7 +24,9 @@ TEST_COMMAND = (
     "no:cacheprovider",
     "--json-report",
 )
-TERMINAL_OUTCOMES = frozenset({"error", "failed", "passed", "skipped", "xfailed", "xpassed"})
+TERMINAL_OUTCOMES = frozenset(
+    {"error", "failed", "passed", "skipped", "subtests passed", "xfailed", "xpassed"}
+)
 
 
 def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
