@@ -545,3 +545,14 @@ requires = ["factory-descendant-kill-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "sigterm_kills_check_process_group"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-spawn-race-v1"
+title = "Abort during check spawn still kills the process group"
+harness = "codex"
+prompt_file = "prompts/factory-spawn-race-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-spawn-race-v1.json"
+requires = ["factory-sigterm-abort-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "spawn_kills_check_process_group"]
+timeout_seconds = 180

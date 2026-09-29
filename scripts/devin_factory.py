@@ -655,6 +655,16 @@ class LocalDispatcher:
             return result
         with self._live_lock:
             self._live.add(process)
+            # Close the spawn/registration race: abort() may have consumed an
+            # empty snapshot between Popen and this add; the stop flag still
+            # witnesses it, so kill the just-registered group ourselves.
+            aborted = self._stop.is_set()
+        if aborted:
+            with self._live_lock:
+                self._live.discard(process)
+            _kill_process_group(process)
+            process.wait()
+            raise KeyboardInterrupt
         try:
             stdout, stderr = process.communicate(timeout=remaining)
         except subprocess.TimeoutExpired:

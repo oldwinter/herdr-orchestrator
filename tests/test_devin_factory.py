@@ -15,6 +15,7 @@ import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 from herdr_orchestrator.completion import ReceiptKind, TaskReceipt
 from herdr_orchestrator.model import (
@@ -1337,6 +1338,46 @@ class FactoryCliTests(BacklogFixture):
         jobs = self.jobs()
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["state"], "running")
+
+    def test_abort_during_spawn_kills_check_process_group(self) -> None:
+        # Deterministic interleave for the Popen→_live registration race:
+        # abort() runs inside the spawn call itself, before the check process
+        # is registered — the post-registration stop recheck must still kill
+        # the group so the descendant cannot write its marker.
+        dispatcher = devin_factory.LocalDispatcher(
+            workspace=self.root,
+            items={},
+            evidence_root=self.root / ".orchestrator/factory/evidence",
+        )
+        marker = self.root / "spawn-race-marker"
+        child_code = (
+            "import time,pathlib;" f"time.sleep(1.2);pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        check = devin_factory.FactoryCheck(
+            argv=(
+                sys.executable,
+                "-c",
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+                "time.sleep(30)",
+            ),
+            timeout_seconds=30,
+        )
+        real_popen = subprocess.Popen
+
+        def spawn_then_abort(argv, **kwargs):
+            process = real_popen(argv, **kwargs)
+            dispatcher.abort()
+            return process
+
+        with (
+            mock.patch.object(subprocess, "Popen", spawn_then_abort),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            dispatcher._run_check(check, time.monotonic() + 30)
+
+        time.sleep(2)
+        self.assertFalse(marker.exists())
 
     def test_cli_concurrent_intake_is_idempotent(self) -> None:
         self.write_workflow()
