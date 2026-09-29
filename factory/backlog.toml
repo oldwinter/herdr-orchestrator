@@ -534,3 +534,14 @@ requires = ["factory-drift-warning-v1"]
 [[items.checks]]
 argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "descendant or term_trapping or sigint"]
 timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-sigterm-abort-v1"
+title = "SIGTERM aborts the check process group and exits 143"
+harness = "codex"
+prompt_file = "prompts/factory-sigterm-abort-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-sigterm-abort-v1.json"
+requires = ["factory-descendant-kill-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "sigterm_kills_check_process_group"]
+timeout_seconds = 180
