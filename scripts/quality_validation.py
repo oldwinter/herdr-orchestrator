@@ -357,8 +357,7 @@ def validate_artifact_payload(
             valid = all(package["status"] == "passed" for package in packages.values())
         if valid and payload["status"] == "passed":
             valid = all(
-                payload[total_name]
-                == sum(package[total_name] for package in packages.values())
+                payload[total_name] == sum(package[total_name] for package in packages.values())
                 for total_name in (
                     "entry_count",
                     "package_size_bytes",

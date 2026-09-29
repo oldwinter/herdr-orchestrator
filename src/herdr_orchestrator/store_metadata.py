@@ -11,6 +11,8 @@ from herdr_orchestrator.attempts import StoreError
 
 
 def _finite_float(value: object, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise StoreError(f"metadata_invalid_float: {key}")
     try:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
