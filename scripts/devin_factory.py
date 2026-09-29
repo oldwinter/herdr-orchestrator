@@ -938,7 +938,7 @@ def _install_sigint_abort(dispatcher: object) -> Any:
     communicate timeout. Returns the previous handler (None when signals are
     unavailable, e.g. off the main thread)."""
 
-    def _handler(signum: int, frame: Any) -> None:
+    def _handler(_signum: int, _frame: Any) -> None:
         abort = getattr(dispatcher, "abort", None)
         if callable(abort):
             abort()
