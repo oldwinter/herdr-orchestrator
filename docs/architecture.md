@@ -373,6 +373,25 @@ schema 都要求 secret/production 升级。由于 Herdr 拒绝向已 blocked ag
 `.orchestrator/deliveries/<run-id>/`。最终产物是隔离 integration branch 与 commit，
 不会自动 push 或 merge 用户 branch。
 
+### Devin factory lane
+
+`scripts/devin_factory.py` 是本仓库的本地 software-factory lane：它把
+`LocalDispatcher` 注入现有 `Coordinator`，复用 claim/lease/attempt/fencing/
+dedupe/retry/receipt 全部语义，只把 Herdr transport 换成在 workflow workspace
+内本地执行 backlog 声明的 bounded 验收检查（无 shell）。工作项来自提交的
+`factory/backlog.toml`（`schema_version = 1`），每项声明 `dedupe_key`、
+`prompt_file`、file receipt、`[[items.checks]]`、可选 `requires` 依赖门与
+可选 `max_attempts` 覆盖；intake 只在所有 `requires` 项已 `succeeded` 时入队。
+单个 dispatch 的全局预算 `agent_timeout_seconds` 对所有 check 共同生效：
+check 各自受 `timeout_seconds` 上限，同时不能超过剩余预算——deadline 之后
+不再调度新 check，记录 `factory_check_timeout` 而不是成功。运行状态与证据留在
+`.orchestrator/factory/`（不进 Git），入口是 justfile 的 `factory-*`
+recipes，细节见 `docs/devin-factory.md`。过期 lease 的 reclaim 在同一 attempt
+上重跑声明的 checks（`recover` = re-dispatch，无交互 session 可接管）；仅当
+reclaim 的 dispatch 仍 ambiguously 收尾时才落到 `blocked`，由
+`just factory-retry`（`--allow-blocked`）重新驱动。本地 lane 不会 merge、
+push、发布或改动权限。
+
 ## 24/7 边界
 
 Herdr detach 不终止 coordinator 与 agent 进程，因此适合长时间运行。以下情况不承诺无缝：

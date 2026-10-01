@@ -18,7 +18,10 @@ for candidate in \
   /opt/google/chrome/chrome \
   /opt/google/chrome/google-chrome \
   /usr/bin/chromium \
-  /usr/bin/chromium-browser
+  /usr/bin/chromium-browser \
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
 do
   if [[ -x "$candidate" ]]; then
     CHROME="$candidate"

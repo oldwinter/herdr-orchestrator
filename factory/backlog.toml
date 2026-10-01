@@ -1,0 +1,558 @@
+schema_version = 1
+
+# Factory backlog: operator-authored work items with declared acceptance
+# checks. `just factory-intake` enqueues them into the durable devin-factory
+# queue (dedupe_key is the idempotence contract; bump the -vN suffix when a
+# completed item's contract changes). `just factory-run` claims each pending
+# item and executes `checks` locally; a nonzero check exits the item through
+# the normal failed-validation path — no success is recorded.
+
+[[items]]
+dedupe_key = "factory-scaffold-v1"
+title = "Stand up the local factory lane over the durable queue"
+harness = "codex"
+prompt_file = "prompts/factory-scaffold-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-scaffold-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-validate-v1"
+title = "Add a dry-run validate verb to the factory lane"
+harness = "codex"
+prompt_file = "prompts/factory-validate-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-validate-v1.json"
+
+[[items.checks]]
+argv = ["python3", "scripts/devin_factory.py", "validate"]
+timeout_seconds = 60
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-failfast-v1"
+title = "Fail fast on first check failure; add recovery recipes"
+harness = "codex"
+prompt_file = "prompts/factory-failfast-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-failfast-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "short_circuit"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-cli-v1"
+title = "Add CLI-level end-to-end coverage for the factory lane"
+harness = "codex"
+prompt_file = "prompts/factory-cli-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-cli-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-hardening-v1"
+title = "Harden validate against corrupt state DB; surface error_summary"
+harness = "codex"
+prompt_file = "prompts/factory-hardening-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-hardening-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "unreadable or empty_queue or error_summary"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-docs-pin-v1"
+title = "Pin jobs() dedupe_key at store layer; document the factory lane"
+harness = "codex"
+prompt_file = "prompts/factory-docs-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-docs-pin-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_store.py", "-q", "-k", "idempotent"]
+timeout_seconds = 600
+
+[[items.checks]]
+argv = ["python3", "scripts/check_docs.py"]
+timeout_seconds = 120
+
+[[items]]
+dedupe_key = "factory-evidence-gc-v1"
+title = "Bound per-item evidence files to the newest 25"
+harness = "codex"
+prompt_file = "prompts/factory-evidence-gc-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-evidence-gc-v1.json"
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "evidence_is_bounded"]
+timeout_seconds = 120
+
+[[items]]
+dedupe_key = "factory-requires-v1"
+title = "Ordered factory states via item requires gating"
+harness = "codex"
+prompt_file = "prompts/factory-requires-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-requires-v1.json"
+requires = ["factory-evidence-gc-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "requires"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-status-truth-v1"
+title = "Surface backlog errors in status; pin concurrent intake idempotence"
+harness = "codex"
+prompt_file = "prompts/factory-status-truth-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-status-truth-v1.json"
+requires = ["factory-requires-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "backlog_error or concurrent_intake"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-receipt-write-v1"
+title = "Stable factory_receipt_write_failed code; architecture doc section"
+harness = "codex"
+prompt_file = "prompts/factory-receipt-write-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-receipt-write-v1.json"
+requires = ["factory-status-truth-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "receipt_write_failed or unwritable"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "factory-max-attempts-v1"
+title = "Per-item retry budget via backlog max_attempts"
+harness = "codex"
+prompt_file = "prompts/factory-max-attempts-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-max-attempts-v1.json"
+requires = ["factory-receipt-write-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_runner.py", "-q"]
+timeout_seconds = 600
+
+[[items]]
+dedupe_key = "verify-helpers-darwin-v1"
+title = "Port verify-herdr-orchestrator helpers to macOS"
+harness = "codex"
+prompt_file = "prompts/verify-helpers-darwin-v1.md"
+receipt = ".orchestrator/factory/receipts/verify-helpers-darwin-v1.json"
+requires = ["factory-max-attempts-v1"]
+
+[[items.checks]]
+argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/common.sh"]
+timeout_seconds = 30
+
+[[items.checks]]
+argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/doctor.sh"]
+timeout_seconds = 30
+
+[[items.checks]]
+argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/cleanup.sh"]
+timeout_seconds = 30
+
+[[items.checks]]
+argv = ["bash", "-n", ".cursor/skills/verify-herdr-orchestrator/helpers/capture-dashboard.sh"]
+timeout_seconds = 30
+[[items]]
+dedupe_key = "factory-deadline-v1"
+title = "Enforce global check deadline inside dispatch budget"
+harness = "codex"
+prompt_file = "prompts/factory-deadline-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-deadline-v1.json"
+requires = ["verify-helpers-darwin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "deadline_overrun or within_budget or check_timeout"]
+timeout_seconds = 300
+
+[[items.checks]]
+argv = ["python3", "-c", "import ast; ast.parse(open('scripts/devin_factory.py').read()); assert 'deadline_exceeded' in open('scripts/devin_factory.py').read()"]
+timeout_seconds = 30
+[[items]]
+dedupe_key = "factory-evidence-write-v1"
+title = "Stable factory_evidence_write_failed code; preserve original error on evidence-write failure"
+harness = "codex"
+prompt_file = "prompts/factory-evidence-write-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-evidence-write-v1.json"
+requires = ["factory-deadline-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "evidence_write"]
+timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-report-coverage-v1"
+title = "Include backlog coverage and waiting items in the operator report"
+harness = "codex"
+prompt_file = "prompts/factory-report-coverage-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-report-coverage-v1.json"
+requires = ["factory-evidence-write-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report"]
+timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-status-waiting-v1"
+title = "Status distinguishes requires-blocked waiting items from plain unqueued"
+harness = "codex"
+prompt_file = "prompts/factory-status-waiting-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-status-waiting-v1.json"
+requires = ["factory-report-coverage-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "status or report"]
+timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-validate-harness-v1"
+title = "Validate fails closed on items whose harness has no worker"
+harness = "codex"
+prompt_file = "prompts/factory-validate-harness-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-validate-harness-v1.json"
+requires = ["factory-status-waiting-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
+timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-atomic-writes-v1"
+title = "Atomic writes for receipts, evidence, and the operator report"
+harness = "codex"
+prompt_file = "prompts/factory-atomic-writes-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-atomic-writes-v1.json"
+requires = ["factory-validate-harness-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "atomic or partial_artifacts or receipt_write or evidence_write"]
+timeout_seconds = 120
+[[items]]
+dedupe_key = "factory-corrupt-db-v1"
+title = "Stable factory_state_db_unreadable exit-2 on corrupt state DB"
+harness = "codex"
+prompt_file = "prompts/factory-corrupt-db-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-corrupt-db-v1.json"
+requires = ["factory-atomic-writes-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli or corrupt"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-evidence-budget-v1"
+title = "Evidence records the dispatch budget and elapsed wall time"
+harness = "codex"
+prompt_file = "prompts/factory-evidence-budget-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-evidence-budget-v1.json"
+requires = ["factory-corrupt-db-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "deadline or within_budget or evidence or receipt"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-run-jobs-v1"
+title = "Run output names per-job outcomes, not just counts"
+harness = "codex"
+prompt_file = "prompts/factory-run-jobs-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-run-jobs-v1.json"
+requires = ["factory-evidence-budget-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Cli or run_once"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-docs-run-jobs-v1"
+title = "Document run jobs list and drain-deadline semantics"
+harness = "codex"
+prompt_file = "prompts/factory-docs-run-jobs-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-docs-run-jobs-v1.json"
+requires = ["factory-run-jobs-v1"]
+
+[[items.checks]]
+argv = ["python3", "scripts/check_docs.py"]
+timeout_seconds = 60
+
+[[items.checks]]
+argv = ["python3", "-c", "import pathlib,sys; t=pathlib.Path('docs/devin-factory.md').read_text(); sys.exit(0 if 'jobs' in t and 'dispatch_deadline' in t else 1)"]
+timeout_seconds = 30
+[[items]]
+dedupe_key = "factory-validate-warnings-v1"
+title = "Validate warns when a check timeout exceeds the agent budget"
+harness = "codex"
+prompt_file = "prompts/factory-validate-warnings-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-validate-warnings-v1.json"
+requires = ["factory-docs-run-jobs-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "ValidateTests"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-waiting-blocker-state-v1"
+title = "Status waiting list exposes blocker states"
+harness = "codex"
+prompt_file = "prompts/factory-waiting-blocker-state-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-waiting-blocker-state-v1.json"
+requires = ["factory-validate-warnings-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "waiting or status"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-report-blocker-state-v1"
+title = "Report renders unmet requirement states"
+harness = "codex"
+prompt_file = "prompts/factory-report-blocker-state-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-report-blocker-state-v1.json"
+requires = ["factory-waiting-blocker-state-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report or waiting"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-report-write-pin-v1"
+title = "Pin factory_report_write_failed stable CLI error"
+harness = "codex"
+prompt_file = "prompts/factory-report-write-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-report-write-pin-v1.json"
+requires = ["factory-report-blocker-state-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "report"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-evidence-stamp-v1"
+title = "Evidence filenames use clean UTC stamp"
+harness = "codex"
+prompt_file = "prompts/factory-evidence-stamp-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-evidence-stamp-v1.json"
+requires = ["factory-report-write-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q"]
+timeout_seconds = 300
+[[items]]
+dedupe_key = "factory-intake-blocker-state-v1"
+title = "Intake waiting list exposes blocker states"
+harness = "codex"
+prompt_file = "prompts/factory-intake-blocker-state-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-intake-blocker-state-v1.json"
+requires = ["factory-evidence-stamp-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "intake or waiting or requires"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-requires-chain-pin-v1"
+title = "Pin transitive requires release ordering"
+harness = "codex"
+prompt_file = "prompts/factory-requires-chain-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-requires-chain-pin-v1.json"
+requires = ["factory-intake-blocker-state-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "requires"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-exec-failure-codes-v1"
+title = "Pin 127/126 exec-failure check codes"
+harness = "codex"
+prompt_file = "prompts/factory-exec-failure-codes-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-exec-failure-codes-v1.json"
+requires = ["factory-requires-chain-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "executable"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-validate-path-warning-v1"
+title = "Validate warns when a check executable will not resolve"
+harness = "codex"
+prompt_file = "prompts/factory-validate-path-warning-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-validate-path-warning-v1.json"
+requires = ["factory-exec-failure-codes-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-status-harness-v1"
+title = "Job summaries name the harness that ran"
+harness = "codex"
+prompt_file = "prompts/factory-status-harness-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-status-harness-v1.json"
+requires = ["factory-validate-path-warning-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q"]
+timeout_seconds = 300
+[[items]]
+dedupe_key = "factory-backlog-ci-pin-v1"
+title = "Committed backlog is validated in CI"
+harness = "codex"
+prompt_file = "prompts/factory-backlog-ci-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-backlog-ci-pin-v1.json"
+requires = ["factory-status-harness-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-output-bound-pin-v1"
+title = "Pin bounded check output in evidence"
+harness = "codex"
+prompt_file = "prompts/factory-output-bound-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-output-bound-pin-v1.json"
+requires = ["factory-backlog-ci-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "bounded"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-job-updated-at-v1"
+title = "Project job timestamps; status shows last-change ISO time"
+harness = "codex"
+prompt_file = "prompts/factory-job-updated-at-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-job-updated-at-v1.json"
+requires = ["factory-output-bound-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "updated or enqueue_is_idempotent or Cli"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-validate-attempts-v1"
+title = "Validate shows declared max_attempts per item"
+harness = "codex"
+prompt_file = "prompts/factory-validate-attempts-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-validate-attempts-v1.json"
+requires = ["factory-job-updated-at-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "Validate"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-sigint-kill-v1"
+title = "SIGINT exits 130 and kills the in-flight check"
+harness = "codex"
+prompt_file = "prompts/factory-sigint-kill-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-sigint-kill-v1.json"
+requires = ["factory-validate-attempts-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "sigint or executable or deadline"]
+timeout_seconds = 300
+[[items]]
+dedupe_key = "factory-once-exit-pin-v1"
+title = "Pin run --once exit code on a failed batch"
+harness = "codex"
+prompt_file = "prompts/factory-once-exit-pin-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-once-exit-pin-v1.json"
+requires = ["factory-sigint-kill-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "once"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-concurrent-run-v1"
+title = "Concurrent factory-run drains do not double-claim"
+harness = "codex"
+prompt_file = "prompts/factory-concurrent-run-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-concurrent-run-v1.json"
+requires = ["factory-once-exit-pin-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "concurrent"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-lease-expired-v1"
+title = "Status flags jobs whose lease has expired"
+harness = "codex"
+prompt_file = "prompts/factory-lease-expired-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-lease-expired-v1.json"
+requires = ["factory-concurrent-run-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "lease or status"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-retry-backoff-v1"
+title = "Status shows retry backoff for deferred pending jobs"
+harness = "codex"
+prompt_file = "prompts/factory-retry-backoff-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-retry-backoff-v1.json"
+requires = ["factory-lease-expired-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "-q", "-k", "backoff or lease or status"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-lease-reclaim-v1"
+title = "Expired-lease factory jobs reclaim and re-dispatch checks"
+harness = "codex"
+prompt_file = "prompts/factory-lease-reclaim-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-lease-reclaim-v1.json"
+requires = ["factory-retry-backoff-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "reclaim"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-retry-blocked-v1"
+title = "factory-retry re-drives blocked jobs via --allow-blocked"
+harness = "codex"
+prompt_file = "prompts/factory-retry-blocked-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-retry-blocked-v1.json"
+requires = ["factory-lease-reclaim-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "tests/test_store.py", "tests/test_cli.py", "-q", "-k", "blocked or reclaim"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-drift-warning-v1"
+title = "Validate warns when a queued item's contract drifted"
+harness = "codex"
+prompt_file = "prompts/factory-drift-warning-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-drift-warning-v1.json"
+requires = ["factory-retry-blocked-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "validate"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-descendant-kill-v1"
+title = "Timeout and SIGINT kill a check's whole process group"
+harness = "codex"
+prompt_file = "prompts/factory-descendant-kill-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-descendant-kill-v1.json"
+requires = ["factory-drift-warning-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "descendant or term_trapping or sigint"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-sigterm-abort-v1"
+title = "SIGTERM aborts the check process group and exits 143"
+harness = "codex"
+prompt_file = "prompts/factory-sigterm-abort-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-sigterm-abort-v1.json"
+requires = ["factory-descendant-kill-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "sigterm_kills_check_process_group"]
+timeout_seconds = 180
+[[items]]
+dedupe_key = "factory-spawn-race-v1"
+title = "Abort during check spawn still kills the process group"
+harness = "codex"
+prompt_file = "prompts/factory-spawn-race-v1.md"
+receipt = ".orchestrator/factory/receipts/factory-spawn-race-v1.json"
+requires = ["factory-sigterm-abort-v1"]
+
+[[items.checks]]
+argv = ["python3", "-m", "pytest", "tests/test_devin_factory.py", "-q", "-k", "spawn_kills_check_process_group"]
+timeout_seconds = 180

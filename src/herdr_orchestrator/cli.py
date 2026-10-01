@@ -119,6 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Failed job id; list job ids with just status.",
     )
     retry_parser.add_argument("--extra-attempts", type=int, choices=range(1, 11), default=1)
+    retry_parser.add_argument(
+        "--allow-blocked",
+        action="store_true",
+        help="Also accept blocked jobs (lanes without a resumable pane).",
+    )
 
     migrate_parser = subparsers.add_parser(
         "migrate-legacy-workspace",
@@ -150,8 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     gc_parser = subparsers.add_parser(
         "gc",
         description=(
-            "Prefer just gc / just gc-failed. "
-            "--apply actually closes agents; default is dry-run."
+            "Prefer just gc / just gc-failed. --apply actually closes agents; default is dry-run."
         ),
     )
     gc_parser.add_argument("--workflow", required=True)
@@ -199,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser(
         "run",
         description=(
-            "Prefer just run, just run-once or just run-until-idle; " "they supply --workflow."
+            "Prefer just run, just run-once or just run-until-idle; they supply --workflow."
         ),
     )
     run.add_argument("--workflow", required=True)
@@ -313,6 +317,7 @@ def _command_retry(config: WorkflowConfig, args: argparse.Namespace) -> int:
             extra_attempts=args.extra_attempts,
             workspace=str(config.workspace.resolve()),
             include_legacy=True,
+            allow_blocked=args.allow_blocked,
         )
     except StoreError as exc:
         code = str(exc)

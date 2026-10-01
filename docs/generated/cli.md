@@ -127,6 +127,7 @@ Run commands from a source checkout with `uv run python -m herdr_orchestrator`.
 | `--workflow` | yes |
 | `--job-id` | yes |
 | `--extra-attempts` | no |
+| `--allow-blocked` | no |
 
 ## `run`
 

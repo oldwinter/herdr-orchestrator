@@ -1229,6 +1229,7 @@ class Store:
         extra_attempts: int = 1,
         workspace: str | Path | None = None,
         include_legacy: bool = False,
+        allow_blocked: bool = False,
     ) -> dict[str, object]:
         if not 1 <= extra_attempts <= 10:
             raise StoreError("extra_attempts_out_of_range")
@@ -1250,7 +1251,12 @@ class Store:
                 has_scoped_jobs=self._has_scoped_jobs(connection, workflow),
             ):
                 raise StoreError("job_not_found")
-            if row["state"] != JobState.FAILED.value:
+            retryable_states = (
+                {JobState.FAILED.value, JobState.BLOCKED.value}
+                if allow_blocked
+                else {JobState.FAILED.value}
+            )
+            if row["state"] not in retryable_states:
                 raise StoreError("job_not_retryable")
             max_attempts = int(row["max_attempts"]) + extra_attempts
             connection.execute(
@@ -1317,7 +1323,7 @@ class Store:
     ) -> list[dict[str, object]]:
         query = """
                 SELECT jobs.id, jobs.workspace, jobs.title, jobs.harness, jobs.placement,
-                       jobs.state,
+                       jobs.state, jobs.dedupe_key,
                        jobs.attempts, jobs.max_attempts, jobs.agent_name,
                        jobs.error_code, jobs.execution_path, jobs.herdr_workspace_id,
                        jobs.receipt_kind, jobs.receipt_value, jobs.agent_settled,
@@ -1325,6 +1331,8 @@ class Store:
                        jobs.completion_policy, jobs.verification_class,
                        jobs.completion_status, jobs.completion_evidence_summary,
                        jobs.completion_error_code, jobs.current_attempt_id,
+                       jobs.created_at, jobs.updated_at, jobs.lease_until,
+                       jobs.available_at,
                        job_attempts.phase AS attempt_phase
                 FROM jobs AS jobs
                 LEFT JOIN job_attempts ON job_attempts.id = jobs.current_attempt_id

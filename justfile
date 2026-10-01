@@ -1,6 +1,8 @@
 set positional-arguments
 
 workflow := "workflows/multi-harness.toml"
+factory_workflow := "workflows/devin-factory.toml"
+factory_backlog := "factory/backlog.toml"
 python := "uv run python"
 
 # List the stable command surface.
@@ -145,6 +147,45 @@ gc *args:
 [positional-arguments]
 gc-failed *args:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{quote(workflow)}} --failed-agents "$@"
+
+# Dry-run the factory backlog: validate items and show queue coverage.
+[positional-arguments]
+factory-validate *args:
+    @PYTHONPATH=src {{python}} scripts/devin_factory.py --workflow {{quote(factory_workflow)}} --backlog {{quote(factory_backlog)}} validate "$@"
+
+# Enqueue factory backlog items into the durable factory queue (idempotent).
+[positional-arguments]
+factory-intake *args:
+    @PYTHONPATH=src {{python}} scripts/devin_factory.py --workflow {{quote(factory_workflow)}} --backlog {{quote(factory_backlog)}} intake "$@"
+
+# Drain factory work items through their declared local checks.
+[positional-arguments]
+factory-run *args:
+    @PYTHONPATH=src {{python}} scripts/devin_factory.py --workflow {{quote(factory_workflow)}} --backlog {{quote(factory_backlog)}} run "$@"
+
+# Show factory queue counts, job states and unqueued backlog items.
+[positional-arguments]
+factory-status *args:
+    @PYTHONPATH=src {{python}} scripts/devin_factory.py --workflow {{quote(factory_workflow)}} --backlog {{quote(factory_backlog)}} status "$@"
+
+# Write the operator report for the factory queue.
+[positional-arguments]
+factory-report *args:
+    @PYTHONPATH=src {{python}} scripts/devin_factory.py --workflow {{quote(factory_workflow)}} --backlog {{quote(factory_backlog)}} report "$@"
+
+# Re-queue a failed or blocked factory job with extra attempts (recovery).
+[positional-arguments]
+factory-retry job_id *args:
+    @shift 1; PYTHONPATH=src {{python}} -m herdr_orchestrator retry --workflow {{quote(factory_workflow)}} --job-id {{quote(job_id)}} --allow-blocked "$@"
+
+# Collect terminal factory job artifacts (dry-run by default).
+[positional-arguments]
+factory-gc *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator gc --workflow {{quote(factory_workflow)}} --failed-agents "$@"
+
+# Run the factory lane regression suite.
+test-devin-factory:
+    @PYTHONPATH=src uv run python -m pytest tests/test_devin_factory.py -q
 
 # Enqueue a job and let the controller pick the harness.
 enqueue-auto title prompt_file dedupe_key *args:

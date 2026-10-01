@@ -48,6 +48,10 @@ class StoreTests(unittest.TestCase):
             self.store.existing_job("example", "same"),
             (first_id, Harness.CODEX),
         )
+        projected = self.store.jobs("example")[0]
+        self.assertEqual(projected["dedupe_key"], "same")
+        self.assertGreater(float(projected["created_at"]), 0)
+        self.assertGreater(float(projected["updated_at"]), 0)
 
     def test_enqueue_rejects_changed_dedupe_contract(self) -> None:
         job = _job("contract")
@@ -1233,6 +1237,37 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(claimed.max_attempts, 3)
         with self.assertRaisesRegex(StoreError, "job_not_retryable"):
             self.store.retry_failed("example", job_id, extra_attempts=1)
+
+    def test_blocked_job_retries_only_with_allow_blocked(self) -> None:
+        job_id, _ = self.store.enqueue(_job("blocked-retry", max_attempts=1))
+        claimed = self.store.claim("example", limit=1, lease_seconds=60)[0]
+        self.store.record_outcome(
+            claimed,
+            DispatchOutcome(
+                "worker",
+                AgentState.BLOCKED,
+                False,
+                "w1:p1",
+                "agent_blocked",
+            ),
+        )
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            state = connection.execute("SELECT state FROM jobs WHERE id = ?", (job_id,)).fetchone()[
+                0
+            ]
+        self.assertEqual(state, JobState.BLOCKED.value)
+
+        with self.assertRaisesRegex(StoreError, "job_not_retryable"):
+            self.store.retry_failed("example", job_id, extra_attempts=1)
+
+        retried = self.store.retry_failed(
+            "example",
+            job_id,
+            extra_attempts=1,
+            allow_blocked=True,
+        )
+
+        self.assertEqual(retried["state"], JobState.PENDING.value)
 
     def test_expired_lease_is_reclaimed(self) -> None:
         self.store.enqueue(_job("one"))

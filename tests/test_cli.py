@@ -476,6 +476,30 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.job_id, 42)
         self.assertEqual(args.extra_attempts, 2)
+        self.assertFalse(args.allow_blocked)
+
+    def test_retry_accepts_allow_blocked_flag(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "retry",
+                "--workflow",
+                "workflow.toml",
+                "--job-id",
+                "42",
+                "--allow-blocked",
+            ]
+        )
+
+        self.assertTrue(args.allow_blocked)
+
+    def test_retry_forwards_allow_blocked_to_store(self) -> None:
+        args = Namespace(job_id=7, extra_attempts=1, allow_blocked=True)
+        store = MagicMock()
+        store.retry_failed.return_value = {"job_id": 7, "state": "pending"}
+        with patch.object(cli_module, "Store", return_value=store):
+            cli_module._command_retry(self.config, args)
+
+        self.assertTrue(store.retry_failed.call_args.kwargs["allow_blocked"])
 
     def test_resume_accepts_job_and_response_file(self) -> None:
         args = build_parser().parse_args(
@@ -714,13 +738,13 @@ class CliTests(unittest.TestCase):
                 workspace=str(self.config.workspace.resolve()),
             )
         )
-        args = Namespace(job_id=job_id, extra_attempts=1)
+        args = Namespace(job_id=job_id, extra_attempts=1, allow_blocked=False)
 
         with self.assertRaisesRegex(StoreError, r"^job_not_retryable: run just status$"):
             cli_module._command_retry(self.config, args)
 
     def test_retry_keeps_other_store_errors(self) -> None:
-        args = Namespace(job_id=1, extra_attempts=1)
+        args = Namespace(job_id=1, extra_attempts=1, allow_blocked=False)
         store = MagicMock()
         store.retry_failed.side_effect = StoreError("extra_attempts_out_of_range")
         with (
@@ -747,7 +771,7 @@ class CliCommandDispatchTests(unittest.TestCase):
         self.config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
 
     def test_simple_coordinator_and_store_commands_emit_json(self) -> None:
-        args = Namespace(apply=False, extra_attempts=2, job_id=7)
+        args = Namespace(apply=False, allow_blocked=False, extra_attempts=2, job_id=7)
         coordinator = MagicMock()
         coordinator.seed.return_value = (2, 1)
         coordinator.gc_succeeded_agents.return_value = {"candidate_count": 0}

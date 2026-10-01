@@ -104,3 +104,12 @@ host_header_ok_curl() {
   shift
   curl -fsS --max-time 5 -H "Accept: application/json" "$url" "$@"
 }
+
+pid_cmdline() {
+  local pid="$1"
+  if [[ -d "/proc/$pid" ]]; then
+    tr '\0' ' ' <"/proc/$pid/cmdline" || true
+  else
+    ps -p "$pid" -o command= 2>/dev/null || true
+  fi
+}
