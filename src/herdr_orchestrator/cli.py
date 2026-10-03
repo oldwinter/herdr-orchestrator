@@ -29,6 +29,7 @@ from herdr_orchestrator.delivery import (
     StandardizedDelivery,
 )
 from herdr_orchestrator.delivery_protocol import DeliveryArtifactError
+from herdr_orchestrator.drift import BaseDriftGuard
 from herdr_orchestrator.git_workspace import GitWorkspaceError
 from herdr_orchestrator.harness_health import HarnessHealth
 from herdr_orchestrator.herdr import HerdrTransport, doctor_agent_name, smoke_agent_name
@@ -46,6 +47,8 @@ from herdr_orchestrator.model import (
     WorkflowConfig,
 )
 from herdr_orchestrator.observability import Observability
+from herdr_orchestrator.orca import add_parser as add_orca_parser
+from herdr_orchestrator.orca import command as orca_command
 from herdr_orchestrator.protocol import TransportError
 from herdr_orchestrator.readiness import (
     BuildIdentity,
@@ -58,6 +61,8 @@ from herdr_orchestrator.readiness import (
 )
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.store import Store, StoreError
+from herdr_orchestrator.supervision_cli import add_parser as add_supervision_parser
+from herdr_orchestrator.supervision_cli import command as supervision_command
 from herdr_orchestrator.tracker import TrackerError
 
 
@@ -71,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    add_supervision_parser(subparsers)
+    add_orca_parser(subparsers)
 
     seed_parser = subparsers.add_parser(
         "seed",
@@ -217,6 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Drain the queue until idle; same as just run-until-idle.",
     )
     run.add_argument("--drain-timeout-seconds", type=int, default=86400)
+    run.add_argument("--base-ref", help="Opt-in pre-claim guard against this local Git ref.")
+    run.add_argument("--max-base-behind", type=int, default=20)
     _add_selection_arguments(run)
 
     enqueue = subparsers.add_parser(
@@ -236,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--title", required=True)
     enqueue.add_argument("--prompt-file", required=True)
     enqueue.add_argument("--dedupe-key", required=True)
+    enqueue.add_argument("--depends-on", type=int, action="append", default=[])
     enqueue.add_argument(
         "--placement",
         choices=["auto", *(item.value for item in PlacementTarget)],
@@ -374,6 +384,7 @@ def _command_enqueue(config: WorkflowConfig, args: argparse.Namespace) -> int:
         title=args.title,
         prompt_file=Path(args.prompt_file).expanduser().resolve(),
         dedupe_key=args.dedupe_key,
+        depends_on=tuple(getattr(args, "depends_on", ())),
         placement=None if args.placement == "auto" else PlacementTarget(args.placement),
         receipt=_task_receipt_from_args(args),
         completion_policy=(
@@ -575,6 +586,8 @@ def _command_profile(config: WorkflowConfig, args: argparse.Namespace) -> int:
 
 CommandHandler = Callable[[WorkflowConfig, argparse.Namespace], int]
 COMMAND_HANDLERS: Mapping[str, CommandHandler] = {
+    "orca": orca_command,
+    "orchestration": supervision_command,
     "catalog": _command_catalog,
     "dashboard": _command_dashboard,
     "deliver": _command_deliver,
@@ -1204,6 +1217,11 @@ def _coordinator_from_args(
         health=health,
         readiness_probe=readiness_probe,
         observability=observability,
+        drift_guard=(
+            BaseDriftGuard(args.base_ref, args.max_base_behind)
+            if getattr(args, "base_ref", None)
+            else None
+        ),
     )
 
 
