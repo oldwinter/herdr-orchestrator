@@ -62,6 +62,7 @@ Run commands from a source checkout with `uv run python -m herdr_orchestrator`.
 | `--title` | yes |
 | `--prompt-file` | yes |
 | `--dedupe-key` | yes |
+| `--depends-on` | no |
 | `--placement` | no |
 | `--receipt-prefix` | no |
 | `--receipt-file` | no |
@@ -87,6 +88,130 @@ Run commands from a source checkout with `uv run python -m herdr_orchestrator`.
 | Argument | Required |
 | --- | --- |
 | `--workflow` | yes |
+
+## `orca`
+
+`herdr-orchestrator orca [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--workflow` | yes |
+| `--apply` | no |
+| `--timeout-seconds` | no |
+| `arguments` | no |
+
+## `orchestration`
+
+`herdr-orchestrator orchestration [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--workflow` | yes |
+| `action` | yes |
+
+## `orchestration ack`
+
+`herdr-orchestrator orchestration ack [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--handle` | yes |
+| `--id` | yes |
+
+## `orchestration ask`
+
+`herdr-orchestrator orchestration ask [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--from` | yes |
+| `--to` | yes |
+| `--body` | yes |
+| `--key` | yes |
+| `--subject` | no |
+| `--thread` | no |
+| `--job-id` | no |
+| `--attempt-id` | no |
+| `--token` | no |
+| `--priority` | no |
+| `--timeout-seconds` | no |
+
+## `orchestration check`
+
+`herdr-orchestrator orchestration check [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--handle` | yes |
+| `--after` | no |
+| `--thread` | no |
+| `--type` | no |
+| `--all` | no |
+| `--timeout-seconds` | no |
+
+## `orchestration gate-create`
+
+`herdr-orchestrator orchestration gate-create [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--job-id` | yes |
+| `--id` | yes |
+| `--question` | yes |
+| `--option` | no |
+
+## `orchestration gate-list`
+
+`herdr-orchestrator orchestration gate-list [arguments]`
+
+## `orchestration gate-resolve`
+
+`herdr-orchestrator orchestration gate-resolve [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--id` | yes |
+| `--resolution` | yes |
+
+## `orchestration reply`
+
+`herdr-orchestrator orchestration reply [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--from` | yes |
+| `--to` | yes |
+| `--body` | yes |
+| `--key` | yes |
+| `--subject` | no |
+| `--thread` | no |
+| `--job-id` | no |
+| `--attempt-id` | no |
+| `--token` | no |
+| `--priority` | no |
+| `--id` | yes |
+
+## `orchestration send`
+
+`herdr-orchestrator orchestration send [arguments]`
+
+| Argument | Required |
+| --- | --- |
+| `--from` | yes |
+| `--to` | yes |
+| `--body` | yes |
+| `--key` | yes |
+| `--subject` | no |
+| `--thread` | no |
+| `--job-id` | no |
+| `--attempt-id` | no |
+| `--token` | no |
+| `--priority` | no |
+| `--type` | no |
+
+## `orchestration task-list`
+
+`herdr-orchestrator orchestration task-list [arguments]`
 
 ## `profile`
 
@@ -138,6 +263,8 @@ Run commands from a source checkout with `uv run python -m herdr_orchestrator`.
 | `--once` | no |
 | `--until-idle, --drain` | no |
 | `--drain-timeout-seconds` | no |
+| `--base-ref` | no |
+| `--max-base-behind` | no |
 | `--controller-harness` | no |
 | `--worker-harness` | no |
 

@@ -6,6 +6,11 @@
 
 ## 组件
 
+普通 queue 的依赖 DAG、worker mailbox/gate 与 Orca 原生入口见
+[`orca-integration.md`](orca-integration.md)。Schema v10 新增这些本地协作表，保留原有
+attempt fencing 与 completion 判定。Orca Run/Dispatch 仍归 Orca 自身管理，不映射为
+本库 job 状态；原生入口不是替换 HerdrTransport 的第二个 queue transport。
+
 ```text
 Harness TOML metadata ─> compact catalog ─> Planner
                                               │ selected harness

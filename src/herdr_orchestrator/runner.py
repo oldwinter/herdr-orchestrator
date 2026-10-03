@@ -18,6 +18,7 @@ from herdr_orchestrator.completion import (
     CompletionPolicy,
     structured_completion_prompt,
 )
+from herdr_orchestrator.drift import BaseDriftGuard
 from herdr_orchestrator.harness_health import (
     HarnessHealth,
     HealthProbe,
@@ -58,6 +59,8 @@ from herdr_orchestrator.selection import (
     select_controller_harness,
 )
 from herdr_orchestrator.store import Store
+from herdr_orchestrator.supervision import Supervision
+from herdr_orchestrator.supervision_cli import worker_preamble
 from herdr_orchestrator.topology import (
     TopologyDecisionError,
     load_topology_decision,
@@ -114,6 +117,7 @@ class Coordinator:
         transition_observer: Callable[[AttemptTransition], None] | None = None,
         health: HarnessHealth | None = None,
         readiness_probe: HealthProbe | None = None,
+        drift_guard: BaseDriftGuard | None = None,
     ) -> None:
         self.config = config
         self._workspace_key = str(config.workspace.resolve())
@@ -129,6 +133,8 @@ class Coordinator:
         self.transition_observer = transition_observer
         self.health = health
         self.readiness_probe = readiness_probe
+        self.drift_guard = drift_guard
+        self._drift_deferred: list[dict[str, object]] = []
         health_harnesses = list(self.worker_harnesses)
         for harness in (self.controller_harness, self.config.planner.harness):
             if harness is not None and harness not in health_harnesses:
@@ -176,6 +182,7 @@ class Coordinator:
         placement: PlacementTarget | None = None,
         receipt: TaskReceipt | None = None,
         completion_policy: CompletionPolicy | None = None,
+        depends_on: tuple[int, ...] = (),
     ) -> tuple[int, bool, Harness]:
         self.initialize()
         if not prompt_file.is_file():
@@ -193,6 +200,7 @@ class Coordinator:
             receipt=receipt,
             completion_policy=completion_policy,
             workspace=self._workspace_key,
+            depends_on=depends_on,
         )
         if existing is not None:
             job_id, existing_harness = existing
@@ -224,6 +232,7 @@ class Coordinator:
                 ),
                 receipt=receipt,
                 completion_policy=completion_policy,
+                depends_on=depends_on,
             )
         )
         if not created:
@@ -263,6 +272,15 @@ class Coordinator:
         )
         batch_key = f"run-{time.time_ns()}"
         slot_names = self._slot_names()
+        allowed_job_ids = None
+        if self.drift_guard is not None:
+            allowed_job_ids, self._drift_deferred = self.drift_guard.filter_jobs(
+                self.config,
+                self.store.jobs(
+                    self.config.name, workspace=self._workspace_key, include_legacy=True
+                ),
+                deadline=dispatch_deadline,
+            )
         jobs = self.store.claim(
             self.config.name,
             limit=self.config.coordinator.max_parallel,
@@ -274,6 +292,7 @@ class Coordinator:
             require_fresh_health=self.health is not None,
             include_legacy=True,
             static_validator=self._static_harness_available if self.health is not None else None,
+            allowed_job_ids=allowed_job_ids,
         )
         results = {state.value: 0 for state in JobState}
         if not jobs:
@@ -378,6 +397,12 @@ class Coordinator:
         report: dict[str, object] = {
             **batch,
             "claimed": claimed,
+            "drift_deferred": self._drift_deferred,
+            "constraints": Supervision(
+                self.store.path,
+                self.config.name,
+                workspace,
+            ).constraints(),
             "batch": dict(batch),
             "queue": self.store.status_counts(
                 self.config.name,
@@ -472,6 +497,11 @@ class Coordinator:
                 health_snapshot = self._last_health_snapshot
                 break
             if claimed == 0:
+                if active[JobState.RUNNING.value] == 0 and self._waiting_on_constraints():
+                    reason = (
+                        "base_drift_wait" if self._drift_deferred else "dependency_or_gate_wait"
+                    )
+                    break
                 time.sleep(min(self.config.coordinator.poll_seconds, remaining))
         return self._drain_report(
             aggregate,
@@ -484,6 +514,21 @@ class Coordinator:
             queue_idle=queue_idle,
             health_snapshot=health_snapshot,
         )
+
+    def _waiting_on_constraints(self) -> bool:
+        constraints = Supervision(
+            self.store.path,
+            self.config.name,
+            self._workspace_key,
+        ).constraints()
+        selected_pending = {
+            row["id"]
+            for row in self.store.jobs(self.config.name, workspace=self._workspace_key)
+            if row["state"] == "pending"
+            and row["harness"] in {h.value for h in self.worker_harnesses}
+        }
+        deferred = {row["job_id"] for row in [*constraints, *self._drift_deferred]}
+        return bool(selected_pending) and selected_pending <= deferred
 
     def resume_blocked(
         self,
@@ -949,10 +994,11 @@ class Coordinator:
         profile = profile_for_harness(self.config.profiles, job.harness)
         timeout_seconds = self._dispatch_timeout(dispatch_deadline)
         completion_identity = _completion_identity(job)
+        coordinated_prompt = job.prompt + worker_preamble(self.config, job)
         task_prompt = (
-            structured_completion_prompt(job.prompt, completion_identity)
+            structured_completion_prompt(coordinated_prompt, completion_identity)
             if completion_identity is not None
-            else job.prompt
+            else coordinated_prompt
         )
         prompt = execution_prompt(profile, task_prompt)
         context = DispatchContext(

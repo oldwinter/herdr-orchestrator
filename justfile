@@ -103,6 +103,16 @@ catalog:
 catalog-json:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator catalog --workflow {{quote(workflow)}} --format json
 
+# Exchange local worker messages and inspect DAG constraints or operator gates.
+[positional-arguments]
+orchestration *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator orchestration --workflow {{quote(workflow)}} "$@"
+
+# Use Orca-native Run/Dispatch state; native writes require --apply before the command.
+[positional-arguments]
+orca *args:
+    @PYTHONPATH=src {{python}} -m herdr_orchestrator orca --workflow {{quote(workflow)}} "$@"
+
 # Print the full execution profile for one harness.
 profile harness:
     @PYTHONPATH=src {{python}} -m herdr_orchestrator profile --workflow {{quote(workflow)}} {{quote(harness)}}
