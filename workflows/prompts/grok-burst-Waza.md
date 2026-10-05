@@ -1,0 +1,1 @@
+在 `/Users/oldwinter/Code/grok-army-campaign/Waza` 做一轮「设计」工作。读 README 与入口，找一个具体可本地修复的问题。用 `gh issue create --repo oldwinter/Waza` 开 issue，标题或正文必须包含「设计」。在该 clone 做对应本地改进。不要 push / PR / merge。把 issue URL 与改动文件追加到 `/Users/oldwinter/Code/herdr-orchestrator/.orchestrator/grok-burst/issues.txt`。复用已有 clone。停止条件：issue 可打开且本地有对应改动。

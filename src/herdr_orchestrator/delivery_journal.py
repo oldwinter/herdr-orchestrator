@@ -21,6 +21,7 @@ from herdr_orchestrator.delivery_protocol import (
     write_artifact_text,
 )
 from herdr_orchestrator.observability import sanitize
+from herdr_orchestrator.tracker import contains_high_confidence_secret
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +104,23 @@ def _reject_json_constant(value: str) -> object:
 
 
 class DeliveryJournal:
+    _STAGE_STATES = {
+        ("running", "wayfinder"),
+        ("running", "spec-and-tickets"),
+        ("running", "tracker-publish"),
+        ("running", "implementation"),
+        ("running", "final-review"),
+        ("succeeded", "complete"),
+        ("failed", "stopped"),
+        ("blocked", "stopped"),
+    }
+    _STAGE_DETAIL_KEYS = {
+        "controller",
+        "error",
+        "failed_stage",
+        "integration_branch",
+        "integration_commit",
+    }
     _OWNER_EVENTS = {
         "owner_acquired",
         "owner_recovered",
@@ -217,6 +235,47 @@ class DeliveryJournal:
                 now,
             )
             self._write_owner("active", now)
+
+    def latest_stage_state(self) -> dict[str, object] | None:
+        with self._lock:
+            return self._latest_stage_state_locked()
+
+    def _latest_stage_state_locked(self) -> dict[str, object] | None:
+        for event in reversed(self._events):
+            if event.event == "stage_transition":
+                return dict(event.details)
+        return None
+
+    def record_stage(self, state: dict[str, object]) -> None:
+        """Persist the complete projection before its snapshot; identical retries are no-ops."""
+        self._validate_stage_state(state)
+        state = self.payload_validator(state)
+        with self._lock:
+            owner = self._durable_owner()
+            if owner is None or owner.status != "active" or owner.owner_token != self.owner_token:
+                raise self.error_type("delivery_owner_lost")
+            if state != self._latest_stage_state_locked():
+                self._persist_event("stage_transition", None, None, dict(state), self.clock())
+
+    def _validate_stage_state(self, state: dict[str, object]) -> None:
+        if (
+            not isinstance(state, dict)
+            or not {"status", "stage"}.issubset(state)
+            or set(state) - {"status", "stage"} - self._STAGE_DETAIL_KEYS
+            or any(
+                not isinstance(value, str) or not 0 < len(value) <= 1024 for value in state.values()
+            )
+        ):
+            raise self.error_type("delivery_journal_stage_invalid")
+        status, stage = state["status"], state["stage"]
+        if (status, stage) not in self._STAGE_STATES:
+            raise self.error_type("delivery_journal_stage_invalid")
+        try:
+            json.dumps(state, ensure_ascii=False).encode("utf-8")
+        except UnicodeError as exc:
+            raise self.error_type("delivery_journal_stage_invalid") from exc
+        if contains_high_confidence_secret(state):
+            raise self.error_type("delivery_journal_sensitive_value")
 
     def reconcile(self, effect: DeliveryEffect) -> dict[str, object]:
         self._validate_effect(effect)
@@ -667,6 +726,14 @@ class DeliveryJournal:
                 details,
                 operations,
             )
+        elif event == "stage_transition":
+            if (
+                owner_state[0] != owner_token
+                or operation_key is not None
+                or effect_kind is not None
+            ):
+                raise self.error_type("delivery_journal_invalid")
+            self._validate_stage_state(details)
         else:
             raise self.error_type("delivery_journal_invalid")
         return _JournalEvent(

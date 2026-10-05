@@ -55,13 +55,13 @@ CLI 用 `enqueue --receipt-file <RELATIVE_PATH>` 声明文件收据。路径相�
 - `pane` / `tab`：workflow workspace；
 - `worktree`：任务的独立 checkout。
 
-Prompt 前后都记录 `_FileReceiptSnapshot(exists, size, sha256)`。通过条件是文件存在、非空，且 snapshot 与 baseline 不同。已有文件内容未改变会返回 `task_receipt_stale`，不存在返回 `task_receipt_missing`，空文件返回 `task_receipt_invalid`。
+Prompt 前后都记录 `FileReceiptSnapshot(exists, size, sha256)`。通过条件是文件存在、非空，且 snapshot 与 baseline 不同。已有文件内容未改变会返回 `task_receipt_stale`，不存在返回 `task_receipt_missing`，空文件返回 `task_receipt_invalid`，超过 1 MiB 返回 `task_receipt_too_large`。
 
-路径验证同时拒绝绝对路径、`..`、root 外解析结果和路径链上的 symlink。入口分别位于：
+路径验证同时拒绝绝对路径、`..`、root 外解析结果和路径链上的 symlink。内容读取打开不跟随 symlink 的文件描述符，按块计算 SHA-256，不把整个文件保留在 snapshot 里。入口分别位于：
 
 - CLI 早期验证：`src/herdr_orchestrator/cli.py::_task_receipt_from_args`
-- Execution-root 验证：`src/herdr_orchestrator/herdr.py::_receipt_file_path`
-- Freshness 验证：`src/herdr_orchestrator/herdr.py::_verify_task_receipt`
+- Execution-root 验证：`src/herdr_orchestrator/completion.py::receipt_file_path`
+- Freshness 验证：`src/herdr_orchestrator/completion.py::file_receipt_snapshot`
 
 ## Attempt receipt 与 durable 记录
 

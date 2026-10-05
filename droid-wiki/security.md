@@ -60,10 +60,10 @@ flowchart LR
 | 类别 | 主要风险 | 已有缓解 | 剩余风险 / 不应误解之处 |
 | --- | --- | --- | --- |
 | **Spoofing** | 外部 agent 使用确定性名称；pane 被移动或替换；伪造 manifest ownership | 复用与恢复校验 agent name、harness、pane、workspace、`cwd`/`foreground_cwd`、状态；GC 还要求本 workflow 的创建 receipt；manifest 校验 package/schema/hash | 同 OS 用户若能同时篡改数据库和 Herdr 事实，仍可伪造证据；没有密码学身份 |
-| **Tampering** | 路径逃逸或 symlink 重定向；模型注入 command；SQL 注入；旧 receipt 冒充本 turn；并发 resume 覆盖 | 相对路径 containment、symlink 拒绝、argv 而非 shell、参数化 SQL、strict schema、前后 SHA-256/size、sequence 与 state/attempt 前置条件 | File receipt 检查与读取不是跨进程原子操作；本地可信账号仍可产生 TOCTOU |
+| **Tampering** | 路径逃逸或 symlink 重定向；模型注入 command；SQL 注入；旧 receipt 冒充本 turn；并发 resume 覆盖 | 相对路径 containment、symlink 拒绝、argv 而非 shell、参数化 SQL、strict schema、`O_NOFOLLOW` 文件描述符、前后 SHA-256/size、sequence 与 state/attempt 前置条件 | File receipt 路径检查与打开之间仍不是跨进程原子操作；本地可信账号仍可产生 TOCTOU |
 | **Repudiation** | 无法还原一次 retry、blocked response、cleanup 或 tracker 修改 | SQLite attempt receipts 保存 attempt、agent、pane、placement、error、settlement、verification、correlation ID；交付 ledger 保存问题 hash、动作、类别和理由 | Ledger 故意不保存具体代理回答；普通本地调用只归因到 OS 用户；没有不可抵赖审计日志 |
 | **Information disclosure** | prompt、response、terminal transcript、secret、PII 或路径经 telemetry/Dashboard/报告泄漏 | telemetry 中央清洗；Dashboard 不读 prompt/terminal output，字段显式白名单；错误摘要有界；exporter 默认关闭且仅 HTTPS | SQLite 本身保存 prompt 与 receipt value；Dashboard 仍展示 title、dedupe key、执行/拓扑路径和 runtime ID，但不展示 receipt value；这些仍是本地敏感数据而非匿名数据 |
-| **Denial of service** | 无界模型输出、等待、文件读取、HTTP/SSE client 或重试耗尽本机资源 | planner/artifact/文本长度上限、worker/repair/proxy 次数上限、Herdr deadline、子进程 timeout、retry backoff、Dashboard poll 范围 | File receipt 当前一次性读入全部字节；SSE 是每连接线程；loopback 上的恶意本地进程仍可施压 |
+| **Denial of service** | 无界模型输出、等待、文件读取、HTTP/SSE client 或重试耗尽本机资源 | planner/artifact/文本长度上限、file receipt 1 MiB 与流式 hash、worker/repair/proxy 次数上限、Herdr deadline、子进程 timeout、retry backoff、Dashboard poll 范围与 16 条 SSE 连接预算 | SSE 仍是每连接线程；loopback 上的恶意本地进程仍可把预算用满 |
 | **Elevation of privilege** | 模型输出直接执行 shell；普通 queue 隐式获得 principal-proxy；GC 关闭用户 pane；已有 CLI credential 被当作授权 | planner 无 command 字段；普通 queue 与交付面分离；标准交付 exact opt-in；blocked 默认人工恢复；GC 排除 blocked/worktree/reused/active/foreign agent；tracker 只实现 issue 操作 | Harness 使用最大自动化参数，仍拥有当前 OS 用户的实际能力；prompt 策略不能替代 OS 沙箱或用户授权 |
 
 威胁模型真源是 `.factory/threat-model.md`，版本和启用的模式集合记录在 `.factory/security-config.json`。该模型把同 OS 用户篡改、worktree 非沙箱、receipt 非签名列为接受风险，而不是已消除风险。
@@ -142,6 +142,7 @@ Schema 只证明 shape 和局部不变量，不证明计划合理、代码正确
 - 只提供 `/`、`/api/health`、`/api/snapshot`、`/api/events` 与五个静态资源；任意其他 asset/path 返回 404；
 - 静态资源 CSP 为 `default-src 'self'`，connect/style/script 限制为 self，图片只额外允许 `data:`，并禁止 base、form 与 frame ancestor；
 - 资产和 JSON 使用 `no-store`、`nosniff`；静态页面另有 `no-referrer`；
+- `/api/events` 同时最多 16 条连接，超出返回 503；
 - 没有 POST、retry、resume、focus、pane input、push 或其他 mutation endpoint。
 
 `src/herdr_orchestrator/dashboard/observer.py` 使用 SQLite `mode=ro`、workflow 条件和显式列，不读取 `jobs.prompt`。Herdr topology 再按当前仓库路径收窄，并分别经过 workspace/tab/pane/agent/worktree 字段白名单；它不读取 terminal transcript。
@@ -157,7 +158,7 @@ Schema 只证明 shape 和局部不变量，不证明计划合理、代码正确
 `src/herdr_orchestrator/herdr.py` 在 prompt 前记录 baseline，只在当前 turn settled 后验证：
 
 - **Output-prefix**：读取有界的 `recent-unwrapped` 120 行，仅在 baseline 后的新行中查找；prompt 中若有一整行以同 prefix 开头则报 `task_receipt_ambiguous`，旧 turn 的 prefix 不算新证据。
-- **File**：必须是 execution root 下非空相对路径；拒绝绝对路径、空 parts、任何 `..`、路径链上的 symlink 和 resolve 后逃逸 root。前后比较 `{exists, size, sha256}`，文件必须存在、非空且发生变化。
+- **File**：必须是 execution root 下非空相对路径；拒绝绝对路径、空 parts、任何 `..`、路径链上的 symlink 和 resolve 后逃逸 root。内容通过 `O_NOFOLLOW` 文件描述符按块散列，超过 1 MiB 返回 `task_receipt_too_large`。前后比较 `{exists, size, sha256}`，文件必须存在、非空且发生变化。
 - Agent 为 blocked/working/unknown 时，即使可见 prefix 或文件存在，也不会得到 `task_verified=true`。
 
 `src/herdr_orchestrator/store.py` 再次 fail closed：声明了 receipt 却没有 `task_verified is True` 时，`idle`/`done` 也不能成为成功。测试覆盖 prompt echo、旧 turn、旧文件、symlink、pane 变化和同 attempt resume。

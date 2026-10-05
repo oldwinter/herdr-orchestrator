@@ -1,0 +1,2 @@
+在 `/Users/oldwinter/Code/grok-army-campaign/herdr-orchestrator` 做第二轮「体验」工作。跳过已有 dashboard 字体、delivery keys、planner schema issue。找一个具体 CLI/status/dashboard 体验问题。`gh issue create --repo oldwinter/herdr-orchestrator`，标题或正文含「体验」。本地改进，不要 push/PR/merge。追加写入 `/Users/oldwinter/Code/herdr-orchestrator/.orchestrator/grok-army/issues.txt`。
+注意：改 campaign clone，不要改正在跑 coordinator 的 `/Users/oldwinter/Code/herdr-orchestrator` 工作区。

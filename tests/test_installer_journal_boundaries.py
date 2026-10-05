@@ -542,7 +542,7 @@ class InstallerJournalBoundaryTests(unittest.TestCase):
 
     def test_uninstall_planning_rejects_concurrent_metadata_edits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             project = root / "project"
             barrier = root / "uninstall-planning-barrier"
             initialized = subprocess.run(

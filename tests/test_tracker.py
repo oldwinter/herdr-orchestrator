@@ -26,7 +26,7 @@ from herdr_orchestrator.tracker import (
 class LocalMarkdownTrackerTests(unittest.TestCase):
     def test_rejects_symlinked_tracker_root_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             outside = root / "outside"
             outside.mkdir()
             tracker_root = root / "tracker"
@@ -38,7 +38,7 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
 
     def test_publishes_one_file_per_ticket_and_closes_with_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             tracker = LocalMarkdownTracker(root)
             plan = _plan()
 
@@ -65,7 +65,7 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
 
     def test_rejects_a_human_note_appended_to_a_completed_ticket(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             plan = _plan()
             tracker = LocalMarkdownTracker(root)
             references = tracker.publish(plan)
@@ -88,7 +88,7 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
 
     def test_refuses_to_overwrite_conflicting_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             tracker = LocalMarkdownTracker(root)
             plan = _plan()
             tracker.publish(plan)
@@ -100,7 +100,7 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
 
     def test_refuses_to_close_over_concurrent_ticket_edit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             tracker = LocalMarkdownTracker(root)
             plan = _plan()
             references = tracker.publish(plan)
@@ -130,14 +130,14 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
 
     def test_rejects_tracker_path_escape_from_unvalidated_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "tracker"
+            root = Path(temporary).resolve() / "tracker"
             with self.assertRaisesRegex(TrackerError, "local_tracker_path_invalid"):
                 LocalMarkdownTracker(root).publish(_plan(slug="../outside"))
-            self.assertFalse((Path(temporary) / "outside").exists())
+            self.assertFalse((Path(temporary).resolve() / "outside").exists())
 
     def test_rejects_symlinked_tracker_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "tracker"
+            root = Path(temporary).resolve() / "tracker"
             plan = _plan()
             feature_root = root / plan.slug
             issues_root = feature_root / "issues"
@@ -146,7 +146,7 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
                 render_spec(plan),
                 encoding="utf-8",
             )
-            target = Path(temporary) / "outside.md"
+            target = Path(temporary).resolve() / "outside.md"
             target.write_text("untouched", encoding="utf-8")
             (issues_root / "01-add-one-slice.md").symlink_to(target)
 
@@ -156,7 +156,7 @@ class LocalMarkdownTrackerTests(unittest.TestCase):
 
     def test_maps_invalid_existing_tracker_encoding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "tracker"
+            root = Path(temporary).resolve() / "tracker"
             plan = _plan()
             LocalMarkdownTracker(root).publish(plan)
             (root / plan.slug / "spec.md").write_bytes(b"\xff")

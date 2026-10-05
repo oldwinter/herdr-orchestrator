@@ -29,6 +29,9 @@ TOPOLOGY_STYLE_JS = files("herdr_orchestrator.dashboard.static").joinpath("topol
 INDEX_HTML = files("herdr_orchestrator.dashboard.static").joinpath("index.html")
 DASHBOARD_CSS = files("herdr_orchestrator.dashboard.static").joinpath("dashboard.css")
 DASHBOARD_JS = files("herdr_orchestrator.dashboard.static").joinpath("dashboard.js")
+DASHBOARD_TOPOLOGY_JS = files("herdr_orchestrator.dashboard.static").joinpath(
+    "dashboard-topology.js"
+)
 
 _DRIVER = r"""
 const fs = require("fs");
@@ -906,7 +909,7 @@ def test_compact_selection_path_label_contracts() -> None:
 
 
 def test_selection_path_lifecycle_contracts() -> None:
-    dashboard = DASHBOARD_JS.read_text(encoding="utf-8")
+    dashboard = DASHBOARD_TOPOLOGY_JS.read_text(encoding="utf-8")
     selection = dashboard[
         dashboard.index("function selectTopologyNode") : dashboard.index(
             "function revealTopologyNode"
@@ -978,8 +981,9 @@ def test_dashboard_static_accessibility_and_overflow_contracts() -> None:
     assert "function showUnavailableState" in javascript
     assert "aria-busy" in javascript
     assert "ArrowRight" in javascript
-    focus_adapter = javascript[
-        javascript.index("function readTopologyFocusInput") : javascript.index(
+    topology_javascript = DASHBOARD_TOPOLOGY_JS.read_text(encoding="utf-8")
+    focus_adapter = topology_javascript[
+        topology_javascript.index("function readTopologyFocusInput") : topology_javascript.index(
             "function readTopologyContentState"
         )
     ]

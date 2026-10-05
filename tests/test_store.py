@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from herdr_orchestrator.attempts import AttemptLedger
+from herdr_orchestrator.attempts_legacy import migrate_v4_to_v5 as migrate_attempts_v4_to_v5
 from herdr_orchestrator.completion import CompletionPolicy, VerificationClass
 from herdr_orchestrator.model import (
     AgentState,
@@ -1956,7 +1956,7 @@ def _create_schema_version(path: Path, version: int) -> None:
     connection.execute(f"INSERT INTO receipts({receipt_columns}) VALUES ({receipt_values})")
     if version == 5:
         connection.row_factory = sqlite3.Row
-        AttemptLedger.migrate_v4_to_v5(connection, Store._add_column_if_missing)
+        migrate_attempts_v4_to_v5(connection, Store._add_column_if_missing)
         for column in (
             "completion_policy",
             "verification_class",

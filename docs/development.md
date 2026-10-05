@@ -41,3 +41,6 @@ uv run pre-commit install --hook-type pre-push
 CI uses the same locked tools, uploads one completed run-scoped bundle, and posts only its bounded
 summary on pull requests. Manifest enforcement remains independent of summary generation. Do not edit
 `docs/generated/cli.md`; run `just docs-generate`.
+
+See [crash recovery acceptance](verification/issue-40.md) for the queue, delivery, installer,
+and quality publication recovery contracts and the separate live readiness boundary.

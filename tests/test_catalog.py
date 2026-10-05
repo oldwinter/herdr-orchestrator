@@ -90,6 +90,17 @@ context_file = "droid.md"
         self.assertIn("updated after catalog load", prompt)
         self.assertNotIn("first version", prompt)
 
+    def test_empty_profiles_dir_names_toml_glob(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            with self.assertRaisesRegex(CatalogError, r"^profiles_empty:") as ctx:
+                load_harness_profiles(root)
+
+            message = str(ctx.exception)
+            self.assertIn(str(root), message)
+            self.assertIn("*.toml", message)
+
     def test_rejects_context_path_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

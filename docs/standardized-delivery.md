@@ -158,7 +158,7 @@ artifact root fails closed.
 | --- | --- |
 | `state.json` | Derived current or terminal stage projection |
 | `decision-ledger.jsonl` | Controller routes and decisions |
-| `journal.jsonl` | Monotonic owner and side-effect intent/start/confirmation records |
+| `journal.jsonl` | Monotonic owner, stage transition, and side-effect intent/start/confirmation records |
 | `run-owner.json` | Current owner token, renewal time, lease deadline, and release state |
 | `delivery-plan.json` | Accepted spec, seams, and ticket DAG |
 | `git-base.json` | Pinned source repository and base commit |
@@ -183,6 +183,12 @@ read-only observer matches the result. Sequence numbers are contiguous and dupli
 changed intent, missing ownership, and malformed records fail closed. `state.json` records
 `wayfinder`, `spec-and-tickets`, `tracker-publish`, `implementation`, and
 `final-review` for operators, but it does not authorize replay on its own.
+
+Each stage transition appends its bounded, owner-fenced state to the journal before replacing
+`state.json`. On recovery, the latest stage event restores a missing, stale, or interrupted
+projection; reading the same completed stage does not append a duplicate transition. Older
+journals without stage events retain their existing recovery path. External effects still
+require their own intent, observation, and confirmation records.
 
 Exit codes:
 

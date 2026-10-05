@@ -23,12 +23,19 @@ After all producers settle, the runner writes one completed manifest and atomica
 ```text
 .orchestrator/quality/runs/<run-id>/
   manifest.json
+  owner.json
   producers/<producer>/producer.json
   producers/<producer>/result.json
   producers/<producer>/<raw-artifacts>
 ```
 
 The manifest records command argv, start and end time, exit outcome, tool version, bounded input identity, artifact path, SHA-256 digest, and verification status. Failed commands remain visible but cannot mark artifacts verified.
+
+One process holds the run's file lock during collection and reconciliation. The runner prepares the PID and run identity in `.claims/` before atomically publishing the pending directory. The owner record remains with the completed bundle; older bundles without it remain readable.
+
+Retrying the same invocation adopts a completed bundle after validating its identity and artifacts. If the previous owner died after manifest publication, recovery finishes the directory rename and validates the bundle before publishing result pointers, without rerunning producers. Result publication failures preserve the completed bundle for another retry.
+
+Incomplete pending runs are reclaimed only with matching ownership evidence and a dead owner. Recovery first moves them out of the canonical pending path, so an interruption during cleanup cannot strand that path without an owner. Live, mismatched, symlinked, or ownerless pending state returns `quality_run_reused` and preserves the evidence. Unpublished preparation or interrupted cleanup directories may remain under `.claims/`; recovery does not infer ownership of arbitrary leftovers or delete them automatically.
 
 ## Validation
 
@@ -42,6 +49,8 @@ The summary and enforcement commands consume the current run result. That result
 - command, timing, tool-version, result-fact, or producer-outcome mismatches.
 
 Missing, failed, stale, and mismatched evidence renders `NOT VERIFIED`. A scanner may report zero findings only when the current command succeeded and every required artifact parsed and matched its digest.
+
+Pytest reports accept `passed` and pytest 9's `subtests passed` outcomes only when their exact counts agree with the individual test records and the command exited successfully. Omitted zero-count summary fields are valid. Failed, skipped, unknown, and contradictory outcomes cannot become verified evidence.
 
 ## Commands
 

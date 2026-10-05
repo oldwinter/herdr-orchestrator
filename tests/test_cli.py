@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,14 +29,24 @@ from herdr_orchestrator.model import (
     DispatchContext,
     DispatchOutcome,
     Harness,
+    NewJob,
     ReceiptKind,
 )
 from herdr_orchestrator.readiness import BuildIdentity, ReadinessEnvironment
+from herdr_orchestrator.store import Store, StoreError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.config = replace(
+            load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+            state_db=Path(temporary.name) / "state.db",
+        )
+
     def test_readiness_probe_classifies_invalid_model_and_closes_created_agent(self) -> None:
         config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
 
@@ -73,7 +83,7 @@ class CliTests(unittest.TestCase):
         self.assertRegex(transport.closed[0], r"^doctor-hermes-[a-f0-9]{6}$")
 
     def test_doctor_fails_when_an_installed_harness_requires_auth(self) -> None:
-        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        config = self.config
         output = io.StringIO()
 
         def readiness_probe(
@@ -120,7 +130,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(droid["ok"])
 
     def test_doctor_can_filter_harnesses_and_reports_probe_timing(self) -> None:
-        config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
+        config = self.config
         output = io.StringIO()
         probed: list[Harness] = []
 
@@ -511,6 +521,69 @@ class CliTests(unittest.TestCase):
         self.assertTrue(args.failed_agents)
         self.assertFalse(args.apply)
 
+    def test_gc_missing_scope_hints_just_recipes(self) -> None:
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            cli_module.main(["gc", "--workflow", "workflow.toml"])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(stderr.getvalue(), "gc_scope_required: run just gc or just gc-failed\n")
+
+    def test_gc_help_prefers_just_recipes(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:
+            build_parser().parse_args(["gc", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("just gc", text)
+        self.assertIn("just gc-failed", text)
+        self.assertIn("dry-run", text)
+        self.assertIn("--apply", text)
+
+    def test_root_help_names_justfile_as_stable_entry(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:
+            build_parser().parse_args(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("justfile", text)
+        self.assertIn("just --list", text)
+        self.assertIn("just seed", text)
+        self.assertIn("just status", text)
+
+    def test_subcommand_help_prefers_just_recipes(self) -> None:
+        cases = (
+            ("seed", "just seed"),
+            ("status", "just status"),
+            ("doctor", "just doctor"),
+            ("retry", "just retry JOB_ID"),
+            ("resume", "just resume JOB_ID FILE"),
+            ("run", "just run-once"),
+            ("enqueue", "just enqueue"),
+        )
+        for command, recipe in cases:
+            with self.subTest(command=command):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:
+                    build_parser().parse_args([command, "--help"])
+                self.assertEqual(ctx.exception.code, 0)
+                self.assertIn(recipe, stdout.getvalue())
+
+    def test_run_help_maps_modes_to_just_recipes(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit):
+            build_parser().parse_args(["run", "--help"])
+        text = stdout.getvalue()
+        self.assertIn("just run-once", text)
+        self.assertIn("just run-until-idle", text)
+
+    def test_retry_and_resume_help_explain_job_id_source(self) -> None:
+        for command in ("retry", "resume"):
+            with self.subTest(command=command):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaises(SystemExit):
+                    build_parser().parse_args([command, "--help"])
+                self.assertIn("just status", stdout.getvalue())
+
     def test_smoke_uses_target_files_and_requires_an_output_receipt(self) -> None:
         base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
 
@@ -615,6 +688,59 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.controller_harness, "grok")
         self.assertEqual(args.worker_harness, ["codex"])
 
+    def test_retry_missing_job_hints_status(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch.object(cli_module, "load_workflow", return_value=self.config),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(
+                cli_module.main(["retry", "--workflow", "workflow.toml", "--job-id", "1"]),
+                2,
+            )
+        self.assertEqual(stderr.getvalue(), "job_not_found: run just status\n")
+
+    def test_retry_pending_job_hints_status(self) -> None:
+        store = Store(self.config.state_db)
+        store.initialize()
+        job_id, _ = store.enqueue(
+            NewJob(
+                workflow=self.config.name,
+                title="pending",
+                harness=Harness.CODEX,
+                prompt="review",
+                dedupe_key="pending-retry-v1",
+                max_attempts=1,
+                workspace=str(self.config.workspace.resolve()),
+            )
+        )
+        args = Namespace(job_id=job_id, extra_attempts=1)
+
+        with self.assertRaisesRegex(StoreError, r"^job_not_retryable: run just status$"):
+            cli_module._command_retry(self.config, args)
+
+    def test_retry_keeps_other_store_errors(self) -> None:
+        args = Namespace(job_id=1, extra_attempts=1)
+        store = MagicMock()
+        store.retry_failed.side_effect = StoreError("extra_attempts_out_of_range")
+        with (
+            patch.object(cli_module, "Store", return_value=store),
+            self.assertRaisesRegex(StoreError, r"^extra_attempts_out_of_range$"),
+        ):
+            cli_module._command_retry(self.config, args)
+
+    def test_status_empty_queue_hints_seed_or_enqueue(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(cli_module._command_status(self.config, Namespace()), 0)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["jobs"], [])
+        self.assertEqual(payload["counts"]["pending"], 0)
+        self.assertEqual(stderr.getvalue(), "queue_empty: run just seed or just enqueue\n")
+
 
 class CliCommandDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -641,6 +767,23 @@ class CliCommandDispatchTests(unittest.TestCase):
             self.assertEqual(cli_module._command_status(self.config, args), 0)
         self.assertIn('"added": 2', output.getvalue())
         store.initialize.assert_called()
+
+    def test_status_populated_queue_skips_empty_hint(self) -> None:
+        args = Namespace()
+        store = MagicMock()
+        store.status_counts.return_value = {"pending": 1}
+        store.jobs.return_value = [{"id": 1, "state": "succeeded", "harness": "codex"}]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(cli_module, "Store", return_value=store),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(cli_module._command_status(self.config, args), 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload["jobs"]), 1)
+        self.assertNotIn("queue_empty", stderr.getvalue())
 
     def test_enqueue_and_run_modes_forward_typed_arguments(self) -> None:
         coordinator = MagicMock()

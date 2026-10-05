@@ -7,6 +7,7 @@ from pathlib import Path
 
 from herdr_orchestrator.model import PlacementMode, PlacementTarget
 from herdr_orchestrator.topology import (
+    PLACEMENT_KEYS,
     TopologyDecisionError,
     load_topology_decision,
     short_display_label,
@@ -99,7 +100,7 @@ class TopologyTests(unittest.TestCase):
 
     def test_controller_decision_is_strict_and_git_aware(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "topology.json"
+            output = Path(temporary).resolve() / "topology.json"
             output.write_text(
                 json.dumps(
                     {
@@ -138,10 +139,12 @@ class TopologyTests(unittest.TestCase):
             prompt,
         )
         self.assertNotIn('"placement":"tab|pane|worktree"', prompt)
+        schema = json.loads(prompt.split("Exact schema:\n", 1)[1].split("\n", 1)[0])
+        self.assertEqual(set(schema), set(PLACEMENT_KEYS))
 
     def test_rejects_worktree_without_git_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "topology.json"
+            output = Path(temporary).resolve() / "topology.json"
             output.write_text(
                 '{"placement":"worktree","rationale":"Needs isolation."}',
                 encoding="utf-8",
@@ -155,7 +158,7 @@ class TopologyTests(unittest.TestCase):
 
     def test_rejects_duplicate_controller_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "topology.json"
+            output = Path(temporary).resolve() / "topology.json"
             output.write_text(
                 '{"placement":"pane","placement":"worktree","rationale":"Ambiguous."}',
                 encoding="utf-8",
@@ -175,11 +178,11 @@ class TopologyTests(unittest.TestCase):
                 "topology_output_unreadable",
             ),
         ):
-            load_topology_decision(Path(temporary), supports_worktree=True)
+            load_topology_decision(Path(temporary).resolve(), supports_worktree=True)
 
     def test_rejects_symlinked_controller_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             target = root / "target.json"
             target.write_text(
                 '{"placement":"pane","rationale":"ok"}',
@@ -203,7 +206,7 @@ class TopologyTests(unittest.TestCase):
 
     def test_rejects_symlinked_controller_output_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             target = root / "target"
             target.mkdir()
             output = root / "runtime" / "topology.json"
@@ -217,7 +220,7 @@ class TopologyTests(unittest.TestCase):
 
     def test_rejects_oversized_controller_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "topology.json"
+            output = Path(temporary).resolve() / "topology.json"
             with output.open("wb") as stream:
                 stream.truncate(32 * 1024 * 1024 + 1)
 
@@ -253,7 +256,7 @@ class TopologyTests(unittest.TestCase):
 
     def test_rejects_nonstandard_json_constants(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "topology.json"
+            output = Path(temporary).resolve() / "topology.json"
             output.write_text(
                 '{"placement":"pane","rationale":NaN}',
                 encoding="utf-8",
@@ -267,7 +270,7 @@ class TopologyTests(unittest.TestCase):
 
     def test_rejects_nul_in_controller_rationale(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "topology.json"
+            output = Path(temporary).resolve() / "topology.json"
             output.write_text(
                 '{"placement":"pane","rationale":"ok\\u0000bad"}',
                 encoding="utf-8",
@@ -281,7 +284,7 @@ class TopologyTests(unittest.TestCase):
 
     def test_rejects_unencodable_controller_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "topology.json"
+            output = Path(temporary).resolve() / "topology.json"
             output.write_text(
                 '{"placement":"pane","rationale":"\\ud800"}',
                 encoding="utf-8",

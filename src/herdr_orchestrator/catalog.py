@@ -44,7 +44,7 @@ def load_harness_profiles(directory: Path) -> tuple[HarnessProfile, ...]:
         profiles.append(profile)
         seen.add(profile.harness)
     if not profiles:
-        raise CatalogError("profiles_empty")
+        raise CatalogError(f"profiles_empty: {directory} (*.toml)")
     return tuple(profiles)
 
 

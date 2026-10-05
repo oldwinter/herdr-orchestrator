@@ -45,7 +45,7 @@ def render() -> str:
         "Run commands from a source checkout with `uv run python -m herdr_orchestrator`.",
         "",
     ]
-    for name, command in sorted(subcommands.choices.items()):
+    for name, command in _commands(subcommands):
         lines.extend((f"## `{name}`", "", f"`herdr-orchestrator {name} [arguments]`", ""))
         options = [action for action in command._actions if action.dest != "help"]
         if options:
@@ -55,6 +55,20 @@ def render() -> str:
                 lines.append(f"| `{option_name(action)}` | {required} |")
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _commands(
+    subcommands: argparse._SubParsersAction[argparse.ArgumentParser],
+    prefix: str = "",
+) -> list[tuple[str, argparse.ArgumentParser]]:
+    commands = []
+    for name, parser in sorted(subcommands.choices.items()):
+        full_name = f"{prefix} {name}".strip()
+        commands.append((full_name, parser))
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                commands.extend(_commands(action, full_name))
+    return commands
 
 
 def main() -> int:

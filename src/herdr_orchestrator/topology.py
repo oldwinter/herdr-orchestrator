@@ -38,7 +38,9 @@ WRITE_SIGNALS = (
     "refactor",
 )
 LABEL_CHAR = re.compile(r"[^a-z0-9]+")
-PLACEMENT_KEYS = {"placement", "rationale"}
+# Canonical key set for the topology decision artifact: the prompt example and
+# the fail-closed loader below both derive from this tuple.
+PLACEMENT_KEYS = ("placement", "rationale")
 TOPOLOGY_OUTPUT_MAX_BYTES = 32 * 1024 * 1024
 
 
@@ -94,6 +96,10 @@ def topology_decision_prompt(
         if supports_worktree
         else ""
     )
+    schema = json.dumps(
+        {key: "pane" if key == "placement" else "..." for key in PLACEMENT_KEYS},
+        separators=(",", ":"),
+    )
     return f"""
 Choose the Herdr execution topology for one already accepted local task.
 
@@ -113,7 +119,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{"placement":"pane","rationale":"..."}}
+{schema}
 """.strip()
 
 
@@ -136,7 +142,7 @@ def load_topology_decision(
         raise TopologyDecisionError("topology_output_invalid_json") from exc
     except RecursionError as exc:
         raise TopologyDecisionError("topology_output_invalid_json") from exc
-    if not isinstance(payload, dict) or set(payload) != PLACEMENT_KEYS:
+    if not isinstance(payload, dict) or set(payload) != set(PLACEMENT_KEYS):
         raise TopologyDecisionError("topology_output_invalid_shape")
     rationale = payload.get("rationale")
     if (

@@ -37,7 +37,7 @@ Active contributors: oldwinter, chendongdong
 | Pylint | 检查命名与重复代码 |
 | Vulture | dead code，最低置信度 90 |
 | Xenon | 圈复杂度：absolute C、module B、average A |
-| import-linter | 执行 `.importlinter` 中 model/protocol 叶子模块边界 |
+| import-linter | 执行 `.importlinter` 中 model/protocol 叶子模块、Dashboard 只读和 delivery_support 边界 |
 | deptry | 检查 `src/` 中未使用、缺失或不合适依赖 |
 | `scripts/check_repository.py` | 文件大小、行数和技术债 marker |
 | `scripts/check_feature_flags.py` | feature flag 声明、consumer、文档、环境示例与测试 |
@@ -46,16 +46,17 @@ Active contributors: oldwinter, chendongdong
 
 格式问题应修改源文件，不要给工具增加宽泛 ignore。`.importlinter` 明确禁止
 `src/herdr_orchestrator/model.py` 和 `src/herdr_orchestrator/protocol.py` 反向依赖
-catalog、CLI、config、delivery、Herdr、runner 或 store 等编排模块。
+catalog、CLI、config、delivery 拆分模块、Dashboard、Herdr、runner 或 store 等编排模块，
+并禁止 Dashboard 导入 write-capable 编排模块、禁止 `delivery_support.py` 导入 delivery mixin。
 
 ## 仓库策略检查
 
 `scripts/check_repository.py` 同时检查 tracked 与未忽略的 untracked 文件：
 
 - 单文件默认不超过 512 KiB；
-- Python source 不超过 1,500 行；
-- `tests/` 中 Python 文件不超过 2,500 行；
-- 其他受检文本不超过 2,000 行；
+- Python source 不超过 1,500 行，且至少留 1 行余量；
+- `tests/` 中 Python 文件不超过 2,500 行，且至少留 1 行余量；
+- 其他受检文本不超过 2,000 行，且至少留 1 行余量；
 - 技术债标记必须使用 `TODO(#123 owner=name):` 这类带 issue 和 owner 的格式。
 
 `src/herdr_orchestrator/dashboard/static/cytoscape.min.js` 是明确的 vendored 大小豁免。

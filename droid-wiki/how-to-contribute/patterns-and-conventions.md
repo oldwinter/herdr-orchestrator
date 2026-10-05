@@ -5,7 +5,7 @@ Active contributors: oldwinter, chendongdong
 
 ## 模块边界
 
-`src/herdr_orchestrator/model.py` 保存跨模块不可变数据结构，`src/herdr_orchestrator/protocol.py` 保存子进程命令协议。`.importlinter` 禁止这两个叶子模块依赖 coordinator、store、delivery 或 CLI。新领域类型应先判断是否被三个以上系统共享，再决定是否放入 model。
+`src/herdr_orchestrator/model.py` 保存跨模块不可变数据结构，`src/herdr_orchestrator/protocol.py` 保存子进程命令协议。`.importlinter` 禁止这两个叶子模块依赖 coordinator、store、delivery 拆分模块、Dashboard 或 CLI；Dashboard 不得导入 delivery、runner、Herdr transport 或 tracker；`delivery_support.py` 不得导入 delivery mixin 或 queue store。新领域类型应先判断是否被三个以上系统共享，再决定是否放入 model。
 
 业务流由较深模块组合：
 

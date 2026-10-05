@@ -29,6 +29,7 @@ from herdr_orchestrator.delivery import (
     StandardizedDelivery,
 )
 from herdr_orchestrator.delivery_protocol import DeliveryArtifactError
+from herdr_orchestrator.drift import BaseDriftGuard
 from herdr_orchestrator.git_workspace import GitWorkspaceError
 from herdr_orchestrator.harness_health import HarnessHealth
 from herdr_orchestrator.herdr import HerdrTransport, doctor_agent_name, smoke_agent_name
@@ -46,6 +47,8 @@ from herdr_orchestrator.model import (
     WorkflowConfig,
 )
 from herdr_orchestrator.observability import Observability
+from herdr_orchestrator.orca import add_parser as add_orca_parser
+from herdr_orchestrator.orca import command as orca_command
 from herdr_orchestrator.protocol import TransportError
 from herdr_orchestrator.readiness import (
     BuildIdentity,
@@ -58,17 +61,40 @@ from herdr_orchestrator.readiness import (
 )
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.store import Store, StoreError
+from herdr_orchestrator.supervision_cli import add_parser as add_supervision_parser
+from herdr_orchestrator.supervision_cli import command as supervision_command
 from herdr_orchestrator.tracker import TrackerError
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Durable multi-harness orchestration over Herdr.")
+    parser = argparse.ArgumentParser(
+        description="Durable multi-harness orchestration over Herdr.",
+        epilog=(
+            "The justfile is the stable entry point: prefer just seed, "
+            "just status, just dashboard and friends. Run just --list for "
+            "every recipe."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("seed", "status"):
-        command = subparsers.add_parser(name)
-        command.add_argument("--workflow", required=True)
+    add_supervision_parser(subparsers)
+    add_orca_parser(subparsers)
 
-    doctor_parser = subparsers.add_parser("doctor")
+    seed_parser = subparsers.add_parser(
+        "seed",
+        description="Prefer just seed; it supplies --workflow.",
+    )
+    seed_parser.add_argument("--workflow", required=True)
+
+    status_parser = subparsers.add_parser(
+        "status",
+        description="Prefer just status; it supplies --workflow.",
+    )
+    status_parser.add_argument("--workflow", required=True)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        description="Prefer just doctor; it supplies --workflow.",
+    )
     doctor_parser.add_argument("--workflow", required=True)
     doctor_parser.add_argument("--probe-timeout-seconds", type=int, default=30)
     doctor_parser.add_argument(
@@ -88,9 +114,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Limit evidence to one enabled harness; repeat for more than one.",
     )
 
-    retry_parser = subparsers.add_parser("retry")
+    retry_parser = subparsers.add_parser(
+        "retry",
+        description="Prefer just retry JOB_ID; it supplies --workflow.",
+    )
     retry_parser.add_argument("--workflow", required=True)
-    retry_parser.add_argument("--job-id", type=int, required=True)
+    retry_parser.add_argument(
+        "--job-id",
+        type=int,
+        required=True,
+        help="Failed job id; list job ids with just status.",
+    )
     retry_parser.add_argument("--extra-attempts", type=int, choices=range(1, 11), default=1)
 
     migrate_parser = subparsers.add_parser(
@@ -99,17 +133,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate_parser.add_argument("--workflow", required=True)
 
-    resume_parser = subparsers.add_parser("resume")
+    resume_parser = subparsers.add_parser(
+        "resume",
+        description=(
+            "Prefer just resume JOB_ID FILE; it supplies --workflow. "
+            "JOB_ID is the blocked job id from just status and FILE is the "
+            "response file answered by the operator."
+        ),
+    )
     resume_parser.add_argument("--workflow", required=True)
-    resume_parser.add_argument("--job-id", type=int, required=True)
-    resume_parser.add_argument("--response-file", required=True)
+    resume_parser.add_argument(
+        "--job-id",
+        type=int,
+        required=True,
+        help="Blocked job id; list job ids with just status.",
+    )
+    resume_parser.add_argument(
+        "--response-file",
+        required=True,
+        help="Operator answer file that unblocks the job.",
+    )
 
-    gc_parser = subparsers.add_parser("gc")
+    gc_parser = subparsers.add_parser(
+        "gc",
+        description=(
+            "Prefer just gc / just gc-failed. "
+            "--apply actually closes agents; default is dry-run."
+        ),
+    )
     gc_parser.add_argument("--workflow", required=True)
     gc_scope = gc_parser.add_mutually_exclusive_group(required=True)
     gc_scope.add_argument("--succeeded-agents", action="store_true")
     gc_scope.add_argument("--failed-agents", action="store_true")
-    gc_parser.add_argument("--apply", action="store_true")
+    gc_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Close agents. Default is dry-run.",
+    )
+    _gc_error = gc_parser.error
+
+    def _hint_just_gc(message: str) -> None:
+        if "succeeded-agents" in message and "failed-agents" in message:
+            gc_parser.exit(2, "gc_scope_required: run just gc or just gc-failed\n")
+        _gc_error(message)
+
+    gc_parser.error = _hint_just_gc  # type: ignore[assignment]
 
     smoke_parser = subparsers.add_parser("smoke")
     smoke_parser.add_argument("--workflow", required=True)
@@ -135,20 +203,39 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.add_argument("--poll-seconds", type=float, default=2.0)
 
-    run = subparsers.add_parser("run")
+    run = subparsers.add_parser(
+        "run",
+        description=(
+            "Prefer just run, just run-once or just run-until-idle; " "they supply --workflow."
+        ),
+    )
     run.add_argument("--workflow", required=True)
     run_mode = run.add_mutually_exclusive_group()
-    run_mode.add_argument("--once", action="store_true")
+    run_mode.add_argument(
+        "--once",
+        action="store_true",
+        help="Dispatch a single cycle; same as just run-once.",
+    )
     run_mode.add_argument(
         "--until-idle",
         "--drain",
         dest="until_idle",
         action="store_true",
+        help="Drain the queue until idle; same as just run-until-idle.",
     )
     run.add_argument("--drain-timeout-seconds", type=int, default=86400)
+    run.add_argument("--base-ref", help="Opt-in pre-claim guard against this local Git ref.")
+    run.add_argument("--max-base-behind", type=int, default=20)
     _add_selection_arguments(run)
 
-    enqueue = subparsers.add_parser("enqueue")
+    enqueue = subparsers.add_parser(
+        "enqueue",
+        description=(
+            "Prefer just enqueue HARNESS TITLE PROMPT_FILE DEDUPE_KEY "
+            "(or just enqueue-auto TITLE PROMPT_FILE DEDUPE_KEY); they "
+            "supply --workflow."
+        ),
+    )
     enqueue.add_argument("--workflow", required=True)
     enqueue.add_argument(
         "--harness",
@@ -158,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--title", required=True)
     enqueue.add_argument("--prompt-file", required=True)
     enqueue.add_argument("--dedupe-key", required=True)
+    enqueue.add_argument("--depends-on", type=int, action="append", default=[])
     enqueue.add_argument(
         "--placement",
         choices=["auto", *(item.value for item in PlacementTarget)],
@@ -228,13 +316,19 @@ def _command_seed(config: WorkflowConfig, args: argparse.Namespace) -> int:
 def _command_retry(config: WorkflowConfig, args: argparse.Namespace) -> int:
     store = Store(config.state_db)
     store.initialize()
-    result = store.retry_failed(
-        config.name,
-        args.job_id,
-        extra_attempts=args.extra_attempts,
-        workspace=str(config.workspace.resolve()),
-        include_legacy=True,
-    )
+    try:
+        result = store.retry_failed(
+            config.name,
+            args.job_id,
+            extra_attempts=args.extra_attempts,
+            workspace=str(config.workspace.resolve()),
+            include_legacy=True,
+        )
+    except StoreError as exc:
+        code = str(exc)
+        if code in {"job_not_found", "job_not_retryable"}:
+            raise StoreError(f"{code}: run just status") from exc
+        raise
     print(json.dumps(result, sort_keys=True))
     return 0
 
@@ -290,6 +384,7 @@ def _command_enqueue(config: WorkflowConfig, args: argparse.Namespace) -> int:
         title=args.title,
         prompt_file=Path(args.prompt_file).expanduser().resolve(),
         dedupe_key=args.dedupe_key,
+        depends_on=tuple(getattr(args, "depends_on", ())),
         placement=None if args.placement == "auto" else PlacementTarget(args.placement),
         receipt=_task_receipt_from_args(args),
         completion_policy=(
@@ -437,6 +532,8 @@ def _command_status(config: WorkflowConfig, args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
+    if not jobs:
+        print("queue_empty: run just seed or just enqueue", file=sys.stderr)
     return 0
 
 
@@ -489,6 +586,8 @@ def _command_profile(config: WorkflowConfig, args: argparse.Namespace) -> int:
 
 CommandHandler = Callable[[WorkflowConfig, argparse.Namespace], int]
 COMMAND_HANDLERS: Mapping[str, CommandHandler] = {
+    "orca": orca_command,
+    "orchestration": supervision_command,
     "catalog": _command_catalog,
     "dashboard": _command_dashboard,
     "deliver": _command_deliver,
@@ -1118,6 +1217,11 @@ def _coordinator_from_args(
         health=health,
         readiness_probe=readiness_probe,
         observability=observability,
+        drift_guard=(
+            BaseDriftGuard(args.base_ref, args.max_base_behind)
+            if getattr(args, "base_ref", None)
+            else None
+        ),
     )
 
 

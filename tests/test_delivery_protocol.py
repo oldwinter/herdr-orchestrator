@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,17 +13,80 @@ from herdr_orchestrator.delivery_protocol import (
     DeliveryArtifactError,
     DeliveryTicket,
     ProxyAction,
+    append_artifact_text,
     load_delivery_plan,
     load_proxy_decision,
     load_review_verdict,
     load_ticket_receipt,
+    read_artifact_text,
 )
+
+
+class ArtifactTextTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_fifo_without_peer_is_rejected_without_blocking(self) -> None:
+        script = """
+import sys
+from pathlib import Path
+from herdr_orchestrator.delivery_protocol import (
+    DeliveryArtifactError, append_artifact_text, read_artifact_text,
+)
+try:
+    if sys.argv[2] == "read":
+        read_artifact_text(Path(sys.argv[1]), "receipt")
+    else:
+        append_artifact_text(Path(sys.argv[1]), "content")
+except DeliveryArtifactError as error:
+    print(error)
+else:
+    raise AssertionError("FIFO was accepted")
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "artifact.fifo"
+            os.mkfifo(path)
+            for operation, error in (
+                ("read", "receipt_unreadable"),
+                ("append", "delivery_artifact_write_failed"),
+            ):
+                with self.subTest(operation=operation):
+                    result = subprocess.run(
+                        [sys.executable, "-c", script, str(path), operation],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), error)
+
+    def test_creates_appends_and_reads_a_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "artifact.txt"
+            append_artifact_text(path, "first\n")
+            append_artifact_text(path, "second\n")
+
+            self.assertEqual(read_artifact_text(path, "receipt"), "first\nsecond\n")
+
+    def test_rejects_symlinks_without_changing_the_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target = root / "target.txt"
+            target.write_text("original\n", encoding="utf-8")
+            path = root / "artifact.txt"
+            path.symlink_to(target.name)
+
+            with self.assertRaisesRegex(DeliveryArtifactError, "^receipt_path_invalid$"):
+                read_artifact_text(path, "receipt")
+            with self.assertRaisesRegex(DeliveryArtifactError, "^delivery_artifact_path_invalid$"):
+                append_artifact_text(path, "content")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
 
 
 class DeliveryProtocolTests(unittest.TestCase):
     def test_loads_dependency_ordered_tracer_bullet_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text(json.dumps(_plan()), encoding="utf-8")
 
             plan = load_delivery_plan(path)
@@ -31,7 +97,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_rejects_ticket_that_precedes_its_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             payload = _plan()
             payload["tickets"][0]["blocked_by"] = ["02"]
             path.write_text(json.dumps(payload), encoding="utf-8")
@@ -44,7 +110,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_proxy_requires_secret_and_production_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "decision.json"
+            path = Path(temporary).resolve() / "decision.json"
             path.write_text(
                 json.dumps(
                     {
@@ -81,7 +147,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_review_verdict_must_account_for_every_finding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_text(
                 json.dumps(
                     {
@@ -111,7 +177,7 @@ class DeliveryProtocolTests(unittest.TestCase):
             acceptance_criteria=("The behavior works.",),
         )
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "receipt.json"
+            path = Path(temporary).resolve() / "receipt.json"
             payload = _receipt()
             path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -128,7 +194,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_review_verdict_rejects_duplicate_finding_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_text(
                 json.dumps(
                     {
@@ -148,7 +214,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_rejects_duplicate_json_object_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_text(
                 """{
                     "accepted": [],
@@ -167,7 +233,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_invalid_utf8_is_reported_as_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_bytes(b"\xff")
 
             with self.assertRaisesRegex(
@@ -178,7 +244,7 @@ class DeliveryProtocolTests(unittest.TestCase):
 
     def test_oversized_json_integer_is_reported_as_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "verdict.json"
+            path = Path(temporary).resolve() / "verdict.json"
             path.write_text(
                 '{"accepted":' + "9" * 5_000 + ',"dismissed":[],"rationale":"valid"}',
                 encoding="utf-8",
@@ -199,7 +265,7 @@ class DeliveryProtocolTests(unittest.TestCase):
             acceptance_criteria=("The behavior works.",),
         )
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "missing.json"
+            path = Path(temporary).resolve() / "missing.json"
 
             with self.assertRaisesRegex(
                 DeliveryArtifactError,

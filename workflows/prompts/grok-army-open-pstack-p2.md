@@ -1,0 +1,1 @@
+在 `/Users/oldwinter/Code/grok-army-campaign/open-pstack` 做第二轮「设计」工作。跳过已有 Grok lane vs parent install issue。找一个具体文档/信息架构设计问题。`gh issue create --repo oldwinter/open-pstack`，标题或正文含「设计」。本地改进，不要 push/PR/merge。追加写入 `/Users/oldwinter/Code/herdr-orchestrator/.orchestrator/grok-army/issues.txt`。

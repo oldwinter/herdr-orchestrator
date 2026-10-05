@@ -8,6 +8,9 @@ from pathlib import Path
 from herdr_orchestrator.model import Harness
 from herdr_orchestrator.planner import (
     MAX_PLANNER_OUTPUT_BYTES,
+    PLANNER_OUTPUT_KEYS,
+    PLANNER_TASK_KEYS,
+    WORKER_SELECTION_KEYS,
     PlannerOutputError,
     load_planner_tasks,
     load_worker_selection,
@@ -20,7 +23,7 @@ class PlannerTests(unittest.TestCase):
     def test_prompt_exposes_compact_catalog_and_dynamic_selection_rule(self) -> None:
         prompt = planner_prompt(
             "Plan work.",
-            Path("/tmp/plan.json"),
+            (Path(tempfile.gettempdir()).resolve() / "plan.json"),
             3,
             '{"harnesses":[{"harness":"codex","summary":"coding"}]}',
             (Harness.CODEX,),
@@ -30,11 +33,11 @@ class PlannerTests(unittest.TestCase):
         self.assertNotIn("claude", prompt)
         self.assertNotIn("hermes", prompt)
         self.assertIn("按需加载所选 harness 的完整 profile", prompt)
-        self.assertIn("/tmp/plan.json", prompt)
+        self.assertIn(str(Path(tempfile.gettempdir()).resolve() / "plan.json"), prompt)
 
     def test_loads_valid_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text(
                 json.dumps(
                     {
@@ -58,7 +61,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_worker_selection_is_limited_to_allowed_harnesses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "route.json"
+            path = Path(temporary).resolve() / "route.json"
             path.write_text('{"harness":"grok"}', encoding="utf-8")
 
             selected = load_worker_selection(
@@ -76,9 +79,26 @@ class PlannerTests(unittest.TestCase):
         self.assertIn('"harness":"grok|codex"', prompt)
         self.assertNotIn("claude", prompt)
 
+    def test_prompt_schema_examples_share_loader_key_sets(self) -> None:
+        out = Path(tempfile.gettempdir()).resolve() / "out.json"
+        catalog = '{"harnesses":[{"harness":"codex","summary":"coding"}]}'
+        planner = planner_prompt("Plan work.", out, 3, catalog, (Harness.CODEX,))
+        marker = "严格符合：\n"
+        planner_schema = json.loads(planner[planner.index(marker) + len(marker) :].split("\n")[0])
+        self.assertEqual(set(planner_schema), set(PLANNER_OUTPUT_KEYS))
+        self.assertEqual(set(planner_schema["tasks"][0]), set(PLANNER_TASK_KEYS))
+
+        selection = worker_selection_prompt(
+            "Implement the feature.", out, catalog, (Harness.CODEX,)
+        )
+        selection_schema = json.loads(
+            selection[selection.index(marker) + len(marker) :].split("\n")[0]
+        )
+        self.assertEqual(set(selection_schema), set(WORKER_SELECTION_KEYS))
+
     def test_rejects_worker_selection_outside_allowed_pool(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "route.json"
+            path = Path(temporary).resolve() / "route.json"
             path.write_text('{"harness":"claude"}', encoding="utf-8")
 
             with self.assertRaisesRegex(PlannerOutputError, "not_allowed"):
@@ -89,7 +109,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_rejects_shell_command_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text(
                 json.dumps(
                     {
@@ -118,7 +138,7 @@ class PlannerTests(unittest.TestCase):
             "dedupe_key": "unsafe-v1",
         }
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             for key in ("shell_command", "argv"):
                 path.write_text(
                     json.dumps({"tasks": [{**task, key: ["sh", "-c", "echo unsafe"]}]}),
@@ -129,7 +149,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_rejects_duplicate_dedupe_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             task = {
                 "title": "One",
                 "harness": "pi",
@@ -143,7 +163,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_rejects_duplicate_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text(
                 '{"tasks":[],"tasks":[{"title":"T","harness":"codex",'
                 '"prompt":"P","dedupe_key":"k"}]}',
@@ -155,7 +175,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_rejects_duplicate_task_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text(
                 '{"tasks":[{"title":"T","harness":"codex","prompt":"P",'
                 '"dedupe_key":"k","dedupe_key":"other"}]}',
@@ -167,7 +187,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_rejects_invalid_utf8_planner_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_bytes(b'{"tasks": []}\xff')
 
             with self.assertRaisesRegex(PlannerOutputError, "planner_output_unreadable"):
@@ -175,7 +195,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_rejects_symlinked_planner_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             target = root / "target.json"
             target.write_text('{"tasks": []}', encoding="utf-8")
             path = root / "plan.json"
@@ -189,11 +209,11 @@ class PlannerTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as temporary,
             self.assertRaisesRegex(PlannerOutputError, "planner_output_unreadable"),
         ):
-            load_planner_tasks(Path(temporary), max_tasks=10)
+            load_planner_tasks(Path(temporary).resolve(), max_tasks=10)
 
     def test_rejects_oversized_planner_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             with path.open("wb") as output:
                 output.truncate(MAX_PLANNER_OUTPUT_BYTES + 1)
 
@@ -202,7 +222,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_rejects_invalid_max_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text('{"tasks": []}', encoding="utf-8")
 
             with self.assertRaisesRegex(PlannerOutputError, "planner_max_tasks_invalid"):
@@ -216,7 +236,7 @@ class PlannerTests(unittest.TestCase):
             "dedupe_key": "k",
         }
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text(
                 json.dumps(
                     {
@@ -258,7 +278,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_worker_selection_rejects_duplicate_keys_and_invalid_utf8(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             duplicate = root / "duplicate.json"
             duplicate.write_text(
                 '{"harness":"codex","harness":"grok"}',
@@ -283,7 +303,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_rejects_nul_in_task_text(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "plan.json"
+            path = Path(temporary).resolve() / "plan.json"
             path.write_text(
                 json.dumps(
                     {

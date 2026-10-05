@@ -22,6 +22,7 @@ _ENV_ASSIGNMENT = re.compile(
     re.MULTILINE,
 )
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_FEATURE_ENVIRONMENT_VARIABLE = re.compile(r"HERDR_FEATURE_[A-Z0-9_]+")
 
 
 def _python_references(
@@ -106,14 +107,40 @@ def _markdown_table_values(text: str) -> set[str]:
     return values
 
 
-def _environment_assignments(text: str) -> dict[str, str]:
+def _environment_assignments(text: str) -> tuple[dict[str, str], set[str]]:
     assignments: dict[str, str] = {}
+    duplicates: set[str] = set()
     for match in _ENV_ASSIGNMENT.finditer(text):
         value = match.group("value").strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1].strip()
-        assignments[match.group("name")] = value
-    return assignments
+        name = match.group("name")
+        if name in assignments:
+            duplicates.add(name)
+        assignments[name] = value
+    return assignments, duplicates
+
+
+def _environment_literal_references(root: Path) -> tuple[list[tuple[Path, str]], list[str]]:
+    references: list[tuple[Path, str]] = []
+    failures: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "feature_flags.py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, UnicodeError) as exc:
+            failures.append(f"{path}: unable to read Python source: {type(exc).__name__}")
+            continue
+        except (SyntaxError, ValueError) as exc:
+            failures.append(f"{path}:{getattr(exc, 'lineno', 0) or 0}: Python parse failed")
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            for variable in _FEATURE_ENVIRONMENT_VARIABLE.findall(node.value):
+                references.append((path, variable))
+    return references, failures
 
 
 def _read(path: Path, failures: list[str]) -> str:
@@ -125,6 +152,7 @@ def _read(path: Path, failures: list[str]) -> str:
 
 
 def policy_failures(root: Path | None = None) -> list[str]:
+    policy_root = ROOT if root is None else root
     if root is None:
         source, tests = SOURCE, TESTS
         lifecycle_path, observability_path, example_path = LIFECYCLE, OBSERVABILITY, EXAMPLE
@@ -180,6 +208,11 @@ def policy_failures(root: Path | None = None) -> list[str]:
     tests_found, test_failures = _python_references(tests)
     failures.extend(production_failures)
     failures.extend(test_failures)
+    environment_literals, environment_literal_failures = _environment_literal_references(source)
+    failures.extend(environment_literal_failures)
+    for path, variable in environment_literals:
+        relative = path.relative_to(policy_root).as_posix()
+        failures.append(f"{relative}: {variable} bypasses typed feature flags")
     for unknown in sorted(production - declared_names):
         failures.append(f"{unknown}: production reference has no declared flag")
     for unknown in sorted(tests_found - declared_names):
@@ -198,8 +231,11 @@ def policy_failures(root: Path | None = None) -> list[str]:
         if len(cells) < 6 or any(not cells[index] for index in (1, 2, 3, 4, 5)):
             failures.append(f"{value}: lifecycle row is incomplete")
     declared_values = {flag.value for flag in variables}
-    environment_assignments = _environment_assignments(example)
+    environment_assignments, duplicate_assignments = _environment_assignments(example)
     declared_variables = set(variables.values())
+    for duplicate in sorted(duplicate_assignments):
+        if duplicate.startswith("HERDR_FEATURE_"):
+            failures.append(f"{duplicate}: duplicate .env.example assignments")
     for unknown in sorted(
         name
         for name in environment_assignments

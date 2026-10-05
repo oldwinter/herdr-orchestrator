@@ -174,13 +174,19 @@ def _attention(
                 )
             )
         updated_at = job.get("updated_at")
-        if state == "running" and isinstance(updated_at, (int, float)) and now - updated_at > 300:
+        lease_until = job.get("lease_until")
+        if (
+            state == "running"
+            and isinstance(updated_at, (int, float))
+            and now - updated_at > 300
+            and not isinstance(lease_until, (int, float))
+        ):
             items.append(
                 _job_attention(
                     job,
                     "warning",
                     "job_stale",
-                    "No durable state change for more than 5 minutes",
+                    "Running job has no lease and no durable state change for more than 5 minutes",
                 )
             )
     return items

@@ -64,13 +64,15 @@ Herdr transport 失败不会伪造空的健康运行态，而是返回 `HerdrObs
 | `topology` | 兼容的 `workspaces` 视图和新增的 `projects` compound 视图 |
 | `timeline` | job enqueue 与 receipt 事件，按时间倒序最多 100 条 |
 
-当前漂移规则包括：running job 缺少 agent、terminal job 的 agent 仍在 working、workspace 不一致，以及 running lease 已过期。running job 超过 5 分钟没有 durable state change 会额外产生 `job_stale` attention。所有诊断均只读，不触发恢复或重试。
+当前漂移规则包括：running job 缺少 agent、terminal job 的 agent 仍在 working、workspace 不一致，以及 running lease 已过期。`job_stale` 只在 running job 缺少 lease 且超过 5 分钟没有 durable state change 时出现；仍持有有效 lease 的长任务不会因此告警。timeline 只投影 `is_stale = 0` 的 receipt，崩溃恢复留下的 audit 行不进入实时历史。所有诊断均只读，不触发恢复或重试。
 
 ### Feed 与 Monitor：线程间发布最新值
 
 `DashboardMonitor` 以配置的 poll interval 调用 projector，并把每次结果发布到 `SnapshotFeed`。Feed 以 `threading.Condition` 保护递增 event ID 与最新 snapshot，支持读取当前值和等待比指定 ID 更新的值。
 
 如果投影抛出未处理异常，monitor 仍发布一份降级 snapshot，只暴露异常类型，并将 queue 标为 unavailable；后台线程不会因此永久停止。浏览器给出超前的 `Last-Event-ID` 时，feed 会把当前 event ID 与 snapshot 发回，帮助客户端重新同步。
+
+同一进程最多 16 条 `/api/events` 连接。超出的请求得到 `503 {"error":"dashboard_sse_limit"}`，不挤掉已有流。
 
 ### HTTP/SSE：同一 feed 的两种读取方式
 

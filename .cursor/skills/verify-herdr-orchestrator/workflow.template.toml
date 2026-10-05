@@ -1,0 +1,61 @@
+schema_version = 1
+name = "verify-orchestrator"
+workspace = "__WORKSPACE__"
+state_db = "__STATE_DB__"
+profiles_dir = "__PROFILES_DIR__"
+
+[coordinator]
+poll_seconds = 5
+max_parallel = 6
+lease_seconds = 32400
+max_attempts = 2
+agent_timeout_seconds = 28800
+
+[placement]
+mode = "hybrid"
+worktree_root = "__WORKTREE_ROOT__"
+
+[planner]
+enabled = false
+harness = "auto"
+worker_harnesses = ["droid", "grok", "codex", "pi", "claude", "hermes"]
+interval_seconds = 1800
+prompt_file = "__PLANNER_PROMPT__"
+output_file = "__PLANNER_OUTPUT__"
+max_tasks = 20
+
+[[workers]]
+name = "operations"
+harness = "droid"
+
+[[workers]]
+name = "grok-build"
+harness = "grok"
+
+[[workers]]
+name = "implementation"
+harness = "codex"
+
+[[workers]]
+name = "quick-analysis"
+harness = "pi"
+
+[[workers]]
+name = "deep-review"
+harness = "claude"
+
+[[workers]]
+name = "research"
+harness = "hermes"
+
+[[seed_jobs]]
+title = "Verify droid inventory"
+harness = "droid"
+prompt_file = "__SEED_PROMPT_DROID__"
+dedupe_key = "verify-droid-inventory-v1"
+
+[[seed_jobs]]
+title = "Verify codex architecture"
+harness = "codex"
+prompt_file = "__SEED_PROMPT_CODEX__"
+dedupe_key = "verify-codex-architecture-v1"

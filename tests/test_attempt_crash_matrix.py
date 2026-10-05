@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from crash_matrix import CrashAfterTransition, run_public_operation_crash_matrix
+from crash_matrix import CrashAfterTransition, CrashInjected, run_public_operation_crash_matrix
 
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.model import (
@@ -565,7 +565,7 @@ def test_run_once_crash_matrix_converges_with_one_prompt() -> None:
         AttemptPhase.OUTCOME_COMMITTED,
     )
 
-    results = run_public_operation_crash_matrix(transitions, _exercise_run_once_crash)
+    results = _run_once_matrix(transitions)
 
     assert set(results) == set(transitions)
     assert all(
@@ -585,7 +585,7 @@ def test_resume_crash_matrix_converges_with_one_response() -> None:
         AttemptPhase.OUTCOME_COMMITTED,
     )
 
-    results = run_public_operation_crash_matrix(transitions, _exercise_resume_crash)
+    results = {phase: _exercise_resume_crash(phase) for phase in transitions}
 
     assert set(results) == set(transitions)
     assert all(
@@ -655,16 +655,17 @@ def test_declared_receipt_observation_crash_restarts_to_verified_success() -> No
     assert job["task_verified"] is True
 
 
-def _exercise_run_once_crash(target: AttemptPhase) -> dict[str, object]:
-    with tempfile.TemporaryDirectory() as temporary:
+def _run_once_matrix(
+    transitions: tuple[AttemptPhase, ...],
+) -> dict[AttemptPhase, dict[str, object]]:
+    def setup(root: Path):
         config = replace(
             load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-            state_db=Path(temporary) / "state.db",
+            state_db=root / "state.db",
         )
         config = replace(config, coordinator=replace(config.coordinator, lease_seconds=60))
         store = Store(config.state_db)
         store.initialize()
-        dispatcher = PersistentAttemptDispatcher()
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 100.0)
             store.enqueue(
@@ -673,34 +674,79 @@ def _exercise_run_once_crash(target: AttemptPhase) -> dict[str, object]:
                     "Crash matrix",
                     Harness.DROID,
                     "Do the task once.",
-                    f"crash-{target.value}",
+                    "crash-matrix",
                     3,
                 )
             )
-            with pytest.raises(OperationInterrupted, match=target.value):
+        return config, PersistentAttemptDispatcher()
+
+    def run(case, boundary: str | None) -> None:
+        config, dispatcher = case
+        observer = CrashAfterTransition(AttemptPhase(boundary)) if boundary else None
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("herdr_orchestrator.store.time.time", lambda: 100.0)
+            try:
                 Coordinator(
                     config,
-                    store=store,
+                    store=Store(config.state_db),
                     dispatcher=dispatcher,
-                    transition_observer=CrashAfterTransition(target),
+                    transition_observer=observer,
                 ).run_once()
-        reports: list[dict[str, object]] = []
+            except OperationInterrupted as exc:
+                assert observer is not None and observer.target in observer.observed
+                raise CrashInjected(boundary) from exc
+
+    def restart(case) -> None:
+        config, dispatcher = case
         for observed_at in (161.0, 163.0, 165.0):
             with pytest.MonkeyPatch.context() as monkeypatch:
                 monkeypatch.setattr(
-                    "herdr_orchestrator.store.time.time",
-                    lambda value=observed_at: value,
+                    "herdr_orchestrator.store.time.time", lambda value=observed_at: value
                 )
-                reports.append(Coordinator(config, store=store, dispatcher=dispatcher).run_once())
-            job = store.jobs(config.name)[0]
-            if job["state"] == "succeeded":
-                break
+                Coordinator(config, store=Store(config.state_db), dispatcher=dispatcher).run_once()
+
+    def observe(case) -> dict[str, object]:
+        config, dispatcher = case
+        store = Store(config.state_db)
+        job = store.jobs(config.name)[0]
+        with closing(sqlite3.connect(config.state_db)) as connection:
+            history = connection.execute("SELECT phase FROM job_attempts ORDER BY id").fetchall()
+            receipts = connection.execute("SELECT error_code FROM receipts").fetchall()
         return {
-            "state": store.jobs(config.name)[0]["state"],
+            "state": job["state"],
             "prompt_count": dispatcher.prompt_count,
-            "reports": reports,
-            "attempt_phase": store.jobs(config.name)[0]["attempt_phase"],
+            "attempt_phase": job["attempt_phase"],
+            "history": history,
+            "receipt_errors": receipts,
         }
+
+    def compare(boundary, expected, actual) -> None:
+        assert actual["prompt_count"] == expected["prompt_count"] == 1
+        if boundary == "prompt_accepted":
+            assert actual["state"] == "blocked"
+            assert actual["attempt_phase"] == "attention"
+            assert actual["history"] == [("attention",)]
+            assert ("unsafe_turn_adoption",) in actual["receipt_errors"]
+        else:
+            assert actual["state"] == expected["state"] == "succeeded"
+            assert actual["attempt_phase"] == expected["attempt_phase"]
+            assert actual["history"][-1] == expected["history"][-1]
+            if boundary in {"claimed", "runtime_acquired"}:
+                assert actual["history"] == [("abandoned",), ("outcome_committed",)]
+                assert ("lease_expired_unaccepted",) in actual["receipt_errors"]
+            else:
+                assert actual["history"] == expected["history"]
+                assert actual["receipt_errors"] == expected["receipt_errors"]
+
+    results = run_public_operation_crash_matrix(
+        (phase.value for phase in transitions),
+        setup=setup,
+        run=run,
+        restart=restart,
+        observe=observe,
+        compare=compare,
+    )
+    return {AttemptPhase(boundary): result for boundary, result in results.items()}
 
 
 def _exercise_resume_crash(target: AttemptPhase) -> dict[str, object]:

@@ -22,8 +22,9 @@ Dashboard 只允许绑定 `127.0.0.1` 或 `localhost`。默认每 2 秒生成一
 浏览器通过 Server-Sent Events 异步接收；断线会自动重连。
 Dashboard 要求 `state_db` 已存在且为当前兼容 schema。它只读打开该数据库，不会创建或迁移
 状态；首次运行请先使用 `seed` 或 `enqueue` 初始化数据库。
-服务关闭时 `shutdown()` 会先唤醒并结束活动 SSE 连接，再停止监听。`shutdown()` 可以重复调用，
-也可以在服务尚未进入监听循环时调用。
+同一进程最多同时保持 16 条 `/api/events` 连接；超出时该请求返回 `503` 和
+`{"error":"dashboard_sse_limit"}`，已有连接不受影响。服务关闭时 `shutdown()` 会先唤醒并结束
+活动 SSE 连接，再停止监听。`shutdown()` 可以重复调用，也可以在服务尚未进入监听循环时调用。
 
 连接指示器在稳定 `Live` 状态保持静止。进入 `Reconnecting` 时保留一次 360ms pill
 transition，重新连通时 dot 只播放一次 640ms pulse；后续普通 SSE snapshot 不重播。
@@ -158,7 +159,7 @@ Canvas 在紧凑与非紧凑尺寸之间切换时，overview ownership 决定 ca
 契约测试：compound 嵌套与状态 class、确定性布局与结构签名稳定性（状态-only
 SSE 更新不移动节点）、v1 workspaces 回退投影、节点身份编码、选择顺序与 viewport
 聚焦计算。没有 Node 时该测试自动 skip。独立的 `static/topology-style.js` 只生成 Cytoscape
-样式，并由 `dashboard.js` 显式传入 compact 与 reduced-motion 状态；它不持有 camera 或 DOM 状态。
+样式，并由 `dashboard-topology.js` 显式传入 compact 与 reduced-motion 状态；它不持有 camera 或 DOM 状态。
 
 Snapshot v1 继续提供原有的 `topology.workspaces`，并以 additive 字段提供
 `topology.projects`，其中嵌套 worktree、tab 与 pane。旧消费者无需修改。

@@ -355,6 +355,80 @@ class StoreHealthCorrectnessTests(unittest.TestCase):
                 SCHEMA_VERSION,
             )
 
+    def test_legacy_health_columns_migrate_without_losing_rows_or_probe_ownership(self) -> None:
+        self._install_legacy_health_table()
+        self.store.initialize()
+        self.store.initialize()
+
+        row = self.store.harness_health_rows("workflow", "/workspace")[0]
+        self.assertEqual(row["reason"], "agent_provider_failed")
+        self.assertEqual(row["retryable_failures"], 2)
+        self.assertEqual(row["probe_owner"], "old-probe")
+        self.assertEqual(row["probe_lease_until"], 150.0)
+        self.assertEqual(row["revision"], 3)
+        self.assertEqual(row["status"], "degraded")
+        self.assertEqual(row["observed_at"], 100.0)
+        self.assertIsNone(
+            self.store.acquire_harness_probe_lease(
+                workflow="workflow",
+                workspace="/workspace",
+                harness=Harness.CODEX,
+                owner="new-probe",
+                now=110.0,
+                lease_seconds=10.0,
+                force=True,
+            )
+        )
+        self.assertTrue(self._write_health(observed_at=160.0, status="ready", expires_at=None))
+        self.store.ensure_harness_health(
+            workflow="workflow",
+            workspace="/workspace",
+            harness=Harness.GROK,
+            observed_at=160.0,
+        )
+        self.assertEqual(len(self.store.harness_health_rows("workflow", "/workspace")), 2)
+
+    def test_legacy_health_migration_rolls_back_when_copy_fails(self) -> None:
+        self._install_legacy_health_table()
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("UPDATE harness_health SET status = NULL")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.initialize()
+
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            self.assertEqual(connection.execute("SELECT version FROM schema_meta").fetchone()[0], 8)
+            self.assertIn(
+                "reason_code",
+                {row[1] for row in connection.execute("PRAGMA table_info(harness_health)")},
+            )
+            connection.execute("UPDATE harness_health SET status = 'degraded'")
+        self.store.initialize()
+        self.assertEqual(
+            self.store.harness_health_rows("workflow", "/workspace")[0]["reason"],
+            "agent_provider_failed",
+        )
+
+    def _install_legacy_health_table(self) -> None:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.executescript("""
+                DROP TABLE harness_health;
+                UPDATE schema_meta SET version = 8;
+                CREATE TABLE harness_health (
+                    workflow TEXT NOT NULL, workspace TEXT NOT NULL, harness TEXT NOT NULL,
+                    status TEXT, reason_code TEXT, source TEXT NOT NULL,
+                    observed_at REAL NOT NULL, expires_at REAL NOT NULL,
+                    cooldown_until REAL NOT NULL, consecutive_failures INTEGER NOT NULL,
+                    probe_lease_until REAL, probe_lease_token TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(workflow, workspace, harness)
+                );
+                INSERT INTO harness_health VALUES (
+                    'workflow', '/workspace', 'codex', 'degraded', 'agent_provider_failed',
+                    'dispatch', 100.0, 120.0, 130.0, 2, 150.0, 'old-probe', 3
+                );
+                """)
+
     def _write_health(
         self,
         *,

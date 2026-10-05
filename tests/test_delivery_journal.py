@@ -10,15 +10,18 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from unittest.mock import patch
+
+from crash_matrix import CrashInjected, run_public_operation_crash_matrix
 
 import herdr_orchestrator.delivery_recovery as recovery_module
 from herdr_orchestrator.config import load_workflow
 from herdr_orchestrator.delivery import DeliveryError, StandardizedDelivery
 from herdr_orchestrator.delivery_journal import DeliveryJournal
 from herdr_orchestrator.delivery_protocol import DeliveryPlan, DeliveryTicket, TicketReceipt
+from herdr_orchestrator.delivery_recovery import DeliveryResult
 from herdr_orchestrator.git_workspace import Worktree
 from herdr_orchestrator.model import (
     AgentState,
@@ -910,7 +913,7 @@ class ProxyResponseCrashDispatcher(CompleteDispatcher):
 class DeliveryJournalTests(unittest.TestCase):
     def test_concurrent_loser_cannot_mutate_an_owned_delivery_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -970,7 +973,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_expired_owner_is_recovered_after_process_death(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1055,7 +1058,7 @@ class DeliveryJournalTests(unittest.TestCase):
                 ),
                 tempfile.TemporaryDirectory() as temporary,
             ):
-                run_root = Path(temporary) / "delivery-run"
+                run_root = Path(temporary).resolve() / "delivery-run"
                 run_root.mkdir()
                 now = [100.0]
                 tokens = iter(("1" * 32, "2" * 32))
@@ -1126,7 +1129,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_tracker_publication_replays_from_intent_without_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1190,7 +1193,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_agent_artifact_recovery_does_not_repeat_the_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1232,7 +1235,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_pending_artifact_stops_while_named_agent_is_working(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1262,7 +1265,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_duplicate_journal_keys_fail_before_external_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1298,7 +1301,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_effect_from_a_non_owner_token_invalidates_the_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1336,7 +1339,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_receipt_merge_and_close_recover_in_durable_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1403,7 +1406,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_final_result_recovers_after_write_before_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1471,7 +1474,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_final_result_rejects_a_commit_after_final_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1515,7 +1518,7 @@ class DeliveryJournalTests(unittest.TestCase):
         )
         for mutation, expected_error in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                repository = Path(temporary) / "repository"
+                repository = Path(temporary).resolve() / "repository"
                 _initialize_repository(repository)
                 config = _workflow(repository)
                 goal = repository / "goal.md"
@@ -1565,7 +1568,7 @@ class DeliveryJournalTests(unittest.TestCase):
         )
         for mutation, expected_error in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                repository = Path(temporary) / "repository"
+                repository = Path(temporary).resolve() / "repository"
                 _initialize_repository(repository)
                 config = _workflow(repository)
                 goal = repository / "goal.md"
@@ -1598,7 +1601,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_repair_commit_recovers_without_a_second_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -1654,7 +1657,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_repair_head_change_without_receipt_is_a_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -1700,7 +1703,7 @@ class DeliveryJournalTests(unittest.TestCase):
     def test_repair_crash_matrix_converges_before_and_after_commit(self) -> None:
         for transition in ("effect_intent", "effect_confirmed"):
             with self.subTest(transition=transition), tempfile.TemporaryDirectory() as temporary:
-                repository = Path(temporary) / "repository"
+                repository = Path(temporary).resolve() / "repository"
                 _initialize_repository(repository)
                 config = _workflow(repository)
                 config = replace(
@@ -1751,7 +1754,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_pre_journal_tracker_publication_is_adopted_before_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -1801,7 +1804,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_legacy_receipt_conflict_causes_zero_tracker_adoption_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             config = replace(
@@ -1847,7 +1850,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_proxy_response_recovers_without_sending_the_answer_twice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1887,7 +1890,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_pre_journal_receipt_merge_and_close_are_adopted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -1947,7 +1950,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_parallel_sibling_survives_crash_after_first_ticket_close(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -2003,67 +2006,82 @@ class DeliveryJournalTests(unittest.TestCase):
             "review:accept:1",
             "result:publish",
         )
-        for operation_key in boundaries:
-            for transition in ("effect_intent", "effect_confirmed"):
-                with (
-                    self.subTest(
-                        operation_key=operation_key,
-                        transition=transition,
-                    ),
-                    tempfile.TemporaryDirectory() as temporary,
-                ):
-                    repository = Path(temporary) / "repository"
-                    _initialize_repository(repository)
-                    config = _workflow(repository)
-                    goal = repository / "goal.md"
-                    goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
-                    external: dict[str, object] = {}
-                    interrupted = [False]
-                    interrupt = _interrupt_journal(
-                        DeliveryJournal._persist_event,
-                        transition,
-                        operation_key,
-                        interrupted,
-                    )
 
-                    first = StandardizedDelivery(
-                        config,
-                        dispatcher=CompleteDispatcher(),
-                        tracker=StableTracker(external),
-                        controller_harness=Harness.DROID,
-                        worker_harnesses=(Harness.DROID,),
-                    )
-                    with (
-                        patch.object(
-                            DeliveryJournal,
-                            "_persist_event",
-                            interrupt,
-                        ),
-                        self.assertRaisesRegex(
-                            RuntimeError,
-                            "journal interruption",
-                        ),
-                    ):
-                        first.run(goal)
-                    self.assertTrue(interrupted[0])
+        @dataclass
+        class DeliveryCase:
+            config: WorkflowConfig
+            goal: Path
+            external: dict[str, object] = field(default_factory=dict)
+            dispatcher: CompleteDispatcher = field(default_factory=CompleteDispatcher)
+            result: DeliveryResult | None = None
 
-                    result = StandardizedDelivery(
-                        config,
-                        dispatcher=CompleteDispatcher(),
-                        tracker=StableTracker(external),
-                        controller_harness=Harness.DROID,
-                        worker_harnesses=(Harness.DROID,),
-                    ).run(goal)
-                    log = _git(
-                        result.artifact_root / "worktrees/integration",
-                        "log",
-                        "--format=%s",
-                    ).stdout
+        def setup(root: Path) -> DeliveryCase:
+            repository = root / "repository"
+            _initialize_repository(repository)
+            goal = repository / "goal.md"
+            goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+            return DeliveryCase(config=_workflow(repository), goal=goal)
 
-                    self.assertEqual(result.status, "succeeded")
-                    self.assertEqual(external["publish_mutations"], 1)
-                    self.assertEqual(external["close_mutations"], 1)
-                    self.assertEqual(log.count("Merge branch"), 1)
+        def execute(case: DeliveryCase) -> None:
+            case.result = StandardizedDelivery(
+                case.config,
+                dispatcher=case.dispatcher,
+                tracker=StableTracker(case.external),
+                controller_harness=Harness.DROID,
+                worker_harnesses=(Harness.DROID,),
+            ).run(case.goal)
+
+        def run(case: DeliveryCase, boundary: str | None) -> None:
+            if boundary is None:
+                execute(case)
+                return
+            transition, operation_key = boundary.split("/", 1)
+            interrupted = [False]
+            interrupt = _interrupt_journal(
+                DeliveryJournal._persist_event,
+                transition,
+                operation_key,
+                interrupted,
+            )
+            with patch.object(DeliveryJournal, "_persist_event", interrupt):
+                try:
+                    execute(case)
+                except RuntimeError as exc:
+                    if not interrupted[0] or str(exc) != "journal interruption":
+                        raise
+                    raise CrashInjected(boundary) from exc
+
+        def observe(case: DeliveryCase) -> dict[str, object]:
+            result = case.result
+            assert result is not None
+            integration = result.artifact_root / "worktrees/integration"
+            subjects = _git(integration, "log", "--format=%s").stdout
+            return {
+                "status": result.status,
+                "tracker": dict(case.external),
+                "merge_count": subjects.count("Merge branch"),
+                "ticket_commit_count": subjects.count("feat: implement journal slice"),
+                "business_artifact": (integration / "slice-01.txt").read_bytes(),
+                "turn_count": len(case.dispatcher.prompts),
+            }
+
+        results = run_public_operation_crash_matrix(
+            (
+                f"{transition}/{key}"
+                for key in boundaries
+                for transition in ("effect_intent", "effect_confirmed")
+            ),
+            setup=setup,
+            run=run,
+            restart=execute,
+            observe=observe,
+        )
+        self.assertEqual(len(results), 16)
+        for result in results.values():
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["tracker"]["publish_mutations"], 1)
+            self.assertEqual(result["tracker"]["close_mutations"], 1)
+            self.assertEqual(result["merge_count"], 1)
 
     def test_applied_git_and_review_effects_converge_without_confirmation(
         self,
@@ -2076,7 +2094,7 @@ class DeliveryJournalTests(unittest.TestCase):
         )
         for target in targets:
             with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
-                repository = Path(temporary) / "repository"
+                repository = Path(temporary).resolve() / "repository"
                 _initialize_repository(repository)
                 config = _workflow(repository)
                 goal = repository / "goal.md"
@@ -2163,7 +2181,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_human_commit_after_confirmed_merge_stops_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"
@@ -2222,7 +2240,7 @@ class DeliveryJournalTests(unittest.TestCase):
 
     def test_completed_result_rejects_missing_confirmed_tracker_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary) / "repository"
+            repository = Path(temporary).resolve() / "repository"
             _initialize_repository(repository)
             config = _workflow(repository)
             goal = repository / "goal.md"

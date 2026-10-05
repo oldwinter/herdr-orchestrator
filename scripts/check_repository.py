@@ -12,6 +12,7 @@ MAX_BYTES = 512 * 1024
 MAX_SOURCE_LINES = 1_500
 MAX_TEST_LINES = 2_500
 MAX_TEXT_LINES = 2_000
+LINE_HEADROOM = 1
 TEXT_SUFFIXES = {".css", ".html", ".js", ".json", ".md", ".mjs", ".py", ".toml", ".yaml", ".yml"}
 DEBT_MARKER = re.compile(r"\b(?:TODO|FIXME|XXX|HACK)\b")
 TRACKED_DEBT = re.compile(r"\b(?:TODO|FIXME|XXX|HACK)\(#[1-9][0-9]* owner=[A-Za-z0-9_.-]+\):")
@@ -55,11 +56,15 @@ def repository_failures(root: Path, files: tuple[Path, ...]) -> list[str]:
             failures.append(f"{relative}: {size} bytes exceeds {MAX_BYTES}")
         if path.suffix not in TEXT_SUFFIXES or relative in EXEMPT_SIZE_PATHS:
             continue
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            failures.append(f"{relative}: unable to read UTF-8 text")
+            continue
         lines = len(text.splitlines())
         maximum = line_limit(path, root)
-        if lines > maximum and relative not in EXEMPT_LINE_PATHS:
-            failures.append(f"{relative}: {lines} lines exceeds {maximum}")
+        if lines + LINE_HEADROOM > maximum and relative not in EXEMPT_LINE_PATHS:
+            failures.append(f"{relative}: {lines} lines leaves no headroom under {maximum}")
         if relative in EXEMPT_DEBT_PATHS:
             continue
         for number, line in enumerate(text.splitlines(), start=1):

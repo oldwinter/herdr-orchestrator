@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -9,18 +10,28 @@ from typing import Any
 from herdr_orchestrator.attempts import StoreError
 
 
+def _finite_float(value: object, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise StoreError(f"metadata_invalid_float: {key}")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise StoreError(f"metadata_invalid_float: {key}") from exc
+    if not math.isfinite(parsed):
+        raise StoreError(f"metadata_invalid_float: {key}")
+    return parsed
+
+
 def metadata_float(store: Any, key: str) -> float | None:
     with store._connect() as connection:
         row = connection.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
     if row is None:
         return None
-    try:
-        return float(row["value"])
-    except ValueError as exc:
-        raise StoreError(f"metadata_invalid_float: {key}") from exc
+    return _finite_float(row["value"], key)
 
 
 def set_metadata_float(store: Any, key: str, value: float) -> None:
+    stored_value = _finite_float(value, key)
     now = time.time()
     with store._connect() as connection:
         connection.execute(
@@ -29,7 +40,7 @@ def set_metadata_float(store: Any, key: str, value: float) -> None:
             ON CONFLICT(key) DO UPDATE
             SET value = excluded.value, updated_at = excluded.updated_at
             """,
-            (key, str(value), now),
+            (key, str(stored_value), now),
         )
 
 
@@ -41,19 +52,16 @@ def reserve_planner_run(
     now: float | None = None,
     workspace: str | Path | None = None,
 ) -> bool:
-    observed_at = time.time() if now is None else now
     key = (
         f"planner_last_attempt:{workflow}:{str(workspace)}"
         if workspace is not None
         else f"planner_last_attempt:{workflow}"
     )
+    observed_at = _finite_float(time.time() if now is None else now, key)
     with store._transaction() as connection:
         row = connection.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
         if row is not None:
-            try:
-                last_attempt = float(row["value"])
-            except (TypeError, ValueError) as exc:
-                raise StoreError(f"metadata_invalid_float: {key}") from exc
+            last_attempt = _finite_float(row["value"], key)
             if observed_at - last_attempt < interval_seconds:
                 return False
         connection.execute(

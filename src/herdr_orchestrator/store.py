@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from herdr_orchestrator.attempts import AttemptLedger, StoreError
+from herdr_orchestrator.attempts_legacy import (
+    migrate_v4_to_v5 as _migrate_attempts_v4_to_v5,
+)
 from herdr_orchestrator.completion import CompletionPolicy, VerificationClass
 from herdr_orchestrator.model import (
     AttemptPhase,
@@ -23,10 +26,16 @@ from herdr_orchestrator.model import (
     TaskReceipt,
 )
 from herdr_orchestrator.store_health import (
+    HEALTH_TABLE_COLUMNS as _HEALTH_TABLE_COLUMNS,
+)
+from herdr_orchestrator.store_health import (
     health_row_accepts_write as _health_row_accepts_write,
 )
 from herdr_orchestrator.store_health import (
     health_update_statement as _health_update_statement,
+)
+from herdr_orchestrator.store_health import (
+    migrate_legacy_health_table as _migrate_legacy_health_table,
 )
 from herdr_orchestrator.store_health import (
     normalize_health_write_fence as _normalize_health_write_fence,
@@ -52,8 +61,9 @@ from herdr_orchestrator.store_workspace import (
 from herdr_orchestrator.store_workspace import (
     workspace_matches as _workspace_matches,
 )
+from herdr_orchestrator.supervision import add_dependencies, create_schema, dependencies
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 __all__ = ["HarnessProbeLease", "SCHEMA_VERSION", "Store", "StoreError"]
 
 _INITIALIZE_LOCK = threading.Lock()
@@ -66,6 +76,13 @@ class HarnessProbeLease:
     revision: int
     owner: str
     lease_until: float
+
+
+@dataclass(slots=True)
+class _SlotOccupancy:
+    active_counts: Counter[str]
+    reserved_counts: Counter[str]
+    owners: dict[str, set[int]]
 
 
 def _nullable_bool(value: object) -> bool | None:
@@ -163,7 +180,7 @@ class Store:
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            connection.executescript("""
+            connection.executescript(f"""
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     version INTEGER NOT NULL
                 );
@@ -239,20 +256,7 @@ class Store:
                     updated_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS harness_health (
-                    workflow TEXT NOT NULL,
-                    workspace TEXT NOT NULL,
-                    harness TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    observed_at REAL NOT NULL,
-                    revision INTEGER NOT NULL DEFAULT 0,
-                    expires_at REAL,
-                    cooldown_until REAL,
-                    retryable_failures INTEGER NOT NULL DEFAULT 0,
-                    probe_lease_until REAL,
-                    probe_owner TEXT,
-                    PRIMARY KEY(workflow, workspace, harness)
+                    {_HEALTH_TABLE_COLUMNS}
                 );
                 CREATE INDEX IF NOT EXISTS harness_health_scope
                     ON harness_health(workflow, workspace, harness);
@@ -285,10 +289,18 @@ class Store:
                 if version == 7:
                     self._migrate_v7_to_v8(connection)
                     version = 8
-                if version == SCHEMA_VERSION:
+                if version == 8:
                     self._ensure_v8_columns(connection)
+                    _migrate_legacy_health_table(connection)
+                    connection.execute("UPDATE schema_meta SET version = 9")
+                    version = 9
+                if version == 9:
+                    create_schema(connection)
+                    connection.execute("UPDATE schema_meta SET version = 10")
+                    version = 10
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
+            create_schema(connection)
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
         self._add_column_if_missing(connection, "jobs", "placement", "TEXT")
@@ -324,7 +336,7 @@ class Store:
         connection.execute("UPDATE schema_meta SET version = 4")
 
     def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
-        AttemptLedger.migrate_v4_to_v5(connection, self._add_column_if_missing)
+        _migrate_attempts_v4_to_v5(connection, self._add_column_if_missing)
 
     def _migrate_v5_to_v6(self, connection: sqlite3.Connection) -> None:
         for table in ("jobs", "job_attempts", "receipts"):
@@ -424,22 +436,9 @@ class Store:
 
     def _migrate_v6_to_v7(self, connection: sqlite3.Connection) -> None:
         self._add_column_if_missing(connection, "jobs", "workspace", "TEXT")
-        connection.execute("""
+        connection.execute(f"""
             CREATE TABLE IF NOT EXISTS harness_health (
-                workflow TEXT NOT NULL,
-                workspace TEXT NOT NULL,
-                harness TEXT NOT NULL,
-                status TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                source TEXT NOT NULL,
-                observed_at REAL NOT NULL,
-                revision INTEGER NOT NULL DEFAULT 0,
-                expires_at REAL,
-                cooldown_until REAL,
-                retryable_failures INTEGER NOT NULL DEFAULT 0,
-                probe_lease_until REAL,
-                probe_owner TEXT,
-                PRIMARY KEY(workflow, workspace, harness)
+                {_HEALTH_TABLE_COLUMNS}
             )
             """)
         connection.execute("""
@@ -513,6 +512,13 @@ class Store:
             if cursor.rowcount == 1:
                 if cursor.lastrowid is None:
                     raise StoreError("job_id_missing")
+                add_dependencies(
+                    connection,
+                    cursor.lastrowid,
+                    job.depends_on,
+                    job.workflow,
+                    job.workspace,
+                )
                 return cursor.lastrowid, True
             row = connection.execute(
                 """
@@ -525,7 +531,9 @@ class Store:
             ).fetchone()
             if row is None:
                 raise StoreError("dedupe_lookup_failed")
-            if not _job_contract_matches(row, job):
+            if not _job_contract_matches(row, job) or dependencies(
+                connection, int(row["id"])
+            ) != tuple(sorted(set(job.depends_on))):
                 raise StoreError("dedupe_contract_conflict")
             return int(row["id"]), False
 
@@ -541,6 +549,7 @@ class Store:
         receipt: TaskReceipt | None,
         completion_policy: CompletionPolicy | None = None,
         workspace: str | None = None,
+        depends_on: tuple[int, ...] = (),
     ) -> tuple[int, Harness] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -552,9 +561,12 @@ class Store:
                 """,
                 (workflow, dedupe_key),
             ).fetchone()
+            prior_dependencies = dependencies(connection, int(row["id"])) if row else ()
         if row is None:
             return None
-        if not _partial_job_contract_matches(
+        if prior_dependencies != tuple(
+            sorted(set(depends_on))
+        ) or not _partial_job_contract_matches(
             row,
             title=title,
             prompt=prompt,
@@ -594,6 +606,7 @@ class Store:
         require_fresh_health: bool = False,
         include_legacy: bool = False,
         static_validator: Callable[[str], bool] | None = None,
+        allowed_job_ids: set[int] | None = None,
     ) -> list[ClaimedJob]:
         if limit <= 0:
             return []
@@ -606,7 +619,7 @@ class Store:
         )
         claimed: list[ClaimedJob] = []
         with self._transaction() as connection:
-            busy_counts, busy_names = self._busy_slots(
+            slots = self._busy_slots(
                 connection,
                 workflow,
                 now,
@@ -621,6 +634,12 @@ class Store:
                 include_legacy=include_legacy,
             )
             for row in candidates:
+                if (
+                    allowed_job_ids is not None
+                    and row["state"] == "pending"
+                    and int(row["id"]) not in allowed_job_ids
+                ):
+                    continue
                 job = self._claim_candidate(
                     connection,
                     row,
@@ -629,8 +648,7 @@ class Store:
                     allowed_values=allowed_values,
                     slot_names=slot_names,
                     slot_limits=slot_limits,
-                    busy_counts=busy_counts,
-                    busy_names=busy_names,
+                    slots=slots,
                     health_workspace=workspace if require_fresh_health else None,
                     static_validator=static_validator,
                 )
@@ -649,12 +667,12 @@ class Store:
         *,
         workspace: str | None = None,
         include_legacy: bool = False,
-    ) -> tuple[Counter[str], dict[str, set[str]]]:
+    ) -> _SlotOccupancy:
         query = """
-            SELECT jobs.harness, jobs.placement, jobs.agent_name FROM jobs AS jobs
-            WHERE jobs.workflow = ? AND jobs.state = ? AND jobs.lease_until > ?
+            SELECT jobs.id, jobs.harness, jobs.agent_name, jobs.lease_until FROM jobs AS jobs
+            WHERE jobs.workflow = ? AND jobs.state IN (?, ?)
         """
-        parameters: tuple[object, ...] = (workflow, JobState.RUNNING.value, now)
+        parameters: tuple[object, ...] = (workflow, JobState.RUNNING.value, JobState.BLOCKED.value)
         scope, scope_parameters = _workspace_clause(
             workspace,
             include_legacy=include_legacy,
@@ -662,15 +680,16 @@ class Store:
         query += scope
         parameters += scope_parameters
         rows = connection.execute(query, parameters).fetchall()
-        counts: Counter[str] = Counter()
-        names: dict[str, set[str]] = {}
+        slots = _SlotOccupancy(Counter(), Counter(), {})
         for row in rows:
             harness_value = str(row["harness"])
-            counts[harness_value] += 1
+            slots.reserved_counts[harness_value] += 1
+            if row["lease_until"] is not None and row["lease_until"] > now:
+                slots.active_counts[harness_value] += 1
             agent_name = row["agent_name"]
             if isinstance(agent_name, str) and agent_name:
-                names.setdefault(harness_value, set()).add(agent_name)
-        return counts, names
+                slots.owners.setdefault(agent_name, set()).add(int(row["id"]))
+        return slots
 
     @staticmethod
     def _claim_candidates(
@@ -689,6 +708,16 @@ class Store:
                 (jobs.state = ? AND jobs.available_at <= ? AND jobs.attempts < jobs.max_attempts)
                 OR (jobs.state = ? AND jobs.lease_until <= ?)
               )
+              AND (jobs.state = 'running' OR (
+                NOT EXISTS (
+                    SELECT 1 FROM job_dependencies d JOIN jobs p ON p.id = d.prerequisite_id
+                    WHERE d.job_id = jobs.id
+                      AND (p.state != 'succeeded' OR p.task_verified IS NOT 1)
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM supervision_gates g
+                    WHERE g.job_id = jobs.id AND g.status != 'resolved'
+                )
+              ))
         """
         parameters: tuple[object, ...] = (
             workflow,
@@ -703,7 +732,7 @@ class Store:
         )
         query += scope
         parameters += scope_parameters
-        query += " ORDER BY created_at, id"
+        query += " ORDER BY CASE WHEN state = 'running' THEN 0 ELSE 1 END, created_at, id"
         return connection.execute(query, parameters).fetchall()
 
     @staticmethod
@@ -716,8 +745,7 @@ class Store:
         allowed_values: set[str] | None,
         slot_names: Mapping[str, Sequence[str]] | None,
         slot_limits: Mapping[str, int] | None,
-        busy_counts: Counter[str],
-        busy_names: dict[str, set[str]],
+        slots: _SlotOccupancy,
         health_workspace: str | None,
         static_validator: Callable[[str], bool] | None,
     ) -> ClaimedJob | None:
@@ -743,13 +771,13 @@ class Store:
         limit = (
             slot_limits.get(harness_value, len(names)) if slot_limits is not None else len(names)
         )
-        if busy_counts[harness_value] >= limit:
+        if slots.active_counts[harness_value] >= limit:
             return None
         if row["state"] == JobState.RUNNING.value:
             persisted_name = row["agent_name"]
             if not isinstance(persisted_name, str) or not persisted_name:
                 raise StoreError("attempt_agent_missing")
-            if persisted_name in busy_names.get(harness_value, set()):
+            if slots.owners.get(persisted_name) != {int(row["id"])}:
                 return None
             recovered = AttemptLedger.reclaim(
                 connection,
@@ -757,11 +785,12 @@ class Store:
                 now=now,
                 lease_until=lease_until,
             )
-            busy_counts[harness_value] += 1
-            busy_names.setdefault(harness_value, set()).add(persisted_name)
+            slots.active_counts[harness_value] += 1
             return recovered
+        if slots.reserved_counts[harness_value] >= limit:
+            return None
         agent_name = next(
-            (name for name in names if name not in busy_names.get(harness_value, set())),
+            (name for name in names if name not in slots.owners),
             None,
         )
         if agent_name is None:
@@ -773,8 +802,9 @@ class Store:
             now=now,
             lease_until=lease_until,
         )
-        busy_counts[harness_value] += 1
-        busy_names.setdefault(harness_value, set()).add(agent_name)
+        slots.active_counts[harness_value] += 1
+        slots.reserved_counts[harness_value] += 1
+        slots.owners.setdefault(agent_name, set()).add(claimed.job_id)
         return claimed
 
     @staticmethod
@@ -1323,6 +1353,7 @@ class Store:
     ) -> list[dict[str, object]]:
         query = """
                 SELECT jobs.id, jobs.workspace, jobs.title, jobs.harness, jobs.placement,
+                       jobs.dedupe_key,
                        jobs.state,
                        jobs.attempts, jobs.max_attempts, jobs.agent_name,
                        jobs.error_code, jobs.execution_path, jobs.herdr_workspace_id,
@@ -1346,8 +1377,12 @@ class Store:
         query += " ORDER BY jobs.id"
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
+            dependency_map = {
+                int(row["id"]): dependencies(connection, int(row["id"])) for row in rows
+            }
         jobs = [dict(row) for row in rows]
         for job in jobs:
+            job["depends_on"] = list(dependency_map[int(str(job["id"]))])
             job["agent_settled"] = _nullable_bool(job["agent_settled"])
             job["task_verified"] = _nullable_bool(job["task_verified"])
         return jobs

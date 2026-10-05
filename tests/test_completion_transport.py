@@ -135,6 +135,103 @@ class CompletionTransportTests(unittest.TestCase):
             dispatcher.prompt.rfind("fencing_token=attacker"),
         )
 
+    def test_current_envelope_accepts_unchanged_idempotent_business_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            business = workspace / "business.json"
+            original = b'{"already_complete":true}\n'
+            business.write_bytes(original)
+            before = business.stat()
+            config = replace(
+                load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
+                workspace=workspace,
+                state_db=workspace / "state.db",
+            )
+
+            class IdempotentDispatcher:
+                def dispatch(self, harness, prompt, *, timeout_seconds, agent_name, context):
+                    identity = context.completion_identity
+                    envelope = {
+                        "schema_version": 2,
+                        "job_id": identity.job_id,
+                        "attempt": identity.attempt,
+                        "fencing_token": identity.fencing_token,
+                        "status": "completed",
+                        "evidence_summary": "business.json already has the desired bytes",
+                    }
+                    idle = {
+                        "agent": {
+                            "agent": "codex",
+                            "agent_status": "idle",
+                            "cwd": str(workspace),
+                            "foreground_cwd": str(workspace),
+                            "interactive_ready": True,
+                            "pane_id": "w1:p9",
+                            "state_change_seq": 1,
+                        }
+                    }
+                    done = {
+                        "agent": {
+                            "agent": "codex",
+                            "agent_status": "done",
+                            "pane_id": "w1:p9",
+                            "state_change_seq": 2,
+                        }
+                    }
+                    runner = FakeCommandRunner(
+                        [
+                            _result(idle),
+                            subprocess.CompletedProcess(["herdr"], 0, "prior", ""),
+                            _result(idle),
+                            _result(done),
+                            subprocess.CompletedProcess(
+                                ["herdr"],
+                                0,
+                                "prior\nHERDR-COMPLETION-V2 " + json.dumps(envelope),
+                                "",
+                            ),
+                        ]
+                    )
+                    transport = HerdrTransport(
+                        "example",
+                        workspace,
+                        environ={
+                            "HERDR_ENV": "1",
+                            "HERDR_PANE_ID": "w1:p1",
+                            "HERDR_WORKSPACE_ID": "w1",
+                        },
+                        runner=runner,
+                        sleeper=lambda _: None,
+                        settled_confirmation_polls=0,
+                        inspect_runtime_errors=False,
+                    )
+                    return transport.dispatch(
+                        harness,
+                        prompt,
+                        timeout_seconds=timeout_seconds,
+                        agent_name=agent_name,
+                        context=context,
+                    )
+
+            prompt = workspace / "task.md"
+            prompt.write_text("Ensure business.json contains the desired bytes.")
+            coordinator = Coordinator(config, dispatcher=IdempotentDispatcher())
+            coordinator.enqueue_prompt_file(
+                harness=Harness.CODEX,
+                title="Idempotent unchanged artifact",
+                prompt_file=prompt,
+                dedupe_key="unchanged",
+                placement=PlacementTarget.PANE,
+                completion_policy=CompletionPolicy.STRUCTURED_V2,
+            )
+            report = coordinator.run_once()
+            job = coordinator.store.jobs(config.name)[0]
+            self.assertEqual(report["succeeded"], 1)
+            self.assertTrue(job["task_verified"])
+            self.assertEqual(job["verification_class"], "verified")
+            self.assertEqual(business.read_bytes(), original)
+            self.assertEqual(business.stat().st_mtime_ns, before.st_mtime_ns)
+
     def test_transport_parses_structured_output_into_typed_result(self) -> None:
         identity = CompletionIdentity(41, 2, "fence-current")
         with tempfile.TemporaryDirectory() as temporary:

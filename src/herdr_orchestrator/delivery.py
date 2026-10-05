@@ -54,11 +54,12 @@ from herdr_orchestrator.delivery_protocol import (
     load_wayfinder_route,
     map_payload,
 )
-from herdr_orchestrator.delivery_recovery import (
+from herdr_orchestrator.delivery_recovery import DeliveryRecoveryMixin
+from herdr_orchestrator.delivery_repair import DeliveryRepairMixin
+from herdr_orchestrator.delivery_support import (
     DeliveryError as DeliveryError,
 )
-from herdr_orchestrator.delivery_recovery import (
-    DeliveryRecoveryMixin,
+from herdr_orchestrator.delivery_support import (
     DeliveryResult,
     _agent_is_active,
     _effect_absent,
@@ -74,7 +75,6 @@ from herdr_orchestrator.delivery_recovery import (
     _validate_worktree_ownership,
     _write_json,
 )
-from herdr_orchestrator.delivery_repair import DeliveryRepairMixin
 from herdr_orchestrator.git_workspace import GitWorkspace, GitWorkspaceError, Worktree
 from herdr_orchestrator.harness_health import (
     EligibilitySnapshot,
@@ -403,7 +403,10 @@ class StandardizedDelivery(
         except (HarnessHealthError, ValueError) as exc:
             raise DeliveryError(str(exc)) from exc
 
-    def _run_claimed(self, run_id: str) -> DeliveryResult:
+    def _restore_previous_state(self) -> None:
+        stage_state = self._require_journal().latest_stage_state()
+        if stage_state is not None:
+            _write_json(self._run_root / "state.json", stage_state)
         if (state_path := self._run_root / "state.json").is_file():
             _safe_delivery_path(state_path, root=self._run_root)
             try:
@@ -415,6 +418,9 @@ class StandardizedDelivery(
                 self._write_state("failed", stage="stopped", error="DeliveryStateInvalid")
                 raise DeliveryError("delivery_state_invalid")
             self._previous_state = state
+
+    def _run_claimed(self, run_id: str) -> DeliveryResult:
+        self._restore_previous_state()
         try:
             completed_result = _load_completed_result(self._run_root / "result.json", run_id)
             if completed_result is None:
@@ -1128,7 +1134,7 @@ class StandardizedDelivery(
             except TransportError as exc:
                 raise DeliveryError(f"principal_proxy_read_failed:{exc.code}") from exc
             question_hash = hashlib.sha256(question.encode()).hexdigest()[:12]
-            if SENSITIVE_QUESTION.search(question):
+            if SENSITIVE_QUESTION.search(question) or contains_high_confidence_secret(question):
                 self._record(
                     "principal_proxy_escalated",
                     {
@@ -1438,24 +1444,13 @@ class StandardizedDelivery(
             )
 
     def _write_state(self, status: str, *, stage: str, **details: str) -> None:
-        state_path = self._run_root / "state.json"
-        state: dict[str, object] = {}
-        if state_path.is_file():
-            try:
-                previous = json.loads(state_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                previous = None
-            if isinstance(previous, dict):
-                state.update(previous)
-        _write_json(
-            state_path,
-            {
-                **state,
-                "status": status,
-                "stage": stage,
-                **details,
-            },
-        )
+        journal = self._require_journal()
+        state = journal.latest_stage_state() or {}
+        if not state and isinstance(self._previous_state.get("controller"), str):
+            state["controller"] = self._previous_state["controller"]
+        state.update({"status": status, "stage": stage, **details})
+        journal.record_stage(state)
+        _write_json(self._run_root / "state.json", state)
 
 
 def _first_decision_frontier(map_: WayfinderMap) -> DecisionTicket:

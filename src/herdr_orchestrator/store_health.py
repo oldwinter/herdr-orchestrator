@@ -7,6 +7,58 @@ import sqlite3
 from herdr_orchestrator.attempts import StoreError
 from herdr_orchestrator.model import Harness
 
+HEALTH_TABLE_COLUMNS = """
+workflow TEXT NOT NULL,
+workspace TEXT NOT NULL,
+harness TEXT NOT NULL,
+status TEXT NOT NULL,
+reason TEXT NOT NULL,
+source TEXT NOT NULL,
+observed_at REAL NOT NULL,
+revision INTEGER NOT NULL DEFAULT 0,
+expires_at REAL,
+cooldown_until REAL,
+retryable_failures INTEGER NOT NULL DEFAULT 0,
+probe_lease_until REAL,
+probe_owner TEXT,
+PRIMARY KEY(workflow, workspace, harness)
+"""
+_HEALTH_UPDATE = """
+        UPDATE harness_health
+        SET status = ?, reason = ?, source = ?, observed_at = ?,
+            revision = revision + 1, expires_at = ?, cooldown_until = ?,
+            retryable_failures = ?,
+            probe_lease_until = {lease_until_sql},
+            probe_owner = {owner_sql}
+        WHERE workflow = ? AND workspace = ? AND harness = ?
+          AND revision = ?{owner_predicate}
+    """
+
+
+def migrate_legacy_health_table(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(harness_health)")}
+    if "reason_code" not in columns:
+        return
+    connection.execute(f"""
+        CREATE TABLE harness_health_v9 (
+            {HEALTH_TABLE_COLUMNS}
+        )
+        """)
+    connection.execute("""
+        INSERT INTO harness_health_v9
+        SELECT workflow, workspace, harness, status,
+               COALESCE(reason_code, CASE WHEN status = 'ready'
+                   THEN 'readiness_ready' ELSE 'health_unknown' END),
+               source, observed_at, revision, expires_at, cooldown_until,
+               consecutive_failures, probe_lease_until, probe_lease_token
+        FROM harness_health
+        """)
+    connection.execute("DROP TABLE harness_health")
+    connection.execute("ALTER TABLE harness_health_v9 RENAME TO harness_health")
+    connection.execute("""
+        CREATE INDEX harness_health_scope ON harness_health(workflow, workspace, harness)
+        """)
+
 
 def normalize_health_write_fence(
     *,
@@ -101,14 +153,10 @@ def health_update_statement(
     if expected_owner is not None:
         owner_predicate = " AND probe_owner = ?"
         values.append(expected_owner)
-    query = f"""
-        UPDATE harness_health
-        SET status = ?, reason = ?, source = ?, observed_at = ?,
-            revision = revision + 1, expires_at = ?, cooldown_until = ?,
-            retryable_failures = ?,
-            probe_lease_until = {lease_until_sql},
-            probe_owner = {owner_sql}
-        WHERE workflow = ? AND workspace = ? AND harness = ?
-          AND revision = ?{owner_predicate}
-    """  # nosec B608: fragments are from a fixed SQL-token allowlist
+    # The interpolated fragments come from fixed SQL-token allowlists.
+    query = _HEALTH_UPDATE.format(  # nosec B608
+        lease_until_sql=lease_until_sql,
+        owner_sql=owner_sql,
+        owner_predicate=owner_predicate,
+    )
     return query, values

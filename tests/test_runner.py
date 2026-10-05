@@ -306,7 +306,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -348,7 +348,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -401,7 +401,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -438,7 +438,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -470,7 +470,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -504,7 +504,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -538,7 +538,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -611,7 +611,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -664,7 +664,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_planner_reservation_is_atomic_across_coordinators(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             planner_prompt_file = root / "planner.md"
             planner_prompt_file.write_text("Plan one task.", encoding="utf-8")
@@ -717,7 +717,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -750,7 +750,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -791,7 +791,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -871,7 +871,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -901,7 +901,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_run_until_idle_deadline_bounds_topology_before_worker_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             config = replace(
                 base,
@@ -946,7 +946,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_run_until_idle_deadline_bounds_planner_before_worker_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             config = replace(
                 base,
@@ -989,7 +989,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -1024,7 +1024,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             coordinator = Coordinator(config, dispatcher=FakeDispatcher({}))
 
@@ -1038,7 +1038,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -1125,7 +1125,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -1167,7 +1167,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -1222,7 +1222,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             store = Store(config.state_db)
             store.initialize()
@@ -1285,7 +1285,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_enqueue_carries_declared_receipt_through_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
                 state_db=root / "state.db",
@@ -1324,7 +1324,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
-                state_db=Path(temporary) / "state.db",
+                state_db=Path(temporary).resolve() / "state.db",
             )
             coordinator = Coordinator(config, dispatcher=FakeDispatcher({}))
 
@@ -1336,7 +1336,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_auto_enqueue_uses_controller_to_select_worker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
                 state_db=root / "state.db",
@@ -1396,7 +1396,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_enqueue_prompt_file_rejects_changed_dedupe_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
                 state_db=root / "state.db",
@@ -1421,7 +1421,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_auto_router_timeout_closes_controller_created_for_routing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             config = replace(
                 base,
@@ -1466,7 +1466,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_explicit_enqueue_does_not_start_router(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = replace(
                 load_workflow(REPO_ROOT / "workflows/multi-harness.toml"),
                 state_db=root / "state.db",
@@ -1489,7 +1489,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_ambiguous_task_uses_controller_topology_decision(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             base = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
             config = replace(
                 base,

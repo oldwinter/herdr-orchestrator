@@ -1,0 +1,1 @@
+在 `/Users/oldwinter/Code/grok-army-campaign/official-prompt-image-gallery` 做第二轮「体验」工作。跳过已有 Inspect 主操作和字体 issue。找另一个具体使用摩擦。`gh issue create --repo oldwinter/official-prompt-image-gallery`，标题或正文含「体验」。本地改进，不要 push/PR/merge。追加写入 `/Users/oldwinter/Code/herdr-orchestrator/.orchestrator/grok-army/issues.txt`。

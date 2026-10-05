@@ -5,7 +5,14 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
-const PACKAGE_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const SEMVER_NUMBER = "(?:0|[1-9]\\d*)";
+const SEMVER_PRERELEASE_IDENTIFIER = "(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)";
+const SEMVER_BUILD_IDENTIFIER = "[0-9A-Za-z-]+";
+const PACKAGE_VERSION = new RegExp(
+  `^${SEMVER_NUMBER}\\.${SEMVER_NUMBER}\\.${SEMVER_NUMBER}`
+    + `(?:-${SEMVER_PRERELEASE_IDENTIFIER}(?:\\.${SEMVER_PRERELEASE_IDENTIFIER})*)?`
+    + `(?:\\+${SEMVER_BUILD_IDENTIFIER}(?:\\.${SEMVER_BUILD_IDENTIFIER})*)?$`,
+);
 
 function packageJsonPath(argv) {
   if (argv.length !== 2 || argv[0] !== "--package-json" || !argv[1]) {
@@ -45,7 +52,12 @@ function registryVersions(name) {
     }
     throw new Error("npm_registry_query_failed");
   }
-  const payload = JSON.parse(result.stdout);
+  let payload;
+  try {
+    payload = JSON.parse(result.stdout);
+  } catch {
+    throw new Error("npm_registry_response_invalid");
+  }
   if (!Array.isArray(payload) || payload.some((version) => typeof version !== "string")) {
     throw new Error("npm_registry_response_invalid");
   }

@@ -1,0 +1,59 @@
+schema_version = 1
+name = "grok-army"
+workspace = ".."
+state_db = "../.orchestrator/grok-army.db"
+
+[coordinator]
+poll_seconds = 20
+max_parallel = 4
+lease_seconds = 32400
+max_attempts = 2
+agent_timeout_seconds = 28800
+
+[placement]
+mode = "hybrid"
+worktree_root = ".orchestrator/worktrees"
+
+[planner]
+enabled = true
+harness = "grok"
+worker_harnesses = ["grok"]
+interval_seconds = 300
+prompt_file = "prompts/planner-grok-army.md"
+output_file = "../.orchestrator/plans/grok-army.json"
+max_tasks = 6
+
+[[workers]]
+name = "grok-army"
+harness = "grok"
+replicas = 4
+capabilities = ["architecture", "experience", "design", "github-issues", "local-improvement"]
+placement = "tab"
+
+[[seed_jobs]]
+title = "Clone oldwinter GitHub repos into the campaign folder"
+harness = "grok"
+prompt_file = "prompts/grok-army-clone.md"
+dedupe_key = "grok-army-clone-v1"
+placement = "tab"
+
+[[seed_jobs]]
+title = "File architecture issues and apply a local architecture improvement"
+harness = "grok"
+prompt_file = "prompts/grok-army-architecture.md"
+dedupe_key = "grok-army-architecture-v1"
+placement = "pane"
+
+[[seed_jobs]]
+title = "File experience issues and apply a local experience improvement"
+harness = "grok"
+prompt_file = "prompts/grok-army-experience.md"
+dedupe_key = "grok-army-experience-v1"
+placement = "tab"
+
+[[seed_jobs]]
+title = "File design issues and apply a local design improvement"
+harness = "grok"
+prompt_file = "prompts/grok-army-design.md"
+dedupe_key = "grok-army-design-v1"
+placement = "pane"

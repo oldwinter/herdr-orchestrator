@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_TIMEOUT_SECONDS = 1500
 TEST_COMMAND = (
     "pytest",
     "tests",
@@ -22,6 +23,9 @@ TEST_COMMAND = (
     "-p",
     "no:cacheprovider",
     "--json-report",
+)
+TERMINAL_OUTCOMES = frozenset(
+    {"error", "failed", "passed", "skipped", "subtests passed", "xfailed", "xpassed"}
 )
 
 
@@ -53,7 +57,12 @@ def outcomes(path: Path) -> dict[str, str]:
             raise ValueError("report_invalid")
         nodeid = test.get("nodeid")
         outcome = test.get("outcome")
-        if not isinstance(nodeid, str) or not nodeid or not isinstance(outcome, str) or not outcome:
+        if (
+            not isinstance(nodeid, str)
+            or not nodeid
+            or not isinstance(outcome, str)
+            or outcome not in TERMINAL_OUTCOMES
+        ):
             raise ValueError("report_invalid")
         if nodeid in result:
             raise ValueError("report_duplicate_test")
@@ -110,7 +119,7 @@ def main() -> int:
                     cwd=ROOT,
                     env=environment,
                     check=False,
-                    timeout=300,
+                    timeout=TEST_TIMEOUT_SECONDS,
                 )
             except subprocess.TimeoutExpired:
                 result = subprocess.CompletedProcess(command, 124)

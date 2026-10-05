@@ -10,15 +10,12 @@ Active contributors: oldwinter, chendongdong
 ```mermaid
 flowchart TD
     E[证据链] --> SR[统一安全报告]
-    E --> RD[收敛文档与运行真源]
     M[可维护性] --> HF[拆分 Herdr 生命周期测试]
     M --> SC[减少 schema 双写]
     H[条件性硬化] --> FR[Receipt 大文件与竞态]
     H --> PX[Principal proxy 分类]
     H --> SSE[Dashboard 连接预算]
     L[生命周期] --> RT[Runtime retention]
-    L --> IN[Installer 事务化]
-    L --> CI[拆分发布权限]
 ```
 
 这些节点不是优先级排序。是否实施取决于触发条件；当前 local-first、单 OS 用户和零运行时依赖的设计本身也是需要保留的价值。
@@ -50,9 +47,9 @@ flowchart TD
 
 **事实依据**
 
-- `src/herdr_orchestrator/herdr.py` 当前约 1,416 行；`scripts/check_repository.py` 对 Python source 的上限是 1,500 行。
-- `tests/test_herdr.py` 当前约 2,393 行；测试 Python 文件上限是 2,500 行。
-- 两个文件同时承载 startup、readiness、prompt reconciliation、settlement、runtime error、blocked response、receipt 与 cleanup ownership。
+- `scripts/check_repository.py` 对 Python source 上限是 1,500 行，测试 Python 是 2,500 行，其他文本是 2,000 行。
+- `delivery_recovery.py` 的 helper 已抽到 `delivery_support.py`。`tests/test_skill_package.py` 要求每个受检文本文件至少留 1 行余量。
+- `tests/test_herdr.py` 仍同时承载 startup、readiness、prompt reconciliation、settlement、runtime error、blocked response、receipt 与 cleanup ownership，接近测试上限。
 
 **风险**
 
@@ -93,23 +90,17 @@ flowchart TD
 
 ## 4. 为 file receipt 定义大小预算与更窄的文件读取原语
 
-**事实依据**
+**已落地的部分**
 
-- `src/herdr_orchestrator/herdr.py` 的 file receipt 会在 prompt 前后用 `Path.read_bytes()` 读取完整文件，再计算 size 与 SHA-256。
-- 路径已拒绝绝对值、`..`、symlink chain 和 resolve 后逃逸；`tests/test_herdr.py` 覆盖旧文件、空文件、当前 turn 新文件和 symlink。
-- 当前 workflow 没有 file receipt 最大字节数；威胁模型接受同 OS 用户为信任域。
+`src/herdr_orchestrator/completion.py` 用 `O_NOFOLLOW` 打开常规文件，按块计算 SHA-256，并拒绝超过 1 MiB 的 file receipt。稳定错误码是 `task_receipt_too_large`。
 
-**风险**
+**仍成立的残余**
 
-误把大 artifact 声明为 receipt 会在每次 baseline/verification 中分配整文件内存，造成局部资源耗尽。路径检查与后续读取也不是跨进程原子的；在更弱的本地信任模型下，检查后替换仍是竞态。
+路径检查与打开之间仍不是跨进程原子的。同 OS 用户可以在验证前替换文件。这个预算服务 sentinel receipt，不把 file receipt 变成构建产物通道。
 
-**取舍**
+**何时再处理**
 
-流式 hash 可降低内存峰值，但不能单独消除 pathname TOCTOU；基于 file descriptor、regular-file metadata 和 no-follow 的实现更稳健，却需要平台语义与额外测试。新增大小上限会改变已存在的大 receipt 的兼容行为。
-
-**何时处理**
-
-在 file receipt 被用于构建产物、支持远程/低信任 worker、出现大文件案例，或项目改变“同 OS 用户可信”假设时处理。当前小型 sentinel 文件场景可以继续依赖现有简单实现。
+file receipt 被用于构建产物、支持远程/低信任 worker，或项目改变“同 OS 用户可信”假设时。
 
 相关：[任务收据与恢复](features/receipts-and-recovery.md) · [安全](security.md#receiptpane-ownership-与路径安全)
 
@@ -138,23 +129,9 @@ flowchart TD
 
 ## 6. 收敛 observability 目录命名的文档漂移
 
-**事实依据**
+**已落地**
 
-- `src/herdr_orchestrator/runner.py` 构造 telemetry root 为 `config.state_db.parent / "telemetry"`。
-- `src/herdr_orchestrator/observability.py` 写入该目录下三个 JSONL。
-- `docs/observability.md` 当前写成 `.orchestrator/observability/`，而实现和现有 Wiki 的可观测性页面使用 `.orchestrator/telemetry/`。
-
-**风险**
-
-运维人员可能在错误目录排查或清理 incident evidence；脚本若按文档路径采集，会静默漏掉实际 telemetry。
-
-**取舍**
-
-只修文档最小但保留“类名 Observability / 目录 telemetry”的术语差异；迁移代码目录会影响已有本地数据和外部采集脚本，需要兼容读取或明确迁移。
-
-**何时处理**
-
-在下一次修改 `docs/observability.md`、增加 telemetry collector、实现 retention，或把该路径纳入稳定 API 前处理。当前实现路径应被视为运行真源。
+`docs/observability.md`、实现和 Wiki 都使用 `.orchestrator/telemetry/`。`runner.py` 构造 `config.state_db.parent / "telemetry"`。不要再把文档改回 `observability/`。
 
 相关：[可观测性与 Attention](features/observability-and-attention.md) · [配置参考](reference/configuration.md)
 
@@ -182,67 +159,41 @@ flowchart TD
 
 ## 8. 为 Dashboard SSE 增加显式连接预算
 
-**事实依据**
+**已落地的部分**
 
-- `src/herdr_orchestrator/dashboard/server.py` 使用 `ThreadingHTTPServer`，每个 `/api/events` 连接在循环中等待 feed，并每 15 秒 heartbeat。
-- Server 只绑定 `127.0.0.1`/`localhost`、验证 Host，且没有写路由；`tests/test_dashboard.py` 固定这些边界。
-- 当前没有认证、最大 SSE 连接数、每客户端总时长或全局 thread budget。
+`/api/events` 同时最多 16 条连接。超出时返回 `503 {"error":"dashboard_sse_limit"}`，已有流继续。`tests/test_dashboard.py` 覆盖预算与 HTTP 拒绝。
 
-**风险**
+**仍成立的残余**
 
-同一 OS 用户下的恶意或故障本地进程可以建立大量连接并消耗线程/文件描述符。当前 loopback 信任假设降低了外部攻击面，但不消除本地 DoS。
+没有按客户端的时长上限，也没有从 ThreadingHTTPServer 换成单线程 async。loopback 上的本机进程仍可以把预算用满。远程访问不能只靠提高这个数字。
 
-**取舍**
+**何时再处理**
 
-连接上限、idle cutoff 或单线程 async server 会增加状态和兼容复杂度，也可能误断浏览器重连。为当前单用户只读工具加入网络认证，会显著扩大配置与 secret 管理面，未必比保持 loopback 更安全。
-
-**何时处理**
-
-在 Dashboard 变成长驻服务、出现多客户端、观察到连接泄漏，或任何人提议扩大 bind 范围前处理。若要远程访问，应重新设计认证/授权/CSRF，而不是只提高连接上限。
+Dashboard 变成长驻多客户端服务，或任何人提议扩大 bind 范围前。那时需要认证、授权和 CSRF，而不是只改连接上限。
 
 相关：[本地 Dashboard](systems/dashboard.md) · [安全](security.md#dashboardloopbackhostcsp-与白名单)
 
 ## 9. 提升 npm installer 多文件协调的崩溃一致性
 
-**事实依据**
+**已落地的部分**
 
-- `bin/herdr-orchestrator.mjs` 会先计算 conflicts、preserved、removals 和 desired files，再逐项 unlink/write，最后写 manifest 和 Git exclude。
-- Hash ownership、symlink guard 和用户修改保留已经由 `tests/test_distribution.py` 覆盖。
-- 多个目标文件及 Git exclude 的更新不是一个文件系统事务；进程在中途崩溃可能留下部分新内容和旧/缺 manifest。
+`bin/installer-journal.mjs` 在首次 owned mutation 前写 journal；install/uninstall 会先 reconcile。`just test-installer-crash-matrix` 和 `docs/installation.md` 覆盖该路径。
 
-**风险**
+**仍成立的残余**
 
-异常退出、磁盘满或机器中断后，doctor 可能只能报告 partial installation，用户需要重新 install 或人工判断 ownership。当前逻辑防止越界覆盖，但不保证跨文件原子可见。
+项目文件、manifest 和 Git common-dir exclude 仍不是同一个内核事务。journal 让 partial install 可恢复，但不能假装跨根目录原子可见。
 
-**取舍**
+**何时再处理**
 
-临时目录加 rename 能改善单文件原子性，却无法把项目文件、manifest 和 Git common-dir exclude 纳入同一事务；完整 rollback journal 会增加 installer 状态、恢复规则和测试矩阵，与当前零 npm runtime dependency 的简单性相冲突。
-
-**何时处理**
-
-在托管根/文件数量继续增长、installer 用于无人值守批量部署，或出现真实 partial-install 事故时处理。此前保留 stable doctor 输出和可重复 install，比假装存在跨文件原子性更重要。
+托管根继续增长、无人值守批量部署，或出现 journal 也无法分类的 partial-install 事故时。
 
 相关：[安装与分发](systems/installation-and-distribution.md) · [依赖参考](reference/dependencies.md)
 
 ## 10. 对齐 npm publish 的实际权限、文档与测试
 
-**事实依据**
+**已落地**
 
-- `.github/workflows/ci.yml` 的 `publish` job 当前同时拥有 `contents: write` 与 `id-token: write`；前者用于 `gh release create`，后者用于 npm Trusted Publishing。
-- `docs/installation.md` 仍写“publish job 只有 `contents: read` 与 `id-token: write`”。
-- `tests/test_release.py` 验证 OIDC、main/version gate、GitHub-hosted runner、无 `NODE_AUTH_TOKEN` 和 action SHA，但没有固定 `contents` permission。
-
-**风险**
-
-维护者可能基于过时文档误判 least-privilege 边界；未来 workflow 变更也可能在没有测试提示的情况下扩大或缩小 repository write 权限。
-
-**取舍**
-
-把 npm publish 与 GitHub release 拆成两个 job 可让 registry publish 保持 `contents: read`，但会增加 job、权限交接和失败恢复状态；保留单 job 更简单，则需要准确记录 `contents: write` 的用途并由测试固定。
-
-**何时处理**
-
-在下一次修改 release workflow、Environment policy、release notes 或 npm Trusted Publishing 配置时处理。无论选择拆分还是保留，都应以 `.github/workflows/ci.yml` 为运行真源，并保持 contributor code 不进入 self-hosted/OIDC 写权限边界。
+`publish` job 只有 `contents: read` 与 `id-token: write`。`github-release` 是单独 job，只有 `contents: write`。`docs/installation.md` 与 `tests/test_release.py` 已固定该拆分。不要再把它们合成一个 job。
 
 相关：[安装与分发](systems/installation-and-distribution.md) · [安全](security.md#ci-与-npm-oidc) · [部署与发布](deployment.md)
 

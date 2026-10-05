@@ -7,13 +7,38 @@ type = forbidden
 source_modules =
     herdr_orchestrator.model
 forbidden_modules =
+    herdr_orchestrator.attempt_runtime
+    herdr_orchestrator.attempts
+    herdr_orchestrator.attempts_legacy
     herdr_orchestrator.catalog
     herdr_orchestrator.cli
     herdr_orchestrator.config
+    herdr_orchestrator.dashboard
     herdr_orchestrator.delivery
+    herdr_orchestrator.delivery_completed_legacy
+    herdr_orchestrator.delivery_identity
+    herdr_orchestrator.delivery_journal
+    herdr_orchestrator.delivery_legacy
+    herdr_orchestrator.delivery_prompts
+    herdr_orchestrator.delivery_protocol
+    herdr_orchestrator.delivery_recovery
+    herdr_orchestrator.delivery_repair
+    herdr_orchestrator.delivery_support
+    herdr_orchestrator.git_workspace
+    herdr_orchestrator.harness_health
+    herdr_orchestrator.health
     herdr_orchestrator.herdr
+    herdr_orchestrator.herdr_layout
+    herdr_orchestrator.planner
+    herdr_orchestrator.readiness
     herdr_orchestrator.runner
+    herdr_orchestrator.selection
     herdr_orchestrator.store
+    herdr_orchestrator.store_health
+    herdr_orchestrator.store_metadata
+    herdr_orchestrator.store_workspace
+    herdr_orchestrator.topology
+    herdr_orchestrator.tracker
 
 [importlinter:contract:protocol-is-a-leaf]
 name = Process protocol must not depend on orchestration modules
@@ -21,10 +46,86 @@ type = forbidden
 source_modules =
     herdr_orchestrator.protocol
 forbidden_modules =
+    herdr_orchestrator.attempt_runtime
+    herdr_orchestrator.attempts
+    herdr_orchestrator.attempts_legacy
     herdr_orchestrator.catalog
     herdr_orchestrator.cli
+    herdr_orchestrator.completion
     herdr_orchestrator.config
+    herdr_orchestrator.dashboard
     herdr_orchestrator.delivery
+    herdr_orchestrator.delivery_completed_legacy
+    herdr_orchestrator.delivery_identity
+    herdr_orchestrator.delivery_journal
+    herdr_orchestrator.delivery_legacy
+    herdr_orchestrator.delivery_prompts
+    herdr_orchestrator.delivery_protocol
+    herdr_orchestrator.delivery_recovery
+    herdr_orchestrator.delivery_repair
+    herdr_orchestrator.delivery_support
+    herdr_orchestrator.feature_flags
+    herdr_orchestrator.git_workspace
+    herdr_orchestrator.harness_health
+    herdr_orchestrator.health
+    herdr_orchestrator.herdr
+    herdr_orchestrator.herdr_layout
+    herdr_orchestrator.model
+    herdr_orchestrator.observability
+    herdr_orchestrator.planner
+    herdr_orchestrator.readiness
+    herdr_orchestrator.runner
+    herdr_orchestrator.selection
+    herdr_orchestrator.store
+    herdr_orchestrator.store_health
+    herdr_orchestrator.store_metadata
+    herdr_orchestrator.store_workspace
+    herdr_orchestrator.topology
+    herdr_orchestrator.tracker
+
+[importlinter:contract:dashboard-is-read-only]
+name = Dashboard must not import write-capable orchestration
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    herdr_orchestrator.dashboard
+forbidden_modules =
+    herdr_orchestrator.attempt_runtime
+    herdr_orchestrator.attempts
+    herdr_orchestrator.attempts_legacy
+    herdr_orchestrator.catalog
+    herdr_orchestrator.cli
+    herdr_orchestrator.delivery
+    herdr_orchestrator.delivery_completed_legacy
+    herdr_orchestrator.delivery_identity
+    herdr_orchestrator.delivery_journal
+    herdr_orchestrator.delivery_legacy
+    herdr_orchestrator.delivery_prompts
+    herdr_orchestrator.delivery_protocol
+    herdr_orchestrator.delivery_recovery
+    herdr_orchestrator.delivery_repair
+    herdr_orchestrator.delivery_support
+    herdr_orchestrator.git_workspace
+    herdr_orchestrator.herdr
+    herdr_orchestrator.planner
+    herdr_orchestrator.runner
+    herdr_orchestrator.store_health
+    herdr_orchestrator.store_metadata
+    herdr_orchestrator.store_workspace
+    herdr_orchestrator.tracker
+
+[importlinter:contract:delivery-support-is-shared]
+name = Delivery support must not depend on delivery mixins or the queue
+type = forbidden
+source_modules =
+    herdr_orchestrator.delivery_support
+forbidden_modules =
+    herdr_orchestrator.cli
+    herdr_orchestrator.dashboard
+    herdr_orchestrator.delivery
+    herdr_orchestrator.delivery_completed_legacy
+    herdr_orchestrator.delivery_recovery
+    herdr_orchestrator.delivery_repair
     herdr_orchestrator.herdr
     herdr_orchestrator.runner
     herdr_orchestrator.store

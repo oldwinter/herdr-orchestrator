@@ -40,8 +40,11 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
         frontmatter = skill.split("---", 2)[1]
 
         self.assertIn("name: herdr-orchestrator", frontmatter)
-        self.assertIn("npx --yes herdr-orchestrator install --project .", skill)
-        self.assertIn("npx --yes herdr-orchestrator doctor --project .", skill)
+        self.assertIn(
+            "npm exec --yes --package=herdr-orchestrator -- herdr-orchestrator install --project .",
+            skill,
+        )
+        self.assertIn("herdr_orchestrator doctor --project .", skill)
         self.assertIn("herdr-manager", skill)
         self.assertNotIn("PYTHONPATH=src", skill)
         self.assertNotIn("workflows/multi-harness.toml", skill)
@@ -83,8 +86,10 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
         for block in re.findall(r"```bash\n(.*?)```", skill, flags=re.DOTALL):
             normalized = block.replace("\\\n", " ")
             for line in normalized.splitlines():
-                if line.startswith("npx --yes herdr-orchestrator "):
-                    commands.append(shlex.split(line)[3:])
+                if line.startswith("herdr_orchestrator "):
+                    commands.append(shlex.split(line)[1:])
+                elif line.startswith("npm exec --yes --package=herdr-orchestrator -- "):
+                    commands.append(shlex.split(line)[6:])
 
         runtime_commands = {
             "catalog",
@@ -92,6 +97,7 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             "doctor",
             "enqueue",
             "gc",
+            "resume",
             "retry",
             "run",
             "status",
@@ -116,6 +122,9 @@ class StandardizedDeliverySkillTests(unittest.TestCase):
             ]
             parsed = parser.parse_args(arguments)
             self.assertEqual(parsed.command, command[0])
+            if parsed.command == "enqueue":
+                self.assertIsNotNone(parsed.receipt_file)
+                self.assertIsNone(parsed.receipt_prefix)
 
     def test_canonical_skill_has_only_exact_opt_in_keyword_triggers(self) -> None:
         skill = (SKILLS / "standardized-delivery/SKILL.md").read_text(encoding="utf-8")
@@ -179,10 +188,63 @@ class RepositoryCheckerTests(unittest.TestCase):
             root = Path(temporary)
             source = root / "sample.py"
             source.write_text("value = 1\n", encoding="utf-8")
-            with patch.object(CHECK_REPOSITORY, "MAX_SOURCE_LINES", 1):
+            with patch.object(CHECK_REPOSITORY, "MAX_SOURCE_LINES", 2):
                 failures = CHECK_REPOSITORY.repository_failures(root, (source,))
 
         self.assertEqual(failures, [])
+
+    def test_repository_checker_requires_line_headroom(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sample.py"
+            source.write_text("value = 1\n", encoding="utf-8")
+            with patch.object(CHECK_REPOSITORY, "MAX_SOURCE_LINES", 1):
+                failures = CHECK_REPOSITORY.repository_failures(root, (source,))
+
+        self.assertEqual(
+            failures,
+            ["sample.py: 1 lines leaves no headroom under 1"],
+        )
+
+    def test_repository_checker_reports_invalid_utf8_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sample.py"
+            source.write_bytes(b"value = \xff\n")
+
+            failures = CHECK_REPOSITORY.repository_failures(root, (source,))
+
+        self.assertEqual(failures, ["sample.py: unable to read UTF-8 text"])
+
+    def test_tracked_text_files_keep_one_line_below_the_repository_limit(self) -> None:
+        files = CHECK_REPOSITORY.tracked_files()
+        failures = []
+        for path in files:
+            if not path.is_file():
+                continue
+            relative = path.relative_to(CHECK_REPOSITORY.ROOT).as_posix()
+            if path.suffix not in CHECK_REPOSITORY.TEXT_SUFFIXES:
+                continue
+            if relative in CHECK_REPOSITORY.EXEMPT_LINE_PATHS:
+                continue
+            lines = len(path.read_text(encoding="utf-8").splitlines())
+            maximum = CHECK_REPOSITORY.line_limit(path)
+            if lines + CHECK_REPOSITORY.LINE_HEADROOM > maximum:
+                failures.append(f"{relative}: {lines} lines leaves no headroom under {maximum}")
+
+        self.assertEqual(failures, [])
+
+    def test_import_linter_covers_split_orchestration_modules(self) -> None:
+        text = (REPO_ROOT / ".importlinter").read_text(encoding="utf-8")
+
+        for required in (
+            "[importlinter:contract:dashboard-is-read-only]",
+            "[importlinter:contract:delivery-support-is-shared]",
+            "herdr_orchestrator.attempts",
+            "herdr_orchestrator.dashboard",
+            "herdr_orchestrator.delivery_support",
+        ):
+            self.assertIn(required, text)
 
     def test_docs_checker_requires_every_key_document(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -209,6 +271,24 @@ class RepositoryCheckerTests(unittest.TestCase):
             failures = CHECK_DOCS.documentation_failures(root)
 
         self.assertEqual(failures, ["README.md: local link escapes repository ../outside.md"])
+
+    def test_docs_checker_parses_balanced_parentheses_in_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "justfile").write_text("check:\n\t@true\n", encoding="utf-8")
+            for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
+                (root / name).write_text("", encoding="utf-8")
+            target = root / "docs" / "name(with-parentheses).md"
+            target.parent.mkdir()
+            target.write_text("ok\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[target](docs/name(with-parentheses).md)\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK_DOCS.documentation_failures(root)
+
+        self.assertEqual(failures, [])
 
     def test_docs_checker_rejects_a_symlinked_key_document(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -268,11 +348,35 @@ class RepositoryCheckerTests(unittest.TestCase):
             failures,
         )
 
+    def test_docs_checker_validates_every_copy_and_move_operand(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "justfile").write_text("check:\n\t@true\n", encoding="utf-8")
+            for name in ("README.md", "AGENTS.md", "CONTRIBUTING.md"):
+                (root / name).write_text("", encoding="utf-8")
+            (root / "existing").mkdir()
+            (root / "existing" / "source.txt").write_text("ok\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "```bash\n"
+                "cp existing/source.txt missing/copy.txt\n"
+                "mv existing/source.txt missing/move.txt\n"
+                "```\n",
+                encoding="utf-8",
+            )
+
+            failures = CHECK_DOCS.documentation_failures(root)
+
+        self.assertIn("README.md: missing command path missing/copy.txt", failures)
+        self.assertIn("README.md: missing command path missing/move.txt", failures)
+
     def test_documented_workflows_are_all_tracked_examples(self) -> None:
-        workflows = sorted(
-            path.relative_to(REPO_ROOT).as_posix()
-            for path in (REPO_ROOT / "workflows").glob("*.toml")
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--", "workflows/*.toml"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=True,
         )
+        workflows = sorted(path.decode() for path in result.stdout.split(b"\0") if path)
         documentation = "\n".join(
             (REPO_ROOT / name).read_text(encoding="utf-8") for name in ("README.md", "AGENTS.md")
         )

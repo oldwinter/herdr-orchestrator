@@ -1,0 +1,115 @@
+schema_version = 1
+name = "grok-burst"
+workspace = ".."
+state_db = "../.orchestrator/grok-burst.db"
+
+[coordinator]
+poll_seconds = 15
+max_parallel = 12
+lease_seconds = 14400
+max_attempts = 2
+agent_timeout_seconds = 10800
+
+[placement]
+mode = "hybrid"
+worktree_root = ".orchestrator/worktrees"
+
+[planner]
+enabled = true
+harness = "grok"
+worker_harnesses = ["grok"]
+interval_seconds = 120
+prompt_file = "prompts/planner-grok-burst.md"
+output_file = "../.orchestrator/plans/grok-burst.json"
+max_tasks = 8
+
+[[workers]]
+name = "grok-burst"
+harness = "grok"
+replicas = 12
+capabilities = ["architecture", "experience", "design", "github-issues", "local-improvement"]
+placement = "tab"
+
+[[seed_jobs]]
+title = "hctl: 架构 issue and local architecture fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-hctl.md"
+dedupe_key = "grok-burst-hctl-v1"
+placement = "tab"
+
+[[seed_jobs]]
+title = "all-cli: 体验 issue and local UX fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-all-cli.md"
+dedupe_key = "grok-burst-all-cli-v1"
+placement = "pane"
+
+[[seed_jobs]]
+title = "skills-desktop: 设计 issue and local design fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-skills-desktop.md"
+dedupe_key = "grok-burst-skills-desktop-v1"
+placement = "tab"
+
+[[seed_jobs]]
+title = "open-pstack: 架构 issue and local architecture fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-open-pstack.md"
+dedupe_key = "grok-burst-open-pstack-v1"
+placement = "pane"
+
+[[seed_jobs]]
+title = "herdrm: 体验 issue and local UX fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-herdrm.md"
+dedupe_key = "grok-burst-herdrm-v1"
+placement = "tab"
+
+[[seed_jobs]]
+title = "hyperframes: 设计 issue and local design fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-hyperframes.md"
+dedupe_key = "grok-burst-hyperframes-v1"
+placement = "pane"
+
+[[seed_jobs]]
+title = "better-harness: 架构 issue and local architecture fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-better-harness.md"
+dedupe_key = "grok-burst-better-harness-v1"
+placement = "tab"
+
+[[seed_jobs]]
+title = "official-prompt-image-gallery: 体验 issue and local UX fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-official-prompt-image-gallery.md"
+dedupe_key = "grok-burst-gallery-v1"
+placement = "pane"
+
+[[seed_jobs]]
+title = "canvas-base-md: 设计 issue and local design fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-canvas-base-md.md"
+dedupe_key = "grok-burst-canvas-v1"
+placement = "tab"
+
+[[seed_jobs]]
+title = "harnessctl: 架构 issue and local architecture fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-harnessctl.md"
+dedupe_key = "grok-burst-harnessctl-v1"
+placement = "pane"
+
+[[seed_jobs]]
+title = "oh-my-mermaid: 体验 issue and local UX fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-oh-my-mermaid.md"
+dedupe_key = "grok-burst-mermaid-v1"
+placement = "tab"
+
+[[seed_jobs]]
+title = "multica: 设计 issue and local design fix"
+harness = "grok"
+prompt_file = "prompts/grok-burst-multica.md"
+dedupe_key = "grok-burst-multica-v1"
+placement = "pane"

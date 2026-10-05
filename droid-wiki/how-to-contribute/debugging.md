@@ -112,6 +112,7 @@ herdr integration status
 | `task_receipt_missing` | 声明 receipt 不存在 | 当前 turn 输出或目标文件 |
 | `task_receipt_ambiguous` | prefix 可能只是 prompt echo | authorship 与新增输出边界 |
 | `task_receipt_stale` | file receipt 当前 turn 前后未变化 | mtime/content 与 execution root |
+| `task_receipt_too_large` | file receipt 超过 1 MiB | 收据应是 sentinel 文件 |
 
 普通 queue 的真实 `blocked` 是 terminal，不会由 coordinator 自动回答。人工确认问题与权限后，
 使用响应文件恢复原 agent/pane/attempt：
