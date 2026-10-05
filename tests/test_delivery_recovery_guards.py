@@ -434,43 +434,45 @@ class DeliveryRecoveryGuardTests(unittest.TestCase):
 
     def test_artifact_recovery_matches_when_agent_inspection_is_inconclusive(self) -> None:
         for dispatcher_type in (MissingAgentDispatcher, NotReadyAgentDispatcher):
-            with self.subTest(dispatcher=dispatcher_type.__name__):
-                with tempfile.TemporaryDirectory() as temporary:
-                    repository = Path(temporary).resolve() / "repository"
-                    _initialize_repository(repository)
-                    config = _workflow(repository)
-                    goal = repository / "goal.md"
-                    goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
-                    crashed_dispatcher = CrashAfterPlanDispatcher()
-                    with self.assertRaisesRegex(
-                        RuntimeError,
-                        "controller died after plan artifact",
-                    ):
-                        StandardizedDelivery(
-                            config,
-                            dispatcher=crashed_dispatcher,
-                            tracker=StableTracker(),
-                            controller_harness=Harness.DROID,
-                            worker_harnesses=(Harness.DROID,),
-                        ).run(goal)
-
-                    resumed_dispatcher = dispatcher_type()
-                    result = StandardizedDelivery(
+            with (
+                self.subTest(dispatcher=dispatcher_type.__name__),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                repository = Path(temporary).resolve() / "repository"
+                _initialize_repository(repository)
+                config = _workflow(repository)
+                goal = repository / "goal.md"
+                goal.write_text("Deliver one recoverable slice.", encoding="utf-8")
+                crashed_dispatcher = CrashAfterPlanDispatcher()
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "controller died after plan artifact",
+                ):
+                    StandardizedDelivery(
                         config,
-                        dispatcher=resumed_dispatcher,
+                        dispatcher=crashed_dispatcher,
                         tracker=StableTracker(),
                         controller_harness=Harness.DROID,
                         worker_harnesses=(Harness.DROID,),
                     ).run(goal)
 
-                    self.assertEqual(result.status, "succeeded")
-                    self.assertEqual(crashed_dispatcher.calls, 1)
-                    self.assertFalse(
-                        any(
-                            "Create one accepted specification" in prompt
-                            for prompt in resumed_dispatcher.prompts
-                        )
+                resumed_dispatcher = dispatcher_type()
+                result = StandardizedDelivery(
+                    config,
+                    dispatcher=resumed_dispatcher,
+                    tracker=StableTracker(),
+                    controller_harness=Harness.DROID,
+                    worker_harnesses=(Harness.DROID,),
+                ).run(goal)
+
+                self.assertEqual(result.status, "succeeded")
+                self.assertEqual(crashed_dispatcher.calls, 1)
+                self.assertFalse(
+                    any(
+                        "Create one accepted specification" in prompt
+                        for prompt in resumed_dispatcher.prompts
                     )
+                )
 
     def test_wayfinder_refuses_to_write_a_map_over_the_decision_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

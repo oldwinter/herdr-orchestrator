@@ -845,12 +845,14 @@ class CliCommandDispatchTests(unittest.TestCase):
             oversized.write_text("x" * 32, encoding="utf-8")
             empty = root / "empty.txt"
             empty.write_text("   \n", encoding="utf-8")
-            with patch.object(cli_module, "RESPONSE_FILE_MAX_BYTES", 8):
-                with self.assertRaisesRegex(ValueError, "response_file_oversized"):
-                    cli_module._command_resume(
-                        self.config,
-                        Namespace(job_id=1, response_file=str(oversized)),
-                    )
+            with (
+                patch.object(cli_module, "RESPONSE_FILE_MAX_BYTES", 8),
+                self.assertRaisesRegex(ValueError, "response_file_oversized"),
+            ):
+                cli_module._command_resume(
+                    self.config,
+                    Namespace(job_id=1, response_file=str(oversized)),
+                )
             with self.assertRaisesRegex(ValueError, "response_file_empty"):
                 cli_module._command_resume(
                     self.config,

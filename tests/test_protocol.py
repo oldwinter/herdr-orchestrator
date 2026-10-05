@@ -203,12 +203,14 @@ class ProtocolTests(unittest.TestCase):
             subprocess.CompletedProcess(["herdr"], 0, "", oversized),
         ):
             for function in (run_json, run_text):
-                with self.subTest(function=function.__name__):
-                    with self.assertRaisesRegex(TransportError, "herdr_output_oversized"):
-                        function(
-                            _return_process(process),
-                            Command(["herdr"], Path("/tmp"), 10),
-                        )
+                with (
+                    self.subTest(function=function.__name__),
+                    self.assertRaisesRegex(TransportError, "herdr_output_oversized"),
+                ):
+                    function(
+                        _return_process(process),
+                        Command(["herdr"], Path("/tmp"), 10),
+                    )
 
     def test_subprocess_runner_rejects_oversized_output(self) -> None:
         with (

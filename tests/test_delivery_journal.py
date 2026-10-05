@@ -1491,15 +1491,17 @@ class DeliveryJournalTests(unittest.TestCase):
             sentinel = b'{"status": "active", "sentinel": true}\n'
             (run_root / "run-owner.json").write_bytes(sentinel)
 
-            with self.assertRaisesRegex(DeliveryError, "delivery_run_active"):
-                with DeliveryJournal.claim(
+            with (
+                self.assertRaisesRegex(DeliveryError, "delivery_run_active"),
+                DeliveryJournal.claim(
                     run_root,
                     "a" * 12,
                     60,
                     error_type=DeliveryError,
                     clock=lambda: 60.0,
-                ):
-                    pass
+                ),
+            ):
+                pass
 
             self.assertEqual((run_root / "run-owner.json").read_bytes(), sentinel)
 
