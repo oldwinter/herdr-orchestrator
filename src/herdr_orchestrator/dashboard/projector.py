@@ -299,7 +299,7 @@ def _project_workspaces(
             continue
         projected = dict(workspace)
         projected["tabs"] = tabs_by_workspace.get(workspace_id, [])
-        linked_worktree = worktree_by_workspace.get(workspace_id, projected.get("worktree"))
+        linked_worktree = worktree_by_workspace.get(workspace_id)
         projected["worktree"] = linked_worktree
         projected_workspaces.append(projected)
         projected_worktrees.append(_project_worktree(workspace_id, projected, linked_worktree))

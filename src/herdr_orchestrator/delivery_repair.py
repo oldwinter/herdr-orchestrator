@@ -31,6 +31,7 @@ from herdr_orchestrator.delivery_protocol import (
 )
 from herdr_orchestrator.delivery_support import (
     DeliveryError,
+    _agent_is_active,
     _effect_absent,
     _effect_conflict,
     _effect_matched,
@@ -49,6 +50,7 @@ from herdr_orchestrator.model import (
     HarnessProfile,
     WorkflowConfig,
 )
+from herdr_orchestrator.protocol import TransportError
 
 
 class _Record(Protocol):
@@ -131,6 +133,11 @@ class DeliveryRepairMixin:
     _preflight_legacy_agent: Callable[[Path, Harness, str], None]
     _require_journal: Callable[[], DeliveryJournal]
     _is_legacy_migration: Callable[[], bool]
+    _inspect_delivery_agent: Callable[
+        [Path, str, Harness],
+        tuple[bool, DispatchOutcome | None],
+    ]
+    _delivery_agent_name: Callable[[Path, Harness, str], str]
 
     def _review_and_repair(self, plan: DeliveryPlan, integration: Worktree) -> int:
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
@@ -214,31 +221,14 @@ class DeliveryRepairMixin:
                 )
                 _require_success(outcome, f"repair_{selected_round}")
 
-            if self._journal is None:
-                outcome = self._dispatch_with_proxy(
-                    integration.path,
-                    harness,
-                    execution_prompt(
-                        profile,
-                        repair_prompt(plan, must_fix, repair_number),
-                    ),
-                    role=f"repair-{repair_number}",
-                )
-                _require_success(outcome, f"repair_{repair_number}")
-                _validate_worktree_ownership(
-                    git,
-                    self._run_root / "worktrees" / "integration",
-                    integration,
-                )
-                after = git.validate_commit(Worktree(integration.path, integration.branch, before))
-            else:
-                after = self._reconcile_repair_commit(
-                    git,
-                    integration,
-                    repair_number,
-                    before,
-                    dispatch=dispatch_repair,
-                )
+            after = self._reconcile_repair_commit(
+                git,
+                integration,
+                repair_number,
+                before,
+                dispatch=dispatch_repair,
+                harness=harness,
+            )
             self._complete_repair_attempt(repair_number, after)
             repair_attempts = repair_number
 
@@ -273,14 +263,13 @@ class DeliveryRepairMixin:
             raise DeliveryError("delivery_repair_state_invalid")
         current = git.head(integration)
         if current != before:
-            if self._journal is not None:
-                current = self._reconcile_repair_commit(
-                    git,
-                    integration,
-                    round_number,
-                    before,
-                    dispatch=None,
-                )
+            current = self._reconcile_repair_commit(
+                git,
+                integration,
+                round_number,
+                before,
+                dispatch=None,
+            )
             attempts = round_number
             self._record(
                 "review_repair_recovered",
@@ -300,6 +289,7 @@ class DeliveryRepairMixin:
         before: str,
         *,
         dispatch: Callable[[], None] | None,
+        harness: Harness | None = None,
     ) -> str:
         journal = self._require_journal()
         receipt_file = self._repair_receipt_path(round_number)
@@ -353,6 +343,21 @@ class DeliveryRepairMixin:
             if current == before:
                 if receipt_file.exists() or started:
                     return _effect_conflict()
+                if harness is not None:
+                    try:
+                        _, inspected = self._inspect_delivery_agent(
+                            integration.path,
+                            self._delivery_agent_name(
+                                integration.path,
+                                harness,
+                                f"repair-{round_number}",
+                            ),
+                            harness,
+                        )
+                    except TransportError:
+                        return _effect_conflict()
+                    if _agent_is_active(inspected):
+                        return _effect_conflict()
                 return _effect_absent()
             try:
                 return _effect_matched(repair_details())

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import Store, StoreError
 
 
 class SqliteLifecycleTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class SqliteLifecycleTests(unittest.TestCase):
             store = Store(Path(temporary) / "state.db")
             with (
                 patch("herdr_orchestrator.store.sqlite3.connect", return_value=connection),
-                self.assertRaisesRegex(sqlite3.OperationalError, "setup failed"),
+                self.assertRaisesRegex(StoreError, "store_unavailable: setup failed"),
                 store._connect(),
             ):
                 pass

@@ -24,6 +24,7 @@ ASSET_TYPES = {
     ".js": "text/javascript; charset=utf-8",
 }
 DEFAULT_SSE_CONNECTION_LIMIT = 16
+SSE_WRITE_TIMEOUT_SECONDS = 30.0
 
 _STATE_DB_REQUIRED_COLUMNS = {
     "schema_meta": frozenset({"version"}),
@@ -200,6 +201,7 @@ class DashboardMonitor:
         self.feed = feed
         self.poll_seconds = poll_seconds
         self._stop = threading.Event()
+        self._last_signature: str | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -232,8 +234,24 @@ class DashboardMonitor:
                     },
                     "error": type(exc).__name__,
                 }
-            self.feed.publish(snapshot)
+            signature = _snapshot_signature(snapshot)
+            if signature is None or signature != self._last_signature:
+                self.feed.publish(snapshot)
+                self._last_signature = signature
             self._stop.wait(self.poll_seconds)
+
+
+def _snapshot_signature(snapshot: object) -> str | None:
+    if not isinstance(snapshot, dict):
+        return None
+    try:
+        return json.dumps(
+            {key: value for key, value in snapshot.items() if key != "generated_at"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 class DashboardServer:
@@ -402,6 +420,7 @@ def _handler(
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
                 self.close_connection = True
+                self.connection.settimeout(SSE_WRITE_TIMEOUT_SECONDS)
                 try:
                     while True:
                         next_id, snapshot = feed.wait_after(event_id, timeout=15)

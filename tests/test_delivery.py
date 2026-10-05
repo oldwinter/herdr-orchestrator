@@ -19,6 +19,7 @@ from herdr_orchestrator.delivery import (
     _delivery_run_claim,
     _write_json,
 )
+from herdr_orchestrator.delivery_journal import DeliveryJournal
 from herdr_orchestrator.delivery_protocol import (
     DeliveryArtifactError,
     FindingSeverity,
@@ -27,6 +28,7 @@ from herdr_orchestrator.delivery_protocol import (
     load_delivery_plan,
     load_wayfinder_route,
 )
+from herdr_orchestrator.delivery_support import _file_sha256
 from herdr_orchestrator.git_workspace import GitWorkspace, GitWorkspaceError, Worktree
 from herdr_orchestrator.model import (
     AgentState,
@@ -597,13 +599,21 @@ class StandardizedDeliveryTests(unittest.TestCase):
             delivery._goal = "Implement the accepted local behavior."
             delivery._run_root = delivery_config.artifact_root / "proxy-test"
             delivery._run_root.mkdir(parents=True)
-
-            outcome = delivery._dispatch_with_proxy(
-                root,
-                Harness.DROID,
-                "Implement it.",
-                role="worker",
-            )
+            with DeliveryJournal.claim(
+                delivery._run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ) as journal:
+                delivery._journal = journal
+                workspace = delivery._run_root / "worktrees" / "ticket-01"
+                workspace.mkdir(parents=True)
+                outcome = delivery._dispatch_with_proxy(
+                    workspace,
+                    Harness.DROID,
+                    "Implement it.",
+                    role="worker",
+                )
 
             ledger = (delivery._run_root / "decision-ledger.jsonl").read_text(encoding="utf-8")
 
@@ -702,8 +712,14 @@ class StandardizedDeliveryTests(unittest.TestCase):
             delivery._run_root = delivery_config.artifact_root / "wayfinder-test"
             delivery._run_root.mkdir(parents=True)
 
-            map_ = delivery._run_wayfinder()
-
+            with DeliveryJournal.claim(
+                delivery._run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ) as journal:
+                delivery._journal = journal
+                map_ = delivery._run_wayfinder()
         assert map_ is not None
         self.assertEqual(len(dispatcher.prompts), 2)
         self.assertEqual(
@@ -734,8 +750,15 @@ class StandardizedDeliveryTests(unittest.TestCase):
             delivery._run_root = delivery_config.artifact_root / "resume-test"
             delivery._run_root.mkdir(parents=True)
 
-            first = delivery._create_plan(None)
-            second = delivery._create_plan(None)
+            with DeliveryJournal.claim(
+                delivery._run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ) as journal:
+                delivery._journal = journal
+                first = delivery._create_plan(None)
+                second = delivery._create_plan(None)
 
         self.assertEqual(first, second)
         self.assertEqual(
@@ -770,7 +793,15 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 worker_harnesses=(Harness.DROID,),
             )
             first._run_root = plan_path.parent
-            published = first._publish_tracker(plan)
+            first._run_id = "a" * 12
+            with DeliveryJournal.claim(
+                first._run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ) as journal:
+                first._journal = journal
+                published = first._publish_tracker(plan)
             second = StandardizedDelivery(
                 config,
                 dispatcher=ScriptedDeliveryDispatcher(),
@@ -779,12 +810,22 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 worker_harnesses=(Harness.DROID,),
             )
             second._run_root = first._run_root
+            second._run_id = "a" * 12
 
-            with patch.object(
-                second.tracker,
-                "publish",
-                side_effect=AssertionError("tracker publish repeated"),
+            with (
+                DeliveryJournal.claim(
+                    second._run_root,
+                    "a" * 12,
+                    60,
+                    error_type=DeliveryError,
+                ) as journal,
+                patch.object(
+                    second.tracker,
+                    "publish",
+                    side_effect=AssertionError("tracker publish repeated"),
+                ),
             ):
+                second._journal = journal
                 recovered = second._publish_tracker(plan)
 
         self.assertEqual(
@@ -815,13 +856,20 @@ class StandardizedDeliveryTests(unittest.TestCase):
             delivery._run_root.mkdir(parents=True)
             output = delivery._run_root / "route.json"
 
-            delivery._dispatch_artifact(
-                root,
-                Harness.DROID,
-                f"Write only this UTF-8 JSON file:\n{output}",
-                output,
-                role="way-route",
-            )
+            with DeliveryJournal.claim(
+                delivery._run_root,
+                "a" * 12,
+                60,
+                error_type=DeliveryError,
+            ) as journal:
+                delivery._journal = journal
+                delivery._dispatch_artifact(
+                    root,
+                    Harness.DROID,
+                    f"Write only this UTF-8 JSON file:\n{output}",
+                    output,
+                    role="way-route",
+                )
 
             ledger = (delivery._run_root / "decision-ledger.jsonl").read_text(encoding="utf-8")
 
@@ -898,15 +946,35 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 )
 
             def repair(*args: object, **kwargs: object) -> DispatchOutcome:
-                marker = integration.path / f"repair-{len(repair_commits) + 1}.txt"
+                round_number = len(repair_commits) + 1
+                before = _git(integration.path, "rev-parse", "HEAD").stdout.strip()
+                marker = integration.path / f"repair-{round_number}.txt"
                 marker.write_text("repaired\n", encoding="utf-8")
                 _git(integration.path, "add", marker.name)
                 _git(integration.path, "commit", "-m", "fix: repair finding")
                 commit = _git(integration.path, "rev-parse", "HEAD").stdout.strip()
+                receipt = delivery._run_root / "repairs" / f"round-{round_number}.json"
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                receipt.write_text(
+                    json.dumps(
+                        {
+                            "round": round_number,
+                            "before_commit": before,
+                            "commit": commit,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 repair_commits.append(commit)
                 return DispatchOutcome("repair", AgentState.DONE, False, "w1:p2")
 
             with (
+                DeliveryJournal.claim(
+                    delivery._run_root,
+                    "a" * 12,
+                    60,
+                    error_type=DeliveryError,
+                ) as journal,
                 patch.object(
                     delivery, "_review", side_effect=lambda *_args, **_kwargs: next(reports)
                 ),
@@ -914,12 +982,13 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 patch.object(delivery, "_dispatch_artifact", side_effect=write_verdict),
                 patch.object(delivery, "_dispatch_with_proxy", side_effect=repair),
             ):
+                delivery._journal = journal
                 rounds = delivery._review_and_repair(plan, integration)
 
         self.assertEqual(rounds, 3)
         self.assertEqual(len(repair_commits), 2)
 
-    def test_review_does_not_reuse_stale_axis_artifacts(self) -> None:
+    def test_review_fails_when_axis_artifact_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             repository = root / "repository"
@@ -950,7 +1019,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 controller_harness=Harness.DROID,
                 worker_harnesses=(Harness.DROID,),
             )
-            delivery._run_root = delivery_config.artifact_root / "stale-review"
+            delivery._run_root = delivery_config.artifact_root / "missing-review"
             delivery._run_root.mkdir(parents=True)
             plan_path = delivery._run_root / "delivery-plan.json"
             plan_path.write_text(json.dumps(_delivery_plan()), encoding="utf-8")
@@ -969,21 +1038,37 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            review_root = delivery._run_root / "reviews/round-1"
-            review_root.mkdir(parents=True)
-            (review_root / "standards.json").write_text(
-                json.dumps({"standards": []}),
-                encoding="utf-8",
-            )
-            (review_root / "spec.json").write_text(
-                json.dumps({"spec": []}),
-                encoding="utf-8",
-            )
 
             with (
+                DeliveryJournal.claim(
+                    delivery._run_root,
+                    "a" * 12,
+                    60,
+                    error_type=DeliveryError,
+                ) as journal,
                 patch.object(delivery, "_select_worker", return_value=Harness.DROID),
                 self.assertRaisesRegex(DeliveryError, "delivery_artifact_missing"),
             ):
+                delivery._journal = journal
+                head = _git(integration.path, "rev-parse", "HEAD").stdout.strip()
+                journal._persist_event(
+                    "effect_intent",
+                    "git:worktree:integration",
+                    "git.worktree.create",
+                    {
+                        "kind": "integration",
+                        "branch": integration.branch,
+                        "base_commit": head,
+                    },
+                    1.0,
+                )
+                journal._persist_event(
+                    "effect_confirmed",
+                    "git:worktree:integration",
+                    "git.worktree.create",
+                    {"branch": integration.branch, "base_commit": head},
+                    1.0,
+                )
                 delivery._review(plan, integration, 1)
 
     def test_rejects_a_foreign_repository_at_ticket_worktree_path(self) -> None:
@@ -1201,11 +1286,26 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 )
 
             def repair(*args: object, **kwargs: object) -> DispatchOutcome:
-                marker = integration.path / f"repair-{len(repair_commits) + 1}.txt"
+                round_number = len(repair_commits) + 1
+                before = _git(integration.path, "rev-parse", "HEAD").stdout.strip()
+                marker = integration.path / f"repair-{round_number}.txt"
                 marker.write_text("repaired\n", encoding="utf-8")
                 _git(integration.path, "add", marker.name)
                 _git(integration.path, "commit", "-m", "fix: repair finding")
-                repair_commits.append(_git(integration.path, "rev-parse", "HEAD").stdout.strip())
+                commit = _git(integration.path, "rev-parse", "HEAD").stdout.strip()
+                receipt = delivery._run_root / "repairs" / f"round-{round_number}.json"
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                receipt.write_text(
+                    json.dumps(
+                        {
+                            "round": round_number,
+                            "before_commit": before,
+                            "commit": commit,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                repair_commits.append(commit)
                 return DispatchOutcome("repair", AgentState.DONE, False, "w1:p2")
 
             review_calls = 0
@@ -1218,6 +1318,12 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 raise RuntimeError("interrupted after repair")
 
             with (
+                DeliveryJournal.claim(
+                    delivery._run_root,
+                    "a" * 12,
+                    60,
+                    error_type=DeliveryError,
+                ) as journal,
                 patch.object(
                     delivery,
                     "_review",
@@ -1228,6 +1334,7 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 patch.object(delivery, "_dispatch_with_proxy", side_effect=repair),
                 self.assertRaisesRegex(RuntimeError, "interrupted after repair"),
             ):
+                delivery._journal = journal
                 delivery._review_and_repair(plan, integration)
 
             resumed = StandardizedDelivery(
@@ -1249,12 +1356,19 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 return DispatchOutcome("repair", AgentState.DONE, False, "w1:p2")
 
             with (
+                DeliveryJournal.claim(
+                    resumed._run_root,
+                    "a" * 12,
+                    60,
+                    error_type=DeliveryError,
+                ) as journal,
                 patch.object(resumed, "_review", return_value=report),
                 patch.object(resumed, "_select_worker", return_value=Harness.DROID),
                 patch.object(resumed, "_dispatch_artifact", side_effect=write_verdict),
                 patch.object(resumed, "_dispatch_with_proxy", side_effect=resumed_repair),
                 self.assertRaisesRegex(DeliveryError, "review_repair_rounds_exhausted"),
             ):
+                resumed._journal = journal
                 resumed._review_and_repair(plan, integration)
 
         self.assertEqual(len(repair_commits), 1)
@@ -1276,6 +1390,27 @@ class StandardizedDeliveryTests(unittest.TestCase):
                 ),
             ):
                 claim_again()
+
+    def test_oversized_artifact_fails_hash_with_stable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary).resolve() / "artifact.json"
+            artifact.write_bytes(b"x" * 64)
+
+            with (
+                patch(
+                    "herdr_orchestrator.delivery_support._ARTIFACT_HASH_MAX_BYTES",
+                    16,
+                ),
+                self.assertRaisesRegex(DeliveryError, "delivery_artifact_too_large"),
+            ):
+                _file_sha256(artifact)
+
+            self.assertEqual(
+                _file_sha256(artifact),
+                # Known SHA-256 of the fixed 64-byte fixture, not a credential.
+                # pragma: allowlist nextline secret
+                "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c",
+            )
 
 
 def _delivery_plan() -> dict[str, object]:

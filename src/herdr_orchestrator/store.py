@@ -25,6 +25,11 @@ from herdr_orchestrator.model import (
     PlacementTarget,
     TaskReceipt,
 )
+from herdr_orchestrator.store_contracts import (
+    _completion_policy,
+    _job_contract_matches,
+    _partial_job_contract_matches,
+)
 from herdr_orchestrator.store_health import (
     HEALTH_TABLE_COLUMNS as _HEALTH_TABLE_COLUMNS,
 )
@@ -42,6 +47,9 @@ from herdr_orchestrator.store_health import (
 )
 from herdr_orchestrator.store_metadata import (
     metadata_float as _metadata_float,
+)
+from herdr_orchestrator.store_metadata import (
+    migrate_v9_to_v10 as _migrate_v9_to_v10,
 )
 from herdr_orchestrator.store_metadata import (
     reserve_planner_run as _reserve_planner_run,
@@ -108,67 +116,6 @@ def _candidate_slot_names(
     return names or (f"ho-{harness_value}",)
 
 
-def _job_contract_matches(row: sqlite3.Row, job: NewJob) -> bool:
-    completion_policy = _completion_policy(job.receipt, job.completion_policy)
-    return all(
-        (
-            row["title"] == job.title,
-            row["workspace"] == job.workspace,
-            row["harness"] == job.harness.value,
-            row["prompt"] == job.prompt,
-            row["placement"] == (job.placement.value if job.placement is not None else None),
-            row["receipt_kind"] == (job.receipt.kind.value if job.receipt is not None else None),
-            row["receipt_value"] == (job.receipt.value if job.receipt is not None else None),
-            row["completion_policy"] == completion_policy.value,
-        )
-    )
-
-
-def _partial_job_contract_matches(
-    row: sqlite3.Row,
-    *,
-    title: str,
-    prompt: str,
-    harness: Harness | None,
-    placement: PlacementTarget | None,
-    receipt: TaskReceipt | None,
-    completion_policy: CompletionPolicy | None,
-    workspace: str | None,
-) -> bool:
-    effective_policy = _completion_policy(receipt, completion_policy)
-    return all(
-        (
-            row["title"] == title,
-            row["workspace"] == workspace,
-            row["prompt"] == prompt,
-            harness is None or row["harness"] == harness.value,
-            placement is None or row["placement"] == placement.value,
-            row["receipt_kind"] == (receipt.kind.value if receipt is not None else None),
-            row["receipt_value"] == (receipt.value if receipt is not None else None),
-            row["completion_policy"] == effective_policy.value,
-        )
-    )
-
-
-def _completion_policy(
-    receipt: TaskReceipt | None,
-    requested: CompletionPolicy | None,
-) -> CompletionPolicy:
-    if requested is None:
-        return (
-            CompletionPolicy.RECEIPT_V1
-            if receipt is not None
-            else CompletionPolicy.LEGACY_UNVERIFIED
-        )
-    if requested is CompletionPolicy.STRUCTURED_V2 and receipt is None:
-        return requested
-    if requested is CompletionPolicy.RECEIPT_V1 and receipt is not None:
-        return requested
-    if requested is CompletionPolicy.LEGACY_UNVERIFIED and receipt is None:
-        return requested
-    raise StoreError("completion_policy_invalid")
-
-
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -182,6 +129,7 @@ class Store:
         with self._connect() as connection:
             connection.executescript(f"""
                 CREATE TABLE IF NOT EXISTS schema_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
                     version INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -250,6 +198,8 @@ class Store:
                     is_stale INTEGER NOT NULL DEFAULT 0,
                     observed_at REAL NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS receipts_job_id
+                    ON receipts(job_id);
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -295,8 +245,7 @@ class Store:
                     connection.execute("UPDATE schema_meta SET version = 9")
                     version = 9
                 if version == 9:
-                    create_schema(connection)
-                    connection.execute("UPDATE schema_meta SET version = 10")
+                    _migrate_v9_to_v10(connection)
                     version = 10
                 if version != SCHEMA_VERSION:
                     raise StoreError(f"unsupported_schema_version: {version}")
@@ -478,6 +427,8 @@ class Store:
 
     def enqueue(self, job: NewJob) -> tuple[int, bool]:
         now = time.time()
+        if job.max_attempts < 1:
+            raise StoreError("max_attempts_invalid")
         completion_policy = _completion_policy(job.receipt, job.completion_policy)
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -669,7 +620,8 @@ class Store:
         include_legacy: bool = False,
     ) -> _SlotOccupancy:
         query = """
-            SELECT jobs.id, jobs.harness, jobs.agent_name, jobs.lease_until FROM jobs AS jobs
+            SELECT jobs.id, jobs.harness, jobs.agent_name, jobs.lease_until, jobs.state
+            FROM jobs AS jobs
             WHERE jobs.workflow = ? AND jobs.state IN (?, ?)
         """
         parameters: tuple[object, ...] = (workflow, JobState.RUNNING.value, JobState.BLOCKED.value)
@@ -683,7 +635,8 @@ class Store:
         slots = _SlotOccupancy(Counter(), Counter(), {})
         for row in rows:
             harness_value = str(row["harness"])
-            slots.reserved_counts[harness_value] += 1
+            if row["state"] == JobState.RUNNING.value:
+                slots.reserved_counts[harness_value] += 1
             if row["lease_until"] is not None and row["lease_until"] > now:
                 slots.active_counts[harness_value] += 1
             agent_name = row["agent_name"]
@@ -779,12 +732,17 @@ class Store:
                 raise StoreError("attempt_agent_missing")
             if slots.owners.get(persisted_name) != {int(row["id"])}:
                 return None
+            if int(row["attempts"]) >= int(row["max_attempts"]):
+                Store._abandon_exhausted_candidate(connection, row, slots, now=now)
+                return None
             recovered = AttemptLedger.reclaim(
                 connection,
                 row,
                 now=now,
                 lease_until=lease_until,
             )
+            if recovered is None:
+                return None
             slots.active_counts[harness_value] += 1
             return recovered
         if slots.reserved_counts[harness_value] >= limit:
@@ -806,6 +764,49 @@ class Store:
         slots.reserved_counts[harness_value] += 1
         slots.owners.setdefault(agent_name, set()).add(claimed.job_id)
         return claimed
+
+    @staticmethod
+    def _abandon_exhausted_candidate(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        slots: _SlotOccupancy,
+        *,
+        now: float,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE jobs SET state = ?, error_code = ?, lease_until = NULL,
+                updated_at = ?
+            WHERE id = ? AND state = ?
+            """,
+            (
+                JobState.FAILED.value,
+                "attempts_exhausted",
+                now,
+                row["id"],
+                JobState.RUNNING.value,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE job_attempts SET phase = ?, finished_at = ?, updated_at = ?
+            WHERE id = ? AND job_id = ?
+            """,
+            (
+                AttemptPhase.ABANDONED.value,
+                now,
+                now,
+                row["current_attempt_id"],
+                row["id"],
+            ),
+        )
+        slots.reserved_counts[str(row["harness"])] -= 1
+        persisted_name = row["agent_name"]
+        owners = slots.owners.get(persisted_name)
+        if owners is not None:
+            owners.discard(int(row["id"]))
+            if not owners:
+                del slots.owners[persisted_name]
 
     @staticmethod
     def _fresh_health(
@@ -850,6 +851,18 @@ class Store:
                 now=time.time(),
             )
         if not recorded:
+            raise StoreError("job_lease_lost")
+
+    def renew_lease(self, job: ClaimedJob, *, lease_seconds: float) -> None:
+        """Extend the attempt lease for an in-flight dispatch."""
+        with self._transaction() as connection:
+            renewed = AttemptLedger.renew_lease(
+                connection,
+                job,
+                lease_seconds=lease_seconds,
+                now=time.time(),
+            )
+        if not renewed:
             raise StoreError("job_lease_lost")
 
     def record_outcome(self, job: ClaimedJob, outcome: DispatchOutcome) -> JobState:
@@ -1054,31 +1067,6 @@ class Store:
                 (workflow, str(workspace), harness.value, observed_at),
             )
 
-    def acquire_harness_probe(
-        self,
-        *,
-        workflow: str,
-        workspace: str | Path,
-        harness: Harness,
-        owner: str,
-        now: float,
-        lease_seconds: float,
-        force: bool = False,
-    ) -> bool:
-        """Atomically reserve one readiness refresh without touching task leases."""
-        return (
-            self.acquire_harness_probe_lease(
-                workflow=workflow,
-                workspace=str(workspace),
-                harness=harness,
-                owner=owner,
-                now=now,
-                lease_seconds=lease_seconds,
-                force=force,
-            )
-            is not None
-        )
-
     def acquire_harness_probe_lease(
         self,
         *,
@@ -1163,16 +1151,18 @@ class Store:
         workspace: str | Path,
         harness: Harness,
         owner: str,
+        lease_until: float,
     ) -> None:
+        """Release only the exact lease generation the caller still holds."""
         with self._transaction() as connection:
             connection.execute(
                 """
                 UPDATE harness_health
                 SET probe_lease_until = NULL, probe_owner = NULL
                 WHERE workflow = ? AND workspace = ? AND harness = ?
-                  AND probe_owner = ?
+                  AND probe_owner = ? AND probe_lease_until = ?
                 """,
-                (workflow, str(workspace), harness.value, owner),
+                (workflow, str(workspace), harness.value, owner, lease_until),
             )
 
     def pending_harnesses(
@@ -1293,6 +1283,7 @@ class Store:
                 """
                 UPDATE jobs
                 SET state = ?, max_attempts = ?, available_at = ?, lease_until = NULL,
+                    agent_name = NULL, current_attempt_id = NULL,
                     error_code = NULL, error_summary = NULL, agent_settled = NULL,
                     task_verified = NULL, verification_class = ?, completion_status = NULL,
                     completion_evidence_summary = NULL, completion_error_code = NULL,
@@ -1464,16 +1455,19 @@ class Store:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        with closing(sqlite3.connect(self.path, timeout=10)) as connection:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
-            try:
-                yield connection
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+        try:
+            with closing(sqlite3.connect(self.path, timeout=10)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA journal_mode = WAL")
+                try:
+                    yield connection
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+        except sqlite3.OperationalError as exc:
+            raise StoreError(f"store_unavailable: {exc}") from exc
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:

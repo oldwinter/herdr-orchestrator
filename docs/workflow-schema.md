@@ -31,7 +31,8 @@ harness 仍可能使用自身工具。prompt policy 不能改变这一点。work
 
 ## `[coordinator]`
 
-该 table 必需，且所有字段都必需。
+该 table 必需。`poll_seconds`、`max_parallel`、`lease_seconds`、`max_attempts` 和
+`agent_timeout_seconds` 必需；三个 readiness 字段可省略并使用表中默认值。
 
 | 字段 | 类型与范围 | 说明 |
 | --- | --- | --- |
@@ -141,7 +142,10 @@ refresh；没有可用候选时 fail closed 并报告每个 harness 的 reason�
 
 Task receipt 是 CLI enqueue 契约，不是 TOML workflow 字段。`--receipt-prefix` 要求 agent
 detection output 中有一行以指定值开头；`--receipt-file` 要求 execution root 下相对路径为
-非空文件。二者互斥，缺失时任务不能成功。`[[seed_jobs]]` 暂不声明 task receipt。
+非空文件。二者互斥，缺失时任务不能成功。`enqueue --completion-policy` 接受
+`legacy-unverified`、`receipt-v1` 或 `structured-v2`；省略时声明 receipt 的任务默认
+`receipt-v1`，否则默认 `legacy-unverified`。`structured-v2` 与 receipt 互斥，组合非法时
+enqueue 以 `completion_policy_invalid` 失败。`[[seed_jobs]]` 暂不声明 task receipt。
 
 ## `[standardized_delivery]`
 

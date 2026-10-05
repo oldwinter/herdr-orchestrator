@@ -74,9 +74,20 @@ def _journal_payload(value: dict[str, object]) -> dict[str, object]:
     return payload
 
 
+_ARTIFACT_HASH_MAX_BYTES = 256 * 1024 * 1024
+
+
 def _file_sha256(path: Path) -> str:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        consumed = 0
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                consumed += len(chunk)
+                if consumed > _ARTIFACT_HASH_MAX_BYTES:
+                    raise DeliveryError("delivery_artifact_too_large")
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError as exc:
         raise DeliveryError("delivery_artifact_unreadable") from exc
 
@@ -148,6 +159,23 @@ def _git_succeeds(git: GitWorkspace, cwd: Path, *args: str) -> bool:
         return git.succeeds(cwd, *args)
     except GitWorkspaceError as exc:
         raise DeliveryError("delivery_git_query_failed") from exc
+
+
+def _assert_source_workspace_stable(git: GitWorkspace, base_commit: str) -> None:
+    head = _git_output(git, git.repository, "rev-parse", "HEAD")
+    try:
+        anchored = head == base_commit or git.is_ancestor(
+            git.repository,
+            base_commit,
+            head,
+        )
+        clean = git.is_clean(git.repository, include_untracked=False)
+    except GitWorkspaceError as exc:
+        raise DeliveryError(str(exc)) from exc
+    if not anchored:
+        raise DeliveryError("delivery_source_workspace_drifted")
+    if not clean:
+        raise DeliveryError("delivery_source_workspace_dirty")
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:

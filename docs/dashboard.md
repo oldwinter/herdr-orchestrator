@@ -155,7 +155,8 @@ Canvas 在紧凑与非紧凑尺寸之间切换时，overview ownership 决定 ca
 `static/topology.js`，在 `dashboard.js` 之前加载并暴露全局函数
 （`stateClass`、`normalizedProjects`、`topologyGraph`、`topologyPresetPositions`、
 `topologyNavigationOrder`、`topologySelectionDirection`、`topologyFocusViewport`、
-`topologyRebaseViewportCapture`、`topologyId`）。它被 `tests/test_topology_js.py` 用 Node 直接求值并做 fixture
+`topologyZoomViewport`、`topologyRebaseViewportCapture`、
+`topologyViewportMotionDuration`、`topologyId`）。它被 `tests/test_topology_js.py` 用 Node 直接求值并做 fixture
 契约测试：compound 嵌套与状态 class、确定性布局与结构签名稳定性（状态-only
 SSE 更新不移动节点）、v1 workspaces 回退投影、节点身份编码、选择顺序与 viewport
 聚焦计算。没有 Node 时该测试自动 skip。独立的 `static/topology-style.js` 只生成 Cytoscape

@@ -5,18 +5,21 @@ import json
 import re
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Protocol
 
 from herdr_orchestrator.catalog import (
     profile_for_harness,
     render_compact_catalog,
 )
 from herdr_orchestrator.delivery_completed_legacy import CompletedLegacyRecoveryMixin
+from herdr_orchestrator.delivery_dispatcher import (
+    DeliveryDispatcher,
+    HerdrDeliveryDispatcher,
+)
 from herdr_orchestrator.delivery_identity import (
     delivery_run_id,
     recoverable_delivery_identity,
@@ -36,6 +39,7 @@ from herdr_orchestrator.delivery_prompts import (
     wayfinder_route_prompt,
 )
 from herdr_orchestrator.delivery_protocol import (
+    WAYFINDER_MAP_MAX_DECISIONS,
     AuthorityCategory,
     DecisionTicket,
     DeliveryArtifactError,
@@ -82,7 +86,6 @@ from herdr_orchestrator.harness_health import (
     HarnessHealthError,
     HealthProbe,
 )
-from herdr_orchestrator.herdr import HerdrTransport
 from herdr_orchestrator.model import (
     AgentState,
     DispatchOutcome,
@@ -97,7 +100,7 @@ from herdr_orchestrator.planner import (
     load_worker_selection,
     worker_selection_prompt,
 )
-from herdr_orchestrator.protocol import Command, TransportError, run_json
+from herdr_orchestrator.protocol import TransportError
 from herdr_orchestrator.selection import (
     AUTO_CONTROLLER_ORDER,
     effective_worker_harnesses,
@@ -115,6 +118,12 @@ MAX_PROXY_ROUNDS = 8
 ARTIFACT_PROMPT_ATTEMPTS = 2
 DELIVERY_LEASE_GRACE_SECONDS = 30.0
 MINIMUM_DELIVERY_LEASE_SECONDS = 60.0
+_STATE_DETAIL_KEYS = {
+    "running": {"controller"},
+    "succeeded": {"controller", "integration_branch", "integration_commit"},
+    "failed": {"controller", "error", "failed_stage"},
+    "blocked": {"controller", "error", "failed_stage"},
+}
 SENSITIVE_QUESTION = re.compile(
     r"(?i)\b(api[ _-]?key|credential|password|secret|token|production|prod)\b"
 )
@@ -125,139 +134,6 @@ _delivery_run_claim = partial(exclusive_file_claim, error_type=DeliveryError)
 
 class DeliveryEscalation(DeliveryError):
     pass
-
-
-class DeliveryDispatcher(Protocol):
-    def dispatch(
-        self,
-        workspace: Path,
-        harness: Harness,
-        prompt: str,
-        *,
-        timeout_seconds: int,
-        agent_name: str,
-    ) -> DispatchOutcome: ...
-
-    def read_agent(self, workspace: Path, name: str, *, lines: int = 120) -> str: ...
-
-    def respond(
-        self,
-        workspace: Path,
-        name: str,
-        harness: Harness,
-        response: str,
-        *,
-        timeout_seconds: int,
-    ) -> DispatchOutcome: ...
-
-
-class HerdrDeliveryDispatcher:
-    def __init__(self, workflow: WorkflowConfig) -> None:
-        self.workflow = workflow
-        self._transports: dict[Path, HerdrTransport] = {}
-        self._lock = threading.Lock()
-
-    def dispatch(
-        self,
-        workspace: Path,
-        harness: Harness,
-        prompt: str,
-        *,
-        timeout_seconds: int,
-        agent_name: str,
-    ) -> DispatchOutcome:
-        return self._transport(workspace).dispatch(
-            harness,
-            prompt,
-            timeout_seconds=timeout_seconds,
-            agent_name=agent_name,
-        )
-
-    def read_agent(self, workspace: Path, name: str, *, lines: int = 120) -> str:
-        return self._transport(workspace).read_agent(name, lines=lines)
-
-    def respond(
-        self,
-        workspace: Path,
-        name: str,
-        harness: Harness,
-        response: str,
-        *,
-        timeout_seconds: int,
-    ) -> DispatchOutcome:
-        return self._transport(workspace).respond(
-            name,
-            harness,
-            response,
-            timeout_seconds=timeout_seconds,
-        )
-
-    def inspect_agent(
-        self,
-        workspace: Path,
-        name: str,
-        harness: Harness,
-    ) -> DispatchOutcome | None:
-        transport = self._transport(workspace)
-        try:
-            result = run_json(
-                transport.runner,
-                Command(
-                    ["herdr", "agent", "get", name],
-                    workspace,
-                    10,
-                ),
-            )
-        except TransportError as exc:
-            if exc.code == "agent_not_found":
-                return None
-            raise
-        agent = result.get("agent")
-        if not isinstance(agent, dict):
-            raise TransportError("herdr_invalid_response")
-        state_value = agent.get("agent_status")
-        pane_id = agent.get("pane_id")
-        workspace_id = agent.get("workspace_id")
-        if (
-            agent.get("name") not in {None, name}
-            or agent.get("agent") != harness.value
-            or not isinstance(state_value, str)
-            or not isinstance(pane_id, str)
-            or not pane_id
-            or not isinstance(agent.get("interactive_ready"), bool)
-            or not agent["interactive_ready"]
-            or any(
-                not isinstance(agent.get(key), str)
-                or Path(agent[key]).resolve() != workspace.resolve()
-                for key in ("cwd", "foreground_cwd")
-            )
-            or (
-                workspace_id is not None and (not isinstance(workspace_id, str) or not workspace_id)
-            )
-        ):
-            raise TransportError("agent_identity_mismatch")
-        try:
-            state = AgentState(state_value)
-        except ValueError as exc:
-            raise TransportError("herdr_invalid_response") from exc
-        return DispatchOutcome(
-            name,
-            state,
-            True,
-            pane_id,
-            execution_path=str(workspace.resolve()),
-            herdr_workspace_id=workspace_id,
-            agent_settled=state in {AgentState.IDLE, AgentState.DONE},
-        )
-
-    def _transport(self, workspace: Path) -> HerdrTransport:
-        resolved = workspace.resolve()
-        with self._lock:
-            transport = self._transports.get(resolved)
-            if transport is None:
-                transport = HerdrTransport(self.workflow.name, resolved)
-                self._transports[resolved] = transport
-            return transport
 
 
 class StandardizedDelivery(
@@ -277,6 +153,7 @@ class StandardizedDelivery(
         lease_seconds: float | None = None,
         health: HarnessHealth | None = None,
         readiness_probe: HealthProbe | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
         self.dispatcher = dispatcher or HerdrDeliveryDispatcher(config)
@@ -319,6 +196,7 @@ class StandardizedDelivery(
         if lease_seconds is not None and (not _finite_number(lease_seconds) or lease_seconds <= 0):
             raise DeliveryError("delivery_lease_seconds_invalid")
         self._lease_seconds = lease_seconds
+        self._clock = clock
 
     def run(self, goal_file: Path) -> DeliveryResult:
         goal_path = _safe_delivery_path(goal_file)
@@ -367,6 +245,7 @@ class StandardizedDelivery(
             lease_seconds,
             error_type=DeliveryError,
             payload_validator=_journal_payload,
+            clock=self._clock,
         ) as journal:
             self._journal = journal
             try:
@@ -539,14 +418,13 @@ class StandardizedDelivery(
             reason = "configured_never"
         else:
             output = self._run_root / "wayfinder-route.json"
-            if self._journal is not None or not output.is_file():
-                self._dispatch_artifact(
-                    self.config.workspace,
-                    self.controller,
-                    wayfinder_route_prompt(self._goal, output),
-                    output,
-                    role="way-route",
-                )
+            self._dispatch_artifact(
+                self.config.workspace,
+                self.controller,
+                wayfinder_route_prompt(self._goal, output),
+                output,
+                role="way-route",
+            )
             route = load_wayfinder_route(output)
             use_wayfinder = route.use_wayfinder
             reason = route.reason
@@ -557,14 +435,13 @@ class StandardizedDelivery(
         if not use_wayfinder:
             return None
         map_path = self._run_root / "wayfinder-map.json"
-        if self._journal is not None or not map_path.is_file():
-            self._dispatch_artifact(
-                self.config.workspace,
-                self.controller,
-                wayfinder_chart_prompt(self._goal, map_path),
-                map_path,
-                role="way-chart",
-            )
+        self._dispatch_artifact(
+            self.config.workspace,
+            self.controller,
+            wayfinder_chart_prompt(self._goal, map_path),
+            map_path,
+            role="way-chart",
+        )
         map_ = load_wayfinder_map(map_path)
         iterations = 0
         while any(not ticket.resolution for ticket in map_.decisions):
@@ -602,6 +479,8 @@ class StandardizedDelivery(
                 )
                 + resolution.new_decisions
             )
+            if len(decisions) > WAYFINDER_MAP_MAX_DECISIONS:
+                raise DeliveryError("wayfinder_decision_limit")
             map_ = WayfinderMap(
                 destination=map_.destination,
                 notes=map_.notes,
@@ -625,14 +504,13 @@ class StandardizedDelivery(
 
     def _create_plan(self, wayfinder: WayfinderMap | None) -> DeliveryPlan:
         output = self._run_root / "delivery-plan.json"
-        if self._journal is not None or not output.is_file():
-            self._dispatch_artifact(
-                self.config.workspace,
-                self.controller,
-                plan_prompt(self._goal, output, wayfinder=wayfinder),
-                output,
-                role="plan",
-            )
+        self._dispatch_artifact(
+            self.config.workspace,
+            self.controller,
+            plan_prompt(self._goal, output, wayfinder=wayfinder),
+            output,
+            role="plan",
+        )
         plan = load_delivery_plan(output)
         if (
             self.config.standardized_delivery.tracker_backend.value == "github"
@@ -664,8 +542,7 @@ class StandardizedDelivery(
             integration,
         )
         _validate_worktree_clean(git, integration.path)
-        if self._journal is not None:
-            self._assert_integration_frontier(git, integration)
+        self._assert_integration_frontier(git, integration)
         head_before = git.validate_commit(integration)
         self._reconstruct_review_artifacts(
             plan,
@@ -800,22 +677,21 @@ class StandardizedDelivery(
             report, expected = observed()
         except (DeliveryArtifactError, GitWorkspaceError) as exc:
             raise DeliveryError("delivery_recovery_conflict:review.accept") from exc
-        journal = self._journal
-        if journal is not None:
-            payload = journal.reconcile(
-                DeliveryEffect(
-                    key=f"review:accept:{round_number}",
-                    kind="review.accept",
-                    intent={
-                        "round": round_number,
-                        "integration_commit": integration_commit,
-                    },
-                    observe=observe,
-                    apply=lambda: expected,
-                )
+        journal = self._require_journal()
+        payload = journal.reconcile(
+            DeliveryEffect(
+                key=f"review:accept:{round_number}",
+                kind="review.accept",
+                intent={
+                    "round": round_number,
+                    "integration_commit": integration_commit,
+                },
+                observe=observe,
+                apply=lambda: expected,
             )
-            if payload != expected:
-                raise DeliveryError("delivery_recovery_conflict:review.accept")
+        )
+        if payload != expected:
+            raise DeliveryError("delivery_recovery_conflict:review.accept")
         return report
 
     def _select_worker(self, title: str, prompt: str, dedupe_key: str) -> Harness:
@@ -839,19 +715,18 @@ class StandardizedDelivery(
         output = self._run_root / "routes" / f"{digest}.json"
         _safe_delivery_path(output, root=self._run_root)
         output.parent.mkdir(parents=True, exist_ok=True)
-        if self._journal is not None or not output.is_file():
-            self._dispatch_artifact(
-                self.config.workspace,
-                self.controller,
-                worker_selection_prompt(
-                    f"Title: {title}\n\nPrompt:\n{prompt}",
-                    output,
-                    render_compact_catalog(profiles),
-                    allowed_harnesses,
-                ),
+        self._dispatch_artifact(
+            self.config.workspace,
+            self.controller,
+            worker_selection_prompt(
+                f"Title: {title}\n\nPrompt:\n{prompt}",
                 output,
-                role=f"route-{digest[:5]}",
-            )
+                render_compact_catalog(profiles),
+                allowed_harnesses,
+            ),
+            output,
+            role=f"route-{digest[:5]}",
+        )
         try:
             selected = load_worker_selection(
                 output,
@@ -879,19 +754,7 @@ class StandardizedDelivery(
     ) -> None:
         _safe_delivery_path(output_file, root=self._run_root)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        journal = self._journal
-        if journal is None:
-            output_file.unlink(missing_ok=True)
-            self._run_artifact_dispatch(
-                workspace,
-                harness,
-                prompt,
-                output_file,
-                role=role,
-                use_principal_proxy=use_principal_proxy,
-                agent_name_override=agent_name_override,
-            )
-            return
+        journal = self._require_journal()
         normalized_role = re.sub(r"[^a-z0-9.-]+", "-", role.lower()).strip("-")
         operation_key = f"agent:artifact:{normalized_role}"
         artifact = str(output_file.relative_to(self._run_root))
@@ -938,23 +801,23 @@ class StandardizedDelivery(
             expected: dict[str, object] | None,
             started: bool,
         ) -> DeliveryEffectObservation:
-            inspection_supported = False
-            inspected: DispatchOutcome | None = None
+            inspection_failed = False
             if started or self._legacy_reconstruction_read_only:
                 try:
-                    inspection_supported, inspected = self._inspect_delivery_agent(
+                    _, inspected = self._inspect_delivery_agent(
                         workspace,
                         agent_name,
                         harness,
                     )
                 except TransportError:
-                    return _effect_conflict()
-                if _agent_is_active(inspected):
-                    return _effect_conflict()
+                    inspection_failed = True
+                else:
+                    if _agent_is_active(inspected):
+                        return _effect_conflict()
             if not output_file.is_file():
+                if inspection_failed:
+                    return _effect_conflict()
                 return _effect_absent()
-            if inspection_supported and inspected is None:
-                return _effect_conflict()
             invariant = {
                 "role": role,
                 "artifact": artifact,
@@ -1204,14 +1067,7 @@ class StandardizedDelivery(
                 )
             except HarnessHealthError as exc:
                 raise DeliveryError(str(exc)) from exc
-        if self._journal is None:
-            return self.dispatcher.respond(
-                workspace,
-                agent_name,
-                harness,
-                decision.response,
-                timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-            )
+        journal = self._require_journal()
         result: DispatchOutcome | None = None
         workspace_key = (
             "source"
@@ -1262,7 +1118,9 @@ class StandardizedDelivery(
             except TransportError:
                 return _effect_conflict()
             if not supported:
-                return _effect_absent() if expected is None else _effect_matched(expected)
+                if expected is not None:
+                    return _effect_matched(expected)
+                return _effect_conflict() if started else _effect_absent()
             if inspected is None:
                 return _effect_conflict()
             if inspected.state is AgentState.BLOCKED:
@@ -1272,7 +1130,7 @@ class StandardizedDelivery(
             observed = details(inspected)
             return _effect_matched(observed)
 
-        payload = self._journal.reconcile(
+        payload = journal.reconcile(
             DeliveryEffect(
                 key=f"agent:response:{agent_name}:{question_hash}:{proxy_round}",
                 kind="agent.respond",
@@ -1297,9 +1155,7 @@ class StandardizedDelivery(
         )
 
     def _recover_proxy_responses(self) -> None:
-        journal = self._journal
-        if journal is None:
-            return
+        journal = self._require_journal()
         for pending in journal.pending_effects(kind="agent.respond"):
             intent = pending.intent
             worker = intent.get("worker")
@@ -1448,6 +1304,8 @@ class StandardizedDelivery(
         state = journal.latest_stage_state() or {}
         if not state and isinstance(self._previous_state.get("controller"), str):
             state["controller"] = self._previous_state["controller"]
+        allowed = _STATE_DETAIL_KEYS.get(status, set())
+        state = {key: value for key, value in state.items() if key in allowed}
         state.update({"status": status, "stage": stage, **details})
         journal.record_stage(state)
         _write_json(self._run_root / "state.json", state)

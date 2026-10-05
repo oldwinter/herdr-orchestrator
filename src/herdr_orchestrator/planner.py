@@ -12,7 +12,7 @@ from herdr_orchestrator.model import Harness, PlannerTask
 
 DEDUPE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 MAX_PLANNER_TASKS = 100
-MAX_PLANNER_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_PLANNER_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_WORKER_SELECTION_OUTPUT_BYTES = 4 * 1024
 # Canonical key sets for model-facing artifacts: the prompt examples and the
 # fail-closed loaders below must both derive from these tuples.
@@ -117,8 +117,14 @@ def load_planner_tasks(
     path: Path,
     *,
     max_tasks: int,
+    allowed_harnesses: Iterable[Harness] | None = None,
 ) -> tuple[PlannerTask, ...]:
     _validate_max_tasks(max_tasks)
+    allowed = (
+        None
+        if allowed_harnesses is None
+        else _normalize_allowed_harnesses(allowed_harnesses, "planner")
+    )
     payload = _load_json(
         path,
         artifact="planner_output",
@@ -146,6 +152,8 @@ def load_planner_tasks(
             harness = Harness(harness_value)
         except ValueError as exc:
             raise PlannerOutputError("planner_harness_unsupported") from exc
+        if allowed is not None and harness not in allowed:
+            raise PlannerOutputError("planner_harness_not_allowed")
         tasks.append(PlannerTask(title, harness, prompt, dedupe_key))
         dedupe_keys.add(dedupe_key)
     return tuple(tasks)

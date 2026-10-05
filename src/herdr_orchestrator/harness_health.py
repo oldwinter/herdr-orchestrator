@@ -820,6 +820,7 @@ class HarnessHealth:
                     workspace=self.workspace,
                     harness=harness,
                     owner=owner,
+                    lease_until=lease.lease_until,
                 )
 
     def _invoke_probe(

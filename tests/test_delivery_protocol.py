@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from herdr_orchestrator.delivery_protocol import (
+    MAX_ARTIFACT_BYTES,
     AuthorityCategory,
     DeliveryArtifactError,
     DeliveryTicket,
@@ -272,6 +273,14 @@ class DeliveryProtocolTests(unittest.TestCase):
                 "ticket_receipt_missing",
             ):
                 load_ticket_receipt(path, ticket)
+
+    def test_oversized_artifact_is_rejected_before_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "verdict.json"
+            with path.open("wb") as stream:
+                stream.truncate(MAX_ARTIFACT_BYTES + 1)
+            with self.assertRaisesRegex(DeliveryArtifactError, "verdict_too_large"):
+                read_artifact_text(path, "verdict")
 
 
 def _plan() -> dict[str, object]:

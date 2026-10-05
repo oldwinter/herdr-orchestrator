@@ -8,16 +8,17 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from herdr_orchestrator.attempts import lease_heartbeat
 from herdr_orchestrator.catalog import (
     execution_prompt,
     profile_for_harness,
     render_compact_catalog,
 )
 from herdr_orchestrator.completion import (
-    CompletionIdentity,
     CompletionPolicy,
     structured_completion_prompt,
 )
+from herdr_orchestrator.config import DEDUPE_KEY
 from herdr_orchestrator.drift import BaseDriftGuard
 from herdr_orchestrator.harness_health import (
     HarnessHealth,
@@ -53,12 +54,21 @@ from herdr_orchestrator.planner import (
     worker_selection_prompt,
 )
 from herdr_orchestrator.protocol import TransportError
+from herdr_orchestrator.runner_support import (
+    _completion_identity,
+    _controller_agent_name,
+    _controller_turn_failed,
+    _failure_outcome,
+    _gc_target_values,
+    _integer,
+    _queue_is_idle,
+)
 from herdr_orchestrator.selection import (
     effective_worker_harnesses,
     eligible_worker_harnesses,
     select_controller_harness,
 )
-from herdr_orchestrator.store import Store
+from herdr_orchestrator.store import Store, StoreError
 from herdr_orchestrator.supervision import Supervision
 from herdr_orchestrator.supervision_cli import worker_preamble
 from herdr_orchestrator.topology import (
@@ -151,6 +161,8 @@ class Coordinator:
         existing = 0
         for seed in self.config.seed_jobs:
             prompt = seed.prompt_file.read_text(encoding="utf-8").strip()
+            if not prompt:
+                raise ValueError("prompt_file_empty")
             _, created = self.store.enqueue(
                 NewJob(
                     workflow=self.config.name,
@@ -184,12 +196,18 @@ class Coordinator:
         completion_policy: CompletionPolicy | None = None,
         depends_on: tuple[int, ...] = (),
     ) -> tuple[int, bool, Harness]:
+        if not isinstance(dedupe_key, str) or not DEDUPE_KEY.fullmatch(dedupe_key):
+            raise ValueError("dedupe_key_invalid")
+        if not isinstance(title, str) or not title.strip() or len(title) > 200:
+            raise ValueError("title_invalid")
         self.initialize()
         if not prompt_file.is_file():
             raise ValueError(f"prompt_file_not_found: {prompt_file}")
         prompt = prompt_file.read_text(encoding="utf-8").strip()
         if not prompt:
             raise ValueError("prompt_file_empty")
+        if len(prompt) > 50_000:
+            raise ValueError("prompt_too_large")
         existing = self.store.existing_job_for_enqueue(
             self.config.name,
             dedupe_key,
@@ -294,16 +312,14 @@ class Coordinator:
             static_validator=self._static_harness_available if self.health is not None else None,
             allowed_job_ids=allowed_job_ids,
         )
-        results = {state.value: 0 for state in JobState}
+        results = {state.value: 0 for state in JobState} | {"stale": 0}
         if not jobs:
             return self._run_report(
                 results,
                 claimed=0,
                 health_snapshot=health_snapshot,
             )
-        for job in jobs:
-            if not job.recovery:
-                self._observe_transition(job, AttemptPhase.CLAIMED)
+        self._observe_claimed_jobs(jobs)
         commit_error: Exception | None = None
         with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="harness") as executor:
             futures = {
@@ -322,31 +338,14 @@ class Coordinator:
                 except OperationInterrupted:
                     raise
                 except TransportError as exc:
-                    outcome = DispatchOutcome(
-                        agent_name=job.agent_name,
-                        state=(
-                            AgentState.BLOCKED
-                            if exc.code == "agent_blocked"
-                            else AgentState.UNKNOWN
-                        ),
-                        member_reused=False,
-                        pane_id=None,
-                        error_code=exc.code,
-                        placement=job.placement,
+                    outcome = _failure_outcome(
+                        job,
+                        exc.code,
                         error_summary=exc.summary,
                         agent_settled=exc.agent_settled,
-                        correlation_id=job.correlation_id,
                     )
                 except Exception:
-                    outcome = DispatchOutcome(
-                        agent_name=job.agent_name,
-                        state=AgentState.UNKNOWN,
-                        member_reused=False,
-                        pane_id=None,
-                        error_code="dispatcher_unhandled_error",
-                        placement=job.placement,
-                        correlation_id=job.correlation_id,
-                    )
+                    outcome = _failure_outcome(job, "dispatcher_unhandled_error")
                 try:
                     state = self.store.record_outcome(job, outcome)
                     self._record_health(job.harness, outcome)
@@ -354,6 +353,11 @@ class Coordinator:
                     results[state.value] += 1
                 except OperationInterrupted:
                     raise
+                except StoreError as exc:
+                    if str(exc) == "job_lease_lost":
+                        results["stale"] += 1
+                    elif commit_error is None:
+                        commit_error = exc
                 except Exception as exc:
                     if commit_error is None:
                         commit_error = exc
@@ -365,12 +369,22 @@ class Coordinator:
             health_snapshot=health_snapshot,
         )
 
+    def _observe_claimed_jobs(self, jobs: list[ClaimedJob]) -> None:
+        for job in jobs:
+            if not job.recovery:
+                self._observe_transition(job, AttemptPhase.CLAIMED)
+
     def _record_attempt_progress(
         self,
         job: ClaimedJob,
         progress: AttemptProgress,
     ) -> None:
-        self.store.record_attempt_progress(job, progress)
+        try:
+            self.store.record_attempt_progress(job, progress)
+        except StoreError as exc:
+            if str(exc) != "job_lease_lost":
+                raise
+            return
         self._observe_transition(job, progress.phase)
 
     def _observe_transition(self, job: ClaimedJob, phase: AttemptPhase) -> None:
@@ -423,7 +437,7 @@ class Coordinator:
             raise ValueError("drain_timeout_must_be_positive")
         self.initialize()
         deadline = time.monotonic() + timeout_seconds
-        aggregate = {state.value: 0 for state in JobState}
+        aggregate = {state.value: 0 for state in JobState} | {"stale": 0}
         total_claimed = 0
         waves = 0
         workspace = self._workspace_key
@@ -464,6 +478,7 @@ class Coordinator:
             assert isinstance(batch, dict)
             for state in JobState:
                 aggregate[state.value] += _integer(batch[state.value])
+            aggregate["stale"] += _integer(batch["stale"])
             queue = report["queue"]
             assert isinstance(queue, dict)
             last_queue = {str(key): _integer(value) for key, value in queue.items()}
@@ -561,49 +576,80 @@ class Coordinator:
             attempt_progress=lambda progress: self._record_attempt_progress(job, progress),
             completion_identity=_completion_identity(job),
         )
-        try:
-            if job.recovery:
-                outcome = self._recover_job(
+        with lease_heartbeat(
+            self.store.renew_lease,
+            job,
+            lease_seconds=float(self.config.coordinator.lease_seconds),
+        ):
+            try:
+                if job.recovery:
+                    outcome = self._recover_job(
+                        job,
+                        response,
+                        timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                        context=context,
+                    )
+                else:
+                    outcome = responder(
+                        job.agent_name,
+                        job.harness,
+                        response,
+                        timeout_seconds=self.config.coordinator.agent_timeout_seconds,
+                        expected_pane_id=expected_pane_id,
+                        context=context,
+                    )
+                outcome = replace(outcome, correlation_id=job.correlation_id)
+            except OperationInterrupted:
+                raise
+            except TransportError as exc:
+                outcome = _failure_outcome(
                     job,
-                    response,
-                    timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-                    context=context,
+                    exc.code,
+                    member_reused=True,
+                    pane_id=expected_pane_id,
+                    error_summary=exc.summary,
+                    agent_settled=exc.agent_settled,
                 )
-            else:
-                outcome = responder(
-                    job.agent_name,
-                    job.harness,
-                    response,
-                    timeout_seconds=self.config.coordinator.agent_timeout_seconds,
-                    expected_pane_id=expected_pane_id,
-                    context=context,
+            except Exception:
+                outcome = _failure_outcome(
+                    job,
+                    "resume_unhandled_error",
+                    member_reused=True,
+                    pane_id=expected_pane_id,
                 )
-            outcome = replace(outcome, correlation_id=job.correlation_id)
-        except OperationInterrupted:
-            raise
-        except TransportError as exc:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
-                member_reused=True,
-                pane_id=expected_pane_id,
-                error_code=exc.code,
-                placement=job.placement,
-                error_summary=exc.summary,
-                agent_settled=exc.agent_settled,
-                correlation_id=job.correlation_id,
+        try:
+            state = self.store.record_resume_outcome(job, outcome)
+        except StoreError as exc:
+            if str(exc) != "job_lease_lost":
+                raise
+            current = next(
+                (
+                    row
+                    for row in self.store.jobs(
+                        self.config.name,
+                        workspace=self._workspace_key,
+                        include_legacy=True,
+                    )
+                    if _integer(row["id"]) == job.job_id
+                ),
+                None,
             )
-        except Exception:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.UNKNOWN,
-                member_reused=True,
-                pane_id=expected_pane_id,
-                error_code="resume_unhandled_error",
-                placement=job.placement,
-                correlation_id=job.correlation_id,
-            )
-        state = self.store.record_resume_outcome(job, outcome)
+            return {
+                "job_id": job.job_id,
+                "state": (str(current["state"]) if current is not None else JobState.BLOCKED.value),
+                "attempt": job.attempt,
+                "agent_name": job.agent_name,
+                "pane_id": expected_pane_id,
+                "agent_state": outcome.state.value,
+                "error_code": "job_lease_lost",
+                "agent_settled": outcome.agent_settled,
+                "task_verified": outcome.task_verified,
+                "queue": self.store.status_counts(
+                    self.config.name,
+                    workspace=self._workspace_key,
+                    include_legacy=True,
+                ),
+            }
         self._record_health(job.harness, outcome)
         self._observe_transition(job, self.store.attempt_phase(job.attempt_id))
         return {
@@ -669,11 +715,7 @@ class Coordinator:
         *,
         dry_run: bool,
     ) -> dict[str, object]:
-        if not target_states or not target_states <= {
-            JobState.SUCCEEDED,
-            JobState.FAILED,
-        }:
-            raise ValueError("gc_states_invalid")
+        target_values = _gc_target_values(target_states)
         self.initialize()
         workspace = self._workspace_key
         rows = self.store.jobs(
@@ -681,7 +723,6 @@ class Coordinator:
             workspace=workspace,
             include_legacy=True,
         )
-        target_values = {state.value for state in target_states}
         created_panes = self.store.created_agent_panes(
             self.config.name,
             workspace=workspace,
@@ -735,15 +776,26 @@ class Coordinator:
         if not callable(closer):
             raise ValueError("dispatcher_cleanup_unsupported")
         candidates = list(candidates_by_name.values())
-        actions = [
-            closer(
-                str(candidate["agent_name"]),
-                PlacementTarget(str(candidate["placement"])),
-                expected_pane_id=str(candidate["pane_id"]),
-                dry_run=dry_run,
-            )
-            for candidate in candidates
-        ]
+        actions: list[dict[str, object]] = []
+        for candidate in candidates:
+            try:
+                actions.append(
+                    closer(
+                        str(candidate["agent_name"]),
+                        PlacementTarget(str(candidate["placement"])),
+                        expected_pane_id=str(candidate["pane_id"]),
+                        dry_run=dry_run,
+                    )
+                )
+            except Exception as exc:
+                actions.append(
+                    {
+                        "agent_name": candidate["agent_name"],
+                        "placement": candidate["placement"],
+                        "action": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
         return {
             "dry_run": dry_run,
             "candidate_count": len(candidates),
@@ -922,42 +974,26 @@ class Coordinator:
                 "placement": job.placement.value,
             },
         )
-        try:
-            outcome = self._dispatch_job_turn(job, batch_key, dispatch_deadline)
-        except OperationInterrupted:
-            raise
-        except TransportError as exc:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.BLOCKED if exc.code == "agent_blocked" else AgentState.UNKNOWN,
-                member_reused=False,
-                pane_id=None,
-                error_code=exc.code,
-                placement=job.placement,
-                error_summary=exc.summary,
-                agent_settled=exc.agent_settled,
-                correlation_id=job.correlation_id,
-            )
-        except _DispatchDeadlineExceeded:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.UNKNOWN,
-                member_reused=False,
-                pane_id=None,
-                error_code="herdr_timeout",
-                placement=job.placement,
-                correlation_id=job.correlation_id,
-            )
-        except Exception:
-            outcome = DispatchOutcome(
-                agent_name=job.agent_name,
-                state=AgentState.UNKNOWN,
-                member_reused=False,
-                pane_id=None,
-                error_code="dispatcher_unhandled_error",
-                placement=job.placement,
-                correlation_id=job.correlation_id,
-            )
+        with lease_heartbeat(
+            self.store.renew_lease,
+            job,
+            lease_seconds=float(self.config.coordinator.lease_seconds),
+        ):
+            try:
+                outcome = self._dispatch_job_turn(job, batch_key, dispatch_deadline)
+            except OperationInterrupted:
+                raise
+            except TransportError as exc:
+                outcome = _failure_outcome(
+                    job,
+                    exc.code,
+                    error_summary=exc.summary,
+                    agent_settled=exc.agent_settled,
+                )
+            except _DispatchDeadlineExceeded:
+                outcome = _failure_outcome(job, "herdr_timeout")
+            except Exception:
+                outcome = _failure_outcome(job, "dispatcher_unhandled_error")
         duration = time.monotonic() - started
         fields = {
             "attempt": job.attempt,
@@ -1166,12 +1202,18 @@ class Coordinator:
             dispatch_deadline,
             health_snapshot=health_snapshot,
         )
+        controller_name = _controller_agent_name(
+            self.config.name,
+            self.config.workspace,
+            controller,
+        )
         digest = hashlib.sha256(f"{self.config.name}\0topology\0{dedupe_key}".encode()).hexdigest()[
             :12
         ]
         output_file = self.config.planner.output_file.parent / f"topology-{digest}.json"
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.unlink(missing_ok=True)
+        outcome: DispatchOutcome | None = None
         try:
             outcome = self._dispatch_controller_turn(
                 controller,
@@ -1181,11 +1223,7 @@ class Coordinator:
                     output_file,
                     supports_worktree=self._supports_worktree(),
                 ),
-                agent_name=_controller_agent_name(
-                    self.config.name,
-                    self.config.workspace,
-                    controller,
-                ),
+                agent_name=controller_name,
                 task_title="Topology decision",
                 task_key=f"topology:{job_id}",
                 dispatch_deadline=dispatch_deadline,
@@ -1201,6 +1239,7 @@ class Coordinator:
             raise ValueError(str(exc)) from exc
         finally:
             output_file.unlink(missing_ok=True)
+            self._close_ephemeral_controller(controller_name, outcome)
 
     def _supports_worktree(self) -> bool:
         return (self.config.workspace / ".git").exists()
@@ -1337,52 +1376,62 @@ class Coordinator:
         planner.output_file.parent.mkdir(parents=True, exist_ok=True)
         planner.output_file.unlink(missing_ok=True)
         profiles = self._worker_profiles(allowed_harnesses)
-        outcome = self._dispatch_controller_turn(
+        controller_name = _controller_agent_name(
+            self.config.name,
+            self.config.workspace,
             controller,
-            planner_prompt(
-                planner.prompt_file.read_text(encoding="utf-8"),
-                planner.output_file,
-                planner.max_tasks,
-                render_compact_catalog(profiles),
-                allowed_harnesses,
-            ),
-            agent_name=_controller_agent_name(
-                self.config.name,
-                self.config.workspace,
-                controller,
-            ),
-            task_title="Planner",
-            task_key=f"planner:{self.config.name}",
-            dispatch_deadline=dispatch_deadline,
         )
-        self._dispatch_timeout(dispatch_deadline)
-        if _controller_turn_failed(outcome) is not None:
-            return
+        outcome: DispatchOutcome | None = None
         try:
-            tasks = load_planner_tasks(planner.output_file, max_tasks=planner.max_tasks)
-        except PlannerOutputError:
-            return
-        allowed_set = set(allowed_harnesses)
-        if any(task.harness not in allowed_set for task in tasks):
-            return
-        for task in tasks:
-            self.store.enqueue(
-                NewJob(
-                    workflow=self.config.name,
-                    workspace=self._workspace_key,
-                    title=task.title,
-                    harness=task.harness,
-                    prompt=task.prompt,
-                    dedupe_key=task.dedupe_key,
-                    max_attempts=self.config.coordinator.max_attempts,
-                    placement=self._static_placement(
-                        task.title,
-                        task.prompt,
-                        task.harness,
-                        None,
-                    ),
-                )
+            outcome = self._dispatch_controller_turn(
+                controller,
+                planner_prompt(
+                    planner.prompt_file.read_text(encoding="utf-8"),
+                    planner.output_file,
+                    planner.max_tasks,
+                    render_compact_catalog(profiles),
+                    allowed_harnesses,
+                ),
+                agent_name=controller_name,
+                task_title="Planner",
+                task_key=f"planner:{self.config.name}",
+                dispatch_deadline=dispatch_deadline,
             )
+            self._dispatch_timeout(dispatch_deadline)
+            if _controller_turn_failed(outcome) is None:
+                try:
+                    tasks = load_planner_tasks(
+                        planner.output_file,
+                        max_tasks=planner.max_tasks,
+                        allowed_harnesses=allowed_harnesses,
+                    )
+                except PlannerOutputError as exc:
+                    self.observability.event(
+                        "planner_output_rejected",
+                        correlation_id="",
+                        fields={"reason": str(exc)},
+                    )
+                else:
+                    for task in tasks:
+                        self.store.enqueue(
+                            NewJob(
+                                workflow=self.config.name,
+                                workspace=self._workspace_key,
+                                title=task.title,
+                                harness=task.harness,
+                                prompt=task.prompt,
+                                dedupe_key=task.dedupe_key,
+                                max_attempts=self.config.coordinator.max_attempts,
+                                placement=self._static_placement(
+                                    task.title,
+                                    task.prompt,
+                                    task.harness,
+                                    None,
+                                ),
+                            )
+                        )
+        finally:
+            self._close_ephemeral_controller(controller_name, outcome)
 
     def _dispatch_controller_turn(
         self,
@@ -1416,40 +1465,3 @@ class Coordinator:
         if remaining <= 0:
             raise _DispatchDeadlineExceeded
         return min(timeout_seconds, remaining)
-
-
-def _completion_identity(job: ClaimedJob) -> CompletionIdentity | None:
-    if job.completion_policy is not CompletionPolicy.STRUCTURED_V2:
-        return None
-    return CompletionIdentity(job.job_id, job.attempt, job.fencing_token)
-
-
-def _controller_agent_name(
-    workflow_name: str,
-    workspace: Path,
-    harness: Harness,
-) -> str:
-    digest = hashlib.sha256(
-        f"{workflow_name}\0{workspace.resolve()}\0controller\0{harness.value}".encode()
-    ).hexdigest()[:8]
-    return f"ho-control-{harness.value}-{digest}"
-
-
-def _integer(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError("integer_value_invalid")
-    return int(value)
-
-
-def _controller_turn_failed(outcome: DispatchOutcome) -> str | None:
-    if outcome.error_code is not None:
-        return outcome.error_code
-    if outcome.state not in {AgentState.IDLE, AgentState.DONE}:
-        return outcome.state.value
-    return None
-
-
-def _queue_is_idle(counts: dict[str, int]) -> bool:
-    return all(
-        counts[state.value] == 0 for state in (JobState.PENDING, JobState.RUNNING, JobState.BLOCKED)
-    )

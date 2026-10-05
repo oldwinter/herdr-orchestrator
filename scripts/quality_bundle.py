@@ -237,17 +237,11 @@ def run_quality(
     commit: str,
     invocation_id: str,
     specs: Sequence[ProducerSpec],
-    source: SourceIdentity | None = None,
+    source: SourceIdentity,
     source_probe: Callable[[], SourceIdentity] | None = None,
     reuse_completed: bool = False,
 ) -> CompletedBundle:
     """Run producer specs and atomically publish one completed bundle."""
-    if source is None:
-        source = SourceIdentity(
-            commit.lower(),
-            hashlib.sha256(f"fixture\0{commit.lower()}".encode()).hexdigest(),
-            True,
-        )
     if source.commit != commit.lower():
         raise QualityBundleError("quality_commit_mismatch")
     run_id = _run_id(commit, invocation_id, source.digest)
@@ -1406,7 +1400,16 @@ def main() -> int:
         type=Path,
         default=Path(os.environ.get("QUALITY_EVIDENCE_ROOT", ROOT / ".orchestrator/quality")),
     )
-    enforce_parser.add_argument("--require-full", action="store_true")
+    enforce_parser.add_argument(
+        "--require-full",
+        action="store_true",
+        help="deprecated no-op; full producer coverage is the default",
+    )
+    enforce_parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="enforce only the producers declared by the manifest",
+    )
     enforce_parser.add_argument("--require-clean", action="store_true")
     latest_parser = subparsers.add_parser("latest-result")
     latest_parser.add_argument(
@@ -1425,9 +1428,9 @@ def main() -> int:
                 expected_root=args.root,
             )
             required = (
-                FULL_PRODUCERS
-                if args.require_full
-                else tuple(producer.name for producer in manifest.producers)
+                tuple(producer.name for producer in manifest.producers)
+                if args.allow_partial
+                else FULL_PRODUCERS
             )
             return enforce_manifest(manifest, required_producers=required)
         if args.command == "latest-result":

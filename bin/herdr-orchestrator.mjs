@@ -1055,8 +1055,13 @@ function manager(options) {
   }
 
   const requestedHarness = options.harnesses[0] ?? options.rest[0];
-  if (requestedHarness !== undefined && !HARNESSES.includes(requestedHarness)) {
-    throw new Error(`unsupported_harness: ${requestedHarness}`);
+  if (requestedHarness !== undefined) {
+    if (!HARNESSES.includes(requestedHarness)) {
+      throw new Error(`unsupported_harness: ${requestedHarness}`);
+    }
+    if (!MANAGER_HARNESSES.includes(requestedHarness)) {
+      throw new Error(`manager_harness_unsupported: ${requestedHarness}`);
+    }
   }
   let directory = join(PACKAGE_ROOT, "manager");
   let enabledHarnesses = HARNESSES;
