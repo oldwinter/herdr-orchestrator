@@ -4,6 +4,11 @@
 
 它让一个确定性 coordinator 持续派发任务给 Droid、Grok Build、Codex、pi、Claude Code、Hermes 等交互式 agent，同时保留 durable queue、lease、重试、去重和收据。可选 planner agent 只向 coordinator 提交结构化任务，不拥有 queue 调度权限；planner 进程仍可使用所选 harness 的工具，也不是安全沙箱。
 
+普通 queue 现支持显式依赖 DAG、持久 worker 消息、ask/reply、人工 gate 和可选 Git base
+漂移检查。`just orchestration` 操作本地协作状态；`just orca` 接入正在运行的 Orca 原生
+Run/Dispatch 协议，不与 Herdr queue 混用状态。参见[使用说明](docs/orca-integration.md)
+和[Orca 源码功能对照](docs/orca-capability-matrix.md)。
+
 ## Harness catalog，像 Skills 一样两级加载
 
 主控不需要一开始读入所有 harness 的完整说明：

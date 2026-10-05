@@ -4,8 +4,6 @@ import json
 import re
 from pathlib import Path
 
-import pytest
-
 from herdr_orchestrator.delivery_prompts import (
     implementation_prompt,
     plan_prompt,
@@ -233,9 +231,7 @@ def test_spec_review_prompt_schema(tmp_path: Path) -> None:
 
 
 def test_review_verdict_prompt_schema_and_findings(tmp_path: Path) -> None:
-    prompt = review_verdict_prompt(
-        _plan(), {"f-1": _finding()}, tmp_path / "verdict.json"
-    )
+    prompt = review_verdict_prompt(_plan(), {"f-1": _finding()}, tmp_path / "verdict.json")
 
     for field in ('"accepted"', '"dismissed"', '"rationale"'):
         assert field in prompt

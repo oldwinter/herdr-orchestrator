@@ -38,13 +38,13 @@ ${CONFIG_END}`;
 function markerPositions(source, marker) {
   const positions = [];
   let offset = 0;
-  while (offset <= source.length) {
-    const position = source.indexOf(marker, offset);
-    if (position === -1) {
-      break;
+  const lines = source.split("\n");
+  for (const [index, rawLine] of lines.entries()) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line === marker) {
+      positions.push(offset);
     }
-    positions.push(position);
-    offset = position + marker.length;
+    offset += rawLine.length + (index < lines.length - 1 ? 1 : 0);
   }
   return positions;
 }

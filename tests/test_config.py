@@ -307,8 +307,7 @@ class ConfigTests(unittest.TestCase):
             (root / "prompt.md").write_text("task", encoding="utf-8")
             workflow = root / "workflow.toml"
             workflow.write_text(
-                _minimal_workflow()
-                + '\n[standardized_delivery]\ntracker_root = "tracker"\n',
+                _minimal_workflow() + '\n[standardized_delivery]\ntracker_root = "tracker"\n',
                 encoding="utf-8",
             )
 

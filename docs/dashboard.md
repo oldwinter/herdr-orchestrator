@@ -160,7 +160,7 @@ Canvas 在紧凑与非紧凑尺寸之间切换时，overview ownership 决定 ca
 契约测试：compound 嵌套与状态 class、确定性布局与结构签名稳定性（状态-only
 SSE 更新不移动节点）、v1 workspaces 回退投影、节点身份编码、选择顺序与 viewport
 聚焦计算。没有 Node 时该测试自动 skip。独立的 `static/topology-style.js` 只生成 Cytoscape
-样式，并由 `dashboard.js` 显式传入 compact 与 reduced-motion 状态；它不持有 camera 或 DOM 状态。
+样式，并由 `dashboard-topology.js` 显式传入 compact 与 reduced-motion 状态；它不持有 camera 或 DOM 状态。
 
 Snapshot v1 继续提供原有的 `topology.workspaces`，并以 additive 字段提供
 `topology.projects`，其中嵌套 worktree、tab 与 pane。旧消费者无需修改。

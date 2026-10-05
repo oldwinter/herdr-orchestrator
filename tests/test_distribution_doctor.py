@@ -7,8 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from herdr_orchestrator import __version__
 from test_distribution import DistributionCliFixture
+
+from herdr_orchestrator import __version__
 
 
 class DistributionDoctorTests(DistributionCliFixture, unittest.TestCase):

@@ -15,11 +15,11 @@ from herdr_orchestrator.catalog import (
     render_compact_catalog,
 )
 from herdr_orchestrator.completion import (
-    CompletionIdentity,
     CompletionPolicy,
     structured_completion_prompt,
 )
 from herdr_orchestrator.config import DEDUPE_KEY
+from herdr_orchestrator.drift import BaseDriftGuard
 from herdr_orchestrator.harness_health import (
     HarnessHealth,
     HealthProbe,
@@ -54,12 +54,23 @@ from herdr_orchestrator.planner import (
     worker_selection_prompt,
 )
 from herdr_orchestrator.protocol import TransportError
+from herdr_orchestrator.runner_support import (
+    _completion_identity,
+    _controller_agent_name,
+    _controller_turn_failed,
+    _failure_outcome,
+    _gc_target_values,
+    _integer,
+    _queue_is_idle,
+)
 from herdr_orchestrator.selection import (
     effective_worker_harnesses,
     eligible_worker_harnesses,
     select_controller_harness,
 )
 from herdr_orchestrator.store import Store, StoreError
+from herdr_orchestrator.supervision import Supervision
+from herdr_orchestrator.supervision_cli import worker_preamble
 from herdr_orchestrator.topology import (
     TopologyDecisionError,
     load_topology_decision,
@@ -116,6 +127,7 @@ class Coordinator:
         transition_observer: Callable[[AttemptTransition], None] | None = None,
         health: HarnessHealth | None = None,
         readiness_probe: HealthProbe | None = None,
+        drift_guard: BaseDriftGuard | None = None,
     ) -> None:
         self.config = config
         self._workspace_key = str(config.workspace.resolve())
@@ -131,6 +143,8 @@ class Coordinator:
         self.transition_observer = transition_observer
         self.health = health
         self.readiness_probe = readiness_probe
+        self.drift_guard = drift_guard
+        self._drift_deferred: list[dict[str, object]] = []
         health_harnesses = list(self.worker_harnesses)
         for harness in (self.controller_harness, self.config.planner.harness):
             if harness is not None and harness not in health_harnesses:
@@ -180,6 +194,7 @@ class Coordinator:
         placement: PlacementTarget | None = None,
         receipt: TaskReceipt | None = None,
         completion_policy: CompletionPolicy | None = None,
+        depends_on: tuple[int, ...] = (),
     ) -> tuple[int, bool, Harness]:
         if not isinstance(dedupe_key, str) or not DEDUPE_KEY.fullmatch(dedupe_key):
             raise ValueError("dedupe_key_invalid")
@@ -203,6 +218,7 @@ class Coordinator:
             receipt=receipt,
             completion_policy=completion_policy,
             workspace=self._workspace_key,
+            depends_on=depends_on,
         )
         if existing is not None:
             job_id, existing_harness = existing
@@ -234,6 +250,7 @@ class Coordinator:
                 ),
                 receipt=receipt,
                 completion_policy=completion_policy,
+                depends_on=depends_on,
             )
         )
         if not created:
@@ -273,6 +290,15 @@ class Coordinator:
         )
         batch_key = f"run-{time.time_ns()}"
         slot_names = self._slot_names()
+        allowed_job_ids = None
+        if self.drift_guard is not None:
+            allowed_job_ids, self._drift_deferred = self.drift_guard.filter_jobs(
+                self.config,
+                self.store.jobs(
+                    self.config.name, workspace=self._workspace_key, include_legacy=True
+                ),
+                deadline=dispatch_deadline,
+            )
         jobs = self.store.claim(
             self.config.name,
             limit=self.config.coordinator.max_parallel,
@@ -284,6 +310,7 @@ class Coordinator:
             require_fresh_health=self.health is not None,
             include_legacy=True,
             static_validator=self._static_harness_available if self.health is not None else None,
+            allowed_job_ids=allowed_job_ids,
         )
         results = {state.value: 0 for state in JobState} | {"stale": 0}
         if not jobs:
@@ -292,9 +319,7 @@ class Coordinator:
                 claimed=0,
                 health_snapshot=health_snapshot,
             )
-        for job in jobs:
-            if not job.recovery:
-                self._observe_transition(job, AttemptPhase.CLAIMED)
+        self._observe_claimed_jobs(jobs)
         commit_error: Exception | None = None
         with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="harness") as executor:
             futures = {
@@ -344,6 +369,11 @@ class Coordinator:
             health_snapshot=health_snapshot,
         )
 
+    def _observe_claimed_jobs(self, jobs: list[ClaimedJob]) -> None:
+        for job in jobs:
+            if not job.recovery:
+                self._observe_transition(job, AttemptPhase.CLAIMED)
+
     def _record_attempt_progress(
         self,
         job: ClaimedJob,
@@ -381,6 +411,12 @@ class Coordinator:
         report: dict[str, object] = {
             **batch,
             "claimed": claimed,
+            "drift_deferred": self._drift_deferred,
+            "constraints": Supervision(
+                self.store.path,
+                self.config.name,
+                workspace,
+            ).constraints(),
             "batch": dict(batch),
             "queue": self.store.status_counts(
                 self.config.name,
@@ -476,6 +512,11 @@ class Coordinator:
                 health_snapshot = self._last_health_snapshot
                 break
             if claimed == 0:
+                if active[JobState.RUNNING.value] == 0 and self._waiting_on_constraints():
+                    reason = (
+                        "base_drift_wait" if self._drift_deferred else "dependency_or_gate_wait"
+                    )
+                    break
                 time.sleep(min(self.config.coordinator.poll_seconds, remaining))
         return self._drain_report(
             aggregate,
@@ -488,6 +529,21 @@ class Coordinator:
             queue_idle=queue_idle,
             health_snapshot=health_snapshot,
         )
+
+    def _waiting_on_constraints(self) -> bool:
+        constraints = Supervision(
+            self.store.path,
+            self.config.name,
+            self._workspace_key,
+        ).constraints()
+        selected_pending = {
+            row["id"]
+            for row in self.store.jobs(self.config.name, workspace=self._workspace_key)
+            if row["state"] == "pending"
+            and row["harness"] in {h.value for h in self.worker_harnesses}
+        }
+        deferred = {row["job_id"] for row in [*constraints, *self._drift_deferred]}
+        return bool(selected_pending) and selected_pending <= deferred
 
     def resume_blocked(
         self,
@@ -580,11 +636,7 @@ class Coordinator:
             )
             return {
                 "job_id": job.job_id,
-                "state": (
-                    str(current["state"])
-                    if current is not None
-                    else JobState.BLOCKED.value
-                ),
+                "state": (str(current["state"]) if current is not None else JobState.BLOCKED.value),
                 "attempt": job.attempt,
                 "agent_name": job.agent_name,
                 "pane_id": expected_pane_id,
@@ -663,11 +715,7 @@ class Coordinator:
         *,
         dry_run: bool,
     ) -> dict[str, object]:
-        if not target_states or not target_states <= {
-            JobState.SUCCEEDED,
-            JobState.FAILED,
-        }:
-            raise ValueError("gc_states_invalid")
+        target_values = _gc_target_values(target_states)
         self.initialize()
         workspace = self._workspace_key
         rows = self.store.jobs(
@@ -675,7 +723,6 @@ class Coordinator:
             workspace=workspace,
             include_legacy=True,
         )
-        target_values = {state.value for state in target_states}
         created_panes = self.store.created_agent_panes(
             self.config.name,
             workspace=workspace,
@@ -983,10 +1030,11 @@ class Coordinator:
         profile = profile_for_harness(self.config.profiles, job.harness)
         timeout_seconds = self._dispatch_timeout(dispatch_deadline)
         completion_identity = _completion_identity(job)
+        coordinated_prompt = job.prompt + worker_preamble(self.config, job)
         task_prompt = (
-            structured_completion_prompt(job.prompt, completion_identity)
+            structured_completion_prompt(coordinated_prompt, completion_identity)
             if completion_identity is not None
-            else job.prompt
+            else coordinated_prompt
         )
         prompt = execution_prompt(profile, task_prompt)
         context = DispatchContext(
@@ -1417,64 +1465,3 @@ class Coordinator:
         if remaining <= 0:
             raise _DispatchDeadlineExceeded
         return min(timeout_seconds, remaining)
-
-
-def _completion_identity(job: ClaimedJob) -> CompletionIdentity | None:
-    if job.completion_policy is not CompletionPolicy.STRUCTURED_V2:
-        return None
-    return CompletionIdentity(job.job_id, job.attempt, job.fencing_token)
-
-
-def _failure_outcome(
-    job: ClaimedJob,
-    error_code: str,
-    *,
-    member_reused: bool = False,
-    pane_id: str | None = None,
-    error_summary: str | None = None,
-    agent_settled: bool | None = None,
-) -> DispatchOutcome:
-    return DispatchOutcome(
-        agent_name=job.agent_name,
-        state=(
-            AgentState.BLOCKED if error_code == "agent_blocked" else AgentState.UNKNOWN
-        ),
-        member_reused=member_reused,
-        pane_id=pane_id,
-        error_code=error_code,
-        placement=job.placement,
-        error_summary=error_summary,
-        agent_settled=agent_settled,
-        correlation_id=job.correlation_id,
-    )
-
-
-def _controller_agent_name(
-    workflow_name: str,
-    workspace: Path,
-    harness: Harness,
-) -> str:
-    digest = hashlib.sha256(
-        f"{workflow_name}\0{workspace.resolve()}\0controller\0{harness.value}".encode()
-    ).hexdigest()[:8]
-    return f"ho-control-{harness.value}-{digest}"
-
-
-def _integer(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError("integer_value_invalid")
-    return int(value)
-
-
-def _controller_turn_failed(outcome: DispatchOutcome) -> str | None:
-    if outcome.error_code is not None:
-        return outcome.error_code
-    if outcome.state not in {AgentState.IDLE, AgentState.DONE}:
-        return outcome.state.value
-    return None
-
-
-def _queue_is_idle(counts: dict[str, int]) -> bool:
-    return all(
-        counts[state.value] == 0 for state in (JobState.PENDING, JobState.RUNNING, JobState.BLOCKED)
-    )

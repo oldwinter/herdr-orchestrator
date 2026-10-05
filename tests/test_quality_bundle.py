@@ -39,7 +39,7 @@ def _expectations(path: Path, *, expected_commit: str | None = None) -> dict[str
     }
 
 
-def _source(commit: str) -> "quality_bundle.SourceIdentity":
+def _source(commit: str) -> quality_bundle.SourceIdentity:
     return quality_bundle.SourceIdentity(
         commit.lower(),
         hashlib.sha256(f"fixture\0{commit.lower()}".encode()).hexdigest(),

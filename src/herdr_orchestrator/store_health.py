@@ -23,6 +23,16 @@ probe_lease_until REAL,
 probe_owner TEXT,
 PRIMARY KEY(workflow, workspace, harness)
 """
+_HEALTH_UPDATE = """
+        UPDATE harness_health
+        SET status = ?, reason = ?, source = ?, observed_at = ?,
+            revision = revision + 1, expires_at = ?, cooldown_until = ?,
+            retryable_failures = ?,
+            probe_lease_until = {lease_until_sql},
+            probe_owner = {owner_sql}
+        WHERE workflow = ? AND workspace = ? AND harness = ?
+          AND revision = ?{owner_predicate}
+    """
 
 
 def _legacy_health_expression(columns: set[str], column: str) -> str:
@@ -178,14 +188,10 @@ def health_update_statement(
     if expected_owner is not None:
         owner_predicate = " AND probe_owner = ?"
         values.append(expected_owner)
-    query = f"""
-        UPDATE harness_health
-        SET status = ?, reason = ?, source = ?, observed_at = ?,
-            revision = revision + 1, expires_at = ?, cooldown_until = ?,
-            retryable_failures = ?,
-            probe_lease_until = {lease_until_sql},
-            probe_owner = {owner_sql}
-        WHERE workflow = ? AND workspace = ? AND harness = ?
-          AND revision = ?{owner_predicate}
-    """  # nosec B608: fragments are from a fixed SQL-token allowlist
+    # The interpolated fragments come from fixed SQL-token allowlists.
+    query = _HEALTH_UPDATE.format(  # nosec B608
+        lease_until_sql=lease_until_sql,
+        owner_sql=owner_sql,
+        owner_predicate=owner_predicate,
+    )
     return query, values

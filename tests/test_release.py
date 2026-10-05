@@ -111,6 +111,39 @@ class NpmReleasePlanTests(unittest.TestCase):
         self.assertEqual(result.stderr.strip(), "npm_registry_query_failed")
         self.assertEqual(github_output, "")
 
+    def test_malformed_registry_response_stops_release_planning(self) -> None:
+        result, github_output = self._run_plan(
+            "1.2.0",
+            "not-json",
+            write_github_output=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "npm_registry_response_invalid")
+        self.assertEqual(github_output, "")
+
+    def test_invalid_semver_versions_are_rejected(self) -> None:
+        for version in (
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.3-01",
+            "1.2.3-alpha..1",
+            "1.2.3+build..1",
+        ):
+            with self.subTest(version=version):
+                result, _ = self._run_plan(version, "[]")
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr.strip(), "package_identity_invalid")
+
+    def test_valid_semver_versions_are_accepted(self) -> None:
+        for version in ("0.0.0", "1.2.3-alpha.1", "1.2.3+build.01"):
+            with self.subTest(version=version):
+                result, _ = self._run_plan(version, "[]")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_missing_registry_package_is_publishable(self) -> None:
         result, _ = self._run_plan(
             "0.1.0",
@@ -730,6 +763,51 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
 
 
 class QualityScriptTests(unittest.TestCase):
+    @staticmethod
+    def _pack_result(
+        command: list[str],
+        *,
+        returncode: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        stdout = json.dumps(
+            [
+                {
+                    "files": [{"path": "package.json"}],
+                    "size": 10,
+                    "unpackedSize": 20,
+                }
+            ]
+        )
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            stdout if returncode == 0 else "",
+            "",
+        )
+
+    def test_build_metrics_collects_both_publishable_packages(self) -> None:
+        results = [
+            self._pack_result(build_metrics.PACKAGE_COMMANDS["herdr-orchestrator"]),
+            self._pack_result(build_metrics.PACKAGE_COMMANDS["herdr-manager"]),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "build.json"
+            with (
+                patch.object(build_metrics.subprocess, "run", side_effect=results) as run,
+                patch.object(sys, "argv", ["build_metrics.py", "--output", str(output)]),
+            ):
+                status = build_metrics.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            set(payload["packages"]),
+            {"herdr-orchestrator", "herdr-manager"},
+        )
+        self.assertEqual(payload["entry_count"], 2)
+
     def test_build_metrics_preserves_a_nonzero_pack_exit(self) -> None:
         result = subprocess.CompletedProcess(
             ["npm", "pack", "--dry-run", "--json"],
@@ -828,6 +906,47 @@ class QualityScriptTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(payload["executions"][0]["error_code"], "report_missing")
         self.assertEqual(payload["unstable"], ["test_a"])
+
+    def test_test_stability_rejects_unknown_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "tests": [
+                            {
+                                "nodeid": "tests/test_example.py::test_it",
+                                "outcome": "mystery",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "report_invalid"):
+                test_stability.outcomes(report)
+
+    def test_test_stability_accepts_terminal_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "tests": [
+                            {"nodeid": f"test-{index}", "outcome": outcome}
+                            for index, outcome in enumerate(
+                                sorted(test_stability.TERMINAL_OUTCOMES)
+                            )
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            outcomes = test_stability.outcomes(report)
+
+        self.assertEqual(set(outcomes.values()), test_stability.TERMINAL_OUTCOMES)
 
 
 if __name__ == "__main__":

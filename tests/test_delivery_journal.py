@@ -40,6 +40,7 @@ JournalPersist = Callable[
 ]
 OwnerProjectionWrite = Callable[[DeliveryJournal, str, float], None]
 
+
 class TrackerPublishInterrupted(BaseException):
     pass
 
@@ -1313,9 +1314,7 @@ class DeliveryJournalTests(unittest.TestCase):
                 confirmed,
             )
             conflict_kinds = [
-                event.effect_kind
-                for event in reloaded._events
-                if event.event == "effect_conflict"
+                event.effect_kind for event in reloaded._events if event.event == "effect_conflict"
             ]
             self.assertEqual(conflict_kinds, ["result.publish"])
 

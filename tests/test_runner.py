@@ -1706,12 +1706,8 @@ class CoordinatorTests(unittest.TestCase):
 
         self.assertEqual(result["candidate_count"], 2)
         self.assertEqual(len(result["actions"]), 2)
-        failed = next(
-            action for action in result["actions"] if action["agent_name"] == droid_name
-        )
-        closed = next(
-            action for action in result["actions"] if action["agent_name"] == grok_name
-        )
+        failed = next(action for action in result["actions"] if action["agent_name"] == droid_name)
+        closed = next(action for action in result["actions"] if action["agent_name"] == grok_name)
         self.assertEqual(failed["action"], "error")
         self.assertIn("close failed", str(failed["error"]))
         self.assertEqual(closed["action"], "closed")
@@ -2051,9 +2047,7 @@ class CoordinatorTests(unittest.TestCase):
 
         self.assertEqual(result["succeeded"], 1)
         self.assertEqual(len(dispatcher.closed_created_agents), 1)
-        self.assertTrue(
-            dispatcher.closed_created_agents[0].startswith("ho-control-droid-")
-        )
+        self.assertTrue(dispatcher.closed_created_agents[0].startswith("ho-control-droid-"))
 
     def test_planner_closes_the_ephemeral_controller(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2081,9 +2075,7 @@ class CoordinatorTests(unittest.TestCase):
 
         self.assertEqual(dispatcher.calls, [Harness.DROID])
         self.assertEqual(len(dispatcher.closed_created_agents), 1)
-        self.assertTrue(
-            dispatcher.closed_created_agents[0].startswith("ho-control-droid-")
-        )
+        self.assertTrue(dispatcher.closed_created_agents[0].startswith("ho-control-droid-"))
 
 
 def _job(workflow: str, harness: Harness, *, suffix: str = "") -> NewJob:

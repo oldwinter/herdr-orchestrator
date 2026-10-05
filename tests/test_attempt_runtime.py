@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -407,9 +406,7 @@ def test_recover_turn_returns_settled_runtime_error(tmp_path: Path) -> None:
     host = FakeHost(
         tmp_path,
         runner,
-        runtime_error=TransportError(
-            "agent_crashed", summary="exit 1", agent_settled=True
-        ),
+        runtime_error=TransportError("agent_crashed", summary="exit 1", agent_settled=True),
     )
 
     outcome = _recover(
@@ -470,9 +467,7 @@ def test_submit_blocked_response_returns_settled_state(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("code", sorted(AMBIGUOUS_RESPONSE_SUBMISSION_ERRORS))
-def test_submit_blocked_response_reconciles_ambiguous_submission(
-    tmp_path: Path, code: str
-) -> None:
+def test_submit_blocked_response_reconciles_ambiguous_submission(tmp_path: Path, code: str) -> None:
     runner = FakeRunner(
         [
             {"_error": code},
@@ -481,9 +476,7 @@ def test_submit_blocked_response_reconciles_ambiguous_submission(
     )
     host = FakeHost(tmp_path, runner)
 
-    state, sequence = submit_blocked_response(
-        host, "blocked-worker", "w1:p2", "Approved", 5, 30
-    )
+    state, sequence = submit_blocked_response(host, "blocked-worker", "w1:p2", "Approved", 5, 30)
 
     assert (state, sequence) == (AgentState.DONE, 6)
     assert sum(call[0:3] == ["herdr", "pane", "run"] for call in runner.calls) == 1

@@ -35,7 +35,7 @@ from herdr_orchestrator.model import (
     TaskReceipt,
 )
 from herdr_orchestrator.runner import Coordinator, OperationInterrupted
-from herdr_orchestrator.store import Store, StoreError
+from herdr_orchestrator.store import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

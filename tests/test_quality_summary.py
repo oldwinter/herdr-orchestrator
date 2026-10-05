@@ -31,7 +31,7 @@ quality_bundle = _load_script("quality_bundle_summary_fixture", BUNDLE_SCRIPT)
 quality_summary = _load_script("quality_summary_regression", SUMMARY_SCRIPT)
 
 
-def _source(commit: str) -> "quality_bundle.SourceIdentity":
+def _source(commit: str) -> quality_bundle.SourceIdentity:
     return quality_bundle.SourceIdentity(
         commit.lower(),
         hashlib.sha256(f"fixture\0{commit.lower()}".encode()).hexdigest(),
@@ -463,10 +463,28 @@ class QualitySummaryTests(unittest.TestCase):
                         "command": "npm pack --dry-run --json",
                         "duration_seconds": 0.1,
                         "exit_code": 0,
-                        "entry_count": 1,
-                        "package_size_bytes": 10,
+                        "entry_count": 2,
+                        "package_size_bytes": 20,
+                        "packages": {
+                            "herdr-orchestrator": {
+                                "command": "npm pack --dry-run --json",
+                                "entry_count": 1,
+                                "exit_code": 0,
+                                "package_size_bytes": 10,
+                                "status": "passed",
+                                "unpacked_size_bytes": 20,
+                            },
+                            "herdr-manager": {
+                                "command": ("npm pack --dry-run --json ./packages/herdr-manager"),
+                                "entry_count": 1,
+                                "exit_code": 0,
+                                "package_size_bytes": 10,
+                                "status": "passed",
+                                "unpacked_size_bytes": 20,
+                            },
+                        },
                         "status": "passed",
-                        "unpacked_size_bytes": 20,
+                        "unpacked_size_bytes": 40,
                     }
                 },
                 {"build": "build.json"},

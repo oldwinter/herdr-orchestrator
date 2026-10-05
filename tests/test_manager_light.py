@@ -90,6 +90,7 @@ else:
 print(json.dumps(payload))
 """
 
+
 def require_node() -> str:
     node = shutil.which("node")
     if node is None:
@@ -213,6 +214,40 @@ class ManagerLightProjectionTests(unittest.TestCase):
                 },
             ),
             "manager",
+        )
+
+    def test_manager_recognizes_windows_executable_paths(self):
+        cases = [
+            {"foreground_processes": [{"argv": [r"C:\tools\herdr-manager.exe"]}]},
+            {
+                "foreground_processes": [
+                    {
+                        "argv": [
+                            r"C:\Program Files\nodejs\node.exe",
+                            r"C:\tools\herdr-manager.exe",
+                        ]
+                    }
+                ]
+            },
+            {
+                "foreground_processes": [
+                    {
+                        "argv": [
+                            r"C:\Program Files\nodejs\node.exe",
+                            r"C:\tools\herdr-orchestrator.mjs",
+                            "manager",
+                        ]
+                    }
+                ]
+            },
+        ]
+
+        self.assertEqual(
+            run_projection(
+                "input.map((processInfo) => projection.hasManagerProcess(processInfo))",
+                cases,
+            ),
+            [True, True, True],
         )
 
     def test_every_patch_owns_the_complete_mutually_exclusive_token_family(self):
@@ -491,6 +526,20 @@ class ManagerLightConfigTests(unittest.TestCase):
                 "manager_light_config_block_modified",
             ],
         )
+
+    def test_marker_text_inside_ordinary_comments_is_ignored(self):
+        sources = [
+            "# Refer to # BEGIN herdr-manager-light managed ui.sidebar.agents "
+            "when troubleshooting.\n",
+            "# Refer to # END herdr-manager-light managed ui.sidebar.agents "
+            "when troubleshooting.\n",
+        ]
+
+        inspections = run_configure(
+            "input.map((source) => configure.inspectConfigText(source))", sources
+        )
+
+        self.assertEqual([item["state"] for item in inspections], ["absent", "absent"])
 
     def test_cli_install_status_and_uninstall_are_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:

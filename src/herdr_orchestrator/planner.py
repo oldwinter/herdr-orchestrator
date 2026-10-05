@@ -14,7 +14,19 @@ DEDUPE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 MAX_PLANNER_TASKS = 100
 MAX_PLANNER_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_WORKER_SELECTION_OUTPUT_BYTES = 4 * 1024
-_TASK_KEYS = frozenset({"title", "harness", "prompt", "dedupe_key"})
+# Canonical key sets for model-facing artifacts: the prompt examples and the
+# fail-closed loaders below must both derive from these tuples.
+PLANNER_TASK_KEYS = ("title", "harness", "prompt", "dedupe_key")
+PLANNER_OUTPUT_KEYS = ("tasks",)
+WORKER_SELECTION_KEYS = ("harness",)
+
+
+def _schema_example(keys: tuple[str, ...], **examples: object) -> str:
+    return json.dumps(
+        {key: examples.get(key, "...") for key in keys},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 class PlannerOutputError(ValueError):
@@ -43,8 +55,11 @@ def planner_prompt(
         "唯一允许写入的文件：\n"
         f"{output_file}\n\n"
         f"最多 {max_tasks} 项。文件必须是 UTF-8 JSON，且严格符合：\n"
-        f'{{"tasks":[{{"title":"...","harness":"{allowed_values}",'
-        '"prompt":"...","dedupe_key":"..."}]}\n'
+        + _schema_example(
+            PLANNER_OUTPUT_KEYS,
+            tasks=[json.loads(_schema_example(PLANNER_TASK_KEYS, harness=allowed_values))],
+        )
+        + "\n"
         "不要输出 shell command 字段。写完文件后只回复任务数量。"
     )
 
@@ -69,7 +84,8 @@ def worker_selection_prompt(
         "唯一允许写入的文件：\n"
         f"{output_file}\n\n"
         "文件必须是 UTF-8 JSON，且严格符合：\n"
-        f'{{"harness":"{allowed_values}"}}\n'
+        + _schema_example(WORKER_SELECTION_KEYS, harness=allowed_values)
+        + "\n"
         "不得选择 catalog 之外的 harness，不要输出其他字段。写完文件后只回复所选 harness。"
     )
 
@@ -85,7 +101,7 @@ def load_worker_selection(
         artifact="worker_selection",
         maximum_bytes=MAX_WORKER_SELECTION_OUTPUT_BYTES,
     )
-    if not isinstance(payload, dict) or set(payload) != {"harness"}:
+    if not isinstance(payload, dict) or set(payload) != set(WORKER_SELECTION_KEYS):
         raise PlannerOutputError("worker_selection_invalid_shape")
     value = _bounded_string(payload, "harness", 32, prefix="worker_selection")
     try:
@@ -114,7 +130,7 @@ def load_planner_tasks(
         artifact="planner_output",
         maximum_bytes=MAX_PLANNER_OUTPUT_BYTES,
     )
-    if not isinstance(payload, dict) or set(payload) != {"tasks"}:
+    if not isinstance(payload, dict) or set(payload) != set(PLANNER_OUTPUT_KEYS):
         raise PlannerOutputError("planner_output_invalid_shape")
     rows = payload["tasks"]
     if not isinstance(rows, list) or len(rows) > max_tasks:
@@ -122,7 +138,7 @@ def load_planner_tasks(
     tasks: list[PlannerTask] = []
     dedupe_keys: set[str] = set()
     for row in rows:
-        if not isinstance(row, dict) or set(row) != _TASK_KEYS:
+        if not isinstance(row, dict) or set(row) != set(PLANNER_TASK_KEYS):
             raise PlannerOutputError("planner_task_invalid_shape")
         title = _bounded_string(row, "title", 200, prefix="planner")
         prompt = _bounded_string(row, "prompt", 50_000, prefix="planner")

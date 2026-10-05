@@ -211,19 +211,21 @@ class ProtocolTests(unittest.TestCase):
                         )
 
     def test_subprocess_runner_rejects_oversized_output(self) -> None:
-        with patch(
-            "herdr_orchestrator.protocol.MAX_OUTPUT_BYTES",
-            1024,
+        with (
+            patch(
+                "herdr_orchestrator.protocol.MAX_OUTPUT_BYTES",
+                1024,
+            ),
+            self.assertRaisesRegex(TransportError, "herdr_output_oversized"),
         ):
-            with self.assertRaisesRegex(TransportError, "herdr_output_oversized"):
-                run_text(
-                    subprocess_runner,
-                    Command(
-                        ["python3", "-c", "print('x' * 2048)"],
-                        Path("/tmp"),
-                        10,
-                    ),
-                )
+            run_text(
+                subprocess_runner,
+                Command(
+                    ["python3", "-c", "print('x' * 2048)"],
+                    Path("/tmp"),
+                    10,
+                ),
+            )
 
 
 def _return_process(

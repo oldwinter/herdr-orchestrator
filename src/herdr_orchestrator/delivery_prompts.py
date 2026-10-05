@@ -4,6 +4,17 @@ import json
 from pathlib import Path
 
 from herdr_orchestrator.delivery_protocol import (
+    ACCEPTANCE_RESULT_KEYS,
+    DECISION_TICKET_KEYS,
+    DELIVERY_PLAN_KEYS,
+    DELIVERY_TICKET_KEYS,
+    PROXY_DECISION_KEYS,
+    REVIEW_FINDING_KEYS,
+    REVIEW_VERDICT_KEYS,
+    TICKET_RECEIPT_KEYS,
+    WAYFINDER_MAP_KEYS,
+    WAYFINDER_RESOLUTION_KEYS,
+    WAYFINDER_ROUTE_KEYS,
     DecisionTicket,
     DeliveryPlan,
     DeliveryTicket,
@@ -39,6 +50,14 @@ def _data_block(label: str, value: object) -> str:
     )
 
 
+def _schema_object(keys: tuple[str, ...], **examples: object) -> dict[str, object]:
+    return {key: examples.get(key, "...") for key in keys}
+
+
+def _schema_example(keys: tuple[str, ...], **examples: object) -> str:
+    return json.dumps(_schema_object(keys, **examples), separators=(",", ":"))
+
+
 def wayfinder_route_prompt(goal: str, output_file: Path) -> str:
     return f"""
 Decide whether this effort needs Wayfinder before specification. Wayfinder is only for work
@@ -55,7 +74,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{"use_wayfinder":true,"reason":"..."}}
+{_schema_example(WAYFINDER_ROUTE_KEYS, use_wayfinder=True)}
 
 Use false when the path to a spec is already clear. Do not implement anything.
 `reason` must be a non-empty string.
@@ -63,6 +82,27 @@ Use false when the path to a spec is already clear. Do not implement anything.
 
 
 def wayfinder_chart_prompt(goal: str, output_file: Path) -> str:
+    schema = json.dumps(
+        _schema_object(
+            WAYFINDER_MAP_KEYS,
+            destination="the specification this map must make possible",
+            notes=["..."],
+            decisions=[
+                _schema_object(
+                    DECISION_TICKET_KEYS,
+                    id="01",
+                    title="human-readable decision name",
+                    kind="research|prototype|grilling|task",
+                    blocked_by=[],
+                    resolution="",
+                )
+            ],
+            not_yet_specified=["..."],
+            out_of_scope=["..."],
+        ),
+        ensure_ascii=False,
+        indent=2,
+    )
     return f"""
 Chart a Wayfinder decision map for the goal below. The map plans, it does not build.
 Each decision is a question whose resolution makes the route to a specification clearer.
@@ -79,22 +119,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{
-  "destination":"the specification this map must make possible",
-  "notes":["..."],
-  "decisions":[
-    {{
-      "id":"01",
-      "title":"human-readable decision name",
-      "question":"...",
-      "kind":"research|prototype|grilling|task",
-      "blocked_by":[],
-      "resolution":""
-    }}
-  ],
-  "not_yet_specified":["..."],
-  "out_of_scope":["..."]
-}}
+{schema}
 
 Keep every decision small enough for one fresh context. `destination`, each decision's
 `title`, and `question` must be non-empty. A decision's `resolution` is empty only in the
@@ -110,6 +135,26 @@ def wayfinder_resolve_prompt(
     selected: DecisionTicket,
     output_file: Path,
 ) -> str:
+    schema = json.dumps(
+        _schema_object(
+            WAYFINDER_RESOLUTION_KEYS,
+            ticket_id=selected.ticket_id,
+            resolution="the decision and its reason",
+            new_decisions=[
+                _schema_object(
+                    DECISION_TICKET_KEYS,
+                    id="next unused two- or three-digit id",
+                    kind="research|prototype|grilling|task",
+                    blocked_by=[],
+                    resolution="",
+                )
+            ],
+            not_yet_specified=["remaining fog only"],
+            out_of_scope=["..."],
+        ),
+        ensure_ascii=False,
+        indent=2,
+    )
     return f"""
 Resolve exactly one frontier decision in a Wayfinder map. Research local primary sources as
 needed. Act as the principal proxy for product and implementation choices. Do not build the
@@ -130,22 +175,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{
-  "ticket_id":{json.dumps(selected.ticket_id, ensure_ascii=False)},
-  "resolution":"the decision and its reason",
-  "new_decisions":[
-    {{
-      "id":"next unused two- or three-digit id",
-      "title":"...",
-      "question":"...",
-      "kind":"research|prototype|grilling|task",
-      "blocked_by":[],
-      "resolution":""
-    }}
-  ],
-  "not_yet_specified":["remaining fog only"],
-  "out_of_scope":["..."]
-}}
+{schema}
 
 New decision ids must be unused two- or three-digit ids and their blockers must already
 exist. Do not resolve more than the selected decision. `resolution` must be non-empty.
@@ -158,6 +188,29 @@ def plan_prompt(
     *,
     wayfinder: WayfinderMap | None,
 ) -> str:
+    schema = json.dumps(
+        _schema_object(
+            DELIVERY_PLAN_KEYS,
+            slug="lowercase-kebab-case",
+            user_stories=["As ..."],
+            implementation_decisions=["..."],
+            testing_decisions=["..."],
+            out_of_scope=["..."],
+            further_notes=["..."],
+            seams=["observable behavior at a public boundary"],
+            tickets=[
+                _schema_object(
+                    DELIVERY_TICKET_KEYS,
+                    id="01",
+                    what_to_build="end-to-end behavior, not layer-by-layer steps",
+                    blocked_by=[],
+                    acceptance_criteria=["observable criterion"],
+                )
+            ],
+        ),
+        ensure_ascii=False,
+        indent=2,
+    )
     wayfinder_context = (
         "No Wayfinder map was needed."
         if wayfinder is None
@@ -190,27 +243,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{
-  "slug":"lowercase-kebab-case",
-  "title":"...",
-  "problem_statement":"...",
-  "solution":"...",
-  "user_stories":["As ..."],
-  "implementation_decisions":["..."],
-  "testing_decisions":["..."],
-  "out_of_scope":["..."],
-  "further_notes":["..."],
-  "seams":["observable behavior at a public boundary"],
-  "tickets":[
-    {{
-      "id":"01",
-      "title":"...",
-      "what_to_build":"end-to-end behavior, not layer-by-layer steps",
-      "blocked_by":[],
-      "acceptance_criteria":["observable criterion"]
-    }}
-  ]
-}}
+{schema}
 
 Do not include file paths or shell commands. `user_stories`, `implementation_decisions`,
 `testing_decisions`, and `seams` must each contain at least one non-empty string. The other
@@ -225,6 +258,24 @@ def implementation_prompt(
     ticket: DeliveryTicket,
     receipt_file: Path,
 ) -> str:
+    schema = json.dumps(
+        _schema_object(
+            TICKET_RECEIPT_KEYS,
+            ticket_id=ticket.ticket_id,
+            commit="full commit SHA",
+            acceptance=[
+                _schema_object(
+                    ACCEPTANCE_RESULT_KEYS,
+                    criterion="copy each criterion verbatim",
+                    passed=True,
+                    evidence="test or inspection",
+                )
+            ],
+            checks=["command and result"],
+        ),
+        ensure_ascii=False,
+        indent=2,
+    )
     return f"""
 Implement exactly one accepted delivery ticket in this isolated git worktree.
 
@@ -246,15 +297,7 @@ After the commit and clean working tree, write only this additional UTF-8 JSON a
 {receipt_file}
 
 Exact schema:
-{{
-  "ticket_id":{json.dumps(ticket.ticket_id, ensure_ascii=False)},
-  "commit":"full commit SHA",
-  "acceptance":[
-    {{"criterion":"copy each criterion verbatim","passed":true,"evidence":"test or inspection"}}
-  ],
-  "checks":["command and result"],
-  "summary":"..."
-}}
+{schema}
 
 Include every acceptance criterion once, in order. A failed criterion means the ticket is
 not complete and no success receipt may be written. `checks` must be non-empty. The commit
@@ -266,9 +309,18 @@ def standards_review_prompt(
     base_commit: str,
     output_file: Path,
 ) -> str:
-    schema = (
-        '{{"standards":[{{"severity":"must-fix|advisory","summary":"...",'
-        '"evidence":"file/hunk","source":"documented rule or named smell"}}]}}'
+    schema = json.dumps(
+        {
+            "standards": [
+                _schema_object(
+                    REVIEW_FINDING_KEYS,
+                    severity="must-fix|advisory",
+                    evidence="file/hunk",
+                    source="documented rule or named smell",
+                )
+            ]
+        },
+        separators=(",", ":"),
     )
     return f"""
 Review the committed diff `{base_commit}...HEAD` along the Standards axis only.
@@ -301,9 +353,18 @@ def spec_review_prompt(
     plan: DeliveryPlan,
     output_file: Path,
 ) -> str:
-    schema = (
-        '{{"spec":[{{"severity":"must-fix|advisory","summary":"...",'
-        '"evidence":"file/hunk","source":"quoted spec text"}}]}}'
+    schema = json.dumps(
+        {
+            "spec": [
+                _schema_object(
+                    REVIEW_FINDING_KEYS,
+                    severity="must-fix|advisory",
+                    evidence="file/hunk",
+                    source="quoted spec text",
+                )
+            ]
+        },
+        separators=(",", ":"),
     )
     return f"""
 Review the committed diff `{base_commit}...HEAD` along the Spec axis only. Report missing or
@@ -361,7 +422,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{"accepted":["finding-id"],"dismissed":["finding-id"],"rationale":"..."}}
+{_schema_example(REVIEW_VERDICT_KEYS, accepted=["finding-id"], dismissed=["finding-id"])}
 
 Every candidate id must appear exactly once in accepted or dismissed. Either list may be
 empty, but their union must match the candidate ids exactly.
@@ -403,6 +464,16 @@ def principal_proxy_prompt(
     worker_question: str,
     output_file: Path,
 ) -> str:
+    schema = json.dumps(
+        _schema_object(
+            PROXY_DECISION_KEYS,
+            action="answer|approve|deny|escalate",
+            category="local-reversible|spec-authorized|secret|production",
+            response="exact response to the worker, empty only for escalation",
+        ),
+        ensure_ascii=False,
+        indent=2,
+    )
     return f"""
 Act as the user's principal proxy for an already accepted local delivery. Decide how to
 answer one blocked worker. You may answer or approve local reversible and specification-
@@ -422,12 +493,7 @@ Write only this UTF-8 JSON file:
 {output_file}
 
 Exact schema:
-{{
-  "action":"answer|approve|deny|escalate",
-  "category":"local-reversible|spec-authorized|secret|production",
-  "response":"exact response to the worker, empty only for escalation",
-  "rationale":"..."
-}}
+{schema}
 
 Use `escalate` for `secret` or `production`; those categories never accept another action.
 Every non-escalation action needs a non-empty response, and rationale is always required.

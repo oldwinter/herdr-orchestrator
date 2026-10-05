@@ -214,6 +214,7 @@ class NewJob:
     receipt: TaskReceipt | None = None
     completion_policy: CompletionPolicy | None = None
     workspace: str | None = None
+    depends_on: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

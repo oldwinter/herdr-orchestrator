@@ -39,6 +39,7 @@ from herdr_orchestrator.delivery_prompts import (
     wayfinder_route_prompt,
 )
 from herdr_orchestrator.delivery_protocol import (
+    WAYFINDER_MAP_MAX_DECISIONS,
     AuthorityCategory,
     DecisionTicket,
     DeliveryArtifactError,
@@ -47,7 +48,6 @@ from herdr_orchestrator.delivery_protocol import (
     ProxyDecision,
     ReviewReport,
     WayfinderMap,
-    WAYFINDER_MAP_MAX_DECISIONS,
     append_artifact_text,
     exclusive_file_claim,
     load_delivery_plan,

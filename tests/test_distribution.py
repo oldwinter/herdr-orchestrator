@@ -47,6 +47,7 @@ def npm_pack_entry(stdout: str) -> dict[str, object]:
         raise AssertionError("npm pack returned an unexpected package shape")
     return payload
 
+
 def require_node() -> str:
     node = shutil.which("node")
     if node is None:

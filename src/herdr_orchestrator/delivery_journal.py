@@ -873,9 +873,7 @@ class DeliveryJournal:
                 raise self.error_type("delivery_journal_invalid")
             operations[operation_key] = (effect_kind, details, False, False)
             return
-        if prior is None or (
-            event != "effect_conflict" and prior[0] != effect_kind
-        ):
+        if prior is None or (event != "effect_conflict" and prior[0] != effect_kind):
             raise self.error_type("delivery_journal_invalid")
         if event == "effect_started":
             if prior[2] or prior[3] or details:

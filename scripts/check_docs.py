@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 KEY_DOC_NAMES = ("README.md", "AGENTS.md", "CONTRIBUTING.md")
-MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+MARKDOWN_LINK_START = re.compile(r"\[[^\]]+\]\(")
 JUST_COMMAND = re.compile(r"`just ([a-z][a-z0-9-]*)")
 JUST_BLOCK_COMMAND = re.compile(r"^just ([a-z][a-z0-9-]*)", re.MULTILINE)
 JUST_RECIPE = re.compile(r"^([a-z][a-z0-9-]*)(?: [^:]*)?:$", re.MULTILINE)
@@ -46,6 +46,8 @@ PATH_COMMANDS = {
     "tail",
     "touch",
 }
+MULTI_PATH_COMMANDS = {"cp", "mv"}
+SHELL_SEPARATORS = {"&&", ";", "|", "||"}
 
 
 def documentation_failures(root: Path = ROOT) -> list[str]:
@@ -58,10 +60,7 @@ def documentation_failures(root: Path = ROOT) -> list[str]:
     names = [*KEY_DOC_NAMES]
     docs_root = root / "docs"
     if docs_root.is_dir():
-        names.extend(
-            path.relative_to(root).as_posix()
-            for path in sorted(docs_root.rglob("*.md"))
-        )
+        names.extend(path.relative_to(root).as_posix() for path in sorted(docs_root.rglob("*.md")))
     for name in dict.fromkeys(names):
         document = root / name
         if document.is_symlink():
@@ -73,7 +72,7 @@ def documentation_failures(root: Path = ROOT) -> list[str]:
                 failures.append(f"{name}: required document is missing")
             continue
         text = document.read_text(encoding="utf-8")
-        for target in MARKDOWN_LINK.findall(text):
+        for target in _markdown_link_targets(text):
             if target.startswith(("http://", "https://", "#", "mailto:")):
                 continue
             path_text = target.split("#", maxsplit=1)[0]
@@ -91,6 +90,30 @@ def documentation_failures(root: Path = ROOT) -> list[str]:
                 failures.append(f"{document.name}: unknown just recipe {recipe}")
         failures.extend(_command_path_failures(document, text, root, repository_roots))
     return failures
+
+
+def _markdown_link_targets(text: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    for match in MARKDOWN_LINK_START.finditer(text):
+        start = match.end()
+        depth = 1
+        escaped = False
+        for index in range(start, len(text)):
+            character = text[index]
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\":
+                escaped = True
+                continue
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    targets.append(text[start:index])
+                    break
+    return tuple(targets)
 
 
 def _command_path_failures(
@@ -111,9 +134,20 @@ def _command_path_failures(
             except ValueError:
                 tokens = line.split()
             expect_path = False
+            multi_path_command = False
             for token in tokens:
-                candidate = _command_path_token(token, expect_path=expect_path)
+                if token in SHELL_SEPARATORS:
+                    expect_path = False
+                    multi_path_command = False
+                    continue
+                explicit_multi_path = multi_path_command
+                candidate = _command_path_token(
+                    token,
+                    expect_path=expect_path or explicit_multi_path,
+                )
                 expect_path = _path_option(token) or token in PATH_COMMANDS
+                if token in MULTI_PATH_COMMANDS:
+                    multi_path_command = True
                 if candidate is None or candidate in seen:
                     continue
                 seen.add(candidate)
@@ -123,7 +157,7 @@ def _command_path_failures(
                     path = (root / candidate).resolve()
                 else:
                     first = candidate.split("/", maxsplit=1)[0]
-                    if first not in repository_roots:
+                    if first not in repository_roots and not explicit_multi_path:
                         continue
                     path = (root / candidate).resolve()
                 if not path.is_relative_to(root):

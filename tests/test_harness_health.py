@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import subprocess
 import threading
 import time
@@ -743,6 +744,17 @@ class HarnessHealthTests(unittest.TestCase):
             smoke_agent_name("example", Harness.DROID, workspace_a),
             smoke_agent_name("example", Harness.DROID, workspace_b),
         )
+
+    def test_no_legacy_health_module_or_importers(self) -> None:
+        package = REPO_ROOT / "src" / "herdr_orchestrator"
+        self.assertFalse((package / "health.py").exists())
+        pattern = re.compile(r"herdr_orchestrator\.health\b")
+        offenders = [
+            path
+            for path in list(package.glob("*.py")) + list((REPO_ROOT / "tests").glob("*.py"))
+            if pattern.search(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":

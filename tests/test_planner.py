@@ -7,6 +7,9 @@ from pathlib import Path
 
 from herdr_orchestrator.model import Harness
 from herdr_orchestrator.planner import (
+    PLANNER_OUTPUT_KEYS,
+    PLANNER_TASK_KEYS,
+    WORKER_SELECTION_KEYS,
     PlannerOutputError,
     load_planner_tasks,
     load_worker_selection,
@@ -74,6 +77,23 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(selected, Harness.GROK)
         self.assertIn('"harness":"grok|codex"', prompt)
         self.assertNotIn("claude", prompt)
+
+    def test_prompt_schema_examples_share_loader_key_sets(self) -> None:
+        out = Path(tempfile.gettempdir()).resolve() / "out.json"
+        catalog = '{"harnesses":[{"harness":"codex","summary":"coding"}]}'
+        planner = planner_prompt("Plan work.", out, 3, catalog, (Harness.CODEX,))
+        marker = "严格符合：\n"
+        planner_schema = json.loads(planner[planner.index(marker) + len(marker) :].split("\n")[0])
+        self.assertEqual(set(planner_schema), set(PLANNER_OUTPUT_KEYS))
+        self.assertEqual(set(planner_schema["tasks"][0]), set(PLANNER_TASK_KEYS))
+
+        selection = worker_selection_prompt(
+            "Implement the feature.", out, catalog, (Harness.CODEX,)
+        )
+        selection_schema = json.loads(
+            selection[selection.index(marker) + len(marker) :].split("\n")[0]
+        )
+        self.assertEqual(set(selection_schema), set(WORKER_SELECTION_KEYS))
 
     def test_rejects_worker_selection_outside_allowed_pool(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -247,9 +247,7 @@ class DeliveryRecoveryGuardTests(unittest.TestCase):
                 commit = _git(integration.path, "rev-parse", "HEAD").stdout.strip()
                 receipt.parent.mkdir(parents=True, exist_ok=True)
                 receipt.write_text(
-                    json.dumps(
-                        {"round": 1, "before_commit": base, "commit": commit}
-                    ),
+                    json.dumps({"round": 1, "before_commit": base, "commit": commit}),
                     encoding="utf-8",
                 )
 
@@ -373,12 +371,12 @@ class DeliveryRecoveryGuardTests(unittest.TestCase):
                 )
                 review = delivery._review_and_repair
 
-                def drift_after_review(plan, integration):
+                def drift_after_review(
+                    plan, integration, review=review, mutation=mutation, repository=repository
+                ):
                     rounds = review(plan, integration)
                     if mutation == "rewrite":
-                        (repository / "drift.txt").write_text(
-                            "drifted\n", encoding="utf-8"
-                        )
+                        (repository / "drift.txt").write_text("drifted\n", encoding="utf-8")
                         _git(repository, "add", "drift.txt")
                         _git(
                             repository,

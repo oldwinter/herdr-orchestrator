@@ -419,9 +419,7 @@ class StoreTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(phase, AttemptPhase.ATTENTION.value)
         self.assertEqual(event, AttemptPhase.ATTENTION.value)
-        resumed, _ = self.store.claim_blocked_for_resume(
-            "example", job_id, lease_seconds=60
-        )
+        resumed, _ = self.store.claim_blocked_for_resume("example", job_id, lease_seconds=60)
         self.assertFalse(resumed.recovery)
         self.assertEqual(resumed.operation_sequence, 1)
         state = self.store.record_resume_outcome(
@@ -436,9 +434,7 @@ class StoreTests(unittest.TestCase):
             ),
         )
         self.assertEqual(state, JobState.SUCCEEDED)
-        self.assertEqual(
-            self.store.jobs("example")[0]["state"], JobState.SUCCEEDED.value
-        )
+        self.assertEqual(self.store.jobs("example")[0]["state"], JobState.SUCCEEDED.value)
         with patch("herdr_orchestrator.store.time.time", return_value=500.0):
             self.assertEqual(self.store.claim("example", limit=1, lease_seconds=60), [])
 
@@ -1329,7 +1325,7 @@ class StoreTests(unittest.TestCase):
         self.store.enqueue(_job("clear-projection", max_attempts=3))
         baseline = time.time() + 1
         with patch("herdr_orchestrator.store.time.time", return_value=baseline):
-            first = self.store.claim("example", limit=1, lease_seconds=30)[0]
+            self.assertEqual(len(self.store.claim("example", limit=1, lease_seconds=30)), 1)
         with patch("herdr_orchestrator.store.time.time", return_value=baseline + 31):
             reclaimed = self.store.claim("example", limit=1, lease_seconds=30)[0]
             self.store.record_outcome(
@@ -2009,12 +2005,8 @@ class StoreTests(unittest.TestCase):
 
         with closing(sqlite3.connect(path)) as connection, connection:
             version = connection.execute("SELECT version FROM schema_meta").fetchone()[0]
-            indexes = {
-                row[1] for row in connection.execute("PRAGMA index_list(receipts)")
-            }
-            meta_columns = {
-                row[1] for row in connection.execute("PRAGMA table_info(schema_meta)")
-            }
+            indexes = {row[1] for row in connection.execute("PRAGMA index_list(receipts)")}
+            meta_columns = {row[1] for row in connection.execute("PRAGMA table_info(schema_meta)")}
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("INSERT INTO schema_meta(id, version) VALUES (2, 10)")
 

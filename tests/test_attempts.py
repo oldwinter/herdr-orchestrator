@@ -7,8 +7,6 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from herdr_orchestrator.model import (
     AgentState,
     AttemptPhase,
@@ -46,11 +44,7 @@ _LEGAL_TRANSITIONS = frozenset(
     }
 )
 
-_ALL_TRANSITIONS = [
-    (current, target)
-    for current in _PROGRESS_PHASES
-    for target in AttemptPhase
-]
+_ALL_TRANSITIONS = [(current, target) for current in _PROGRESS_PHASES for target in AttemptPhase]
 
 
 def _job(dedupe_key: str, *, max_attempts: int = 3, workflow: str = "example") -> NewJob:
@@ -101,9 +95,7 @@ class AttemptPhaseTransitionTests(unittest.TestCase):
     def _claimed(self, dedupe_key: str, *, max_attempts: int = 3):
         # Each subtest gets its own workflow: claim admits at most one running
         # job per harness slot, so a shared workflow would starve later claims.
-        self.store.enqueue(
-            _job(dedupe_key, max_attempts=max_attempts, workflow=dedupe_key)
-        )
+        self.store.enqueue(_job(dedupe_key, max_attempts=max_attempts, workflow=dedupe_key))
         return self.store.claim(dedupe_key, limit=1, lease_seconds=60)[0]
 
     def _advance(self, claimed, target: AttemptPhase) -> None:
@@ -156,9 +148,7 @@ class AttemptPhaseTransitionTests(unittest.TestCase):
                 claimed = self._claimed(f"legal-{index}")
                 self._advance(claimed, current)
 
-                self.store.record_attempt_progress(
-                    claimed, _progress(target, claimed.agent_name)
-                )
+                self.store.record_attempt_progress(claimed, _progress(target, claimed.agent_name))
 
                 self.assertEqual(self.store.attempt_phase(claimed.attempt_id), target)
 
@@ -210,9 +200,7 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
     def _claimed(self, dedupe_key: str, *, max_attempts: int = 3):
         # Unique workflow per case: claim admits at most one running job per
         # harness slot, so a shared workflow would starve later claims.
-        self.store.enqueue(
-            _job(dedupe_key, max_attempts=max_attempts, workflow=dedupe_key)
-        )
+        self.store.enqueue(_job(dedupe_key, max_attempts=max_attempts, workflow=dedupe_key))
         return self.store.claim(dedupe_key, limit=1, lease_seconds=60)[0]
 
     def _advance(self, claimed, target: AttemptPhase) -> None:
@@ -267,9 +255,7 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
         self.assertEqual(state, JobState.PENDING)
         self.assertEqual(job["state"], JobState.PENDING.value)
         self.assertEqual(job["error_code"], "agent_not_settled")
-        self.assertEqual(
-            self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ABANDONED
-        )
+        self.assertEqual(self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ABANDONED)
 
     def test_working_outcome_before_acceptance_retries_with_backoff(self) -> None:
         claimed = self._claimed("working-retry")
@@ -286,9 +272,7 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
         job = self._job_row("working-retry")
         self.assertEqual(state, JobState.PENDING)
         self.assertEqual(job["error_code"], "agent_not_settled")
-        self.assertEqual(
-            self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ABANDONED
-        )
+        self.assertEqual(self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ABANDONED)
 
     def test_working_outcome_after_receipt_observation_needs_attention(self) -> None:
         claimed = self._claimed("working-attention")
@@ -306,9 +290,7 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
         job = self._job_row("working-attention")
         self.assertEqual(state, JobState.BLOCKED)
         self.assertEqual(job["state"], JobState.BLOCKED.value)
-        self.assertEqual(
-            self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ATTENTION
-        )
+        self.assertEqual(self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ATTENTION)
 
     def test_unsafe_turn_adoption_blocks_for_attention(self) -> None:
         claimed = self._claimed("unsafe-adoption")
@@ -328,9 +310,7 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
         self.assertEqual(state, JobState.BLOCKED)
         self.assertEqual(job["state"], JobState.BLOCKED.value)
         self.assertEqual(job["error_code"], "unsafe_turn_adoption")
-        self.assertEqual(
-            self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ATTENTION
-        )
+        self.assertEqual(self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ATTENTION)
 
     def test_blocked_agent_outcome_commits_blocked_job(self) -> None:
         claimed = self._claimed("agent-blocked")
@@ -394,7 +374,7 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
                 _job("backoff", max_attempts=len(expected_deltas) + 1, workflow="backoff")
             )
         observed: list[float] = []
-        for delta in expected_deltas:
+        for _delta in expected_deltas:
             with patch("herdr_orchestrator.store.time.time", return_value=now):
                 claimed = self.store.claim("backoff", limit=1, lease_seconds=60)[0]
                 self.store.record_outcome(
@@ -480,9 +460,7 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
                 correlation_id=claimed.correlation_id,
             ),
         )
-        self.assertEqual(
-            self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ATTENTION
-        )
+        self.assertEqual(self.store.attempt_phase(claimed.attempt_id), AttemptPhase.ATTENTION)
 
         resumed, pane_id = self.store.claim_blocked_for_resume(
             "attention-resume", claimed.job_id, lease_seconds=60
@@ -508,9 +486,7 @@ class AttemptOutcomeClassificationTests(unittest.TestCase):
         )
 
         self.assertEqual(state, JobState.SUCCEEDED)
-        self.assertEqual(
-            self._job_row("attention-resume")["state"], JobState.SUCCEEDED.value
-        )
+        self.assertEqual(self._job_row("attention-resume")["state"], JobState.SUCCEEDED.value)
         self.assertEqual(
             self.store.attempt_phase(claimed.attempt_id), AttemptPhase.OUTCOME_COMMITTED
         )

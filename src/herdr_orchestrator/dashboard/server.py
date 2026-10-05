@@ -456,6 +456,7 @@ def _handler(
                 "dashboard-utils.js",
                 "source-warning.js",
                 "timeline-continuity.js",
+                "dashboard-topology.js",
                 "dashboard.js",
             }:
                 self.send_error(HTTPStatus.NOT_FOUND)

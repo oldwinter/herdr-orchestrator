@@ -77,8 +77,7 @@ class DistributionManagerTests(DistributionCliFixture, unittest.TestCase):
             for name in ("grok", "codex", "claude"):
                 harness = commands / name
                 harness.write_text(
-                    "#!/bin/sh\n"
-                    f'printf "{name}\\n" >> "$MANAGER_PROBE"\n',
+                    "#!/bin/sh\n" f'printf "{name}\\n" >> "$MANAGER_PROBE"\n',
                     encoding="utf-8",
                 )
                 harness.chmod(0o755)

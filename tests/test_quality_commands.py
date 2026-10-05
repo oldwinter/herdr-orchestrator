@@ -360,7 +360,6 @@ class QualityCommandTests(unittest.TestCase):
         self.assertEqual(enforce.returncode, 1, enforce.stderr)
         self.assertEqual(partial.returncode, 0, partial.stderr)
 
-
     def test_full_bundle_rejects_each_omitted_missing_and_corrupt_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
