@@ -10,6 +10,21 @@
 - name: priority:triage
   color: cfd3d7
   description: Priority has not been assigned
+- name: needs-triage
+  color: cfd3d7
+  description: Maintainer needs to evaluate this issue
+- name: needs-info
+  color: d4c5f9
+  description: Waiting on reporter for more information
+- name: ready-for-agent
+  color: 0e8a16
+  description: Fully specified, ready for an AFK agent
+- name: ready-for-human
+  color: fbca04
+  description: Requires human implementation
+- name: wontfix
+  color: ffffff
+  description: Will not be actioned
 - name: type:bug
   color: d73a4a
   description: Incorrect behavior
