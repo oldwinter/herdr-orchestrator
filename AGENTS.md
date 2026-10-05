@@ -47,3 +47,17 @@
 - 配置 schema、SQLite migration 和 receipt 保持向后兼容。
 - CLI 输出面向 automation：失败给稳定错误码或明确原因。
 - 改后跑最小相关 unittest，收口前 `just check`。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in this repository's GitHub Issues; pull requests are not a request surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles map directly to same-named GitHub labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses a single-context domain documentation layout. See `docs/agents/domain.md`.
