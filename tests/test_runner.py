@@ -2069,7 +2069,9 @@ class CoordinatorTests(unittest.TestCase):
             store = Store(config.state_db)
             store.initialize()
             dispatcher = PlannerDispatcher(config.planner.output_file)
-            coordinator = Coordinator(config, store=store, dispatcher=dispatcher)
+            coordinator = Coordinator(
+                config, store=store, dispatcher=dispatcher, controller_harness=Harness.DROID
+            )
 
             coordinator._run_planner_if_due()
 
