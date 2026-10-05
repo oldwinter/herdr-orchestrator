@@ -8,12 +8,12 @@ import time
 import unittest
 from pathlib import Path
 
-from test_distribution import CLI, REPO_ROOT, DistributionCliCase
+from test_distribution import CLI, REPO_ROOT, DistributionCliFixture
 
 from herdr_orchestrator import __version__
 
 
-class DistributionJournalTests(DistributionCliCase):
+class DistributionJournalTests(DistributionCliFixture, unittest.TestCase):
     def test_malformed_installer_journal_fails_closed_for_every_reader(self) -> None:
         def mixed_modes(journal: bytes) -> bytes:
             payload = json.loads(journal)

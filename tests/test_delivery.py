@@ -1407,6 +1407,8 @@ class StandardizedDeliveryTests(unittest.TestCase):
 
             self.assertEqual(
                 _file_sha256(artifact),
+                # Known SHA-256 of the fixed 64-byte fixture, not a credential.
+                # pragma: allowlist nextline secret
                 "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c",
             )
 
