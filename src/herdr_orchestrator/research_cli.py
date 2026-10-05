@@ -25,10 +25,14 @@ from herdr_orchestrator.executor_store import ExecutorStore, ExecutorStoreError
 from herdr_orchestrator.model import WorkflowConfig
 from herdr_orchestrator.research_executor import (
     CriticalityPolicy,
+    NovelLead,
+    ResearchBudgetState,
+    ResearchBudgets,
     ResearchConfig,
     ResearchEvidenceError,
     ResearchEvidenceRegister,
     ResearchInputError,
+    ResearchTerminal,
     EvidenceRelation,
     ExcerptReceipt,
     SourceReceipt,
@@ -36,7 +40,10 @@ from herdr_orchestrator.research_executor import (
     VerificationAssignment,
     VerificationDisposition,
     build_research_view,
+    build_progress_signature,
     classify_input,
+    decide_novel_lead,
+    decide_source_availability,
     decompose_question,
     parse_research_input,
 )
@@ -90,6 +97,31 @@ def _research_select_run(
 
 def research_command(config: WorkflowConfig, args: argparse.Namespace) -> int:
     command = args.research_command
+    if command in {
+        "round-fixture",
+        "research-round-fixture",
+        "loop-fixture",
+        "budget-fixture",
+        "exhaustion-fixture",
+        "progress-fixture",
+        "lead-fixture",
+    }:
+        return _research_round_fixture(
+            config,
+            args.case,
+            route=f"research.{command}",
+        )
+    if command in {
+        "source-fixture",
+        "unavailable-fixture",
+        "unavailable-source-fixture",
+        "source-availability-fixture",
+    }:
+        return _research_round_fixture(
+            config,
+            args.case,
+            route="research.source-fixture",
+        )
     if command in {"evidence-fixture", "verification-fixture"}:
         return _research_evidence_fixture(
             config,
@@ -150,6 +182,1108 @@ def research_command(config: WorkflowConfig, args: argparse.Namespace) -> int:
             output=args.output,
         )
     raise ConfigError(f"research_route_unknown: {command}")
+
+
+_RESEARCH_ROUND_FIXTURE_CASES = frozenset(
+    {
+        "novel-lead",
+        "duplicate-lead",
+        "already-covered-lead",
+        "unknown-target-lead",
+        "ungrounded-lead",
+        "stagnant",
+        "duplicate-evidence",
+        "prose-only",
+        "work-item-exhaustion",
+        "turn-exhaustion",
+        "time-exhaustion",
+        "lead-round-exhaustion",
+        "required-route-exhaustion",
+    }
+)
+_RESEARCH_ROUND_FIXTURE_ALIASES = {
+    "novel": "novel-lead",
+    "already-covered": "already-covered-lead",
+    "unknown-target": "unknown-target-lead",
+    "ungrounded": "ungrounded-lead",
+    "coverage-stagnant": "stagnant",
+    "stagnation": "stagnant",
+    "duplicate-evidence-only": "duplicate-evidence",
+    "duplicate-only": "duplicate-evidence",
+    "prose": "prose-only",
+    "work-items": "work-item-exhaustion",
+    "work-item": "work-item-exhaustion",
+    "work": "work-item-exhaustion",
+    "turns": "turn-exhaustion",
+    "turn": "turn-exhaustion",
+    "time": "time-exhaustion",
+    "time-budget": "time-exhaustion",
+    "lead-rounds": "lead-round-exhaustion",
+    "lead-round": "lead-round-exhaustion",
+    "route": "required-route-exhaustion",
+    "route-exhaustion": "required-route-exhaustion",
+    "required-route": "required-route-exhaustion",
+    "required-public-route": "required-route-exhaustion",
+}
+_RESEARCH_SOURCE_FIXTURE_CASES = frozenset(
+    {
+        "unavailable-retry",
+        "unavailable-replacement",
+        "unavailable-fail",
+        "denied-retry",
+        "denied-replacement",
+        "denied-fail",
+        "changed-retry",
+        "changed-replacement",
+        "changed-fail",
+    }
+)
+_RESEARCH_SOURCE_FIXTURE_ALIASES = {
+    "unavailable": "unavailable-retry",
+    "unreachable": "unavailable-retry",
+    "unreachable-source": "unavailable-retry",
+    "unavailable-source": "unavailable-retry",
+    "denied": "denied-retry",
+    "denied-source": "denied-retry",
+    "changed": "changed-replacement",
+    "changed-source": "changed-replacement",
+    "source-changed": "changed-replacement",
+    "changed-without-excerpt": "changed-replacement",
+}
+
+
+def _round_fixture_definitions(
+    config: WorkflowConfig,
+    *,
+    case_id: str,
+    research_config: ResearchConfig,
+) -> dict[str, object]:
+    worker_rows = [
+        {
+            "name": worker.name,
+            "harness": worker.harness.value,
+            "capabilities": list(worker.capabilities),
+            "replicas": worker.replicas,
+        }
+        for worker in config.workers
+    ]
+    return {
+        "workflow": {
+            "path": str(config.path),
+            "name": config.name,
+            "schema_version": 2,
+            "fixture_case_id": case_id,
+            "source": config.path.read_text(encoding="utf-8"),
+        },
+        "config": {
+            "coordinator": {
+                "max_parallel": config.coordinator.max_parallel,
+                "lease_seconds": config.coordinator.lease_seconds,
+                "max_attempts": config.coordinator.max_attempts,
+                "agent_timeout_seconds": config.coordinator.agent_timeout_seconds,
+            },
+            "research": research_config.to_dict(),
+            "workers": worker_rows,
+        },
+        "input": {"version": 1, "kind": "public-question", "question": "round fixture"},
+        "route": {
+            "roles": dict(research_config.roles),
+            "workers": worker_rows,
+        },
+        "profile": {"name": "scripted-fixture"},
+        "prompt": {"version": 1},
+        "static_checks": [],
+        "contract": {"version": "research-round-v1"},
+        "executor": {"kind": "research-synthesis", "version": 1},
+        "artifact_contract": {
+            "version": ARTIFACT_CONTRACT_VERSION,
+            "schema_version": 1,
+        },
+    }
+
+
+def _research_round_fixture(
+    config: WorkflowConfig,
+    requested_case_id: str,
+    *,
+    route: str,
+) -> int:
+    research_config = ResearchConfig.from_mapping(
+        config.executor.settings if config.executor is not None else {}
+    )
+    if route == "research.source-fixture":
+        canonical_case_id = _RESEARCH_SOURCE_FIXTURE_ALIASES.get(
+            requested_case_id,
+            requested_case_id,
+        )
+        if canonical_case_id not in _RESEARCH_SOURCE_FIXTURE_CASES:
+            raise ConfigError(
+                f"research_source_fixture_unknown_case:{requested_case_id}"
+            )
+    else:
+        if requested_case_id == "duplicate":
+            canonical_case_id = (
+                "duplicate-evidence"
+                if route == "research.progress-fixture"
+                else "duplicate-lead"
+            )
+        else:
+            canonical_case_id = _RESEARCH_ROUND_FIXTURE_ALIASES.get(
+                requested_case_id,
+                requested_case_id,
+            )
+        if canonical_case_id not in _RESEARCH_ROUND_FIXTURE_CASES:
+            raise ConfigError(
+                f"research_round_fixture_unknown_case:{requested_case_id}"
+            )
+    store = ExecutorStore(config.state_db)
+    kernel = _research_kernel(config, store)
+    definitions = _round_fixture_definitions(
+        config,
+        case_id=canonical_case_id,
+        research_config=research_config,
+    )
+    run_id, created = store.create_run(
+        config.name,
+        "research-synthesis",
+        f"research-round-fixture-{canonical_case_id}",
+        state="running",
+        workflow_definition=definitions["workflow"],
+        config_definition=definitions["config"],
+        input_value=definitions["input"],
+        route_definition=definitions["route"],
+        profile_definition=definitions["profile"],
+        prompt_definition=definitions["prompt"],
+        static_checks=definitions["static_checks"],
+        contract_definition=definitions["contract"],
+        executor_definition=definitions["executor"],
+        artifact_contract_definition=definitions["artifact_contract"],
+    )
+    if not created:
+        return _replay_round_fixture(
+            config,
+            store=store,
+            kernel=kernel,
+            run_id=run_id,
+            requested_case_id=requested_case_id,
+            canonical_case_id=canonical_case_id,
+            route=route,
+        )
+    if route == "research.source-fixture":
+        return _run_source_fixture(
+            config,
+            store=store,
+            kernel=kernel,
+            run_id=run_id,
+            requested_case_id=requested_case_id,
+            case_id=canonical_case_id,
+        )
+    return _run_round_budget_fixture(
+        config,
+        store=store,
+        kernel=kernel,
+        run_id=run_id,
+        requested_case_id=requested_case_id,
+        case_id=canonical_case_id,
+        budgets=research_config.budgets,
+    )
+
+
+def _replay_round_fixture(
+    config: WorkflowConfig,
+    *,
+    store: ExecutorStore,
+    kernel: ExecutionKernel,
+    run_id: str,
+    requested_case_id: str,
+    canonical_case_id: str,
+    route: str,
+) -> int:
+    events = kernel.list_events(run_id)
+    fixture_event = next(
+        (
+            event
+            for event in reversed(events)
+            if event.event_type == "research_round_fixture"
+        ),
+        None,
+    )
+    if fixture_event is None or not isinstance(fixture_event.payload, dict):
+        raise ExecutorStoreError("research_round_fixture_checkpoint_missing")
+    payload = json.loads(json.dumps(fixture_event.payload))
+    result_success = bool(payload.get("result_success", False))
+    payload.update(
+        {
+            "schema_version": 2,
+            "executor": "research-synthesis",
+            "route": route,
+            "success": result_success,
+            "fixture_case_id": requested_case_id,
+            "canonical_case_id": canonical_case_id,
+            "run_id": run_id,
+            "idempotent": True,
+            "events": len(events),
+        }
+    )
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def _run_round_budget_fixture(
+    config: WorkflowConfig,
+    *,
+    store: ExecutorStore,
+    kernel: ExecutionKernel,
+    run_id: str,
+    requested_case_id: str,
+    case_id: str,
+    budgets: ResearchBudgets,
+) -> int:
+    if case_id in {
+        "novel-lead",
+        "duplicate-lead",
+        "already-covered-lead",
+        "unknown-target-lead",
+        "ungrounded-lead",
+    }:
+        return _run_lead_fixture(
+            config,
+            store=store,
+            kernel=kernel,
+            run_id=run_id,
+            requested_case_id=requested_case_id,
+            case_id=case_id,
+            budgets=budgets,
+        )
+
+    if case_id in {"duplicate-evidence", "prose-only"}:
+        progress = ResearchBudgetState()
+        signature = build_progress_signature(
+            canonical_evidence_ids={"evidence-initial"},
+            credited_required_cell_ids={"scope:operator"},
+            resolved_verification_ids=set(),
+            contested_disposition_transitions=[],
+        )
+        progress.observe_signature(signature)
+        # Prose/confidence edits are deliberately not represented in the
+        # canonical signature.  A duplicate evidence record is the same
+        # semantic set, regardless of insertion/replay order.
+        progress_changed = progress.observe_signature(signature)
+        terminal = progress.terminal_for(budgets, unresolved_coverage=True)
+        if terminal is None:
+            raise ExecutorStoreError("research_fixture_terminal_not_reached")
+        payload = {
+            "fixture_case_id": requested_case_id,
+            "canonical_case_id": case_id,
+            "code": terminal.code,
+            "reason": terminal.reason,
+            "budget": budgets.to_dict(),
+            "exhausted_budget": terminal.budget,
+            "terminal_state": terminal.state,
+            "terminal": terminal.to_dict(),
+            "progress": {
+                **progress.to_dict(),
+                "progress_changed": progress_changed,
+            },
+            "dispatch_log_after_terminal": [],
+            "result_success": False,
+        }
+        kernel.append_event(
+            run_id,
+            event_key=f"research-round-fixture:{requested_case_id}",
+            event_type="research_round_fixture",
+            payload=payload,
+            error_code=terminal.code,
+        )
+        kernel.transition_run(run_id, terminal.state)
+        return _print_round_fixture_result(
+            store=store,
+            kernel=kernel,
+            run_id=run_id,
+            requested_case_id=requested_case_id,
+            canonical_case_id=case_id,
+            code=terminal.code,
+            reason=terminal.reason,
+            success=False,
+            payload=payload,
+        )
+
+    state_kwargs = {
+        "stagnant_rounds": budgets.max_stagnant_rounds
+        if case_id == "stagnant"
+        else 0,
+        "work_items_used": budgets.max_work_items
+        if case_id == "work-item-exhaustion"
+        else 0,
+        "turns_used": budgets.max_turns if case_id == "turn-exhaustion" else 0,
+        "elapsed_seconds": budgets.max_seconds if case_id == "time-exhaustion" else 0,
+        "lead_rounds_used": budgets.max_lead_rounds
+        if case_id == "lead-round-exhaustion"
+        else 0,
+        "public_route_attempts_used": budgets.max_public_route_attempts
+        if case_id == "required-route-exhaustion"
+        else 0,
+    }
+    progress = ResearchBudgetState(**state_kwargs)
+    terminal = progress.terminal_for(budgets, unresolved_coverage=True)
+    if terminal is None:
+        raise ExecutorStoreError("research_fixture_terminal_not_reached")
+    kernel.append_event(
+        run_id,
+        event_key=f"research-round-fixture:{requested_case_id}",
+        event_type="research_round_fixture",
+        payload={
+            "fixture_case_id": requested_case_id,
+            "canonical_case_id": case_id,
+            "code": terminal.code,
+            "reason": terminal.reason,
+            "budget": budgets.to_dict(),
+            "exhausted_budget": terminal.budget,
+            "terminal_state": terminal.state,
+            "terminal": terminal.to_dict(),
+            "progress": progress.to_dict(),
+            "dispatch_log_after_terminal": [],
+            "result_success": False,
+        },
+        error_code=terminal.code,
+    )
+    kernel.transition_run(run_id, terminal.state)
+    return _print_round_fixture_result(
+        store=store,
+        kernel=kernel,
+        run_id=run_id,
+        requested_case_id=requested_case_id,
+        canonical_case_id=case_id,
+        code=terminal.code,
+        reason=terminal.reason,
+        success=False,
+        payload={
+            "budget": budgets.to_dict(),
+            "exhausted_budget": terminal.budget,
+            "terminal": terminal.to_dict(),
+            "progress": progress.to_dict(),
+            "dispatch_log_after_terminal": [],
+            "result_success": False,
+        },
+    )
+
+
+def _run_lead_fixture(
+    config: WorkflowConfig,
+    *,
+    store: ExecutorStore,
+    kernel: ExecutionKernel,
+    run_id: str,
+    requested_case_id: str,
+    case_id: str,
+    budgets: ResearchBudgets,
+) -> int:
+    progress = ResearchBudgetState()
+    origin_work_id = "research-round-0-origin"
+    kernel.add_work_item(
+        run_id,
+        origin_work_id,
+        worker=config.workers[0].name,
+        harness=config.workers[0].harness.value,
+        payload={
+            "research_kind": "collection",
+            "round": 0,
+            "target_cell_id": "scope:operator",
+            "assigned_path": "rounds/0/scope-operator.json",
+            "lineage": [origin_work_id],
+        },
+    )
+    origin_claims = kernel.claim_ready(run_id, limit=1)
+    if len(origin_claims) != 1:
+        raise ExecutorStoreError("research_round_fixture_origin_not_ready")
+    _settle_research_round_work(
+        kernel,
+        origin_claims[0],
+        evidence_id="evidence-initial",
+    )
+    progress.work_items_used += 1
+    progress.turns_used += 1
+    initial_signature = build_progress_signature(
+        canonical_evidence_ids={"evidence-initial"},
+        credited_required_cell_ids={"scope:operator"},
+        resolved_verification_ids=set(),
+        contested_disposition_transitions=[],
+    )
+    progress.observe_signature(initial_signature)
+    round_barrier = kernel.create_barrier(
+        run_id,
+        "research-round-0-settled",
+        required_work_ids=(origin_work_id,),
+        release_work_ids=(),
+    )
+    kernel.append_event(
+        run_id,
+        event_key="research-round-barrier:0",
+        event_type="research_round_barrier",
+        payload={
+            "round": 0,
+            "barrier_id": round_barrier.barrier_id,
+            "state": round_barrier.state,
+            "origin_work_id": origin_work_id,
+            "progress_signature": initial_signature.to_dict(),
+            "progress": progress.to_dict(),
+        },
+    )
+    lead = NovelLead(
+        lead_id="lead-next",
+        canonical_id="canonical-next",
+        origin_evidence_ids=("evidence-initial",),
+        target_cell_id="scope:user",
+        declared_round=0,
+    )
+    if case_id == "duplicate-lead":
+        canonical_ids = {"canonical-next"}
+    else:
+        canonical_ids = set()
+    target = "scope:user" if case_id != "unknown-target-lead" else "unknown:cell"
+    if target != lead.target_cell_id:
+        lead = replace(lead, target_cell_id=target)
+    origins = (
+        ("missing-evidence",)
+        if case_id == "ungrounded-lead"
+        else lead.origin_evidence_ids
+    )
+    if origins != lead.origin_evidence_ids:
+        lead = replace(lead, origin_evidence_ids=origins)
+    covered = {"scope:operator"}
+    if case_id == "already-covered-lead":
+        covered.add("scope:user")
+    decision = decide_novel_lead(
+        lead,
+        admitted_evidence_ids={"evidence-initial"},
+        required_cell_ids={"scope:operator", "scope:user"},
+        covered_cell_ids=covered,
+        canonical_lead_ids=canonical_ids,
+        current_round=0,
+        max_lead_rounds=budgets.max_lead_rounds,
+    )
+    kernel.append_event(
+        run_id,
+        event_key="research-novel-lead-decision:lead-next",
+        event_type="research_novel_lead_decision",
+        payload={
+            "lead": lead.to_dict(),
+            "decision": decision.to_dict(),
+            "round": 0,
+            "barrier_id": round_barrier.barrier_id,
+            "origin_artifact": origin_work_id,
+        },
+    )
+    if decision.accepted:
+        kernel.append_event(
+            run_id,
+            event_key="research-novel-lead-admitted:canonical-next",
+            event_type="research_novel_lead_admitted",
+            payload={
+                "lead": lead.to_dict(),
+                "decision": decision.to_dict(),
+                "round": 0,
+                "barrier_id": round_barrier.barrier_id,
+                "origin_artifact": origin_work_id,
+                "next_round": decision.next_round,
+            },
+        )
+    decisions = [decision.to_dict()]
+    next_round_work: list[dict[str, object]] = []
+    dispatch_log: list[str] = []
+    if decision.accepted:
+        second = decide_novel_lead(
+            lead,
+            admitted_evidence_ids={"evidence-initial"},
+            required_cell_ids={"scope:operator", "scope:user"},
+            covered_cell_ids=covered,
+            canonical_lead_ids={"canonical-next"},
+            current_round=0,
+            max_lead_rounds=budgets.max_lead_rounds,
+        )
+        decisions.append(second.to_dict())
+        work_id = "research-round-1-scope-user"
+        path = "rounds/1/scope-user.json"
+        kernel.add_work_item(
+            run_id,
+            work_id,
+            worker=config.workers[0].name,
+            harness=config.workers[0].harness.value,
+            payload={
+                "research_kind": "collection",
+                "round": 1,
+                "lead_id": lead.lead_id,
+                "canonical_id": lead.canonical_id,
+                "target_cell_id": lead.target_cell_id,
+                "assigned_path": path,
+                "lineage": [work_id, origin_work_id],
+                "lead_lineage": {
+                    "lead_id": lead.lead_id,
+                    "canonical_id": lead.canonical_id,
+                    "origin_artifact": origin_work_id,
+                    "round_barrier": round_barrier.barrier_id,
+                },
+            },
+            depends_on_barriers=(round_barrier.barrier_id,),
+        )
+        next_barrier = kernel.create_barrier(
+            run_id,
+            "research-round-1-ready",
+            required_work_ids=(),
+            release_work_ids=(work_id,),
+        )
+        claims = kernel.claim_ready(run_id, limit=1)
+        if len(claims) != 1:
+            raise ExecutorStoreError("research_round_fixture_work_not_ready")
+        claim = claims[0]
+        dispatch_log.append(claim.work_id)
+        _settle_research_round_work(
+            kernel,
+            claim,
+            evidence_id="evidence-next",
+        )
+        progress.work_items_used += 1
+        progress.turns_used += 1
+        progress.lead_rounds_used = 1
+        progressed_signature = build_progress_signature(
+            canonical_evidence_ids={"evidence-initial", "evidence-next"},
+            credited_required_cell_ids={"scope:operator", "scope:user"},
+            resolved_verification_ids=set(),
+            contested_disposition_transitions=[],
+        )
+        progress.observe_signature(progressed_signature)
+        next_round_work.append(
+            {
+                "work_id": work_id,
+                "round": 1,
+                "lead_id": lead.lead_id,
+                "canonical_id": lead.canonical_id,
+                "target_cell_id": lead.target_cell_id,
+                "state": kernel.get_work_item(run_id, work_id).state,
+                "barrier_id": next_barrier.barrier_id,
+            }
+        )
+    else:
+        progress.observe_signature(initial_signature)
+    payload = {
+        "fixture_case_id": requested_case_id,
+        "canonical_case_id": case_id,
+        "lead_decisions": decisions,
+        "next_round_work": next_round_work,
+        "progress": progress.to_dict(),
+        "dispatch_log": dispatch_log,
+        "dispatch_log_after_terminal": [],
+        "budget": budgets.to_dict(),
+        "terminal_state": "succeeded",
+        "code": decision.code,
+        "reason": decision.reason,
+        "result_success": decision.accepted,
+    }
+    kernel.append_event(
+        run_id,
+        event_key=f"research-round-fixture:{requested_case_id}",
+        event_type="research_round_fixture",
+        payload=payload,
+        error_code=None,
+    )
+    kernel.transition_run(run_id, "succeeded")
+    return _print_round_fixture_result(
+        store=store,
+        kernel=kernel,
+        run_id=run_id,
+        requested_case_id=requested_case_id,
+        canonical_case_id=case_id,
+        code=decision.code,
+        reason=decision.reason,
+        success=decision.accepted,
+        payload=payload,
+    )
+
+
+def _run_source_fixture(
+    config: WorkflowConfig,
+    *,
+    store: ExecutorStore,
+    kernel: ExecutionKernel,
+    run_id: str,
+    requested_case_id: str,
+    case_id: str,
+) -> int:
+    outcome, action_case = case_id.split("-", 1)
+    replacement_available = action_case == "replacement"
+    should_retry = action_case == "retry"
+    budgets = ResearchConfig.from_mapping(
+        config.executor.settings if config.executor is not None else {}
+    ).budgets
+    max_route_attempts = budgets.max_public_route_attempts
+    max_work_items = budgets.max_work_items
+    attempts_to_run = (
+        1
+        if should_retry
+        else min(max_route_attempts, max_work_items)
+    )
+    source_attempts: list[dict[str, object]] = []
+    dispatch_log: list[str] = []
+    sources: list[SourceReceipt] = []
+    next_work_items: list[dict[str, object]] = []
+    for attempt_number in range(1, attempts_to_run + 1):
+        work_id = f"collect-source-{attempt_number}"
+        kernel.add_work_item(
+            run_id,
+            work_id,
+            worker=config.workers[0].name,
+            harness=config.workers[0].harness.value,
+            payload={
+                "research_kind": "source-retrieval",
+                "source_route": outcome,
+                "route_attempt": attempt_number,
+                "assigned_path": f"sources/attempt-{attempt_number}.json",
+                "lineage": [work_id],
+            },
+        )
+        claims = kernel.claim_ready(run_id, limit=1)
+        if len(claims) != 1:
+            raise ExecutorStoreError("research_source_fixture_work_not_ready")
+        claim = claims[0]
+        dispatch_log.append(claim.work_id)
+        if outcome == "unavailable":
+            status_code = 503
+            content: bytes | None = None
+            observed_outcome = "unavailable"
+        elif outcome == "denied":
+            status_code = 403
+            content = None
+            observed_outcome = "denied"
+        else:
+            status_code = 200
+            content = b"changed page without the requested excerpt"
+            observed_outcome = "changed"
+        source = SourceReceipt.from_retrieval(
+            requested_url=f"https://example.test/{outcome}",
+            final_url=f"https://example.test/{outcome}",
+            redirect_chain=(),
+            retrieved_content=content,
+            retrieval_order=attempt_number,
+            retrieved_at=1_700_000_000 + attempt_number,
+            content_type="text/plain",
+            role="collector",
+            run_id=run_id,
+            work_id=claim.work_id,
+            attempt_id=claim.attempt_id,
+            fencing_token=claim.fencing_token,
+            harness=claim.harness,
+            worker=claim.worker,
+            agent=claim.agent_name,
+            pane=f"pane:{claim.agent_name}",
+            status=status_code,
+            outcome=observed_outcome,
+        )
+        sources.append(source)
+        source_attempts.append(
+            {
+                "attempt": attempt_number,
+                "work_id": claim.work_id,
+                "attempt_id": claim.attempt_id,
+                "fencing_token": claim.fencing_token,
+                "source_id": source.source_id,
+                "outcome": source.outcome,
+                "receipt": source.to_dict(),
+            }
+        )
+        decision = decide_source_availability(
+            source,
+            attempts_used=attempt_number,
+            max_attempts=max_route_attempts,
+            replacement_available=replacement_available,
+        )
+        kernel.append_event(
+            run_id,
+            event_key=f"research-source-decision:{claim.attempt_id}",
+            event_type="research_source_decision",
+            work_id=claim.work_id,
+            attempt_id=claim.attempt_id,
+            fencing_token=claim.fencing_token,
+            payload={
+                "source": source.to_dict(),
+                "decision": decision.to_dict(),
+                "attempt": attempt_number,
+            },
+            error_code=decision.code if decision.action == "fail" else None,
+        )
+        if decision.action in {"retry", "fail"}:
+            kernel.complete_work_item(
+                claim,
+                state="failed",
+                error_code=decision.code,
+                receipt_payload=source.to_dict(),
+                receipt_kind="transport",
+                outcome=decision.code,
+            )
+            kernel.cleanup_attempt(claim)
+            if decision.action == "retry":
+                if should_retry:
+                    next_work_id = f"retry-source-{outcome}-{attempt_number + 1}"
+                    kernel.add_work_item(
+                        run_id,
+                        next_work_id,
+                        worker=config.workers[0].name,
+                        harness=config.workers[0].harness.value,
+                        payload={
+                            "research_kind": "source-retrieval",
+                            "source_route": outcome,
+                            "route_attempt": attempt_number + 1,
+                            "assigned_path": (
+                                f"sources/retry/{outcome}-{attempt_number + 1}.json"
+                            ),
+                            "lineage": [next_work_id],
+                        },
+                    )
+                    next_work_items.append(
+                        {
+                            "work_id": next_work_id,
+                            "state": kernel.get_work_item(
+                                run_id,
+                                next_work_id,
+                            ).state,
+                            "route_action": decision.action,
+                            "source_id": source.source_id,
+                        }
+                    )
+                    break
+                continue
+            if decision.action == "fail":
+                break
+        else:
+            kernel.complete_work_item(
+                claim,
+                artifact=_source_artifact_envelope(kernel, claim, source),
+                receipt_payload=source.to_dict(),
+                outcome="source_retrieved",
+                expected_lineage=[claim.work_id],
+                expected_path=f"sources/attempt-{attempt_number}.json",
+            )
+            kernel.cleanup_attempt(claim)
+            replacement_work_id = (
+                f"replace-source-{outcome}-{attempt_number + 1}"
+            )
+            kernel.add_work_item(
+                run_id,
+                replacement_work_id,
+                worker=config.workers[0].name,
+                harness=config.workers[0].harness.value,
+                payload={
+                    "research_kind": "source-retrieval",
+                    "source_route": f"replacement/{outcome}",
+                    "route_attempt": attempt_number + 1,
+                    "assigned_path": (
+                        f"sources/replacement/{outcome}.json"
+                    ),
+                    "lineage": [replacement_work_id],
+                },
+            )
+            replacement_claims = kernel.claim_ready(run_id, limit=1)
+            if len(replacement_claims) != 1:
+                raise ExecutorStoreError(
+                    "research_source_fixture_replacement_not_ready"
+                )
+            replacement_claim = replacement_claims[0]
+            dispatch_log.append(replacement_claim.work_id)
+            replacement_payload = b"replacement source observation"
+            replacement = SourceReceipt.from_retrieval(
+                requested_url=f"https://example.test/replacement/{outcome}",
+                final_url=f"https://example.test/replacement/{outcome}",
+                redirect_chain=(),
+                retrieved_content=replacement_payload,
+                retrieval_order=attempt_number + 1,
+                retrieved_at=1_700_000_100 + attempt_number,
+                content_type="text/plain",
+                role="collector",
+                run_id=run_id,
+                work_id=replacement_claim.work_id,
+                attempt_id=replacement_claim.attempt_id,
+                fencing_token=replacement_claim.fencing_token,
+                harness=replacement_claim.harness,
+                worker=replacement_claim.worker,
+                agent=replacement_claim.agent_name,
+                pane=f"pane:{replacement_claim.agent_name}",
+                source_id=None,
+            )
+            replacement_source = {
+                **replacement.to_dict(),
+                "excerpt_ids": [],
+                "reason": (
+                    "new_url_receipted_without_reusing_unavailable_source"
+                ),
+            }
+            source_attempts.append(
+                {
+                    "attempt": attempt_number + 1,
+                    "work_id": replacement_claim.work_id,
+                    "attempt_id": replacement_claim.attempt_id,
+                    "fencing_token": replacement_claim.fencing_token,
+                    "source_id": replacement.source_id,
+                    "outcome": replacement.outcome,
+                    "receipt": replacement.to_dict(),
+                }
+            )
+            kernel.complete_work_item(
+                replacement_claim,
+                artifact=_source_artifact_envelope(
+                    kernel,
+                    replacement_claim,
+                    replacement,
+                ),
+                receipt_payload=replacement.to_dict(),
+                outcome="source_replacement_retrieved",
+                expected_lineage=[replacement_claim.work_id],
+                expected_path=f"sources/replacement/{outcome}.json",
+            )
+            kernel.cleanup_attempt(replacement_claim)
+            next_work_items.append(
+                {
+                    "work_id": replacement_claim.work_id,
+                    "state": kernel.get_work_item(
+                        run_id,
+                        replacement_claim.work_id,
+                    ).state,
+                    "route_action": decision.action,
+                    "source_id": replacement.source_id,
+                }
+            )
+            break
+    final_source = sources[-1]
+    final_decision = decide_source_availability(
+        final_source,
+        attempts_used=len(sources),
+        max_attempts=max_route_attempts,
+        replacement_available=replacement_available,
+    )
+    progress = ResearchBudgetState(
+        work_items_used=len(source_attempts),
+        turns_used=len(source_attempts),
+        public_route_attempts_used=len(source_attempts),
+    )
+    progress_signature = build_progress_signature(
+        canonical_evidence_ids=set(),
+        credited_required_cell_ids=set(),
+        resolved_verification_ids=set(),
+        contested_disposition_transitions=[],
+    )
+    progress.observe_signature(progress_signature)
+    terminal = (
+        ResearchTerminal(
+            code=final_decision.code,
+            reason=final_decision.reason,
+            budget="required_public_route_attempts",
+        )
+        if final_decision.action == "fail"
+        else None
+    )
+    terminal_code = terminal.code if terminal is not None else final_decision.code
+    terminal_reason = terminal.reason if terminal is not None else final_decision.reason
+    failed = terminal is not None
+    budget_payload = budgets.to_dict()
+    payload = {
+        "fixture_case_id": requested_case_id,
+        "canonical_case_id": case_id,
+        "source": {
+            **sources[0].to_dict(),
+            "excerpt_ids": [],
+        },
+        "source_attempts": source_attempts,
+        "source_decision": final_decision.to_dict(),
+        "replacement_source": (
+            next(
+                (
+                    attempt["receipt"]
+                    for attempt in source_attempts
+                    if attempt["outcome"] == "retrieved"
+                    and attempt["work_id"] != sources[0].work_id
+                ),
+                None,
+            )
+        ),
+        "next_work_items": next_work_items,
+        "coverage_decision": {
+            "credited": False,
+            "reason": "unavailable_or_changed_source_has_no_excerpt",
+        },
+        "budget": budget_payload,
+        "progress": progress.to_dict(),
+        "terminal": (
+            terminal.to_dict()
+            if terminal is not None
+            else {
+                "state": "running",
+                "code": final_decision.code,
+                "reason": final_decision.reason,
+                "budget": "required_public_route_attempts",
+            }
+        ),
+        "terminal_state": "failed" if failed else "running",
+        "dispatch_log": dispatch_log,
+        "dispatch_log_after_terminal": [],
+        "result_success": False,
+    }
+    kernel.append_event(
+        run_id,
+        event_key=f"research-round-fixture:{requested_case_id}",
+        event_type="research_round_fixture",
+        payload=payload,
+        error_code=terminal_code if failed else None,
+    )
+    if failed:
+        kernel.transition_run(run_id, "failed")
+    return _print_round_fixture_result(
+        store=store,
+        kernel=kernel,
+        run_id=run_id,
+        requested_case_id=requested_case_id,
+        canonical_case_id=case_id,
+        code=terminal_code,
+        reason=terminal_reason,
+        success=False,
+        payload=payload,
+        route="research.source-fixture",
+    )
+
+
+def _source_artifact_envelope(
+    kernel: ExecutionKernel,
+    claim: object,
+    source: SourceReceipt,
+) -> dict[str, object]:
+    if not hasattr(claim, "payload"):
+        raise ExecutorStoreError("research_source_fixture_claim_required")
+    path = claim.payload.get("assigned_path")
+    if not isinstance(path, str):
+        raise ExecutorStoreError("research_source_fixture_assignment_invalid")
+    content = json.dumps(
+        {
+            "research_kind": "source-retrieval",
+            "source": source.to_dict(),
+            "excerpt_ids": [],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    manifest = kernel.store.require_run(claim.run_id).manifest
+    kernel.stage_artifact(claim, path, content)
+    return {
+        "contract_version": ARTIFACT_CONTRACT_VERSION,
+        "artifact_type": "research-source",
+        "run_id": claim.run_id,
+        "work_id": claim.work_id,
+        "logical_id": claim.work_id,
+        "attempt_id": claim.attempt_id,
+        "fencing_token": claim.fencing_token,
+        "path": path,
+        "content_digest": digest_bytes(content),
+        "size_bytes": len(content),
+        "lineage": [claim.work_id],
+        "pinned_digests": {
+            field: getattr(manifest, field)
+            for field in MANIFEST_DIGEST_FIELDS
+        },
+        "harness": claim.harness,
+        "worker": claim.worker,
+        "agent": claim.agent_name,
+        "pane": f"pane:{claim.agent_name}",
+        "payload": {
+            "research_kind": "source-retrieval",
+            "source_id": source.source_id,
+            "outcome": source.outcome,
+        },
+    }
+
+
+def _settle_research_round_work(
+    kernel: ExecutionKernel,
+    claim: object,
+    *,
+    evidence_id: str,
+) -> None:
+    if not hasattr(claim, "payload"):
+        raise ExecutorStoreError("research_round_fixture_claim_required")
+    path = claim.payload.get("assigned_path")
+    lineage = claim.payload.get("lineage")
+    if not isinstance(path, str) or not isinstance(lineage, list):
+        raise ExecutorStoreError("research_round_fixture_assignment_invalid")
+    content = json.dumps(
+        {
+            "research_kind": "collection",
+            "evidence_id": evidence_id,
+            "round": claim.payload.get("round"),
+            "target_cell_id": claim.payload.get("target_cell_id"),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    kernel.stage_artifact(claim, path, content)
+    manifest = kernel.store.require_run(claim.run_id).manifest
+    envelope = {
+        "contract_version": ARTIFACT_CONTRACT_VERSION,
+        "artifact_type": "research-collection",
+        "run_id": claim.run_id,
+        "work_id": claim.work_id,
+        "logical_id": claim.work_id,
+        "attempt_id": claim.attempt_id,
+        "fencing_token": claim.fencing_token,
+        "path": path,
+        "content_digest": digest_bytes(content),
+        "size_bytes": len(content),
+        "lineage": lineage,
+        "pinned_digests": {
+            field: getattr(manifest, field)
+            for field in MANIFEST_DIGEST_FIELDS
+        },
+        "harness": claim.harness,
+        "worker": claim.worker,
+        "agent": claim.agent_name,
+        "pane": f"pane:{claim.agent_name}",
+        "payload": {
+            "research_kind": "collection",
+            "evidence_id": evidence_id,
+        },
+    }
+    kernel.complete_work_item(
+        claim,
+        artifact=envelope,
+        receipt_payload={"evidence_id": evidence_id},
+        expected_lineage=lineage,
+        expected_path=path,
+    )
+    kernel.cleanup_attempt(claim)
+
+
+def _print_round_fixture_result(
+    *,
+    store: ExecutorStore,
+    kernel: ExecutionKernel,
+    run_id: str,
+    requested_case_id: str,
+    canonical_case_id: str,
+    code: str,
+    reason: str,
+    success: bool,
+    payload: dict[str, object],
+    route: str = "research.round-fixture",
+) -> int:
+    result = {
+        "schema_version": 2,
+        "executor": "research-synthesis",
+        "route": route,
+        "success": success,
+        "fixture_case_id": requested_case_id,
+        "canonical_case_id": canonical_case_id,
+        "run_id": run_id,
+        "code": code,
+        "reason": reason,
+        "terminal_state": store.require_run(run_id).state,
+        "idempotent": False,
+        "events": len(kernel.list_events(run_id)),
+        **payload,
+    }
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 _RESEARCH_EVIDENCE_FIXTURE_CASES = frozenset(
@@ -2125,6 +3259,7 @@ def _research_start(
         decomposition,
         input_policy=research_config.input_policy,
         verification_policy=research_config.verification,
+        budgets=research_config.budgets,
     )
     initial_state = "blocked" if classification.requires_input else "pending"
     store = ExecutorStore(config.state_db)
@@ -2204,6 +3339,8 @@ def _research_start(
                 "phase": domain_view["phase"],
                 "required_input": domain_view["required_input"],
                 "verification_policy": domain_view["verification_policy"],
+                "budgets": domain_view["budgets"],
+                "progress": domain_view["progress"],
             },
         )
         if classification.requires_input:
@@ -2216,13 +3353,38 @@ def _research_start(
                 error_code="input_required",
             )
         else:
-            _create_research_frontier(
-                config,
-                kernel,
-                run_id,
+            initial_terminal = _initial_frontier_terminal(
                 decomposition,
-                worker_role="collector",
+                research_config.budgets,
             )
+            if initial_terminal is not None:
+                domain_view["terminal"] = initial_terminal.to_dict()
+                domain_view["progress"] = ResearchBudgetState(
+                    work_items_used=research_config.budgets.max_work_items,
+                ).to_dict()
+                kernel.append_event(
+                    run_id,
+                    event_key="research-terminal",
+                    event_type="research_terminal",
+                    payload={
+                        "terminal": initial_terminal.to_dict(),
+                        "budgets": research_config.budgets.to_dict(),
+                        "progress": domain_view["progress"],
+                        "coverage": domain_view["coverage"],
+                        "dispatch_log_after_terminal": [],
+                    },
+                    error_code=initial_terminal.code,
+                )
+                kernel.transition_run(run_id, initial_terminal.state)
+            else:
+                _create_research_frontier(
+                    config,
+                    kernel,
+                    run_id,
+                    decomposition,
+                    worker_role="collector",
+                    max_work_items=research_config.budgets.max_work_items,
+                )
     else:
         # A deduped start must not create a second frontier or append a second
         # semantic record.  The existing durable domain events are authoritative.
@@ -2272,6 +3434,818 @@ def _research_status(config: WorkflowConfig, *, run_id: str | None) -> int:
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
+
+
+def _pinned_research_budgets(
+    view: dict[str, object],
+    fallback: ResearchBudgets,
+) -> ResearchBudgets:
+    raw_budgets = view.get("budgets")
+    if isinstance(raw_budgets, dict):
+        return ResearchBudgets.from_mapping(raw_budgets)
+    return fallback
+
+
+def prepare_research_dispatch(
+    config: WorkflowConfig,
+    store: ExecutorStore,
+    kernel: ExecutionKernel,
+    run_ids: list[str],
+) -> list[str]:
+    """Reconcile bounded research state before the shared kernel claims work."""
+
+    if (
+        config.executor is None
+        or config.executor.kind.value != "research-synthesis"
+    ):
+        return run_ids
+    claimable: list[str] = []
+    for run_id in run_ids:
+        run = store.require_run(run_id)
+        if run.executor_kind != "research-synthesis" or run.state in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            continue
+        events = kernel.list_events(run_id)
+        if any(
+            event.event_type == "research_round_fixture"
+            for event in events
+        ):
+            if run.state not in {"succeeded", "failed"}:
+                claimable.append(run_id)
+            continue
+        inspected = kernel.inspect_run(run_id)
+        view = _research_domain_view(kernel, run_id)
+        budgets = _pinned_research_budgets(
+            view,
+            ResearchConfig.from_mapping(config.executor.settings).budgets,
+        )
+        state = _normal_research_budget_state(inspected)
+        state.work_items_used = max(
+            state.work_items_used,
+            len(inspected["work_items"]),
+        )
+        state.turns_used = max(state.turns_used, len(inspected["attempts"]))
+        state.elapsed_seconds = max(
+            state.elapsed_seconds,
+            max(0.0, time.time() - run.created_at),
+        )
+        state = _settle_normal_research_round(
+            config,
+            kernel,
+            run_id,
+            inspected,
+            view,
+            state,
+            budgets,
+        )
+        if store.require_run(run_id).state in {"failed", "cancelled"}:
+            continue
+        latest_round = next(
+            (
+                event.payload
+                for event in reversed(kernel.list_events(run_id))
+                if event.event_type == "research_round_settled"
+                and isinstance(event.payload, dict)
+            ),
+            None,
+        )
+        coverage = (
+            latest_round.get("coverage")
+            if isinstance(latest_round, dict)
+            else view.get("coverage")
+        )
+        unresolved = not (
+            isinstance(coverage, dict)
+            and bool(coverage.get("sufficient", False))
+        )
+        terminal = state.terminal_for(
+            budgets,
+            unresolved_coverage=unresolved,
+        )
+        if terminal is not None:
+            _persist_research_terminal(
+                kernel,
+                run_id,
+                terminal,
+                budgets=budgets,
+                progress=state,
+                coverage=coverage,
+            )
+            continue
+        claimable.append(run_id)
+    return claimable
+
+
+def _normal_research_budget_state(
+    inspected: dict[str, object],
+) -> ResearchBudgetState:
+    events = inspected.get("events", [])
+    if isinstance(events, list):
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("event_type") not in {
+                "research_budget_state",
+                "research_round_settled",
+            }:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            progress = payload.get("progress")
+            if isinstance(progress, dict):
+                return ResearchBudgetState.from_mapping(progress)
+    return ResearchBudgetState()
+
+
+def _reconcile_source_transport_receipts(
+    config: WorkflowConfig,
+    kernel: ExecutionKernel,
+    run_id: str,
+    inspected: dict[str, object],
+    state: ResearchBudgetState,
+    budgets: ResearchBudgets,
+) -> None:
+    events = inspected.get("events", [])
+    processed = {
+        event.payload.get("source", {}).get("attempt_id")
+        for event in events
+        if event.event_type == "research_source_decision"
+        and isinstance(event.payload, dict)
+        and isinstance(event.payload.get("source"), dict)
+    }
+    work_items = {
+        item.work_id
+        for item in kernel.list_work_items(run_id)
+    }
+    for receipt in inspected.get("receipts", []):
+        if not isinstance(receipt, dict) or receipt.get("kind") != "transport":
+            continue
+        payload = receipt.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        source_payload = (
+            payload.get("source_receipt")
+            or payload.get("source")
+            or (
+                payload
+                if "source_id" in payload and "outcome" in payload
+                else None
+            )
+        )
+        if not isinstance(source_payload, dict):
+            continue
+        attempt_id = source_payload.get("attempt_id")
+        if not isinstance(attempt_id, str) or attempt_id in processed:
+            continue
+        try:
+            source = SourceReceipt.from_mapping(source_payload)
+            decision = decide_source_availability(
+                source,
+                attempts_used=state.public_route_attempts_used + 1,
+                max_attempts=budgets.max_public_route_attempts,
+                replacement_available=False,
+            )
+        except (ResearchInputError, ResearchEvidenceError, TypeError, ValueError) as exc:
+            terminal = ResearchTerminal(
+                code="integrity_error",
+                reason="source transport receipt failed typed admission",
+                budget="integrity",
+            )
+            _persist_research_terminal(
+                kernel,
+                run_id,
+                terminal,
+                budgets=budgets,
+                progress=state,
+                coverage=None,
+            )
+            kernel.append_event(
+                run_id,
+                event_key=f"research-source-receipt-invalid:{receipt.get('receipt_id')}",
+                event_type="research_source_decision",
+                work_id=receipt.get("work_id"),
+                attempt_id=receipt.get("attempt_id"),
+                fencing_token=receipt.get("fencing_token"),
+                payload={"code": "source_receipt_invalid", "reason": str(exc)},
+                error_code="source_receipt_invalid",
+            )
+            return
+        state.public_route_attempts_used += 1
+        processed.add(attempt_id)
+        kernel.append_event(
+            run_id,
+            event_key=f"research-source-decision:{attempt_id}",
+            event_type="research_source_decision",
+            work_id=source.work_id,
+            attempt_id=source.attempt_id,
+            fencing_token=source.fencing_token,
+            payload={
+                "source": source.to_dict(),
+                "decision": decision.to_dict(),
+                "transport_receipt": receipt,
+            },
+            error_code=decision.code if decision.action == "fail" else None,
+        )
+        if decision.action not in {"retry", "replace"}:
+            continue
+        followup_id = f"source-{decision.action}-{source.work_id[-12:]}"
+        if (
+            followup_id in work_items
+            or state.work_items_used >= budgets.max_work_items
+        ):
+            continue
+        retry_barrier_id = f"research-source-{decision.action}-{attempt_id[-8:]}"
+        kernel.create_barrier(
+            run_id,
+            retry_barrier_id,
+            required_work_ids=(),
+            release_work_ids=(),
+        )
+        kernel.add_work_item(
+            run_id,
+            followup_id,
+            worker=config.workers[0].name,
+            harness=config.workers[0].harness.value,
+            payload={
+                "research_kind": "collection",
+                "source_route": decision.action,
+                "source_id": source.source_id,
+                "assigned_path": f"collection/{followup_id}.json",
+                "lineage": [followup_id, source.work_id],
+                "source_lineage": {
+                    "source_id": source.source_id,
+                    "attempt_id": source.attempt_id,
+                    "decision": decision.code,
+                },
+            },
+            depends_on_barriers=(retry_barrier_id,),
+        )
+        work_items.add(followup_id)
+        state.work_items_used += 1
+
+
+def _settle_normal_research_round(
+    config: WorkflowConfig,
+    kernel: ExecutionKernel,
+    run_id: str,
+    inspected: dict[str, object],
+    view: dict[str, object],
+    state: ResearchBudgetState,
+    budgets: ResearchBudgets,
+) -> ResearchBudgetState:
+    barriers = inspected.get("barriers", [])
+    fanins = [
+        barrier
+        for barrier in barriers
+        if isinstance(barrier, dict)
+        and isinstance(barrier.get("barrier_id"), str)
+        and barrier["barrier_id"].startswith("research-frontier-")
+        and barrier["barrier_id"].endswith("-fanin")
+    ]
+    fanin = max(
+        fanins,
+        key=lambda barrier: int(
+            str(barrier["barrier_id"]).split("-")[2]
+        ),
+        default=None,
+    )
+    if not isinstance(fanin, dict):
+        return state
+    if fanin.get("state") != "succeeded":
+        _reconcile_source_transport_receipts(
+            config,
+            kernel,
+            run_id,
+            inspected,
+            state,
+            budgets,
+        )
+        return state
+    events = inspected.get("events", [])
+    settled_rounds = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("event_type") == "research_round_settled"
+    ]
+    work_items = {
+        item.get("work_id"): item
+        for item in inspected.get("work_items", [])
+        if isinstance(item, dict)
+    }
+    processed_source_attempts = {
+        payload.get("source", {}).get("attempt_id")
+        for event in events
+        if isinstance(event, dict)
+        and event.get("event_type") == "research_source_decision"
+        and isinstance(event.get("payload"), dict)
+        and isinstance(event["payload"].get("source"), dict)
+        and isinstance(
+            event["payload"]["source"].get("attempt_id"),
+            str,
+        )
+        for payload in (event["payload"],)
+    }
+    non_crediting_work_ids: set[str] = set()
+    evidence_ids: set[str] = set()
+    credited_cells: set[str] = set()
+    for artifact in inspected.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        envelope = artifact.get("envelope")
+        if not isinstance(envelope, dict):
+            continue
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        source_payload = payload.get("source") or payload.get("source_receipt")
+        excerpt_payload = payload.get("excerpt") or payload.get("excerpt_receipt")
+        if isinstance(source_payload, dict):
+            attempt_id = source_payload.get("attempt_id")
+            if (
+                isinstance(attempt_id, str)
+                and attempt_id not in processed_source_attempts
+            ):
+                try:
+                    source = SourceReceipt.from_mapping(source_payload)
+                    decision = decide_source_availability(
+                        source,
+                        attempts_used=state.public_route_attempts_used + 1,
+                        max_attempts=budgets.max_public_route_attempts,
+                        replacement_available=bool(
+                            payload.get("replacement_available", False)
+                            or payload.get("source_route") == "replace"
+                        ),
+                    )
+                    state.public_route_attempts_used += 1
+                    processed_source_attempts.add(attempt_id)
+                    kernel.append_event(
+                        run_id,
+                        event_key=f"research-source-decision:{attempt_id}",
+                        event_type="research_source_decision",
+                        work_id=envelope.get("work_id"),
+                        attempt_id=attempt_id,
+                        fencing_token=source.fencing_token,
+                        payload={
+                            "source": source.to_dict(),
+                            "decision": decision.to_dict(),
+                        },
+                        error_code=(
+                            decision.code
+                            if decision.action == "fail"
+                            else None
+                        ),
+                    )
+                    if decision.action in {"retry", "replace"}:
+                        source_work_id = str(envelope.get("work_id"))
+                        replacement_work_id = (
+                            f"source-{decision.action}-"
+                            f"{source_work_id[-12:]}"
+                        )
+                        if (
+                            replacement_work_id not in work_items
+                            and state.work_items_used < budgets.max_work_items
+                        ):
+                            retry_barrier_id = (
+                                f"research-source-{decision.action}-"
+                                f"{source_work_id[-8:]}"
+                            )
+                            kernel.create_barrier(
+                                run_id,
+                                retry_barrier_id,
+                                required_work_ids=(),
+                                release_work_ids=(),
+                            )
+                            replacement_path = (
+                                f"collection/{replacement_work_id}.json"
+                            )
+                            kernel.add_work_item(
+                                run_id,
+                                replacement_work_id,
+                                worker=config.workers[0].name,
+                                harness=config.workers[0].harness.value,
+                                payload={
+                                    "research_kind": "collection",
+                                    "source_route": decision.action,
+                                    "source_id": source.source_id,
+                                    "assigned_path": replacement_path,
+                                    "lineage": [
+                                        replacement_work_id,
+                                        source_work_id,
+                                    ],
+                                    "source_lineage": {
+                                        "source_id": source.source_id,
+                                        "attempt_id": source.attempt_id,
+                                        "decision": decision.code,
+                                    },
+                                },
+                                depends_on_barriers=(retry_barrier_id,),
+                            )
+                            work_items[replacement_work_id] = {
+                                "work_id": replacement_work_id
+                            }
+                            state.work_items_used += 1
+                    has_excerpt = (
+                        isinstance(payload.get("excerpt_ids"), list)
+                        and bool(payload["excerpt_ids"])
+                    ) or (
+                        isinstance(excerpt_payload, dict)
+                        and excerpt_payload.get("source_id") == source.source_id
+                    )
+                    if source.outcome != "retrieved" or not has_excerpt:
+                        non_crediting_work_ids.add(str(envelope.get("work_id")))
+                except (ResearchInputError, ResearchEvidenceError, TypeError, ValueError) as exc:
+                    failed = ResearchTerminal(
+                        code="integrity_error",
+                        reason="source receipt failed typed admission",
+                        budget="integrity",
+                    )
+                    _persist_research_terminal(
+                        kernel,
+                        run_id,
+                        failed,
+                        budgets=budgets,
+                        progress=state,
+                        coverage=None,
+                    )
+                    kernel.append_event(
+                        run_id,
+                        event_key=(
+                            f"research-source-decision-invalid:"
+                            f"{envelope.get('work_id')}"
+                        ),
+                        event_type="research_source_decision",
+                        work_id=envelope.get("work_id"),
+                        payload={
+                            "code": "source_receipt_invalid",
+                            "reason": str(exc),
+                        },
+                        error_code="source_receipt_invalid",
+                    )
+                    non_crediting_work_ids.add(str(envelope.get("work_id")))
+        evidence_id = payload.get("evidence_id")
+        if (
+            isinstance(evidence_id, str)
+            and str(envelope.get("work_id")) not in non_crediting_work_ids
+        ):
+            evidence_ids.add(evidence_id)
+            work = work_items.get(envelope.get("work_id"))
+            if isinstance(work, dict) and isinstance(work.get("payload"), dict):
+                cell_id = work["payload"].get("cell_id")
+                if isinstance(cell_id, str):
+                    credited_cells.add(cell_id)
+    for receipt_record in inspected.get("receipts", []):
+        if not isinstance(receipt_record, dict):
+            continue
+        if receipt_record.get("kind") != "transport":
+            continue
+        raw_payload = receipt_record.get("payload")
+        if not isinstance(raw_payload, dict):
+            continue
+        source_payload = (
+            raw_payload.get("source_receipt")
+            or raw_payload.get("source")
+            or (
+                raw_payload
+                if "source_id" in raw_payload and "outcome" in raw_payload
+                else None
+            )
+        )
+        if not isinstance(source_payload, dict):
+            continue
+        attempt_id = source_payload.get("attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or attempt_id in processed_source_attempts
+        ):
+            continue
+        try:
+            source = SourceReceipt.from_mapping(source_payload)
+            decision = decide_source_availability(
+                source,
+                attempts_used=state.public_route_attempts_used + 1,
+                max_attempts=budgets.max_public_route_attempts,
+                replacement_available=False,
+            )
+            state.public_route_attempts_used += 1
+            processed_source_attempts.add(attempt_id)
+            kernel.append_event(
+                run_id,
+                event_key=f"research-source-decision:{attempt_id}",
+                event_type="research_source_decision",
+                work_id=source.work_id,
+                attempt_id=source.attempt_id,
+                fencing_token=source.fencing_token,
+                payload={
+                    "source": source.to_dict(),
+                    "decision": decision.to_dict(),
+                    "transport_receipt": receipt_record,
+                },
+                error_code=decision.code if decision.action == "fail" else None,
+            )
+            if decision.action in {"retry", "replace"}:
+                followup_id = f"source-{decision.action}-{source.work_id[-12:]}"
+                if (
+                    followup_id not in work_items
+                    and state.work_items_used < budgets.max_work_items
+                ):
+                    retry_barrier_id = (
+                        f"research-source-{decision.action}-"
+                        f"{source.work_id[-8:]}"
+                    )
+                    kernel.create_barrier(
+                        run_id,
+                        retry_barrier_id,
+                        required_work_ids=(),
+                        release_work_ids=(),
+                    )
+                    followup_path = f"collection/{followup_id}.json"
+                    kernel.add_work_item(
+                        run_id,
+                        followup_id,
+                        worker=config.workers[0].name,
+                        harness=config.workers[0].harness.value,
+                        payload={
+                            "research_kind": "collection",
+                            "source_route": decision.action,
+                            "source_id": source.source_id,
+                            "assigned_path": followup_path,
+                            "lineage": [followup_id, source.work_id],
+                            "source_lineage": {
+                                "source_id": source.source_id,
+                                "attempt_id": source.attempt_id,
+                                "decision": decision.code,
+                            },
+                        },
+                        depends_on_barriers=(retry_barrier_id,),
+                    )
+                    work_items[followup_id] = {"work_id": followup_id}
+                    state.work_items_used += 1
+            non_crediting_work_ids.add(source.work_id)
+        except (ResearchInputError, ResearchEvidenceError, TypeError, ValueError) as exc:
+            failed = ResearchTerminal(
+                code="integrity_error",
+                reason="source transport receipt failed typed admission",
+                budget="integrity",
+            )
+            _persist_research_terminal(
+                kernel,
+                run_id,
+                failed,
+                budgets=budgets,
+                progress=state,
+                coverage=None,
+            )
+            kernel.append_event(
+                run_id,
+                event_key=(
+                    f"research-source-receipt-invalid:"
+                    f"{receipt_record.get('receipt_id')}"
+                ),
+                event_type="research_source_decision",
+                work_id=receipt_record.get("work_id"),
+                attempt_id=receipt_record.get("attempt_id"),
+                fencing_token=receipt_record.get("fencing_token"),
+                payload={
+                    "code": "source_receipt_invalid",
+                    "reason": str(exc),
+                },
+                error_code="source_receipt_invalid",
+            )
+            break
+    signature = build_progress_signature(
+        canonical_evidence_ids=evidence_ids,
+        credited_required_cell_ids=credited_cells,
+        resolved_verification_ids=(),
+        contested_disposition_transitions=(),
+    )
+    progress_changed = state.observe_signature(signature)
+    decomposition = view.get("decomposition")
+    required_cells = (
+        decomposition.get("required_cells", [])
+        if isinstance(decomposition, dict)
+        else []
+    )
+    required_ids = {
+        item.get("id")
+        for item in required_cells
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    credited_required = sorted(credited_cells & required_ids)
+    threshold = (
+        view.get("coverage", {}).get("threshold")
+        if isinstance(view.get("coverage"), dict)
+        else None
+    )
+    total = len(required_ids)
+    coverage = {
+        "credited_cells": len(credited_required),
+        "total_cells": total,
+        "ratio": (len(credited_required) / total) if total else 0,
+        "threshold": threshold,
+        "sufficient": (
+            bool(total)
+            and isinstance(threshold, (int, float))
+            and len(credited_required) / total >= threshold
+        ),
+        "formula": "credited_required_cells / total_required_cells",
+    }
+    round_number = len(settled_rounds)
+    required_ids = {
+        item.get("id")
+        for item in required_cells
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    existing_lead_ids: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict) or event.get("event_type") not in {
+            "research_novel_lead_decision",
+            "research_novel_lead_admitted",
+        }:
+            continue
+        payload = event.get("payload")
+        lead = payload.get("lead") if isinstance(payload, dict) else None
+        canonical_id = lead.get("canonical_id") if isinstance(lead, dict) else None
+        if isinstance(canonical_id, str):
+            existing_lead_ids.add(canonical_id)
+    lead_decisions: list[dict[str, object]] = []
+    worker = config.workers[0]
+    for artifact in inspected.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        envelope = artifact.get("envelope")
+        if not isinstance(envelope, dict):
+            continue
+        artifact_payload = envelope.get("payload")
+        if not isinstance(artifact_payload, dict):
+            continue
+        raw_leads = artifact_payload.get("novel_leads", [])
+        if isinstance(raw_leads, (str, bytes)) or not isinstance(raw_leads, list):
+            continue
+        for raw_lead in raw_leads:
+            try:
+                decision = decide_novel_lead(
+                    raw_lead,
+                    admitted_evidence_ids=evidence_ids,
+                    required_cell_ids=required_ids,
+                    covered_cell_ids=credited_cells,
+                    canonical_lead_ids=existing_lead_ids,
+                    current_round=round_number,
+                    max_lead_rounds=budgets.max_lead_rounds,
+                )
+            except ResearchInputError as exc:
+                kernel.append_event(
+                    run_id,
+                    event_key=f"research-novel-lead-invalid:{envelope.get('work_id')}",
+                    event_type="research_novel_lead_decision",
+                    payload={
+                        "accepted": False,
+                        "code": "lead_invalid",
+                        "reason": str(exc),
+                        "lead": raw_lead,
+                        "round": round_number,
+                    },
+                    error_code="lead_invalid",
+                )
+                continue
+            lead_decisions.append(decision.to_dict())
+            existing_lead_ids.add(decision.lead.canonical_id)
+            kernel.append_event(
+                run_id,
+                event_key=(
+                    f"research-novel-lead-decision:"
+                    f"{decision.lead.canonical_id}"
+                ),
+                event_type="research_novel_lead_decision",
+                payload={
+                    "lead": decision.lead.to_dict(),
+                    "decision": decision.to_dict(),
+                    "round": round_number,
+                    "barrier_id": fanin.get("barrier_id"),
+                    "origin_artifact": envelope.get("work_id"),
+                },
+                error_code=None if decision.accepted else decision.code,
+            )
+            if not decision.accepted or decision.next_round is None:
+                continue
+            work_id = (
+                f"collect-round-{decision.next_round}-"
+                f"{decision.lead.target_cell_id.replace(':', '-')}"
+            )
+            if work_id in work_items:
+                continue
+            path = f"collection/{work_id}.json"
+            kernel.add_work_item(
+                run_id,
+                work_id,
+                worker=worker.name,
+                harness=worker.harness.value,
+                payload={
+                    "research_kind": "collection",
+                    "frontier_id": f"frontier-{decision.next_round}",
+                    "round": decision.next_round,
+                    "cell_id": decision.lead.target_cell_id,
+                    "lead_id": decision.lead.lead_id,
+                    "canonical_id": decision.lead.canonical_id,
+                    "assigned_path": path,
+                    "lineage": [work_id, str(envelope.get("work_id"))],
+                    "lead_lineage": {
+                        "canonical_id": decision.lead.canonical_id,
+                        "origin_evidence_ids": list(
+                            decision.lead.origin_evidence_ids
+                        ),
+                        "origin_artifact": envelope.get("work_id"),
+                        "round_barrier": fanin.get("barrier_id"),
+                    },
+                },
+                depends_on_barriers=(str(fanin.get("barrier_id")),),
+            )
+            next_fanin = kernel.create_barrier(
+                run_id,
+                f"research-frontier-{decision.next_round}-fanin",
+                required_work_ids=(work_id,),
+                release_work_ids=(),
+            )
+            kernel.append_event(
+                run_id,
+                event_key=(
+                    f"research-novel-lead-admitted:"
+                    f"{decision.lead.canonical_id}"
+                ),
+                event_type="research_novel_lead_admitted",
+                payload={
+                    "lead": decision.lead.to_dict(),
+                    "decision": decision.to_dict(),
+                    "round": round_number,
+                    "next_round": decision.next_round,
+                    "barrier_id": fanin.get("barrier_id"),
+                    "next_barrier_id": next_fanin.barrier_id,
+                    "origin_artifact": envelope.get("work_id"),
+                    "work_id": work_id,
+                },
+            )
+            state.lead_rounds_used = max(
+                state.lead_rounds_used,
+                decision.next_round,
+            )
+            state.work_items_used += 1
+            state.turns_used += 1
+    kernel.append_event(
+        run_id,
+        event_key=f"research-round-settled:{round_number}",
+        event_type="research_round_settled",
+        payload={
+            "round": round_number,
+            "barrier_id": fanin.get("barrier_id"),
+            "progress_signature": signature.to_dict(),
+            "progress": state.to_dict(),
+            "progress_changed": progress_changed,
+            "coverage": coverage,
+            "evidence_ids": sorted(evidence_ids),
+        },
+    )
+    kernel.append_event(
+        run_id,
+        event_key="research-budget-state",
+        event_type="research_budget_state",
+        payload={
+            "budgets": budgets.to_dict(),
+            "progress": state.to_dict(),
+        },
+    )
+    return state
+
+
+def _persist_research_terminal(
+    kernel: ExecutionKernel,
+    run_id: str,
+    terminal: ResearchTerminal,
+    *,
+    budgets: ResearchBudgets,
+    progress: ResearchBudgetState,
+    coverage: object,
+) -> None:
+    events = kernel.list_events(run_id)
+    if any(event.event_type == "research_terminal" for event in events):
+        return
+    kernel.append_event(
+        run_id,
+        event_key="research-terminal",
+        event_type="research_terminal",
+        payload={
+            "terminal": terminal.to_dict(),
+            "budgets": budgets.to_dict(),
+            "progress": progress.to_dict(),
+            "coverage": coverage,
+            "dispatch_log_after_terminal": [],
+        },
+        error_code=terminal.code,
+    )
+    kernel.transition_run(run_id, terminal.state)
 
 
 def _research_export(
@@ -2599,6 +4573,10 @@ def _research_resume(
     if run.workflow != config.name or run.executor_kind != "research-synthesis":
         raise ExecutorStoreError("run_not_found")
     domain = _research_domain_view(kernel, run_id)
+    pinned_budgets = _pinned_research_budgets(
+        domain,
+        ResearchConfig.from_mapping(config.executor.settings).budgets,
+    )
     required = domain.get("required_input")
     if not isinstance(required, dict) or required.get("input_id") != input_id:
         raise ResearchInputError("research_required_input_mismatch")
@@ -2625,6 +4603,7 @@ def _research_resume(
                 run_id,
                 _decomposition_from_view(domain),
                 worker_role="collector",
+                max_work_items=pinned_budgets.max_work_items,
             )
             domain = _research_domain_view(kernel, run_id)
             inspected = kernel.inspect_run(run_id)
@@ -2686,6 +4665,7 @@ def _research_resume(
         run_id,
         decomposition,
         worker_role="collector",
+        max_work_items=pinned_budgets.max_work_items,
     )
     updated_domain = _research_domain_view(kernel, run_id)
     inspected = kernel.inspect_run(run_id)
@@ -2715,6 +4695,7 @@ def _create_research_frontier(
     decomposition: object,
     *,
     worker_role: str,
+    max_work_items: int | None = None,
 ) -> None:
     if not hasattr(decomposition, "required_cells"):
         raise ResearchInputError("decomposition_required")
@@ -2727,10 +4708,17 @@ def _create_research_frontier(
         if isinstance(roles, dict):
             role_worker = roles.get(worker_role)
     worker = workers_by_name.get(role_worker) or config.workers[0]
-    collection_ids = [
+    all_collection_ids = [
         f"collect-{cell.facet_id}-{cell.perspective_id}"
         for cell in required_cells
     ]
+    if max_work_items is not None and (
+        not isinstance(max_work_items, int)
+        or isinstance(max_work_items, bool)
+        or max_work_items < len(all_collection_ids) + 1
+    ):
+        raise ResearchInputError("research_budget_max_work_items_invalid")
+    collection_ids = all_collection_ids
     specifications = [
         {
             "work_id": "classify",
@@ -2790,6 +4778,22 @@ def _create_research_frontier(
     )
 
 
+def _initial_frontier_terminal(
+    decomposition: object,
+    budgets: ResearchBudgets,
+) -> ResearchTerminal | None:
+    if not hasattr(decomposition, "required_cells"):
+        raise ResearchInputError("decomposition_required")
+    initial_work_items = 1 + len(decomposition.required_cells)
+    if initial_work_items > budgets.max_work_items:
+        return ResearchTerminal(
+            code="work_item_budget_exhausted",
+            reason="research work-item budget exhausted before frontier dispatch",
+            budget="work_items",
+        )
+    return None
+
+
 def _settle_classification_artifact(
     kernel: ExecutionKernel,
     claim: object,
@@ -2838,6 +4842,40 @@ def _research_domain_view(kernel: ExecutionKernel, run_id: str) -> dict[str, obj
         elif event.event_type == "research_input_admitted":
             if isinstance(event.payload, dict):
                 admitted = dict(event.payload)
+        elif event.event_type in {
+            "research_round_barrier",
+            "research_round_fixture",
+            "research_round_settled",
+            "research_budget_state",
+            "research_terminal",
+        }:
+            if isinstance(event.payload, dict):
+                for key in (
+                    "budgets",
+                    "progress",
+                    "lead_decisions",
+                    "next_round_work",
+                    "source",
+                    "source_attempts",
+                    "source_decision",
+                    "coverage_decision",
+                    "terminal",
+                    "coverage",
+                ):
+                    if key in event.payload:
+                        definition[key] = json.loads(
+                            json.dumps(event.payload[key])
+                        )
+        elif event.event_type == "research_novel_lead_decision":
+            if isinstance(event.payload, dict):
+                definition.setdefault("lead_decisions", []).append(
+                    json.loads(json.dumps(event.payload))
+                )
+        elif event.event_type == "research_source_decision":
+            if isinstance(event.payload, dict):
+                definition.setdefault("source_attempts", []).append(
+                    json.loads(json.dumps(event.payload))
+                )
         elif event.event_type == "research_verification_fixture":
             if isinstance(event.payload, dict):
                 verification = json.loads(json.dumps(event.payload))
@@ -2850,6 +4888,39 @@ def _research_domain_view(kernel: ExecutionKernel, run_id: str) -> dict[str, obj
                 )
                 definition["evidence"] = verification.get("evidence")
     if not definition or "classification" not in definition:
+        round_fixture = next(
+            (
+                event.payload
+                for event in reversed(events)
+                if event.event_type == "research_round_fixture"
+                and isinstance(event.payload, dict)
+            ),
+            None,
+        )
+        if isinstance(round_fixture, dict):
+            persisted_terminal = round_fixture.get("terminal")
+            if not isinstance(persisted_terminal, dict):
+                persisted_terminal = {
+                    "state": kernel.store.require_run(run_id).state,
+                    "code": round_fixture.get("code"),
+                    "reason": round_fixture.get("reason"),
+                    "budget": round_fixture.get("exhausted_budget"),
+                }
+            return {
+                "phase": "round-fixture",
+                "fixture_case_id": round_fixture.get("fixture_case_id"),
+                "canonical_case_id": round_fixture.get("canonical_case_id"),
+                "budgets": round_fixture.get("budget"),
+                "progress": round_fixture.get("progress"),
+                "lead_decisions": round_fixture.get("lead_decisions", []),
+                "next_round_work": round_fixture.get("next_round_work", []),
+                "source": round_fixture.get("source"),
+                "source_attempts": round_fixture.get("source_attempts", []),
+                "source_decision": round_fixture.get("source_decision"),
+                "replacement_source": round_fixture.get("replacement_source"),
+                "coverage_decision": round_fixture.get("coverage_decision"),
+                "terminal": persisted_terminal,
+            }
         fixture = next(
             (
                 event.payload

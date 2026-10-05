@@ -99,6 +99,27 @@ def build_parser() -> argparse.ArgumentParser:
         dest="case",
         required=True,
     )
+    for fixture_name in (
+        "round-fixture",
+        "research-round-fixture",
+        "loop-fixture",
+        "budget-fixture",
+        "exhaustion-fixture",
+        "progress-fixture",
+        "lead-fixture",
+        "source-fixture",
+        "unavailable-source-fixture",
+        "source-availability-fixture",
+        "unavailable-fixture",
+    ):
+        research_round_fixture = research_subparsers.add_parser(fixture_name)
+        research_round_fixture.add_argument("--workflow", required=True)
+        research_round_fixture.add_argument(
+            "--case",
+            "--fixture-case",
+            dest="case",
+            required=True,
+        )
     research_export = research_subparsers.add_parser("export")
     research_export.add_argument("--workflow", required=True)
     research_export.add_argument("--run-id", "--run", required=True)
@@ -991,12 +1012,25 @@ def _run_v2_tick(config: WorkflowConfig, *, run_id: str | None) -> int:
     claims: list[dict[str, object]] = []
     for selected_run in selected:
         reclaimed[selected_run] = kernel.reclaim_expired(selected_run)
+    claimable = selected
+    if (
+        config.executor is not None
+        and config.executor.kind.value == "research-synthesis"
+    ):
+        from herdr_orchestrator.research_cli import prepare_research_dispatch
+
+        claimable = prepare_research_dispatch(
+            config,
+            store,
+            kernel,
+            selected,
+        )
     if selected:
         claims = [
             claim.to_dict()
             for claim in kernel.claim_ready_for_workflow(
                 config.name,
-                run_ids=selected,
+                run_ids=claimable,
             )
         ]
     print(
@@ -1008,6 +1042,7 @@ def _run_v2_tick(config: WorkflowConfig, *, run_id: str | None) -> int:
                 "success": True,
                 "once": True,
                 "considered_run_ids": selected,
+                "claimable_run_ids": claimable,
                 "reclaimed_attempt_ids": reclaimed,
                 "claimed": claims,
                 "states": [
