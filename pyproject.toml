@@ -79,7 +79,7 @@ known_first_party = ["herdr_orchestrator"]
 [dependency-groups]
 dev = [
     "bandit==1.9.4",
-    "black==26.5.1",
+    "black==26.10.1",
     "coverage==7.16.0",
     "deptry==0.25.1",
     "detect-secrets==1.5.0",
