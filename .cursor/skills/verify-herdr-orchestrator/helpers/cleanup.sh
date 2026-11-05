@@ -26,7 +26,7 @@ case "$SCRATCH" in
 esac
 
 if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-  CMDLINE="$(tr '\0' ' ' <"/proc/$PID/cmdline" || true)"
+  CMDLINE="$(pid_cmdline "$PID")"
   case "$CMDLINE" in
     *herdr_orchestrator*dashboard*)
       kill -TERM "$PID" 2>/dev/null || true

@@ -14,6 +14,8 @@ mkdir -p "$EVIDENCE"
 
 CHROME=""
 for candidate in \
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  "/Applications/Chromium.app/Contents/MacOS/Chromium" \
   /usr/bin/google-chrome-stable \
   /opt/google/chrome/chrome \
   /opt/google/chrome/google-chrome \
@@ -36,7 +38,7 @@ mkdir -p "$PROFILE"
 SCREENSHOT="$EVIDENCE/board.png"
 DOM="$EVIDENCE/page.html"
 
-timeout --signal=TERM --kill-after=5s 30s \
+run_with_timeout 30 \
   node "$HELPERS/capture-dashboard.mjs" \
     "$URL" "$SCREENSHOT" "$DOM" "$CHROME" "$PROFILE" \
   | tee "$EVIDENCE/capture.json"
