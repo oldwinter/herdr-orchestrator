@@ -99,6 +99,29 @@ else:
 ' "$file" "$key"
 }
 
+pid_cmdline() {
+  local pid="$1"
+  if [[ -r "/proc/$pid/cmdline" ]]; then
+    tr '\0' ' ' <"/proc/$pid/cmdline"
+    return 0
+  fi
+  ps -p "$pid" -o command= 2>/dev/null || true
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=5s "${seconds}s" "$@"
+    return
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout --signal=TERM --kill-after=5s "${seconds}s" "$@"
+    return
+  fi
+  "$@"
+}
+
 host_header_ok_curl() {
   local url="$1"
   shift

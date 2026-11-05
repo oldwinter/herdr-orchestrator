@@ -8,12 +8,14 @@ herdr-orchestrator 的操作者表面。验证时用隔离 workflow `verify-orch
 | Durable queue seed + status | CLI | [durable-queue.md](durable-queue.md) | `seed` 后 `status` 看到两张 pending |
 | Dashboard work-in-flight board | Web | [dashboard-queue-board.md](dashboard-queue-board.md) | 启动后跑 `helpers/drive-dashboard-board.sh` |
 | Dashboard recent lifecycle | Web | [dashboard-lifecycle.md](dashboard-lifecycle.md) | `#timeline` 出现 `enqueued` 事件 |
-| Enqueue then project | CLI + Web | [enqueue-and-project.md](enqueue-and-project.md) | 显式 `enqueue` 后第三张卡出现在 Queued |
+| Enqueue then project | CLI + Web | [enqueue-and-project.md](enqueue-and-project.md) | 显式 `enqueue` 后第三张卡出现在 Queued（需 Herdr 里已注册 worker） |
+| Durable worker mail + gates | CLI | [orchestration-mail.md](orchestration-mail.md) | `send`→`check`→`ack`，gate create/list/resolve |
 
 未入图（缺 Herdr 或会碰到真实 agent，先不要当默认环）：
 
 - Herdr topology canvas（无 runtime 时 `#topology-empty` 为 `Waiting for Herdr…` 或 observation unavailable）
-- `run` / `retry` / `resume` / `gc --apply`
+- `ask` / `reply`（需要受监督的真实 attempt，隔离 queue 里 `supervision_attempt_required`）
+- `orca` 桥、`run` / `retry` / `resume` / `gc --apply`
 - `just doctor` / smoke / readiness-matrix
 - Manual manager
 - Standardized delivery
