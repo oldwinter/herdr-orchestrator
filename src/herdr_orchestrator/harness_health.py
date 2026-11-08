@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
+import multiprocessing
 import os
 import re
-import select
 import shutil
-import signal
 import threading
 import time
 import uuid
@@ -832,7 +830,7 @@ class HarnessHealth:
     ) -> Mapping[str, object]:
         if deadline is None:
             return _normalize_probe_result(probe(self.workflow, harness, timeout_seconds))
-        if self.isolate_probes and hasattr(os, "fork"):
+        if self.isolate_probes:
             return self._invoke_probe_subprocess(
                 probe,
                 harness,
@@ -883,51 +881,36 @@ class HarnessHealth:
         timeout_seconds: int,
         deadline: float,
     ) -> Mapping[str, object]:
-        read_fd, write_fd = os.pipe()
-        child = os.fork()
-        if child == 0:
-            os.close(read_fd)
-            try:
-                payload = json.dumps(
-                    ["ok", _normalize_probe_result(probe(self.workflow, harness, timeout_seconds))]
-                ).encode()
-            except BaseException:
-                payload = json.dumps(["error", "readiness_probe_failed"]).encode()
-            try:
-                os.write(write_fd, payload)
-            finally:
-                os.close(write_fd)
-                os._exit(0)
-
-        os.close(write_fd)
-        data = bytearray()
+        # A fresh interpreter, not os.fork(). Forking a threaded parent can
+        # deadlock, and Python 3.14 warns at this call site.
+        ctx = multiprocessing.get_context("spawn")
+        parent, child = ctx.Pipe(duplex=False)
+        process = ctx.Process(
+            target=_isolated_probe_main,
+            args=(child, probe, self.workflow, harness, timeout_seconds),
+        )
         try:
-            while True:
-                remaining = deadline - PROBE_COMMIT_GRACE_SECONDS - time.monotonic()
-                if remaining <= 0:
-                    _terminate_probe_process(child)
-                    return {"status": "timeout", "error_code": "timeout"}
-                ready, _, _ = select.select([read_fd], [], [], remaining)
-                if not ready:
-                    _terminate_probe_process(child)
-                    return {"status": "timeout", "error_code": "timeout"}
-                chunk = os.read(read_fd, 65536)
-                if not chunk:
-                    break
-                data.extend(chunk)
+            process.start()
+        except Exception:
+            parent.close()
+            child.close()
+            raise
+        child.close()
+        try:
+            remaining = deadline - PROBE_COMMIT_GRACE_SECONDS - time.monotonic()
+            if remaining <= 0 or not parent.poll(remaining):
+                _stop_probe_process(process)
+                return {"status": "timeout", "error_code": "timeout"}
+            try:
+                decoded = parent.recv()
+            except (EOFError, OSError):
+                return {"status": "error", "error_code": "readiness_probe_failed"}
         finally:
-            os.close(read_fd)
-        _, status = os.waitpid(child, 0)
-        if not data:
-            return {"status": "error", "error_code": "readiness_probe_failed"}
-        try:
-            decoded = json.loads(bytes(data))
-            if not isinstance(decoded, list) or len(decoded) != 2:
-                raise ValueError("readiness_result_invalid")
-            result_kind, payload = decoded
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+            parent.close()
+            _stop_probe_process(process)
+        if not isinstance(decoded, list) or len(decoded) != 2:
             return {"status": "error", "error_code": "readiness_result_invalid"}
-        del status
+        result_kind, payload = decoded
         if result_kind != "ok":
             return {"status": "error", "error_code": "readiness_probe_failed"}
         return _normalize_probe_result(payload)
@@ -1013,11 +996,27 @@ def _normalize_probe_result(result: Mapping[str, object] | object) -> Mapping[st
     }
 
 
-def _terminate_probe_process(pid: int) -> None:
-    with suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
-    with suppress(ChildProcessError):
-        os.waitpid(pid, 0)
+def _isolated_probe_main(conn, probe, workflow, harness, timeout_seconds) -> None:
+    try:
+        normalized = _normalize_probe_result(probe(workflow, harness, timeout_seconds))
+        payload = ["ok", dict(normalized)]
+    except BaseException:
+        payload = ["error", "readiness_probe_failed"]
+    try:
+        conn.send(payload)
+    except Exception:
+        return
+    finally:
+        conn.close()
+
+
+def _stop_probe_process(process: multiprocessing.Process) -> None:
+    if process.pid is None:
+        return
+    with suppress(ProcessLookupError, OSError):
+        if process.is_alive():
+            process.kill()
+    process.join(timeout=5)
 
 
 def _workspace_id(workspace: str) -> str:
