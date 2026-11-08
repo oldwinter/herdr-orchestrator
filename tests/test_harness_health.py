@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import subprocess
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from herdr_orchestrator.cli import doctor
 from herdr_orchestrator.config import load_workflow
@@ -28,8 +30,22 @@ from herdr_orchestrator.observability import Observability
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.selection import select_controller_harness
 from herdr_orchestrator.store import Store
+from tests.isolation_probes import ready_probe, sleep_probe
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def _forbid_os_fork():
+    if not hasattr(os, "fork"):
+        yield
+        return
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("os.fork called")
+
+    with mock.patch("os.fork", boom):
+        yield
 
 
 class HarnessHealthTests(unittest.TestCase):
@@ -234,15 +250,10 @@ class HarnessHealthTests(unittest.TestCase):
     def test_live_probe_deadline_terminates_isolated_probe_process(self) -> None:
         with TemporaryDirectory() as temporary:
             config = self._config(Path(temporary))
-
-            def probe(_workflow, _harness, _timeout):
-                time.sleep(30)
-                return {"status": "ready"}
-
             health = HarnessHealth(
                 Store(config.state_db),
                 config,
-                probe=probe,
+                probe=sleep_probe,
                 allow_live_probe=True,
                 environment={
                     "HERDR_ENV": "1",
@@ -254,12 +265,13 @@ class HarnessHealthTests(unittest.TestCase):
                 probe_timeout_seconds=5,
             )
             began = time.monotonic()
-            snapshot = health.snapshot(
-                (Harness.DROID,),
-                refresh=True,
-                timeout_seconds=5,
-                deadline=time.monotonic() + 5.1,
-            )
+            with _forbid_os_fork():
+                snapshot = health.snapshot(
+                    (Harness.DROID,),
+                    refresh=True,
+                    timeout_seconds=5,
+                    deadline=time.monotonic() + 5.1,
+                )
 
             self.assertLess(time.monotonic() - began, 6.0)
             self.assertEqual(snapshot.eligible_harnesses, ())
@@ -267,6 +279,35 @@ class HarnessHealthTests(unittest.TestCase):
                 health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID).reason,
                 "timeout",
             )
+
+    def test_isolated_probe_returns_ready_without_fork(self) -> None:
+        with TemporaryDirectory() as temporary:
+            config = self._config(Path(temporary))
+            health = HarnessHealth(
+                Store(config.state_db),
+                config,
+                probe=ready_probe,
+                allow_live_probe=True,
+                environment={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w:p",
+                    "HERDR_WORKSPACE_ID": "w",
+                },
+                executable_finder=lambda command: f"/bin/{command}",
+                isolate_probes=True,
+                probe_timeout_seconds=5,
+            )
+            with _forbid_os_fork():
+                snapshot = health.snapshot(
+                    (Harness.DROID,),
+                    refresh=True,
+                    timeout_seconds=5,
+                    deadline=time.monotonic() + 15,
+                )
+            record = health.snapshot((Harness.DROID,), refresh=False).record_for(Harness.DROID)
+            self.assertEqual(snapshot.eligible_harnesses, (Harness.DROID,))
+            self.assertEqual(record.status, HarnessHealthStatus.READY)
+            self.assertEqual(record.reason, "readiness_ready")
 
     def test_injected_ci_disables_and_persists_probe_classification(self) -> None:
         with TemporaryDirectory() as temporary:
