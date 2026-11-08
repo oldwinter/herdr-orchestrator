@@ -23,6 +23,8 @@ from herdr_orchestrator.harness_health import (
     HarnessHealthError,
     HarnessHealthStatus,
     HealthSource,
+    _ready_probe as ready_probe,
+    _sleep_probe as sleep_probe,
 )
 from herdr_orchestrator.herdr import doctor_agent_name, smoke_agent_name
 from herdr_orchestrator.model import AgentState, DispatchOutcome, Harness, NewJob
@@ -30,7 +32,6 @@ from herdr_orchestrator.observability import Observability
 from herdr_orchestrator.runner import Coordinator
 from herdr_orchestrator.selection import select_controller_harness
 from herdr_orchestrator.store import Store
-from tests.isolation_probes import ready_probe, sleep_probe
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
