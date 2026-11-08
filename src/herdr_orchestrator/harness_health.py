@@ -962,6 +962,25 @@ class HarnessHealth:
         )
 
 
+def _ready_probe(
+    _workflow: WorkflowConfig,
+    _harness: Harness,
+    _timeout_seconds: int,
+) -> Mapping[str, object]:
+    """Picklable ready probe. Spawn imports this installed module, not tests."""
+    return {"status": "ready"}
+
+
+def _sleep_probe(
+    _workflow: WorkflowConfig,
+    _harness: Harness,
+    _timeout_seconds: int,
+) -> Mapping[str, object]:
+    """Picklable probe that outlives a short readiness deadline."""
+    time.sleep(30)
+    return {"status": "ready"}
+
+
 def _unique_harnesses(harnesses: Iterable[Harness]) -> tuple[Harness, ...]:
     values = tuple(harnesses)
     if any(not isinstance(harness, Harness) for harness in values):
@@ -996,7 +1015,13 @@ def _normalize_probe_result(result: Mapping[str, object] | object) -> Mapping[st
     }
 
 
-def _isolated_probe_main(conn, probe, workflow, harness, timeout_seconds) -> None:
+def _isolated_probe_main(
+    conn: multiprocessing.connection.Connection,
+    probe: HealthProbe,
+    workflow: WorkflowConfig,
+    harness: Harness,
+    timeout_seconds: int,
+) -> None:
     try:
         normalized = _normalize_probe_result(probe(workflow, harness, timeout_seconds))
         payload = ["ok", dict(normalized)]
@@ -1010,7 +1035,7 @@ def _isolated_probe_main(conn, probe, workflow, harness, timeout_seconds) -> Non
         conn.close()
 
 
-def _stop_probe_process(process: multiprocessing.Process) -> None:
+def _stop_probe_process(process: multiprocessing.process.BaseProcess) -> None:
     if process.pid is None:
         return
     with suppress(ProcessLookupError, OSError):
