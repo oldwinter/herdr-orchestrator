@@ -23,7 +23,11 @@ from herdr_orchestrator.harness_health import (
     HarnessHealthError,
     HarnessHealthStatus,
     HealthSource,
+)
+from herdr_orchestrator.harness_health import (
     _ready_probe as ready_probe,
+)
+from herdr_orchestrator.harness_health import (
     _sleep_probe as sleep_probe,
 )
 from herdr_orchestrator.herdr import doctor_agent_name, smoke_agent_name
