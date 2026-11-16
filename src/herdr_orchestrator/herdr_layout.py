@@ -414,6 +414,8 @@ class HerdrLayout:
                     del self._batch_tabs[key]
                 elif terminal.pane_id in batch.pane_ids:
                     batch.pane_ids.remove(terminal.pane_id)
+                    if not batch.pane_ids:
+                        del self._batch_tabs[key]
 
 
 def _created_layout(

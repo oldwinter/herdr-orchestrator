@@ -7,7 +7,6 @@ from pathlib import Path
 
 from herdr_orchestrator.model import Harness
 from herdr_orchestrator.planner import (
-    MAX_PLANNER_OUTPUT_BYTES,
     PLANNER_OUTPUT_KEYS,
     PLANNER_TASK_KEYS,
     WORKER_SELECTION_KEYS,
@@ -106,6 +105,48 @@ class PlannerTests(unittest.TestCase):
                     path,
                     allowed_harnesses=(Harness.GROK, Harness.CODEX),
                 )
+
+    def test_rejects_task_harness_outside_allowed_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "plan.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "title": "Review config",
+                                "harness": "claude",
+                                "prompt": "Read only.",
+                                "dedupe_key": "review-config-v1",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(PlannerOutputError, "planner_harness_not_allowed"):
+                load_planner_tasks(
+                    path,
+                    max_tasks=10,
+                    allowed_harnesses=(Harness.GROK, Harness.CODEX),
+                )
+
+            tasks = load_planner_tasks(
+                path,
+                max_tasks=10,
+                allowed_harnesses=(Harness.CLAUDE,),
+            )
+
+        self.assertEqual(tasks[0].harness, Harness.CLAUDE)
+
+    def test_rejects_invalid_allowed_harness_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "plan.json"
+            path.write_text('{"tasks": []}', encoding="utf-8")
+
+            with self.assertRaisesRegex(PlannerOutputError, "planner_harnesses_invalid"):
+                load_planner_tasks(path, max_tasks=10, allowed_harnesses=())
 
     def test_rejects_shell_command_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -211,11 +252,19 @@ class PlannerTests(unittest.TestCase):
         ):
             load_planner_tasks(Path(temporary).resolve(), max_tasks=10)
 
+    def test_accepts_planner_output_within_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "plan.json"
+            payload = b'{"tasks": []}'
+            path.write_bytes(payload + b" " * (7 * 1024 * 1024 - len(payload)))
+
+            self.assertEqual(load_planner_tasks(path, max_tasks=10), ())
+
     def test_rejects_oversized_planner_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary).resolve() / "plan.json"
             with path.open("wb") as output:
-                output.truncate(MAX_PLANNER_OUTPUT_BYTES + 1)
+                output.truncate(9 * 1024 * 1024)
 
             with self.assertRaisesRegex(PlannerOutputError, "planner_output_too_large"):
                 load_planner_tasks(path, max_tasks=10)

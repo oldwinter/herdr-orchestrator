@@ -103,16 +103,26 @@ class QueueOwnershipTests(unittest.TestCase):
                     if stage == "health" and harness is Harness.CODEX:
                         raise StoreError("health_write_failed")
 
-                with (
+                patches = (
                     patch.object(self.store, "record_outcome", side_effect=record_outcome),
                     patch.object(coordinator, "_record_health", side_effect=record_health),
                     patch(
                         "herdr_orchestrator.runner.as_completed",
                         side_effect=lambda futures: iter(futures),
                     ),
-                    self.assertRaisesRegex(StoreError, "job_lease_lost|health_write_failed"),
-                ):
-                    coordinator.run_once()
+                )
+                if failing_stage == "outcome":
+                    with patches[0], patches[1], patches[2]:
+                        report = coordinator.run_once()
+                    self.assertEqual(report["stale"], 1)
+                else:
+                    with (
+                        patches[0],
+                        patches[1],
+                        patches[2],
+                        self.assertRaisesRegex(StoreError, "health_write_failed"),
+                    ):
+                        coordinator.run_once()
 
                 sibling = next(
                     row for row in self.store.jobs(config.name) if row["harness"] == "droid"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -73,3 +74,21 @@ def reserve_planner_run(
             (key, str(observed_at), observed_at),
         )
     return True
+
+
+def migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
+    """Index receipts by job and pin schema_meta to a single row."""
+    connection.execute("CREATE INDEX IF NOT EXISTS receipts_job_id ON receipts(job_id)")
+    connection.execute("""
+        CREATE TABLE schema_meta_v10 (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL
+        )
+        """)
+    connection.execute("""
+        INSERT INTO schema_meta_v10(id, version)
+        SELECT 1, version FROM schema_meta ORDER BY rowid LIMIT 1
+        """)
+    connection.execute("DROP TABLE schema_meta")
+    connection.execute("ALTER TABLE schema_meta_v10 RENAME TO schema_meta")
+    connection.execute("UPDATE schema_meta SET version = 10")

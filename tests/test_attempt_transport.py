@@ -35,7 +35,7 @@ from herdr_orchestrator.model import (
     TaskReceipt,
 )
 from herdr_orchestrator.runner import Coordinator, OperationInterrupted
-from herdr_orchestrator.store import Store, StoreError
+from herdr_orchestrator.store import Store
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -810,7 +810,7 @@ def test_settled_fatal_recovery_follows_store_retry_policy() -> None:
                     Harness.CODEX,
                     "must not be sent",
                     "recover-settled-fatal",
-                    2,
+                    3,
                 )
             )
             claimed = store.claim(
@@ -957,6 +957,9 @@ def test_resume_pane_run_timeout_reconciles_acceptance_without_rotating_operatio
                 {"_error": "timeout"},
                 {"agent": _agent(workspace, AgentState.WORKING, 21)},
                 {"_error": "herdr_timeout"},
+                {"agent": _agent(workspace, AgentState.BLOCKED, 21)},
+                {},
+                {"agent": _agent(workspace, AgentState.DONE, 22)},
             ]
         )
         coordinator = Coordinator(
@@ -975,17 +978,24 @@ def test_resume_pane_run_timeout_reconciles_acceptance_without_rotating_operatio
                 """,
                 (claimed.attempt_id,),
             ).fetchone()
-        with (
-            patch("herdr_orchestrator.store.time.time", return_value=101.0),
-            pytest.raises(StoreError, match="job_not_resumable"),
-        ):
-            coordinator.resume_blocked(claimed.job_id, "Approved again")
+        with patch("herdr_orchestrator.store.time.time", return_value=101.0):
+            second = coordinator.resume_blocked(claimed.job_id, "Approved again")
+        with closing(sqlite3.connect(config.state_db)) as connection, connection:
+            rotated = connection.execute(
+                """
+                SELECT operation_sequence, phase
+                FROM job_attempts WHERE id = ?
+                """,
+                (claimed.attempt_id,),
+            ).fetchone()
 
     assert result["state"] == JobState.BLOCKED.value
     assert result["error_code"] == "herdr_timeout"
     assert operation is not None
     assert operation[1:] == (1, AttemptPhase.ATTENTION.value)
-    assert sum(call[0:3] == ["herdr", "pane", "run"] for call in runner.calls) == 1
+    assert second["state"] == JobState.SUCCEEDED.value
+    assert rotated == (2, AttemptPhase.OUTCOME_COMMITTED.value)
+    assert sum(call[0:3] == ["herdr", "pane", "run"] for call in runner.calls) == 2
 
 
 def _agent(workspace: Path, state: AgentState, sequence: int) -> dict[str, object]:

@@ -261,6 +261,62 @@ class ConfigTests(unittest.TestCase):
             ):
                 load_workflow(artifact_workflow)
 
+    def test_rejects_runtime_paths_nested_outside_runtime_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+
+            worktree_workflow = root / "worktree.toml"
+            worktree_workflow.write_text(
+                _minimal_workflow()
+                + '\n[placement]\nworktree_root = "nested/.orchestrator/worktrees"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ConfigError,
+                "placement_worktree_root_must_be_in_workspace_runtime",
+            ):
+                load_workflow(worktree_workflow)
+
+            planner_workflow = root / "planner.toml"
+            planner_workflow.write_text(
+                _minimal_workflow(planner_output="nested/.orchestrator/planner.json"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ConfigError,
+                "planner_output_must_be_in_workspace_runtime",
+            ):
+                load_workflow(planner_workflow)
+
+            artifact_workflow = root / "artifact.toml"
+            artifact_workflow.write_text(
+                _minimal_workflow()
+                + '\n[standardized_delivery]\nartifact_root = "nested/.orchestrator/deliveries"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ConfigError,
+                "delivery_artifact_root_must_be_in_workspace_runtime",
+            ):
+                load_workflow(artifact_workflow)
+
+    def test_rejects_workspace_tracker_root_outside_scratch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "prompt.md").write_text("task", encoding="utf-8")
+            workflow = root / "workflow.toml"
+            workflow.write_text(
+                _minimal_workflow() + '\n[standardized_delivery]\ntracker_root = "tracker"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ConfigError,
+                "delivery_tracker_root_must_be_in_workspace_runtime",
+            ):
+                load_workflow(workflow)
+
     def test_requires_lease_to_cover_agent_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

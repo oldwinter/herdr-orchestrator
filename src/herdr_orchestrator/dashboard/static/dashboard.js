@@ -24,11 +24,9 @@ let previousAttentionVisuals = new Map();
 let timelineHasRendered = false;
 let timelineSignature = "";
 let previousTimelineVisuals = new Map();
-let recoveryState = {
-  browserTransport: { kind: "connecting" },
-  awaitingFreshSnapshot: false,
-};
+let recoveryState = { browserTransport: { kind: "connecting" }, awaitingFreshSnapshot: false };
 const dataRegionIds = ["kanban", "attention-list", "topology", "timeline"];
+const KANBAN_COLUMN_CARD_LIMIT = 200;
 const columns = [
   { key: "queued", label: "Queued", states: ["pending"] },
   { key: "working", label: "In motion", states: ["running"] },
@@ -229,18 +227,9 @@ function renderKanban(jobs) {
   target.innerHTML = boardPresentation.columnOrder.map((column) => {
     const selected = boardPresentation.selectedByColumn.get(column.key) || [];
     const cards = selected.length
-      ? selected.map((job) => {
-        const id = textValue(job.id);
-        const previous = previousJobVisuals.get(id);
-        const motionClass = !kanbanHasRendered
-          ? ""
-          : previous === undefined
-            ? " is-entering"
-            : previous !== nextJobVisuals.get(id)
-              ? " is-state-change"
-              : "";
-        return jobCard(job, motionClass);
-      }).join("")
+      ? selected.slice(0, KANBAN_COLUMN_CARD_LIMIT).map((job) => (
+        jobCard(job, kanbanCardMotion(job, nextJobVisuals))
+      )).join("") + overflowNote(selected.length - KANBAN_COLUMN_CARD_LIMIT)
       : `<div class="empty-state compact">No ${escapeHtml(column.label.toLowerCase())} jobs</div>`;
     return `
       <section class="kanban-column" tabindex="0" id="${kanbanColumnId(column.key)}" data-column-key="${escapeHtml(column.key)}" data-column-state="${selected.length ? "populated" : "empty"}" role="region" aria-label="${escapeHtml(column.label)}" aria-keyshortcuts="ArrowLeft ArrowRight">
@@ -276,6 +265,17 @@ function renderKanban(jobs) {
     }));
   }
   kanbanHasRendered = true;
+}
+function kanbanCardMotion(job, nextJobVisuals) {
+  if (!kanbanHasRendered) return "";
+  const id = textValue(job.id);
+  const previous = previousJobVisuals.get(id);
+  return previous === undefined
+    ? " is-entering"
+    : previous !== nextJobVisuals.get(id) ? " is-state-change" : "";
+}
+function overflowNote(hidden) {
+  return hidden > 0 ? `<div class="overflow-note">+${hidden} more</div>` : "";
 }
 function kanbanColumnId(columnKey) {
   return `kanban-column-${columnKey}`;
@@ -757,7 +757,7 @@ function renderTimeline(events) {
   const nextVisuals = new Map(
     visible.map((event, index) => [timelineVisualId(event, index), timelineVisualSignature(event)]),
   );
-  const nextSignature = JSON.stringify([...nextVisuals]);
+  const nextSignature = JSON.stringify([events.length, ...nextVisuals]);
   if (timelineHasRendered && nextSignature === timelineSignature) return;
   const continuity = timelineHasRendered ? captureTimelineContinuity(target) : null;
   target.innerHTML = visible.length
@@ -784,7 +784,7 @@ function renderTimeline(events) {
         </div>
       </article>
     `;
-    }).join("")
+    }).join("") + overflowNote(events.length - visible.length)
     : '<div class="empty-state compact">No lifecycle events yet</div>';
   restoreTimelineContinuity(target, continuity, { animate: motionAllowed() });
   previousTimelineVisuals = nextVisuals;

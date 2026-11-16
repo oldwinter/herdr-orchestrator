@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -747,7 +748,7 @@ class CliCommandDispatchTests(unittest.TestCase):
         self.config = load_workflow(REPO_ROOT / "workflows/multi-harness.toml")
 
     def test_simple_coordinator_and_store_commands_emit_json(self) -> None:
-        args = Namespace(apply=False, extra_attempts=2, job_id=7)
+        args = Namespace(apply=False, extra_attempts=2, job_id=7, succeeded_agents=True)
         coordinator = MagicMock()
         coordinator.seed.return_value = (2, 1)
         coordinator.gc_succeeded_agents.return_value = {"candidate_count": 0}
@@ -818,6 +819,111 @@ class CliCommandDispatchTests(unittest.TestCase):
             coordinator.run_forever.side_effect = KeyboardInterrupt
             self.assertEqual(cli_module._command_run(self.config, args), 0)
         coordinator.enqueue_prompt_file.assert_called_once()
+
+    def test_gc_dispatches_failed_scope_and_requires_explicit_flag(self) -> None:
+        coordinator = MagicMock()
+        coordinator.gc_failed_agents.return_value = {"candidate_count": 0}
+        args = Namespace(apply=True, succeeded_agents=False)
+        with (
+            patch.object(cli_module, "Coordinator", return_value=coordinator),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli_module._command_gc(self.config, args), 0)
+        coordinator.gc_failed_agents.assert_called_once_with(dry_run=False)
+        coordinator.gc_succeeded_agents.assert_not_called()
+
+        with (
+            patch.object(cli_module, "Coordinator", return_value=coordinator),
+            self.assertRaises(AttributeError),
+        ):
+            cli_module._command_gc(self.config, Namespace(apply=False))
+
+    def test_resume_rejects_oversized_and_empty_response_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            oversized = root / "oversized.txt"
+            oversized.write_text("x" * 32, encoding="utf-8")
+            empty = root / "empty.txt"
+            empty.write_text("   \n", encoding="utf-8")
+            with (
+                patch.object(cli_module, "RESPONSE_FILE_MAX_BYTES", 8),
+                self.assertRaisesRegex(ValueError, "response_file_oversized"),
+            ):
+                cli_module._command_resume(
+                    self.config,
+                    Namespace(job_id=1, response_file=str(oversized)),
+                )
+            with self.assertRaisesRegex(ValueError, "response_file_empty"):
+                cli_module._command_resume(
+                    self.config,
+                    Namespace(job_id=1, response_file=str(empty)),
+                )
+            with self.assertRaisesRegex(ValueError, "response_file_not_found"):
+                cli_module._command_resume(
+                    self.config,
+                    Namespace(job_id=1, response_file=str(root / "missing.txt")),
+                )
+
+    def test_doctor_reports_environment_checks_as_booleans(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            doctor(
+                self.config,
+                environ={
+                    "HERDR_ENV": "1",
+                    "HERDR_PANE_ID": "w1:p1",
+                    "HERDR_WORKSPACE_ID": "w1",
+                },
+                which=lambda name: f"/bin/{name}",
+                version_runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                    ["herdr", "--version"],
+                    0,
+                    "herdr 0.8.2\n",
+                    "",
+                ),
+                readiness_probe=lambda *args: {
+                    "status": "ready",
+                    "error_code": None,
+                    "error_summary": None,
+                },
+                selected_harnesses=["droid"],
+            )
+        report = json.loads(output.getvalue())
+        env_checks = {
+            check["check"]: check["value"]
+            for check in report["checks"]
+            if check["check"].startswith("HERDR_")
+        }
+        self.assertEqual(
+            env_checks, {"HERDR_ENV": True, "HERDR_PANE_ID": True, "HERDR_WORKSPACE_ID": True}
+        )
+
+    def test_enqueue_rejects_invalid_inputs_with_stable_error_code(self) -> None:
+        cases = (
+            (["--dedupe-key", "a b!"], "dedupe_key_invalid"),
+            (["--title", "t" * 201], "title_invalid"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            prompt_file = Path(temporary) / "task.md"
+            prompt_file.write_text("Inspect the repository.", encoding="utf-8")
+            for overrides, error_code in cases:
+                argv = [
+                    "enqueue",
+                    "--workflow",
+                    str(REPO_ROOT / "workflows/multi-harness.toml"),
+                    "--title",
+                    "Inspect",
+                    "--prompt-file",
+                    str(prompt_file),
+                    "--dedupe-key",
+                    "inspect-v1",
+                ]
+                for index in range(0, len(overrides), 2):
+                    argv[argv.index(overrides[index]) + 1] = overrides[index + 1]
+                stderr = io.StringIO()
+                with self.subTest(error_code=error_code), redirect_stderr(stderr):
+                    self.assertEqual(cli_module.main(argv), 2)
+                self.assertIn(error_code, stderr.getvalue())
 
     def test_run_rejects_unbounded_drain(self) -> None:
         args = Namespace(
@@ -936,6 +1042,20 @@ class CliCommandDispatchTests(unittest.TestCase):
                 cli_module.main(["catalog", "--workflow", "workflow.toml"]),
                 3,
             )
+
+    def test_main_normalizes_os_and_sqlite_errors_to_stable_code(self) -> None:
+        for error in (OSError("disk gone"), sqlite3.OperationalError("database is locked")):
+            stderr = io.StringIO()
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(cli_module, "load_workflow", side_effect=error),
+                redirect_stderr(stderr),
+            ):
+                self.assertEqual(
+                    cli_module.main(["catalog", "--workflow", "workflow.toml"]),
+                    2,
+                )
+            self.assertTrue(stderr.getvalue().startswith("herdr_internal_error"))
 
 
 def _git(workspace: Path, *arguments: str) -> None:

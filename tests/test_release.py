@@ -163,6 +163,85 @@ class NpmReleasePlanTests(unittest.TestCase):
             },
         )
 
+    def test_missing_registry_package_on_stdout_is_publishable(self) -> None:
+        result, _ = self._run_plan(
+            "0.1.0",
+            "[]",
+            npm_exit=1,
+            npm_stdout="npm error code E404\nnpm error 404 Not Found\n",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "name": "example-package",
+                "publish": True,
+                "reason": "version_missing",
+                "version": "0.1.0",
+            },
+        )
+
+    def test_manager_release_requires_exact_orchestrator_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps({"name": "herdr-orchestrator", "version": "0.1.7"}),
+                encoding="utf-8",
+            )
+            manager_dir = root / "packages" / "herdr-manager"
+            manager_dir.mkdir(parents=True)
+            package = manager_dir / "package.json"
+            package.write_text(
+                json.dumps(
+                    {
+                        "name": "herdr-manager",
+                        "version": "0.1.2",
+                        "dependencies": {"herdr-orchestrator": "0.1.6"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result, _ = self._run_plan("0.1.2", '["0.1.2"]', package_path=package)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "manager_dependency_mismatch")
+
+    def test_manager_release_accepts_exact_orchestrator_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps({"name": "herdr-orchestrator", "version": "0.1.7"}),
+                encoding="utf-8",
+            )
+            manager_dir = root / "packages" / "herdr-manager"
+            manager_dir.mkdir(parents=True)
+            package = manager_dir / "package.json"
+            package.write_text(
+                json.dumps(
+                    {
+                        "name": "herdr-manager",
+                        "version": "0.1.2",
+                        "dependencies": {"herdr-orchestrator": "0.1.7"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result, _ = self._run_plan("0.1.2", '["0.1.1"]', package_path=package)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "name": "herdr-manager",
+                "publish": True,
+                "reason": "version_missing",
+                "version": "0.1.2",
+            },
+        )
+
     def _run_plan(
         self,
         version: str,
@@ -170,20 +249,26 @@ class NpmReleasePlanTests(unittest.TestCase):
         *,
         npm_exit: int = 0,
         npm_stderr: str = "",
+        npm_stdout: str = "",
+        package_path: Path | None = None,
         write_github_output: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            package = root / "package.json"
-            package.write_text(
-                json.dumps(
-                    {
-                        "name": "example-package",
-                        "version": version,
-                    }
-                ),
-                encoding="utf-8",
-            )
+            if package_path is None:
+                package = root / "package.json"
+                package.write_text(
+                    json.dumps(
+                        {
+                            "name": "example-package",
+                            "version": version,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                package = package_path
+            name = json.loads(package.read_text(encoding="utf-8"))["name"]
             fake_bin = root / "bin"
             fake_bin.mkdir()
             npm = fake_bin / "npm"
@@ -191,11 +276,12 @@ class NpmReleasePlanTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import os\n"
                 "import sys\n"
-                "expected = ['view', 'example-package', 'versions', '--json']\n"
+                "expected = ['view', os.environ['PACKAGE_NAME'], 'versions', '--json']\n"
                 "if sys.argv[1:] != expected:\n"
                 "    raise SystemExit(9)\n"
                 "sys.stderr.write(os.environ['NPM_STDERR'])\n"
                 "if os.environ['NPM_EXIT'] != '0':\n"
+                "    sys.stdout.write(os.environ['NPM_STDOUT'])\n"
                 "    raise SystemExit(int(os.environ['NPM_EXIT']))\n"
                 "print(os.environ['REGISTRY_VERSIONS'])\n",
                 encoding="utf-8",
@@ -206,6 +292,8 @@ class NpmReleasePlanTests(unittest.TestCase):
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "NPM_EXIT": str(npm_exit),
                 "NPM_STDERR": npm_stderr,
+                "NPM_STDOUT": npm_stdout,
+                "PACKAGE_NAME": name,
                 "REGISTRY_VERSIONS": registry_versions,
             }
             github_output = root / "github-output.txt"
@@ -393,6 +481,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("npm publish --access public", publish)
         self.assertIn("npm publish --access public ./packages/herdr-manager", publish)
         self.assertIn('npm view "$name@$version" version', verify)
+        self.assertIn('npm view "$name@$version" gitHead', verify)
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -407,25 +496,39 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
                 "import pathlib\n"
                 "import sys\n"
                 "state = pathlib.Path(os.environ['REGISTRY_STATE'])\n"
-                "versions = set(filter(None, state.read_text().splitlines()))\n"
+                "entries = dict(\n"
+                "    line.split(' ', 1)\n"
+                "    for line in filter(None, state.read_text().splitlines())\n"
+                ")\n"
                 "args = sys.argv[1:]\n"
                 "if args[:1] == ['publish']:\n"
                 "    package = (\n"
                 "        'example-package@1.2.0' if len(args) == 3 else 'herdr-manager@0.2.0'\n"
                 "    )\n"
+                "    if package in entries:\n"
+                "        raise SystemExit(18)\n"
                 "    if (\n"
                 "        os.environ.get('FAIL_MANAGER') == '1'\n"
                 "        and package.startswith('herdr-manager@')\n"
                 "    ):\n"
                 "        raise SystemExit(17)\n"
-                "    versions.add(package)\n"
-                "    state.write_text('\\n'.join(sorted(versions)) + '\\n')\n"
+                "    entries[package] = os.environ.get('GITHUB_SHA', '')\n"
+                "    state.write_text(\n"
+                "        '\\n'.join(\n"
+                "            f'{name} {head}' for name, head in sorted(entries.items())\n"
+                "        )\n"
+                "        + '\\n'\n"
+                "    )\n"
                 "    raise SystemExit(0)\n"
-                "if args[:1] == ['view'] and len(args) == 3 and args[2] == 'version':\n"
+                "if args[:1] == ['view'] and len(args) == 3:\n"
                 "    package = args[1]\n"
-                "    if package in versions:\n"
-                "        print(package.rsplit('@', 1)[1])\n"
-                "        raise SystemExit(0)\n"
+                "    if package in entries:\n"
+                "        if args[2] == 'version':\n"
+                "            print(package.rsplit('@', 1)[1])\n"
+                "            raise SystemExit(0)\n"
+                "        if args[2] == 'gitHead':\n"
+                "            print(entries[package])\n"
+                "            raise SystemExit(0)\n"
                 "    raise SystemExit(1)\n"
                 "raise SystemExit(19)\n",
                 encoding="utf-8",
@@ -436,6 +539,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
                 **os.environ,
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "REGISTRY_STATE": str(state),
+                "GITHUB_SHA": "aaaaaaa",
                 "ORCHESTRATOR_PUBLISH": "true",
                 "MANAGER_PUBLISH": "true",
                 "ORCHESTRATOR_NAME": "example-package",
@@ -455,7 +559,8 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             )
             self.assertNotEqual(first.returncode, 0, first.stderr)
             self.assertEqual(
-                state.read_text(encoding="utf-8").splitlines(), ["example-package@1.2.0"]
+                state.read_text(encoding="utf-8").splitlines(),
+                ["example-package@1.2.0 aaaaaaa"],
             )
 
             environment.update(
@@ -477,7 +582,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertEqual(
                 state.read_text(encoding="utf-8").splitlines(),
-                ["example-package@1.2.0", "herdr-manager@0.2.0"],
+                ["example-package@1.2.0 aaaaaaa", "herdr-manager@0.2.0 aaaaaaa"],
             )
 
             environment.update(
@@ -496,6 +601,104 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(no_op.returncode, 0, no_op.stderr)
+
+    def test_verify_rejects_registry_version_published_by_another_commit(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        publish = _workflow_run_block(workflow, "Publish package versions")
+        verify = _workflow_run_block(workflow, "Verify package versions")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            state = root / "registry.txt"
+            state.write_text(
+                "example-package@1.2.0 bbbbbbb\nherdr-manager@0.2.0 bbbbbbb\n",
+                encoding="utf-8",
+            )
+            npm = fake_bin / "npm"
+            npm.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import pathlib\n"
+                "import sys\n"
+                "state = pathlib.Path(os.environ['REGISTRY_STATE'])\n"
+                "entries = dict(\n"
+                "    line.split(' ', 1)\n"
+                "    for line in filter(None, state.read_text().splitlines())\n"
+                ")\n"
+                "args = sys.argv[1:]\n"
+                "if args[:1] == ['publish']:\n"
+                "    package = (\n"
+                "        'example-package@1.2.0' if len(args) == 3 else 'herdr-manager@0.2.0'\n"
+                "    )\n"
+                "    raise SystemExit(18 if package in entries else 0)\n"
+                "if args[:1] == ['view'] and len(args) == 3:\n"
+                "    package = args[1]\n"
+                "    if package in entries:\n"
+                "        if args[2] == 'version':\n"
+                "            print(package.rsplit('@', 1)[1])\n"
+                "            raise SystemExit(0)\n"
+                "        if args[2] == 'gitHead':\n"
+                "            print(entries[package])\n"
+                "            raise SystemExit(0)\n"
+                "    raise SystemExit(1)\n"
+                "raise SystemExit(19)\n",
+                encoding="utf-8",
+            )
+            npm.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "REGISTRY_STATE": str(state),
+                "GITHUB_SHA": "ccccccc",
+                "ORCHESTRATOR_PUBLISH": "true",
+                "MANAGER_PUBLISH": "true",
+                "ORCHESTRATOR_NAME": "example-package",
+                "ORCHESTRATOR_VERSION": "1.2.0",
+                "MANAGER_NAME": "herdr-manager",
+                "MANAGER_VERSION": "0.2.0",
+            }
+
+            raced = subprocess.run(
+                ["bash", "-eu", "-c", publish],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertNotEqual(raced.returncode, 0, raced.stderr)
+
+            mismatched = subprocess.run(
+                ["bash", "-eu", "-c", verify],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertNotEqual(mismatched.returncode, 0, mismatched.stderr)
+            self.assertIn("gitHead mismatch", mismatched.stderr)
+
+            environment.update(
+                {
+                    "ORCHESTRATOR_PUBLISH": "false",
+                    "MANAGER_PUBLISH": "false",
+                }
+            )
+            skipped = subprocess.run(
+                ["bash", "-eu", "-c", verify],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(skipped.returncode, 0, skipped.stderr)
 
     def test_github_release_model_is_idempotent_across_retries(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
@@ -669,6 +872,40 @@ class QualityScriptTests(unittest.TestCase):
         self.assertIn("-p", command)
         self.assertIn("no:cacheprovider", command)
         self.assertEqual(payload["executions"][0]["error_code"], "report_missing")
+
+    def test_test_stability_baselines_on_first_valid_report(self) -> None:
+        reports = [
+            None,
+            {"tests": [{"nodeid": "test_a", "outcome": "passed"}]},
+            {"tests": [{"nodeid": "test_a", "outcome": "failed"}]},
+        ]
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            calls.append(command)
+            report = reports[len(calls) - 1]
+            if report is not None:
+                target = Path(command[-1].split("=", 1)[1])
+                target.write_text(json.dumps(report), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "stability.json"
+            with (
+                patch.object(test_stability.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["test_stability.py", "--runs", "3", "--output", str(output)],
+                ),
+            ):
+                status = test_stability.main()
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["executions"][0]["error_code"], "report_missing")
+        self.assertEqual(payload["unstable"], ["test_a"])
 
     def test_test_stability_rejects_unknown_outcomes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

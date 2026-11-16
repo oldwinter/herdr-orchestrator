@@ -107,7 +107,9 @@ budget；`blocked`、`pending`、`running` 或已成功任务拒绝 retry。普�
 `blocked`；人工审查后可用显式 `resume --response-file` 回答原 agent。resume 必须匹配已记录的
 agent 与 pane，并保持原 attempt。每个 resume 有独立 operation token 和 sequence。未接受的
 operation 以 `abandoned` receipt 收口后，下一次显式 resume 才发送 response；已接受但尚未
-durably settled 的 operation 进入 `attention`，不会自动或人工重复发送。
+durably settled 的 operation 进入 `attention`，不会自动重发。operator 审查后可显式
+`resume --response-file`：这会放弃该 turn 的 ownership 记账并以新的 operation sequence
+重新提交 response。
 
 ### Coordinator
 

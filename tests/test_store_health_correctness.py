@@ -409,6 +409,106 @@ class StoreHealthCorrectnessTests(unittest.TestCase):
             "agent_provider_failed",
         )
 
+    def test_fenced_holder_write_is_exempt_from_monotonic_observed_at(self) -> None:
+        self.assertTrue(self._write_health(observed_at=100.0, status="ready", expires_at=200.0))
+        lease = self.store.acquire_harness_probe_lease(
+            workflow="workflow",
+            workspace="/workspace",
+            harness=Harness.CODEX,
+            owner="probe",
+            now=110.0,
+            lease_seconds=10.0,
+            force=True,
+        )
+        self.assertIsNotNone(lease)
+        assert lease is not None
+
+        self.assertTrue(
+            self._write_health(
+                observed_at=90.0,
+                status="degraded",
+                expires_at=None,
+                expected_revision=lease.revision,
+                expected_owner=lease.owner,
+                clear_probe_lease=True,
+            )
+        )
+        row = self.store.harness_health_rows("workflow", "/workspace")[0]
+        self.assertEqual(row["status"], "degraded")
+        self.assertEqual(row["observed_at"], 90.0)
+
+    def test_probe_release_only_clears_the_matching_lease_generation(self) -> None:
+        first = self.store.acquire_harness_probe_lease(
+            workflow="workflow",
+            workspace="/workspace",
+            harness=Harness.CODEX,
+            owner="probe",
+            now=100.0,
+            lease_seconds=10.0,
+        )
+        self.assertIsNotNone(first)
+        assert first is not None
+        second = self.store.acquire_harness_probe_lease(
+            workflow="workflow",
+            workspace="/workspace",
+            harness=Harness.CODEX,
+            owner="probe",
+            now=101.0,
+            lease_seconds=10.0,
+        )
+        self.assertIsNotNone(second)
+        assert second is not None
+
+        self.store.release_harness_probe(
+            workflow="workflow",
+            workspace="/workspace",
+            harness=Harness.CODEX,
+            owner="probe",
+            lease_until=first.lease_until,
+        )
+        row = self.store.harness_health_rows("workflow", "/workspace")[0]
+        self.assertEqual(row["probe_owner"], "probe")
+        self.assertEqual(row["probe_lease_until"], second.lease_until)
+
+        self.store.release_harness_probe(
+            workflow="workflow",
+            workspace="/workspace",
+            harness=Harness.CODEX,
+            owner="probe",
+            lease_until=second.lease_until,
+        )
+        row = self.store.harness_health_rows("workflow", "/workspace")[0]
+        self.assertIsNone(row["probe_owner"])
+        self.assertIsNone(row["probe_lease_until"])
+
+    def test_legacy_health_migration_tolerates_missing_optional_columns(self) -> None:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.executescript("""
+                DROP TABLE harness_health;
+                UPDATE schema_meta SET version = 8;
+                CREATE TABLE harness_health (
+                    workflow TEXT NOT NULL, workspace TEXT NOT NULL, harness TEXT NOT NULL,
+                    status TEXT, reason_code TEXT, source TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    PRIMARY KEY(workflow, workspace, harness)
+                );
+                INSERT INTO harness_health VALUES (
+                    'workflow', '/workspace', 'codex', 'degraded', 'agent_auth_required',
+                    'dispatch', 100.0
+                );
+                """)
+
+        self.store.initialize()
+
+        row = self.store.harness_health_rows("workflow", "/workspace")[0]
+        self.assertEqual(row["status"], "degraded")
+        self.assertEqual(row["reason"], "agent_auth_required")
+        self.assertEqual(row["retryable_failures"], 0)
+        self.assertIsNone(row["probe_owner"])
+        self.assertIsNone(row["probe_lease_until"])
+        self.assertIsNone(row["expires_at"])
+        self.assertIsNone(row["cooldown_until"])
+
     def _install_legacy_health_table(self) -> None:
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.executescript("""

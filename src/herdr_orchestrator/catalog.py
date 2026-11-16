@@ -32,6 +32,8 @@ def load_harness_profiles(directory: Path) -> tuple[HarnessProfile, ...]:
     profiles: list[HarnessProfile] = []
     seen: set[Harness] = set()
     for path in sorted(directory.glob("*.toml")):
+        if path.is_symlink() or not path.is_file():
+            raise CatalogError(f"profile_invalid_file: {path}")
         try:
             raw = tomllib.loads(path.read_text(encoding="utf-8"))
         except UnicodeDecodeError as exc:
@@ -157,7 +159,10 @@ def _resolve_context_file(base: Path, raw: Mapping[str, Any]) -> Path:
     candidate = Path(value)
     if candidate.is_absolute() or ".." in candidate.parts:
         raise CatalogError("profile_context_path_invalid")
-    path = (base / candidate).resolve()
+    unresolved = base / candidate
+    if unresolved.is_symlink():
+        raise CatalogError("profile_context_path_invalid")
+    path = unresolved.resolve()
     if not path.is_relative_to(base.resolve()):
         raise CatalogError("profile_context_path_invalid")
     if not path.is_file():

@@ -38,6 +38,7 @@ from herdr_orchestrator.delivery_support import (
     DeliveryError,
     DeliveryResult,
     _agent_is_active,
+    _assert_source_workspace_stable,
     _effect_absent,
     _effect_conflict,
     _effect_matched,
@@ -244,6 +245,7 @@ class DeliveryRecoveryMixin:
             raise DeliveryError("delivery_result_tracker_publication_mismatch")
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)
         base_commit = self._delivery_base_commit(git)
+        _assert_source_workspace_stable(git, base_commit)
         integration = Worktree(
             self._run_root / "worktrees/integration",
             result.integration_branch,
@@ -349,123 +351,114 @@ class DeliveryRecoveryMixin:
                 "delivery_secret_material_rejected: remove secret material before retry"
             )
         path = self._run_root / "tracker-publication.json"
-        journal = self._journal
+        journal = self._require_journal()
         try:
             observation_receipts = existing_ticket_receipts(
                 self._run_root,
                 plan,
-                confirmed=None if journal is None else journal.has_confirmation,
+                confirmed=journal.has_confirmation,
             )
         except DeliveryArtifactError as exc:
             raise DeliveryError("delivery_recovery_conflict:receipt.ticket.accept") from exc
         if path.is_file():
             references = self._restore_tracker_publication(path, plan)
-            if journal is not None:
-                recorded = journal._intent_details("tracker:publish")
-                spec_url = getattr(self.tracker, "spec_url", None)
-                migration_receipts: dict[str, TicketReceipt] | None = None
-                if recorded is None:
-                    markers = tracker_markers(self._run_id, plan)
-                    migration_receipts = self._preflight_legacy_delivery(
-                        plan,
-                        references,
-                        spec_url,
-                        markers,
-                    )
-                    observation_receipts = migration_receipts
-                    recorded = {
-                        "markers": markers.payload(),
-                        "migration": legacy_migration_payload(
-                            self._run_root,
-                            references,
-                            spec_url,
-                            migration_receipts,
-                            file_sha256=_file_sha256,
-                        ),
-                    }
-                else:
-                    markers = tracker_markers_from_payload(recorded.get("markers"), plan)
-                migration = recorded.get("migration")
-                migration_completed = completed_legacy_migration(migration)
-                if migration is not None:
-                    migration_receipts = self._preflight_legacy_delivery(
-                        plan,
-                        references,
-                        spec_url,
-                        markers,
-                        require_closed=migration_completed,
-                    )
-                    observation_receipts = migration_receipts
-                    if migration != legacy_migration_payload(
+            recorded = journal._intent_details("tracker:publish")
+            spec_url = getattr(self.tracker, "spec_url", None)
+            migration_receipts: dict[str, TicketReceipt] | None = None
+            if recorded is None:
+                markers = tracker_markers(self._run_id, plan)
+                migration_receipts = self._preflight_legacy_delivery(
+                    plan,
+                    references,
+                    spec_url,
+                    markers,
+                )
+                observation_receipts = migration_receipts
+                recorded = {
+                    "markers": markers.payload(),
+                    "migration": legacy_migration_payload(
                         self._run_root,
                         references,
                         spec_url,
                         migration_receipts,
                         file_sha256=_file_sha256,
-                        completed=migration_completed,
-                    ):
-                        raise DeliveryError("delivery_recovery_conflict:tracker.publish")
-                apply = (
-                    partial(
-                        self._adopt_tracker_effect,
-                        plan,
-                        markers,
-                        references,
-                        spec_url,
-                        migration_receipts,
-                        migration_completed,
-                    )
-                    if migration is not None
-                    else partial(self._publish_tracker_effect, plan, markers)
+                    ),
+                }
+            else:
+                markers = tracker_markers_from_payload(recorded.get("markers"), plan)
+            migration = recorded.get("migration")
+            migration_completed = completed_legacy_migration(migration)
+            if migration is not None:
+                migration_receipts = self._preflight_legacy_delivery(
+                    plan,
+                    references,
+                    spec_url,
+                    markers,
+                    require_closed=migration_completed,
                 )
-                payload = journal.reconcile(
-                    DeliveryEffect(
-                        key="tracker:publish",
-                        kind="tracker.publish",
-                        intent=recorded,
-                        observe=partial(
-                            self._observe_tracker_publication,
-                            plan,
-                            markers,
-                            observation_receipts,
-                        ),
-                        apply=apply,
-                    )
+                observation_receipts = migration_receipts
+                if migration != legacy_migration_payload(
+                    self._run_root,
+                    references,
+                    spec_url,
+                    migration_receipts,
+                    file_sha256=_file_sha256,
+                    completed=migration_completed,
+                ):
+                    raise DeliveryError("delivery_recovery_conflict:tracker.publish")
+            apply = (
+                partial(
+                    self._adopt_tracker_effect,
+                    plan,
+                    markers,
+                    references,
+                    spec_url,
+                    migration_receipts,
+                    migration_completed,
                 )
-                observed, observed_spec = self._tracker_references_from_effect(payload, plan)
-                if observed != references or observed_spec != spec_url:
-                    raise DeliveryError("delivery_tracker_publication_mismatch")
-                references = observed
-            self._record("tracker_recovered", {"tickets": sorted(references)})
-            return references
-        journal = self._journal
-        if journal is None:
-            payload = self._publish_tracker_effect(plan, None)
-        else:
-            if self._tracker_publish_was_interrupted() and not journal.has_intent(
-                "tracker:publish"
-            ):
-                raise DeliveryError("delivery_tracker_publish_interrupted")
-            recorded = journal._intent_details("tracker:publish")
-            markers = (
-                tracker_markers(self._run_id, plan)
-                if recorded is None
-                else tracker_markers_from_payload(recorded.get("markers"), plan)
+                if migration is not None
+                else partial(self._publish_tracker_effect, plan, markers)
             )
             payload = journal.reconcile(
                 DeliveryEffect(
                     key="tracker:publish",
                     kind="tracker.publish",
-                    intent={"markers": markers.payload()},
+                    intent=recorded,
                     observe=partial(
                         self._observe_tracker_publication,
                         plan,
                         markers,
                         observation_receipts,
                     ),
-                    apply=partial(self._publish_tracker_effect, plan, markers),
+                    apply=apply,
                 )
             )
+            observed, observed_spec = self._tracker_references_from_effect(payload, plan)
+            if observed != references or observed_spec != spec_url:
+                raise DeliveryError("delivery_tracker_publication_mismatch")
+            references = observed
+            self._record("tracker_recovered", {"tickets": sorted(references)})
+            return references
+        recorded = journal._intent_details("tracker:publish")
+        markers = (
+            tracker_markers(self._run_id, plan)
+            if recorded is None
+            else tracker_markers_from_payload(recorded.get("markers"), plan)
+        )
+        payload = journal.reconcile(
+            DeliveryEffect(
+                key="tracker:publish",
+                kind="tracker.publish",
+                intent={"markers": markers.payload()},
+                observe=partial(
+                    self._observe_tracker_publication,
+                    plan,
+                    markers,
+                    observation_receipts,
+                ),
+                apply=partial(self._publish_tracker_effect, plan, markers),
+            )
+        )
         references, spec_url = self._tracker_references_from_effect(payload, plan)
         _write_json(
             path,
@@ -704,13 +697,6 @@ class DeliveryRecoveryMixin:
                 raise DeliveryError("delivery_tracker_publication_invalid")
             self.tracker.spec_url = spec_url
         return references
-
-    def _tracker_publish_was_interrupted(self) -> bool:
-        if self.config.standardized_delivery.tracker_backend.value != "github":
-            return False
-        return any(
-            self._previous_state.get(key) == "tracker-publish" for key in ("stage", "failed_stage")
-        )
 
     def _implement_plan(self, plan: DeliveryPlan) -> tuple[Worktree, int]:
         git = GitWorkspace(self.config.workspace, self._run_root, plan.slug)

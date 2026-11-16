@@ -15,14 +15,14 @@ def existing_ticket_receipts(
     run_root: Path,
     plan: DeliveryPlan,
     *,
-    confirmed: Callable[[str], bool] | None = None,
+    confirmed: Callable[[str], bool],
 ) -> dict[str, TicketReceipt]:
     receipts: dict[str, TicketReceipt] = {}
     for ticket in plan.tickets:
         path = run_root / "receipts" / f"ticket-{ticket.ticket_id}.json"
         if not path.is_file():
             continue
-        if confirmed is not None and not (
+        if not (
             confirmed(f"ticket:accept:{ticket.ticket_id}")
             and confirmed(f"git:merge:{ticket.ticket_id}")
         ):

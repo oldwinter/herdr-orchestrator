@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -28,6 +29,14 @@ def _load_script(name: str, path: Path):
 
 quality_bundle = _load_script("quality_bundle_summary_fixture", BUNDLE_SCRIPT)
 quality_summary = _load_script("quality_summary_regression", SUMMARY_SCRIPT)
+
+
+def _source(commit: str) -> quality_bundle.SourceIdentity:
+    return quality_bundle.SourceIdentity(
+        commit.lower(),
+        hashlib.sha256(f"fixture\0{commit.lower()}".encode()).hexdigest(),
+        True,
+    )
 
 
 class QualitySummaryTests(unittest.TestCase):
@@ -136,6 +145,7 @@ class QualitySummaryTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit="c" * 40,
+                source=_source("c" * 40),
                 invocation_id="manifest-only",
                 specs=specs,
             )
@@ -276,6 +286,7 @@ class QualitySummaryTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="unbounded-coverage",
                 specs=tuple(specs),
             )
@@ -340,6 +351,7 @@ class QualitySummaryTests(unittest.TestCase):
             bundle = quality_bundle.run_quality(
                 root=root / "quality",
                 commit=commit,
+                source=_source(commit),
                 invocation_id="summary-fixture",
                 specs=specs,
             )

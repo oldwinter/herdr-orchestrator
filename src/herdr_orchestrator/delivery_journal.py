@@ -104,6 +104,7 @@ def _reject_json_constant(value: str) -> object:
 
 
 class DeliveryJournal:
+    _JOURNAL_MAX_BYTES = 256 * 1024 * 1024
     _STAGE_STATES = {
         ("running", "wayfinder"),
         ("running", "spec-and-tickets"),
@@ -123,7 +124,6 @@ class DeliveryJournal:
     }
     _OWNER_EVENTS = {
         "owner_acquired",
-        "owner_recovered",
         "owner_released",
         "owner_renewed",
     }
@@ -165,6 +165,10 @@ class DeliveryJournal:
         self.clock = clock
         self.payload_validator = payload_validator
         self._events = self._load_events()
+        self._events_by_key: dict[str, list[_JournalEvent]] = {}
+        for event in self._events:
+            if event.operation_key is not None:
+                self._events_by_key.setdefault(event.operation_key, []).append(event)
         self._lock = threading.Lock()
 
     @classmethod
@@ -192,14 +196,14 @@ class DeliveryJournal:
                 payload_validator=payload_validator,
             )
             previous = journal._durable_owner()
-            if previous is not None:
-                journal._write_owner_snapshot(previous)
             if (
                 previous is not None
                 and previous.status == "active"
                 and previous.lease_deadline > now
             ):
                 raise error_type("delivery_run_active")
+            if previous is not None:
+                journal._write_owner_snapshot(previous)
             owner_token = token_factory()
             if not re.fullmatch(r"[0-9a-f]{32}", owner_token):
                 raise error_type("delivery_owner_token_invalid")
@@ -216,7 +220,13 @@ class DeliveryJournal:
             journal._write_owner("active", now)
             try:
                 yield journal
-            finally:
+            except BaseException as exc:
+                try:
+                    journal.release()
+                except Exception as release_error:
+                    exc.add_note(f"delivery journal release failed: {release_error!r}")
+                raise
+            else:
                 journal.release()
 
     def renew(self) -> None:
@@ -458,13 +468,8 @@ class DeliveryJournal:
 
     def pending_effects(self, *, kind: str | None = None) -> tuple[PendingDeliveryEffect, ...]:
         with self._lock:
-            keys = tuple(
-                event.operation_key
-                for event in self._events
-                if event.event == "effect_intent" and event.operation_key is not None
-            )
             pending: list[PendingDeliveryEffect] = []
-            for key in keys:
+            for key in self._events_by_key:
                 intent, started, confirmation = self._operation(key)
                 if (
                     intent is not None
@@ -646,6 +651,8 @@ class DeliveryJournal:
             error_type=self.error_type,
         )
         self._events.append(row)
+        if operation_key is not None:
+            self._events_by_key.setdefault(operation_key, []).append(row)
 
     def _operation(
         self,
@@ -654,9 +661,7 @@ class DeliveryJournal:
         intent: _JournalEvent | None = None
         started = False
         confirmation: _JournalEvent | None = None
-        for event in self._events:
-            if event.operation_key != operation_key:
-                continue
+        for event in self._events_by_key.get(operation_key, ()):
             if event.event == "effect_intent":
                 intent = event
             elif event.event == "effect_started":
@@ -675,24 +680,33 @@ class DeliveryJournal:
             return []
         payloads = self._read_event_payloads(path)
         operations: dict[str, tuple[str, dict[str, object], bool, bool]] = {}
-        owner_state: list[str | None] = [None, None]
+        owner_state: list[str | None] = [None]
         return [
             self._decode_event(sequence, payload, operations, owner_state)
             for sequence, payload in enumerate(payloads, 1)
         ]
 
     def _read_event_payloads(self, path: Path) -> list[object]:
+        payloads: list[object] = []
+        consumed = 0
         try:
-            return [
-                json.loads(
-                    line,
-                    object_pairs_hook=_unique_json_object,
-                    parse_constant=_reject_json_constant,
-                )
-                for line in path.read_text(encoding="utf-8").splitlines()
-            ]
+            with path.open("rb") as stream:
+                for line in stream:
+                    consumed += len(line)
+                    if consumed > self._JOURNAL_MAX_BYTES:
+                        break
+                    payloads.append(
+                        json.loads(
+                            line,
+                            object_pairs_hook=_unique_json_object,
+                            parse_constant=_reject_json_constant,
+                        )
+                    )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise self.error_type("delivery_journal_invalid") from exc
+        if consumed > self._JOURNAL_MAX_BYTES:
+            raise self.error_type("delivery_journal_too_large")
+        return payloads
 
     def _decode_event(
         self,
@@ -754,26 +768,21 @@ class DeliveryJournal:
         details: dict[str, object],
         state: list[str | None],
     ) -> None:
-        active, pending = state
-        if event == "owner_recovered":
-            if active is None or owner_token == active:
-                raise self.error_type("delivery_journal_invalid")
-            state[1] = owner_token
-            return
+        active = state[0]
         self._validate_owner_details(event, details)
         if event == "owner_acquired":
             previous_owner = details.get("previous_owner")
             if active is None:
                 if previous_owner is not None:
                     raise self.error_type("delivery_journal_invalid")
-            elif previous_owner != active and pending != owner_token:
+            elif previous_owner != active:
                 raise self.error_type("delivery_journal_invalid")
-            state[:] = [owner_token, None]
+            state[0] = owner_token
             return
         if active != owner_token:
             raise self.error_type("delivery_journal_invalid")
         if event == "owner_released":
-            state[:] = [None, None]
+            state[0] = None
 
     def _validate_owner_details(
         self,
@@ -864,7 +873,7 @@ class DeliveryJournal:
                 raise self.error_type("delivery_journal_invalid")
             operations[operation_key] = (effect_kind, details, False, False)
             return
-        if prior is None or prior[0] != effect_kind:
+        if prior is None or (event != "effect_conflict" and prior[0] != effect_kind):
             raise self.error_type("delivery_journal_invalid")
         if event == "effect_started":
             if prior[2] or prior[3] or details:

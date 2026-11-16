@@ -206,6 +206,20 @@ class GitWorkspace:
         if self._git(path, "status", "--porcelain").stdout.strip():
             raise GitWorkspaceError(f"delivery_worktree_dirty: {path}")
 
+    def is_clean(self, cwd: Path, *, include_untracked: bool = True) -> bool:
+        self._validate_git_cwd(cwd)
+        untracked = "all" if include_untracked else "no"
+        process = self._git(
+            cwd,
+            "status",
+            "--porcelain",
+            f"--untracked-files={untracked}",
+            check=False,
+        )
+        if process.returncode != 0:
+            raise GitWorkspaceError("delivery_git_query_failed")
+        return not process.stdout.strip()
+
     def succeeds(self, cwd: Path, *args: str) -> bool:
         self._validate_git_cwd(cwd)
         return self._git(cwd, *args, check=False).returncode == 0

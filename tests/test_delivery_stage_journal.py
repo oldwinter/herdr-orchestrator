@@ -144,6 +144,34 @@ class DeliveryStageJournalTests(unittest.TestCase):
             with self.assertRaisesRegex(DeliveryError, "delivery_owner_lost"):
                 journal.record_stage({"status": "running", "stage": "wayfinder"})
 
+    def test_resumed_state_drops_stale_failure_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            delivery = StandardizedDelivery.__new__(StandardizedDelivery)
+            delivery._run_root = root
+            delivery._previous_state = {}
+            with DeliveryJournal.claim(root, "run", 60, error_type=DeliveryError) as journal:
+                delivery._journal = journal
+                delivery._write_state("running", stage="wayfinder", controller="droid")
+                delivery._write_state(
+                    "failed",
+                    stage="stopped",
+                    error="RuntimeError",
+                    failed_stage="implementation",
+                )
+                delivery._write_state("running", stage="implementation")
+                state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                state,
+                {
+                    "status": "running",
+                    "stage": "implementation",
+                    "controller": "droid",
+                },
+            )
+            self.assertEqual(journal.latest_stage_state(), state)
+
     def test_invalid_and_sensitive_stage_records_are_rejected_before_append(self) -> None:
         cases = [
             {},
